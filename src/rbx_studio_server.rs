@@ -42,6 +42,13 @@ pub struct AppState {
 }
 pub type PackedState = Arc<Mutex<AppState>>;
 
+#[derive(Serialize)]
+pub struct StatusResponse {
+    service: &'static str,
+    queued_requests: usize,
+    pending_responses: usize,
+}
+
 impl AppState {
     pub fn new() -> Self {
         let (trigger, waiter) = watch::channel(());
@@ -52,6 +59,15 @@ impl AppState {
             trigger,
         }
     }
+}
+
+pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResponse> {
+    let state = state.lock().await;
+    Json(StatusResponse {
+        service: "rbx-studio-mcp",
+        queued_requests: state.process_queue.len(),
+        pending_responses: state.output_map.len(),
+    })
 }
 
 impl ToolArguments {
@@ -320,7 +336,7 @@ pub async fn proxy_handler(
     }))
 }
 
-pub async fn dud_proxy_loop(state: PackedState, exit: Receiver<()>) {
+pub async fn dud_proxy_loop(state: PackedState, exit: Receiver<()>, plugin_port: u16) {
     let client = reqwest::Client::new();
 
     let mut waiter = { state.lock().await.waiter.clone() };
@@ -328,7 +344,7 @@ pub async fn dud_proxy_loop(state: PackedState, exit: Receiver<()>) {
         let entry = { state.lock().await.process_queue.pop_front() };
         if let Some(entry) = entry {
             let res = client
-                .post(format!("http://127.0.0.1:{STUDIO_PLUGIN_PORT}/proxy"))
+                .post(format!("http://127.0.0.1:{plugin_port}/proxy"))
                 .json(&entry)
                 .send()
                 .await;

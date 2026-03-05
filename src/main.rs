@@ -1,10 +1,23 @@
-use axum::routing::{get, post};
+use axum::{
+    extract::{Request, State},
+    http::{header, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
 use clap::Parser;
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{eyre, Result, WrapErr};
 use rbx_studio_server::*;
-use rmcp::ServiceExt;
+use rmcp::{
+    transport::streamable_http_server::{
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    },
+    ServiceExt,
+};
+use std::fs;
 use std::io;
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing_subscriber::{self, EnvFilter};
@@ -17,9 +30,118 @@ mod rbx_studio_server;
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Run as MCP server on stdio
+    /// Run as MCP server on stdio.
     #[arg(short, long)]
     stdio: bool,
+
+    /// Run as MCP streamable HTTP server on /mcp.
+    #[arg(long)]
+    http: bool,
+
+    /// Disable bearer authentication for HTTP mode.
+    #[arg(long, default_value_t = false)]
+    no_auth: bool,
+
+    /// Bearer token used for HTTP mode. Accepts both raw token and "Bearer <token>".
+    #[arg(long)]
+    bearer_token: Option<String>,
+
+    /// Path to bearer token file for HTTP mode.
+    #[arg(long)]
+    bearer_token_file: Option<PathBuf>,
+
+    /// Local port for Studio plugin bridge server.
+    #[arg(long, default_value_t = STUDIO_PLUGIN_PORT)]
+    plugin_port: u16,
+
+    /// Local port for HTTP MCP endpoint (/mcp).
+    #[arg(long, default_value_t = 44756)]
+    http_port: u16,
+
+    /// Write the bundled plugin file and exit.
+    #[arg(long)]
+    write_plugin: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct HttpAuthState {
+    bearer_token: Option<String>,
+}
+
+fn normalize_bearer_token(token: &str) -> Option<String> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let raw = trimmed.strip_prefix("Bearer ").unwrap_or(trimmed).trim();
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw.to_owned())
+    }
+}
+
+fn default_feishu_token_path() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".dev.clock-p.com").join("feishu-token"))
+}
+
+fn load_token_from_file(path: &PathBuf) -> Result<Option<String>> {
+    let content = fs::read_to_string(path)
+        .wrap_err_with(|| format!("Could not read token file at {}", path.display()))?;
+    Ok(normalize_bearer_token(&content))
+}
+
+fn resolve_http_bearer_token(args: &Args) -> Result<Option<String>> {
+    if args.no_auth {
+        return Ok(None);
+    }
+
+    if let Some(token) = args
+        .bearer_token
+        .as_deref()
+        .and_then(normalize_bearer_token)
+    {
+        return Ok(Some(token));
+    }
+
+    if let Some(path) = args.bearer_token_file.as_ref() {
+        return load_token_from_file(path);
+    }
+
+    if let Some(path) = default_feishu_token_path() {
+        if path.exists() {
+            return load_token_from_file(&path);
+        }
+    }
+
+    Ok(None)
+}
+
+async fn require_http_auth(
+    State(auth): State<HttpAuthState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(expected_token) = auth.bearer_token.as_ref() else {
+        return next.run(request).await;
+    };
+
+    let authorized = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(normalize_bearer_token)
+        .map(|provided| provided == *expected_token)
+        .unwrap_or(false);
+
+    if !authorized {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+
+    next.run(request).await
 }
 
 #[tokio::main]
@@ -33,7 +155,14 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    if !args.stdio {
+
+    if let Some(path) = args.write_plugin.as_ref() {
+        install::write_plugin_to_path(path)?;
+        println!("Wrote plugin to {}", path.display());
+        return Ok(());
+    }
+
+    if !args.stdio && !args.http {
         return install::install().await;
     }
 
@@ -44,7 +173,7 @@ async fn main() -> Result<()> {
     let (close_tx, close_rx) = tokio::sync::oneshot::channel();
 
     let listener =
-        tokio::net::TcpListener::bind((Ipv4Addr::new(127, 0, 0, 1), STUDIO_PLUGIN_PORT)).await;
+        tokio::net::TcpListener::bind((Ipv4Addr::new(127, 0, 0, 1), args.plugin_port)).await;
 
     let server_state_clone = Arc::clone(&server_state);
     let server_handle = if let Ok(listener) = listener {
@@ -52,8 +181,12 @@ async fn main() -> Result<()> {
             .route("/request", get(request_handler))
             .route("/response", post(response_handler))
             .route("/proxy", post(proxy_handler))
+            .route("/status", get(status_handler))
             .with_state(server_state_clone);
-        tracing::info!("This MCP instance is HTTP server listening on {STUDIO_PLUGIN_PORT}");
+        tracing::info!(
+            "Studio plugin bridge HTTP server listening on 127.0.0.1:{}",
+            args.plugin_port
+        );
         tokio::spawn(async {
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
@@ -64,23 +197,87 @@ async fn main() -> Result<()> {
         })
     } else {
         tracing::info!("This MCP instance will use proxy since port is busy");
+        let plugin_port = args.plugin_port;
         tokio::spawn(async move {
-            dud_proxy_loop(server_state_clone, close_rx).await;
+            dud_proxy_loop(server_state_clone, close_rx, plugin_port).await;
         })
     };
 
-    // Create an instance of our counter router
-    let service = RBXStudioServer::new(Arc::clone(&server_state))
-        .serve(rmcp::transport::stdio())
-        .await
-        .inspect_err(|e| {
-            tracing::error!("serving error: {:?}", e);
-        })?;
-    service.waiting().await?;
+    let mut http_close_tx = None;
+    let mut http_handle = None;
+
+    if args.http {
+        let token = resolve_http_bearer_token(&args)?;
+        if token.is_none() && !args.no_auth {
+            return Err(eyre!(
+                "HTTP mode requires a bearer token. Pass --bearer-token, --bearer-token-file, or use --no-auth for local testing."
+            ));
+        }
+
+        let auth_state = HttpAuthState {
+            bearer_token: token,
+        };
+
+        let streamable_state = Arc::clone(&server_state);
+        let streamable_http_service: StreamableHttpService<RBXStudioServer, LocalSessionManager> =
+            StreamableHttpService::new(
+                move || Ok(RBXStudioServer::new(Arc::clone(&streamable_state))),
+                Default::default(),
+                StreamableHttpServerConfig::default(),
+            );
+
+        let http_app = axum::Router::new()
+            .route("/status", get(status_handler))
+            .nest_service("/mcp", streamable_http_service)
+            .with_state(Arc::clone(&server_state))
+            .layer(middleware::from_fn_with_state(
+                auth_state,
+                require_http_auth,
+            ));
+
+        let listener =
+            tokio::net::TcpListener::bind((Ipv4Addr::new(127, 0, 0, 1), args.http_port)).await?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        http_close_tx = Some(tx);
+
+        tracing::info!(
+            "HTTP MCP endpoint listening on http://127.0.0.1:{}/mcp",
+            args.http_port
+        );
+
+        http_handle = Some(tokio::spawn(async move {
+            axum::serve(listener, http_app)
+                .with_graceful_shutdown(async move {
+                    _ = rx.await;
+                })
+                .await
+                .unwrap();
+        }));
+    }
+
+    if args.stdio {
+        let service = RBXStudioServer::new(Arc::clone(&server_state))
+            .serve(rmcp::transport::stdio())
+            .await
+            .inspect_err(|e| {
+                tracing::error!("serving error: {:?}", e);
+            })?;
+        service.waiting().await?;
+    } else {
+        tracing::info!("HTTP mode running. Press Ctrl+C to stop.");
+        tokio::signal::ctrl_c().await?;
+    }
 
     close_tx.send(()).ok();
+    if let Some(tx) = http_close_tx {
+        tx.send(()).ok();
+    }
+
     tracing::info!("Waiting for web server to gracefully shutdown");
     server_handle.await.ok();
+    if let Some(handle) = http_handle {
+        handle.await.ok();
+    }
     tracing::info!("Bye!");
     Ok(())
 }

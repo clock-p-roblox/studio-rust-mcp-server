@@ -98,6 +98,32 @@ To build and install the MCP reference implementation from this repository's sou
 After the command completes, the Studio MCP Server is installed and ready for your prompts from
 Claude Desktop.
 
+### Backend mode (domain/proxy friendly)
+
+For game backend usage, you can run this process without installer behavior and expose two local endpoints:
+
+- Studio plugin bridge (long polling): `http://127.0.0.1:44755`
+- MCP Streamable HTTP: `http://127.0.0.1:44756/mcp`
+
+```sh
+cargo run -- --http
+```
+
+By default `--http` requires a bearer token. It checks in this order:
+
+1. `--bearer-token`
+2. `--bearer-token-file`
+3. `~/.dev.clock-p.com/feishu-token`
+
+Use `--no-auth` only for local debugging.
+
+Useful flags:
+
+- `--plugin-port <port>`: plugin bridge port (default `44755`)
+- `--http-port <port>`: MCP HTTP port (default `44756`)
+- `--stdio`: run stdio MCP mode (can be combined with `--http`)
+- `--write-plugin <path>`: export bundled `MCPStudioPlugin.rbxm` and exit
+
 ## Verify setup
 
 To make sure everything is set up correctly, follow these steps:

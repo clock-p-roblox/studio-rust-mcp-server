@@ -10,6 +10,22 @@ use std::path::PathBuf;
 use std::vec;
 use std::{env, fs, io};
 
+pub fn plugin_bytes() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/MCPStudioPlugin.rbxm"))
+}
+
+pub fn write_plugin_to_path(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut file = File::create(path)
+        .wrap_err_with(|| format!("Could not create plugin file at {}", path.display()))?;
+    file.write_all(plugin_bytes())
+        .wrap_err_with(|| format!("Could not write plugin file at {}", path.display()))?;
+    Ok(())
+}
+
 fn get_message(successes: String) -> String {
     format!("Roblox Studio MCP is ready to go.
 Please restart Studio and MCP clients to apply the changes.
@@ -189,7 +205,6 @@ pub fn install_to_config(
 }
 
 async fn install_internal() -> Result<String> {
-    let plugin_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/MCPStudioPlugin.rbxm"));
     let studio = RobloxStudio::locate()?;
     let plugins = studio.plugins_path();
     if let Err(err) = fs::create_dir(plugins) {
@@ -198,15 +213,7 @@ async fn install_internal() -> Result<String> {
         }
     }
     let output_plugin = Path::new(&plugins).join("MCPStudioPlugin.rbxm");
-    {
-        let mut file = File::create(&output_plugin).wrap_err_with(|| {
-            format!(
-                "Could write Roblox Plugin file at {}",
-                output_plugin.display()
-            )
-        })?;
-        file.write_all(plugin_bytes)?;
-    }
+    write_plugin_to_path(&output_plugin)?;
     println!(
         "Installed Roblox Studio plugin to {}",
         output_plugin.display()
