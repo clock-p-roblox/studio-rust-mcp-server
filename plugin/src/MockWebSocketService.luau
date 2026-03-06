@@ -22,6 +22,7 @@ export type MockWebSocketClient = {
 	Close: (self: MockWebSocketClient) -> (),
 	SetReceiveEndpoint: (self: MockWebSocketClient, endpoint: string) -> (),
 	SetSendEndpoint: (self: MockWebSocketClient, endpoint: string) -> (),
+	SetHeaders: (self: MockWebSocketClient, headers: { [string]: string }) -> (),
 	Opened: RBXScriptSignal,
 	Closed: RBXScriptSignal,
 	MessageReceived: RBXScriptSignal,
@@ -34,6 +35,7 @@ type MockWebSocketClientPrivate = MockWebSocketClient & {
 	_uri: string,
 	_receiveEndpoint: string,
 	_sendEndpoint: string,
+	_headers: { [string]: string },
 	_pollTask: thread?,
 	_OpenedEvent: BindableEvent,
 	_ClosedEvent: BindableEvent,
@@ -46,6 +48,7 @@ function MockWebSocketClient.new(uri: string): MockWebSocketClient
 	self._uri = uri
 	self._receiveEndpoint = ""
 	self._sendEndpoint = ""
+	self._headers = {}
 	self._pollTask = nil :: thread?
 
 	self._OpenedEvent = Instance.new("BindableEvent")
@@ -64,14 +67,24 @@ function MockWebSocketClient.new(uri: string): MockWebSocketClient
 	return self
 end
 
-local function doRequest(url: string, method: "GET" | "POST", body: any)
+local function doRequest(url: string, method: "GET" | "POST", body: any, headers: { [string]: string }?)
+	local requestHeaders = {}
+
+	if headers then
+		for key, value in headers do
+			requestHeaders[key] = value
+		end
+	end
+
+	if body ~= nil then
+		requestHeaders["Content-Type"] = "application/json"
+	end
+
 	local ok, response = pcall(function()
 		return HttpService:RequestAsync({
 			Url = url,
 			Method = method,
-			Headers = {
-				["Content-Type"] = "application/json",
-			},
+			Headers = requestHeaders,
 			Body = if body then HttpService:JSONEncode(body) else nil,
 			Compress = Enum.HttpCompression.None,
 		})
@@ -88,7 +101,7 @@ function MockWebSocketClient._OpenImpl(self: MockWebSocketClientPrivate)
 
 	self._pollTask = task.spawn(function()
 		while self.ConnectionState == EnumWebSocketState.Open do
-			local response = doRequest(self._uri .. self._receiveEndpoint, "GET")
+			local response = doRequest(self._uri .. self._receiveEndpoint, "GET", nil, self._headers)
 
 			if response then
 				if response.StatusCode == 200 and response.Success then
@@ -105,7 +118,7 @@ function MockWebSocketClient._OpenImpl(self: MockWebSocketClientPrivate)
 end
 
 function MockWebSocketClient.Send(self: MockWebSocketClientPrivate, data: any)
-	doRequest(self._uri .. self._sendEndpoint, "POST", data)
+	doRequest(self._uri .. self._sendEndpoint, "POST", data, self._headers)
 end
 
 function MockWebSocketClient.Close(self: MockWebSocketClientPrivate)
@@ -129,6 +142,10 @@ end
 
 function MockWebSocketClient.SetSendEndpoint(self: MockWebSocketClientPrivate, endpoint: string)
 	self._sendEndpoint = endpoint
+end
+
+function MockWebSocketClient.SetHeaders(self: MockWebSocketClientPrivate, headers: { [string]: string })
+	self._headers = headers
 end
 -- END DEVIATION
 
