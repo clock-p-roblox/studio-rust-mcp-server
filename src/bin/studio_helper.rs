@@ -48,9 +48,17 @@ struct Args {
 struct HelperConfig {
     port: u16,
     user_name: String,
-    bearer_token: String,
+    bearer_token: Arc<Mutex<String>>,
+    bearer_token_source: Arc<Mutex<String>>,
+    bearer_token_candidates: Arc<Vec<ResolvedToken>>,
     domain_suffix: String,
     client: reqwest::Client,
+}
+
+#[derive(Clone)]
+struct ResolvedToken {
+    value: String,
+    source: String,
 }
 
 struct PluginInstance {
@@ -237,27 +245,58 @@ fn resolve_user_name(args: &Args) -> Result<String> {
 }
 
 fn resolve_bearer_token(args: &Args) -> Result<String> {
+    Ok(resolve_bearer_token_candidates(args)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| eyre!("cannot resolve feishu-token for helper"))?
+        .value)
+}
+
+fn resolve_bearer_token_candidates(args: &Args) -> Result<Vec<ResolvedToken>> {
+    let mut resolved = Vec::new();
+
     if let Some(value) = args.bearer_token.as_ref() {
         if let Some(normalized) = normalize_bearer_token(value) {
-            return Ok(normalized);
+            resolved.push(ResolvedToken {
+                value: normalized,
+                source: "cli --bearer-token".to_owned(),
+            });
         }
     }
 
     if let Some(path) = args.bearer_token_file.as_ref() {
         if let Some(normalized) = normalize_bearer_token(&read_trimmed_file(path)?) {
-            return Ok(normalized);
+            resolved.push(ResolvedToken {
+                value: normalized,
+                source: path.display().to_string(),
+            });
         }
     }
 
     for candidate in token_candidates() {
         if candidate.is_file() {
             if let Some(normalized) = normalize_bearer_token(&read_trimmed_file(&candidate)?) {
-                return Ok(normalized);
+                resolved.push(ResolvedToken {
+                    value: normalized,
+                    source: candidate.display().to_string(),
+                });
             }
         }
     }
 
-    Err(eyre!("cannot resolve feishu-token for helper"))
+    let mut unique = Vec::new();
+    let mut seen = HashSet::new();
+    for item in resolved {
+        if seen.insert(item.value.clone()) {
+            unique.push(item);
+        }
+    }
+
+    if unique.is_empty() {
+        return Err(eyre!("cannot resolve feishu-token for helper"));
+    }
+
+    Ok(unique)
 }
 
 fn derive_public_base_url(kind: &str, place_id: &str, helper: &HelperConfig) -> String {
@@ -346,11 +385,12 @@ async fn rojo_config_handler(
 ) -> Result<Json<RojoConfigResponse>, HelperError> {
     let place_id = sanitize_place_id(&query.place_id)?;
     let base_url = derive_public_base_url("rojo", &place_id, &app.helper);
+    let bearer_token = app.helper.bearer_token.lock().await.clone();
     tracing::info!(place_id, base_url, "resolved rojo config from helper");
     Ok(Json(RojoConfigResponse {
         place_id,
         base_url,
-        auth_header: format!("Bearer {}", app.helper.bearer_token),
+        auth_header: format!("Bearer {bearer_token}"),
     }))
 }
 
@@ -537,10 +577,11 @@ async fn remote_poll_loop(app: AppState, place_id: String) {
 }
 
 async fn poll_remote_command(helper: &HelperConfig, base_url: &str) -> Result<Option<Value>> {
+    let bearer_token = helper.bearer_token.lock().await.clone();
     let response = helper
         .client
         .get(format!("{base_url}/request"))
-        .header(AUTHORIZATION, format!("Bearer {}", helper.bearer_token))
+        .header(AUTHORIZATION, format!("Bearer {bearer_token}"))
         .send()
         .await?;
     match response.status() {
@@ -551,17 +592,42 @@ async fn poll_remote_command(helper: &HelperConfig, base_url: &str) -> Result<Op
 }
 
 async fn probe_remote_mcp(helper: &HelperConfig, base_url: &str) -> Result<()> {
-    let response = helper
+    let current_token = helper.bearer_token.lock().await.clone();
+    let status = helper
         .client
         .get(format!("{base_url}/status"))
-        .header(AUTHORIZATION, format!("Bearer {}", helper.bearer_token))
+        .header(AUTHORIZATION, format!("Bearer {current_token}"))
         .send()
-        .await?;
-    let status = response.status();
-    if !status.is_success() {
+        .await?
+        .status();
+    if status.is_success() {
+        return Ok(());
+    }
+    if status != StatusCode::UNAUTHORIZED {
         return Err(eyre!("remote MCP status probe returned {status}"));
     }
-    Ok(())
+
+    for candidate in helper.bearer_token_candidates.iter() {
+        if candidate.value == current_token {
+            continue;
+        }
+        tracing::info!(source = candidate.source, "helper is trying alternate bearer token after unauthorized MCP probe");
+        let status = helper
+            .client
+            .get(format!("{base_url}/status"))
+            .header(AUTHORIZATION, format!("Bearer {}", candidate.value))
+            .send()
+            .await?
+            .status();
+        if status.is_success() {
+            *helper.bearer_token.lock().await = candidate.value.clone();
+            *helper.bearer_token_source.lock().await = candidate.source.clone();
+            tracing::warn!(source = candidate.source, "helper switched to alternate bearer token after unauthorized MCP probe");
+            return Ok(());
+        }
+    }
+
+    Err(eyre!("remote MCP status probe returned {status}"))
 }
 
 async fn post_remote_response(
@@ -569,10 +635,11 @@ async fn post_remote_response(
     base_url: &str,
     response: &PluginResponsePayload,
 ) -> Result<()> {
+    let bearer_token = helper.bearer_token.lock().await.clone();
     let status = helper
         .client
         .post(format!("{base_url}/response"))
-        .header(AUTHORIZATION, format!("Bearer {}", helper.bearer_token))
+        .header(AUTHORIZATION, format!("Bearer {bearer_token}"))
         .header(CONTENT_TYPE, "application/json")
         .json(response)
         .send()
@@ -811,14 +878,24 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let bearer_token_candidates = resolve_bearer_token_candidates(&args)?;
+    let initial_bearer_token = resolve_bearer_token(&args)?;
+    let initial_bearer_token_source = bearer_token_candidates
+        .iter()
+        .find(|candidate| candidate.value == initial_bearer_token)
+        .map(|candidate| candidate.source.clone())
+        .unwrap_or_else(|| "unknown".to_owned());
     let helper = HelperConfig {
         port: args.port,
         user_name: resolve_user_name(&args)?,
-        bearer_token: resolve_bearer_token(&args)?,
+        bearer_token: Arc::new(Mutex::new(initial_bearer_token)),
+        bearer_token_source: Arc::new(Mutex::new(initial_bearer_token_source)),
+        bearer_token_candidates: Arc::new(bearer_token_candidates),
         domain_suffix: args.domain_suffix.clone(),
         client: reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?,
     };
-    tracing::info!(user_name = helper.user_name, port = args.port, domain_suffix = helper.domain_suffix, "starting Studio helper");
+    let token_source = helper.bearer_token_source.lock().await.clone();
+    tracing::info!(user_name = helper.user_name, port = args.port, domain_suffix = helper.domain_suffix, token_source, "starting Studio helper");
 
     let state = Arc::new(Mutex::new(HelperState {
         instances: HashMap::new(),
