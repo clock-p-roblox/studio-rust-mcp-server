@@ -161,6 +161,20 @@ fn trim(value: &str) -> String {
     value.trim().to_owned()
 }
 
+fn normalize_bearer_token(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_start_matches('\u{feff}').trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let raw = trimmed.strip_prefix("Bearer ").unwrap_or(trimmed).trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    Some(raw.to_owned())
+}
+
 fn home_dir() -> Option<PathBuf> {
     env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
@@ -224,24 +238,21 @@ fn resolve_user_name(args: &Args) -> Result<String> {
 
 fn resolve_bearer_token(args: &Args) -> Result<String> {
     if let Some(value) = args.bearer_token.as_ref() {
-        let trimmed = trim(value);
-        if !trimmed.is_empty() {
-            return Ok(trimmed);
+        if let Some(normalized) = normalize_bearer_token(value) {
+            return Ok(normalized);
         }
     }
 
     if let Some(path) = args.bearer_token_file.as_ref() {
-        let value = read_trimmed_file(path)?;
-        if !value.is_empty() {
-            return Ok(value);
+        if let Some(normalized) = normalize_bearer_token(&read_trimmed_file(path)?) {
+            return Ok(normalized);
         }
     }
 
     for candidate in token_candidates() {
         if candidate.is_file() {
-            let value = read_trimmed_file(&candidate)?;
-            if !value.is_empty() {
-                return Ok(value);
+            if let Some(normalized) = normalize_bearer_token(&read_trimmed_file(&candidate)?) {
+                return Ok(normalized);
             }
         }
     }

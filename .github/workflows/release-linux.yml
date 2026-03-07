@@ -8,31 +8,77 @@ on:
 permissions:
   contents: write
 
-jobs:
-  release-linux:
-    runs-on: ubuntu-latest
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
 
+jobs:
+  build-linux-plugin:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Windows cross toolchain
-        run: sudo ./util/install-ubuntu-windows-cross.sh
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
 
       - name: Build Linux binary
-        run: |
-          cargo build --release
-          cargo build --release --bin studio_helper --target x86_64-pc-windows-gnu
+        run: cargo build --release --bin rbx-studio-mcp
 
-      - name: Prepare release artifacts
+      - name: Prepare Linux artifacts
         run: |
           mkdir -p output
           cp target/release/rbx-studio-mcp output/rbx-studio-mcp-linux-x86_64
           chmod +x output/rbx-studio-mcp-linux-x86_64
           ./target/release/rbx-studio-mcp --write-plugin output/MCPStudioPlugin.rbxm
-          cp target/x86_64-pc-windows-gnu/release/studio_helper.exe output/studio_helper-windows-x86_64.exe
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: studio-rust-mcp-linux-plugin
+          path: |
+            output/rbx-studio-mcp-linux-x86_64
+            output/MCPStudioPlugin.rbxm
+
+  build-windows-helper:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Windows helper
+        run: cargo build --release --bin studio_helper
+
+      - name: Prepare Windows artifact
+        shell: bash
+        run: |
+          mkdir -p output
+          cp target/release/studio_helper.exe output/studio_helper-windows-x86_64.exe
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: studio-rust-mcp-windows-helper
+          path: output/studio_helper-windows-x86_64.exe
+
+  publish-release:
+    runs-on: ubuntu-latest
+    needs:
+      - build-linux-plugin
+      - build-windows-helper
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: output
+          merge-multiple: true
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
