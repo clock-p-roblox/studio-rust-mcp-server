@@ -21,6 +21,16 @@ use uuid::Uuid;
 pub const STUDIO_PLUGIN_PORT: u16 = 44755;
 const LONG_POLL_DURATION: Duration = Duration::from_secs(15);
 
+fn summarize_text(value: &str) -> String {
+    const LIMIT: usize = 180;
+    let trimmed = value.trim();
+    if trimmed.len() <= LIMIT {
+        trimmed.to_owned()
+    } else {
+        format!("{}...", &trimmed[..LIMIT])
+    }
+}
+
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ToolArguments {
     args: ToolArgumentValues,
@@ -63,6 +73,11 @@ impl AppState {
 
 pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResponse> {
     let state = state.lock().await;
+    tracing::info!(
+        queued_requests = state.process_queue.len(),
+        pending_responses = state.output_map.len(),
+        "status requested"
+    );
     Json(StatusResponse {
         service: "rbx-studio-mcp",
         queued_requests: state.process_queue.len(),
@@ -83,6 +98,10 @@ impl ToolArguments {
             },
             id,
         )
+    }
+
+    fn tool_name(&self) -> &'static str {
+        self.args.tool_name()
     }
 }
 #[derive(Clone)]
@@ -159,6 +178,19 @@ enum ToolArgumentValues {
     StartStopPlay(StartStopPlay),
     RunScriptInPlayMode(RunScriptInPlayMode),
     GetStudioMode(GetStudioMode),
+}
+
+impl ToolArgumentValues {
+    fn tool_name(&self) -> &'static str {
+        match self {
+            ToolArgumentValues::RunCode(_) => "run_code",
+            ToolArgumentValues::InsertModel(_) => "insert_model",
+            ToolArgumentValues::GetConsoleOutput(_) => "get_console_output",
+            ToolArgumentValues::StartStopPlay(_) => "start_stop_play",
+            ToolArgumentValues::RunScriptInPlayMode(_) => "run_script_in_play_mode",
+            ToolArgumentValues::GetStudioMode(_) => "get_studio_mode",
+        }
+    }
 }
 #[tool_router]
 impl RBXStudioServer {
@@ -242,14 +274,25 @@ impl RBXStudioServer {
         args: ToolArgumentValues,
     ) -> Result<CallToolResult, ErrorData> {
         let (command, id) = ToolArguments::new(args);
-        tracing::debug!("Running command: {:?}", command);
+        let tool_name = command.tool_name();
         let (tx, mut rx) = mpsc::unbounded_channel::<Result<String>>();
-        let trigger = {
+        let (trigger, queued_requests, pending_responses) = {
             let mut state = self.state.lock().await;
             state.process_queue.push_back(command);
             state.output_map.insert(id, tx);
-            state.trigger.clone()
+            (
+                state.trigger.clone(),
+                state.process_queue.len(),
+                state.output_map.len(),
+            )
         };
+        tracing::info!(
+            %id,
+            tool = tool_name,
+            queued_requests,
+            pending_responses,
+            "queued tool request"
+        );
         trigger
             .send(())
             .map_err(|e| ErrorData::internal_error(format!("Unable to trigger send {e}"), None))?;
@@ -261,10 +304,25 @@ impl RBXStudioServer {
             let mut state = self.state.lock().await;
             state.output_map.remove_entry(&id);
         }
-        tracing::debug!("Sending to MCP: {result:?}");
         match result {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(result)])),
-            Err(err) => Ok(CallToolResult::error(vec![Content::text(err.to_string())])),
+            Ok(result) => {
+                tracing::info!(
+                    %id,
+                    tool = tool_name,
+                    result = summarize_text(&result),
+                    "tool request succeeded"
+                );
+                Ok(CallToolResult::success(vec![Content::text(result)]))
+            }
+            Err(err) => {
+                tracing::warn!(
+                    %id,
+                    tool = tool_name,
+                    error = summarize_text(&err.to_string()),
+                    "tool request failed"
+                );
+                Ok(CallToolResult::error(vec![Content::text(err.to_string())]))
+            }
         }
     }
 }
@@ -276,6 +334,13 @@ pub async fn request_handler(State(state): State<PackedState>) -> Result<impl In
             {
                 let mut state = state.lock().await;
                 if let Some(task) = state.process_queue.pop_front() {
+                    tracing::info!(
+                        id = ?task.id,
+                        tool = task.tool_name(),
+                        queued_requests = state.process_queue.len(),
+                        pending_responses = state.output_map.len(),
+                        "plugin long poll received queued tool"
+                    );
                     return Ok::<ToolArguments, Error>(task);
                 }
             }
@@ -285,7 +350,10 @@ pub async fn request_handler(State(state): State<PackedState>) -> Result<impl In
     .await;
     match timeout {
         Ok(result) => Ok(Json(result?).into_response()),
-        _ => Ok((StatusCode::LOCKED, String::new()).into_response()),
+        _ => {
+            tracing::debug!("plugin long poll timed out with no queued tool");
+            Ok((StatusCode::LOCKED, String::new()).into_response())
+        }
     }
 }
 
@@ -293,7 +361,12 @@ pub async fn response_handler(
     State(state): State<PackedState>,
     Json(payload): Json<RunCommandResponse>,
 ) -> Result<impl IntoResponse> {
-    tracing::debug!("Received reply from studio {payload:?}");
+    tracing::info!(
+        id = %payload.id,
+        success = payload.success,
+        response = summarize_text(&payload.response),
+        "received plugin response"
+    );
     let mut state = state.lock().await;
     let tx = state
         .output_map
@@ -312,7 +385,7 @@ pub async fn proxy_handler(
     Json(command): Json<ToolArguments>,
 ) -> Result<impl IntoResponse> {
     let id = command.id.ok_or_eyre("Got proxy command with no id")?;
-    tracing::debug!("Received request to proxy {command:?}");
+    tracing::info!(%id, tool = command.tool_name(), "proxy received tool request");
     let (tx, mut rx) = mpsc::unbounded_channel();
     {
         let mut state = state.lock().await;
@@ -328,7 +401,12 @@ pub async fn proxy_handler(
         Ok(s) => (true, s),
         Err(e) => (false, e.to_string()),
     };
-    tracing::debug!("Sending back to dud: success={success}, response={response:?}");
+    tracing::info!(
+        %id,
+        success,
+        response = summarize_text(&response),
+        "proxy returning tool response"
+    );
     Ok(Json(RunCommandResponse {
         success,
         response,
@@ -343,25 +421,35 @@ pub async fn dud_proxy_loop(state: PackedState, exit: Receiver<()>, plugin_port:
     while exit.is_empty() {
         let entry = { state.lock().await.process_queue.pop_front() };
         if let Some(entry) = entry {
+            let id = entry.id.unwrap();
+            let tool_name = entry.tool_name();
+            tracing::info!(%id, tool = tool_name, plugin_port, "proxy forwarding tool to busy plugin port");
             let res = client
                 .post(format!("http://127.0.0.1:{plugin_port}/proxy"))
                 .json(&entry)
                 .send()
                 .await;
             if let Ok(res) = res {
-                let tx = {
-                    state
-                        .lock()
-                        .await
-                        .output_map
-                        .remove(&entry.id.unwrap())
-                        .unwrap()
-                };
+                let tx = { state.lock().await.output_map.remove(&id).unwrap() };
                 let res = res
                     .json::<RunCommandResponse>()
                     .await
                     .map(|r| r.response)
-                    .map_err(Into::into);
+                    .map_err(Report::from);
+                match &res {
+                    Ok(body) => tracing::info!(
+                        %id,
+                        tool = tool_name,
+                        response = summarize_text(body),
+                        "proxy received plugin response"
+                    ),
+                    Err(err) => tracing::warn!(
+                        %id,
+                        tool = tool_name,
+                        error = summarize_text(&err.to_string()),
+                        "proxy failed to decode plugin response"
+                    ),
+                }
                 tx.send(res).unwrap();
             } else {
                 tracing::error!("Failed to proxy: {res:?}");

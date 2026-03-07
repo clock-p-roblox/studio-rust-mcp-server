@@ -125,6 +125,7 @@ async fn require_http_auth(
     request: Request,
     next: Next,
 ) -> Response {
+    let path = request.uri().path().to_owned();
     let Some(expected_token) = auth.bearer_token.as_ref() else {
         return next.run(request).await;
     };
@@ -138,26 +139,31 @@ async fn require_http_auth(
         .unwrap_or(false);
 
     if !authorized {
+        tracing::warn!(path, "rejected unauthorized HTTP request");
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
 
+    tracing::info!(path, "accepted authorized HTTP request");
     next.run(request).await
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(env_filter)
         .with_writer(io::stderr)
         .with_target(false)
         .with_thread_ids(true)
         .init();
 
     let args = Args::parse();
+    tracing::info!(?args.stdio, ?args.http, plugin_port = args.plugin_port, http_port = args.http_port, no_auth = args.no_auth, "starting rbx-studio-mcp");
 
     if let Some(path) = args.write_plugin.as_ref() {
         install::write_plugin_to_path(path)?;
+        tracing::info!(path = %path.display(), "wrote plugin bundle");
         println!("Wrote plugin to {}", path.display());
         return Ok(());
     }
@@ -166,7 +172,7 @@ async fn main() -> Result<()> {
         return install::install().await;
     }
 
-    tracing::debug!("Debug MCP tracing enabled");
+    tracing::info!("initialized server state");
 
     let server_state = Arc::new(Mutex::new(AppState::new()));
 
@@ -196,7 +202,10 @@ async fn main() -> Result<()> {
                 .unwrap();
         })
     } else {
-        tracing::info!("This MCP instance will use proxy since port is busy");
+        tracing::warn!(
+            plugin_port = args.plugin_port,
+            "plugin bridge port busy; falling back to proxy mode"
+        );
         let plugin_port = args.plugin_port;
         tokio::spawn(async move {
             dud_proxy_loop(server_state_clone, close_rx, plugin_port).await;
@@ -213,6 +222,17 @@ async fn main() -> Result<()> {
                 "HTTP mode requires a bearer token. Pass --bearer-token, --bearer-token-file, or use --no-auth for local testing."
             ));
         }
+        tracing::info!(
+            auth_enabled = token.is_some(),
+            source = if args.bearer_token.is_some() {
+                "cli-token"
+            } else if args.bearer_token_file.is_some() {
+                "token-file"
+            } else {
+                "default-token-path"
+            },
+            "resolved HTTP auth configuration"
+        );
 
         let auth_state = HttpAuthState {
             bearer_token: token,
@@ -256,6 +276,7 @@ async fn main() -> Result<()> {
     }
 
     if args.stdio {
+        tracing::info!("starting stdio MCP transport");
         let service = RBXStudioServer::new(Arc::clone(&server_state))
             .serve(rmcp::transport::stdio())
             .await
