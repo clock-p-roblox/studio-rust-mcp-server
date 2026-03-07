@@ -37,8 +37,8 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
 use windows_sys::Win32::Networking::WinSock::AF_INET;
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, EnumWindows, GetClientRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindowVisible,
+    EnumChildWindows, EnumWindows, GetClientRect, GetWindowRect, GetWindowTextLengthW,
+    GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
 };
 
 const DEFAULT_DOMAIN_SUFFIX: &str = "dev.clock-p.com";
@@ -149,8 +149,10 @@ struct HelperInstanceStatus {
 }
 
 #[cfg(target_os = "windows")]
+#[derive(Clone)]
 struct WindowCandidate {
     hwnd: HWND,
+    process_id: u32,
     title: String,
     width: i32,
     height: i32,
@@ -158,7 +160,6 @@ struct WindowCandidate {
 
 #[cfg(target_os = "windows")]
 struct TopWindowSearch {
-    target_pid: u32,
     candidates: Vec<WindowCandidate>,
 }
 
@@ -437,19 +438,18 @@ unsafe extern "system" fn enum_top_windows_callback(hwnd: HWND, lparam: LPARAM) 
 
     let mut window_pid = 0u32;
     GetWindowThreadProcessId(hwnd, &mut window_pid);
-    if window_pid != search.target_pid {
-        return 1;
-    }
 
     let mut rect = RECT::default();
-    if GetClientRect(hwnd, &mut rect) == 0 {
-        return 1;
+    let used_window_rect = if GetWindowRect(hwnd, &mut rect) != 0 {
+        true
+    } else {
+        GetClientRect(hwnd, &mut rect) != 0
+    };
+    if !used_window_rect {
+        rect = RECT::default();
     }
     let width = rect.right - rect.left;
     let height = rect.bottom - rect.top;
-    if width <= 0 || height <= 0 {
-        return 1;
-    }
 
     let title_length = GetWindowTextLengthW(hwnd);
     let mut title_buffer = vec![0u16; title_length as usize + 1];
@@ -458,9 +458,10 @@ unsafe extern "system" fn enum_top_windows_callback(hwnd: HWND, lparam: LPARAM) 
 
     search.candidates.push(WindowCandidate {
         hwnd,
+        process_id: window_pid,
         title,
-        width,
-        height,
+        width: width.max(0),
+        height: height.max(0),
     });
     1
 }
@@ -580,24 +581,59 @@ fn collect_visible_child_windows(parent_hwnd: HWND, min_width: i32, min_height: 
 
 #[cfg(target_os = "windows")]
 fn find_studio_capture_target_for_pid(studio_pid: u32) -> Result<(HWND, HWND, String)> {
-    let mut search = TopWindowSearch {
-        target_pid: studio_pid,
-        candidates: Vec::new(),
-    };
+    let mut search = TopWindowSearch { candidates: Vec::new() };
     unsafe {
         EnumWindows(
             Some(enum_top_windows_callback),
             (&mut search as *mut TopWindowSearch) as LPARAM,
         );
     }
-    let studio_window = search
-        .candidates
+    let all_candidates = search.candidates;
+    let exact_candidates: Vec<_> = all_candidates
+        .iter()
+        .filter(|candidate| candidate.process_id == studio_pid)
+        .cloned()
+        .collect();
+    let studio_window = exact_candidates
         .into_iter()
         .max_by_key(|candidate| {
             let title_score = if candidate.title.contains("Roblox Studio") { 1 } else { 0 };
             (title_score, i64::from(candidate.width) * i64::from(candidate.height))
         })
-        .ok_or_else(|| eyre!("could not find a visible Roblox Studio window for pid {studio_pid}"))?;
+        .or_else(|| {
+            let studio_named: Vec<_> = all_candidates
+                .iter()
+                .filter(|candidate| candidate.title.contains("Roblox Studio"))
+                .cloned()
+                .collect();
+            if studio_named.len() == 1 {
+                let candidate = studio_named.into_iter().next().unwrap();
+                tracing::warn!(
+                    requested_pid = studio_pid,
+                    fallback_pid = candidate.process_id,
+                    title = candidate.title,
+                    "did not find an exact Studio window pid match; falling back to the only visible Roblox Studio window"
+                );
+                Some(candidate)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            let visible_studio_windows: Vec<_> = all_candidates
+                .iter()
+                .filter(|candidate| candidate.title.contains("Roblox Studio"))
+                .map(|candidate| format!("pid={} title={}", candidate.process_id, candidate.title))
+                .collect();
+            if visible_studio_windows.is_empty() {
+                eyre!("could not find any visible Roblox Studio window while resolving pid {studio_pid}")
+            } else {
+                eyre!(
+                    "could not find an exact visible Roblox Studio window for pid {studio_pid}; visible Studio windows: {}",
+                    visible_studio_windows.join(" | ")
+                )
+            }
+        })?;
 
     let descendants = collect_visible_child_windows(studio_window.hwnd, 500, 400);
     let content_area = descendants
