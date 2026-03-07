@@ -543,7 +543,11 @@ local function connectToHelper(helperPort: string)
 	client.Opened:Connect(function()
 		if isCurrentClient(client) then
 			logInfo("Started local long polling against helper on port " .. helperPort)
-			setStatus("info", "Waiting on helper", "Registered place " .. tostring(game.PlaceId) .. " as instance " .. instanceId .. ". Waiting for a healthy poll response.")
+			setStatus("connected", "Connected to helper", "Registered place " .. tostring(game.PlaceId) .. " as instance " .. instanceId .. ". Waiting for tool requests.")
+			if not readyAnnounced then
+				logInfo("The MCP Studio plugin is ready for prompts.")
+				readyAnnounced = true
+			end
 		end
 	end)
 
@@ -652,7 +656,8 @@ connectCurrentClient = function()
 	end
 
 	currentClient = clientOrError
-	setStatus("info", "Waiting on helper", "Registered helper instance " .. tostring(instanceId) .. " for PlaceId " .. tostring(game.PlaceId) .. ". Waiting for helper poll readiness.")
+	setStatus("connected", "Connected to helper", "Registered helper instance " .. tostring(instanceId) .. " for PlaceId " .. tostring(game.PlaceId) .. ". Waiting for tool requests.")
+	readyAnnounced = true
 	return true
 end
 
