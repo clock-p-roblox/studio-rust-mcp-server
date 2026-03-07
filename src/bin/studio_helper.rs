@@ -1,4 +1,4 @@
-use axum::extract::{Query, State};
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -11,7 +11,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,7 +22,24 @@ use uuid::Uuid;
 #[cfg(target_os = "windows")]
 use regex::Regex;
 #[cfg(target_os = "windows")]
+use std::mem::size_of;
+#[cfg(target_os = "windows")]
+use std::ptr::null_mut;
+#[cfg(target_os = "windows")]
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
+};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Networking::WinSock::AF_INET;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    EnumChildWindows, EnumWindows, GetClientRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsWindowVisible,
+};
 
 const DEFAULT_DOMAIN_SUFFIX: &str = "dev.clock-p.com";
 const DEFAULT_HELPER_PORT: u16 = 44750;
@@ -63,6 +80,7 @@ struct ResolvedToken {
 
 struct PluginInstance {
     place_id: String,
+    studio_pid: Option<u32>,
     last_seen_at: Instant,
     queue: VecDeque<Value>,
     notify: Arc<Notify>,
@@ -119,7 +137,43 @@ struct HelperStatusResponse {
     user_name: String,
     active_instances: usize,
     active_places: Vec<String>,
+    instances: Vec<HelperInstanceStatus>,
     last_remote_errors: HashMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HelperInstanceStatus {
+    instance_id: String,
+    place_id: String,
+    studio_pid: Option<u32>,
+}
+
+#[cfg(target_os = "windows")]
+struct WindowCandidate {
+    hwnd: HWND,
+    title: String,
+    width: i32,
+    height: i32,
+}
+
+#[cfg(target_os = "windows")]
+struct TopWindowSearch {
+    target_pid: u32,
+    candidates: Vec<WindowCandidate>,
+}
+
+#[cfg(target_os = "windows")]
+struct ChildWindowCandidate {
+    hwnd: HWND,
+    width: i32,
+    height: i32,
+}
+
+#[cfg(target_os = "windows")]
+struct ChildWindowSearch {
+    min_width: i32,
+    min_height: i32,
+    candidates: Vec<ChildWindowCandidate>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -364,17 +418,244 @@ fn summarize_error(value: &str) -> String {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn decode_ipv4_addr(value: u32) -> Ipv4Addr {
+    Ipv4Addr::from(u32::from_be(value))
+}
+
+#[cfg(target_os = "windows")]
+fn decode_ipv4_port(value: u32) -> u16 {
+    u16::from_be(value as u16)
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn enum_top_windows_callback(hwnd: HWND, lparam: LPARAM) -> i32 {
+    let search = &mut *(lparam as *mut TopWindowSearch);
+    if IsWindowVisible(hwnd) == 0 {
+        return 1;
+    }
+
+    let mut window_pid = 0u32;
+    GetWindowThreadProcessId(hwnd, &mut window_pid);
+    if window_pid != search.target_pid {
+        return 1;
+    }
+
+    let mut rect = RECT::default();
+    if GetClientRect(hwnd, &mut rect) == 0 {
+        return 1;
+    }
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if width <= 0 || height <= 0 {
+        return 1;
+    }
+
+    let title_length = GetWindowTextLengthW(hwnd);
+    let mut title_buffer = vec![0u16; title_length as usize + 1];
+    let copied = GetWindowTextW(hwnd, title_buffer.as_mut_ptr(), title_buffer.len() as i32);
+    let title = String::from_utf16_lossy(&title_buffer[..copied.max(0) as usize]);
+
+    search.candidates.push(WindowCandidate {
+        hwnd,
+        title,
+        width,
+        height,
+    });
+    1
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn enum_child_windows_callback(hwnd: HWND, lparam: LPARAM) -> i32 {
+    let search = &mut *(lparam as *mut ChildWindowSearch);
+    if IsWindowVisible(hwnd) == 0 {
+        return 1;
+    }
+
+    let mut rect = RECT::default();
+    if GetClientRect(hwnd, &mut rect) == 0 {
+        return 1;
+    }
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if width < search.min_width || height < search.min_height {
+        return 1;
+    }
+
+    search.candidates.push(ChildWindowCandidate { hwnd, width, height });
+    1
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_peer_process_id(peer_addr: SocketAddr, helper_port: u16) -> Result<Option<u32>> {
+    let SocketAddr::V4(peer_v4) = peer_addr else {
+        return Ok(None);
+    };
+
+    let mut buffer_size = 0u32;
+    unsafe {
+        GetExtendedTcpTable(
+            null_mut(),
+            &mut buffer_size,
+            0,
+            AF_INET as u32,
+            TCP_TABLE_OWNER_PID_ALL,
+            0,
+        );
+    }
+    if buffer_size == 0 {
+        return Err(eyre!("GetExtendedTcpTable did not report a buffer size"));
+    }
+
+    let mut buffer = vec![0u8; buffer_size as usize + size_of::<MIB_TCPROW_OWNER_PID>()];
+    let result = unsafe {
+        GetExtendedTcpTable(
+            buffer.as_mut_ptr().cast(),
+            &mut buffer_size,
+            0,
+            AF_INET as u32,
+            TCP_TABLE_OWNER_PID_ALL,
+            0,
+        )
+    };
+    if result != 0 {
+        return Err(eyre!("GetExtendedTcpTable failed with code {result}"));
+    }
+
+    let table = unsafe { &*(buffer.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>()) };
+    let rows = unsafe { std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize) };
+    let peer_ip = *peer_v4.ip();
+    let peer_port = peer_v4.port();
+    let helper_ip = Ipv4Addr::LOCALHOST;
+    for row in rows {
+        let local_ip = decode_ipv4_addr(row.dwLocalAddr);
+        let remote_ip = decode_ipv4_addr(row.dwRemoteAddr);
+        let local_port = decode_ipv4_port(row.dwLocalPort);
+        let remote_port = decode_ipv4_port(row.dwRemotePort);
+        if local_ip == peer_ip
+            && local_port == peer_port
+            && remote_ip == helper_ip
+            && remote_port == helper_port
+        {
+            return Ok(Some(row.dwOwningPid));
+        }
+    }
+
+    Ok(None)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn resolve_peer_process_id(_peer_addr: SocketAddr, _helper_port: u16) -> Result<Option<u32>> {
+    Ok(None)
+}
+
+async fn resolve_peer_process_id_with_retry(peer_addr: SocketAddr, helper_port: u16) -> Result<Option<u32>> {
+    for attempt in 0..10 {
+        if let Some(pid) = resolve_peer_process_id(peer_addr, helper_port)? {
+            return Ok(Some(pid));
+        }
+        if attempt < 9 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(target_os = "windows")]
+fn collect_visible_child_windows(parent_hwnd: HWND, min_width: i32, min_height: i32) -> Vec<ChildWindowCandidate> {
+    let mut search = ChildWindowSearch {
+        min_width,
+        min_height,
+        candidates: Vec::new(),
+    };
+    unsafe {
+        EnumChildWindows(
+            parent_hwnd,
+            Some(enum_child_windows_callback),
+            (&mut search as *mut ChildWindowSearch) as LPARAM,
+        );
+    }
+    search.candidates
+}
+
+#[cfg(target_os = "windows")]
+fn find_studio_capture_target_for_pid(studio_pid: u32) -> Result<(HWND, HWND, String)> {
+    let mut search = TopWindowSearch {
+        target_pid: studio_pid,
+        candidates: Vec::new(),
+    };
+    unsafe {
+        EnumWindows(
+            Some(enum_top_windows_callback),
+            (&mut search as *mut TopWindowSearch) as LPARAM,
+        );
+    }
+    let studio_window = search
+        .candidates
+        .into_iter()
+        .max_by_key(|candidate| {
+            let title_score = if candidate.title.contains("Roblox Studio") { 1 } else { 0 };
+            (title_score, i64::from(candidate.width) * i64::from(candidate.height))
+        })
+        .ok_or_else(|| eyre!("could not find a visible Roblox Studio window for pid {studio_pid}"))?;
+
+    let descendants = collect_visible_child_windows(studio_window.hwnd, 500, 400);
+    let content_area = descendants
+        .iter()
+        .find(|candidate| candidate.height > 600 && candidate.height < 750 && candidate.width > 2000)
+        .map(|candidate| candidate.hwnd)
+        .or_else(|| {
+            descendants
+                .iter()
+                .filter(|candidate| candidate.width > candidate.height)
+                .max_by_key(|candidate| i64::from(candidate.width) * i64::from(candidate.height))
+                .map(|candidate| candidate.hwnd)
+        })
+        .unwrap_or(studio_window.hwnd);
+
+    let viewport_candidates = collect_visible_child_windows(content_area, 500, 400);
+    let viewport = viewport_candidates
+        .iter()
+        .find(|candidate| {
+            candidate.width < 1660
+                && candidate.height < 680
+                && candidate.width > 1000
+                && candidate.height > 500
+        })
+        .map(|candidate| candidate.hwnd)
+        .or_else(|| {
+            viewport_candidates
+                .iter()
+                .find(|candidate| candidate.width > 1000 && candidate.height > 500)
+                .map(|candidate| candidate.hwnd)
+        })
+        .unwrap_or(studio_window.hwnd);
+
+    Ok((studio_window.hwnd, viewport, studio_window.title))
+}
+
 async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse> {
     let mut state = app.state.lock().await;
     cleanup_stale_instances(&mut state.instances);
     refresh_active_places(&mut state);
     let mut active_places: Vec<_> = state.active_remote_places.iter().cloned().collect();
     active_places.sort();
+    let mut instances: Vec<_> = state
+        .instances
+        .iter()
+        .map(|(instance_id, instance)| HelperInstanceStatus {
+            instance_id: instance_id.clone(),
+            place_id: instance.place_id.clone(),
+            studio_pid: instance.studio_pid,
+        })
+        .collect();
+    instances.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
     Json(HelperStatusResponse {
         helper_port: app.helper.port,
         user_name: app.helper.user_name.clone(),
         active_instances: state.instances.len(),
         active_places,
+        instances,
         last_remote_errors: state.last_remote_errors.clone(),
     })
 }
@@ -396,18 +677,21 @@ async fn rojo_config_handler(
 
 async fn mcp_register_handler(
     State(app): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<RegisterPluginRequest>,
 ) -> Result<Json<RegisterPluginResponse>, HelperError> {
     let place_id = sanitize_place_id(&payload.place_id)?;
     let instance_id = Uuid::new_v4().to_string();
     let remote_base_url = derive_public_base_url("mcp", &place_id, &app.helper);
     probe_remote_mcp(&app.helper, &remote_base_url).await?;
+    let studio_pid = resolve_peer_process_id_with_retry(peer_addr, app.helper.port).await?;
     {
         let mut state = app.state.lock().await;
         state.instances.insert(
             instance_id.clone(),
             PluginInstance {
                 place_id: place_id.clone(),
+                studio_pid,
                 last_seen_at: Instant::now(),
                 queue: VecDeque::new(),
                 notify: Arc::new(Notify::new()),
@@ -421,7 +705,7 @@ async fn mcp_register_handler(
             });
         }
     }
-    tracing::info!(instance_id, place_id, remote_base_url, "registered MCP plugin instance with helper");
+    tracing::info!(instance_id, place_id, studio_pid, remote_base_url, "registered MCP plugin instance with helper");
     Ok(Json(RegisterPluginResponse {
         instance_id,
         place_id,
@@ -502,13 +786,14 @@ async fn mcp_plugin_response_handler(
 }
 
 async fn screenshot_debug_handler(
+    State(app): State<AppState>,
     Query(query): Query<ScreenshotQuery>,
 ) -> Result<Json<ScreenshotResponse>, HelperError> {
     let place_id = match query.place_id.as_deref() {
         Some(value) => Some(sanitize_place_id(value)?),
         None => None,
     };
-    let path = take_screenshot(place_id.as_deref()).await?;
+    let path = take_screenshot(app, place_id.as_deref()).await?;
     Ok(Json(ScreenshotResponse { path }))
 }
 
@@ -655,7 +940,7 @@ async fn handle_remote_command(app: AppState, place_id: &str, command: Value) ->
     let (tool_name, payload) = extract_tool_name_and_args(&command)?;
     tracing::info!(place_id, tool = tool_name, "helper received remote MCP command");
     match tool_name.as_str() {
-        "TakeScreenshot" => take_screenshot(Some(place_id)).await,
+        "TakeScreenshot" => take_screenshot(app, Some(place_id)).await,
         "ReadStudioLog" => {
             let args: ReadStudioLogArgs = serde_json::from_value(payload)?;
             Ok(serde_json::to_string(&read_studio_log(args)?)?)
@@ -725,38 +1010,90 @@ fn select_instance_for_place(place_id: &str, instances: &HashMap<String, PluginI
         .map(|(instance_id, _)| instance_id.clone())
 }
 
-async fn take_screenshot(place_id: Option<&str>) -> Result<String> {
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+async fn resolve_capture_pid(app: &AppState, place_id: Option<&str>) -> Result<(Option<String>, u32)> {
+    let state = app.state.lock().await;
+    let selected = if let Some(place_id) = place_id {
+        let instance_id = select_instance_for_place(place_id, &state.instances)
+            .ok_or_else(|| eyre!("no active Studio plugin registered for placeId {place_id}"))?;
+        let instance = state
+            .instances
+            .get(&instance_id)
+            .ok_or_else(|| eyre!("selected helper instance disappeared"))?;
+        (Some(place_id.to_owned()), instance.studio_pid)
+    } else if state.instances.len() == 1 {
+        let instance = state
+            .instances
+            .values()
+            .next()
+            .ok_or_else(|| eyre!("no active Studio plugin registered"))?;
+        (Some(instance.place_id.clone()), instance.studio_pid)
+    } else if state.instances.is_empty() {
+        return Err(eyre!("no active Studio plugin registered"));
+    } else {
+        return Err(eyre!("multiple Studio instances are active; pass placeId explicitly"));
+    };
+
+    let studio_pid = selected
+        .1
+        .ok_or_else(|| eyre!("helper could not resolve a Studio process id for the selected plugin instance"))?;
+    Ok((selected.0, studio_pid))
+}
+
+async fn take_screenshot(app: AppState, place_id: Option<&str>) -> Result<String> {
     #[cfg(target_os = "windows")]
     {
+        let (resolved_place_id, studio_pid) = resolve_capture_pid(&app, place_id).await?;
+        let (studio_hwnd, viewport_hwnd, window_title) =
+            find_studio_capture_target_for_pid(studio_pid)?;
         let output_dir = helper_data_dir()?.join("screenshots");
         fs::create_dir_all(&output_dir)?;
-        let file_name = if let Some(place_id) = place_id {
+        let file_name = if let Some(place_id) = resolved_place_id.as_deref() {
             format!("studio-{place_id}-{}.png", now_stamp())
         } else {
             format!("studio-{}.png", now_stamp())
         };
         let output_path = output_dir.join(file_name);
         let escaped_path = output_path.display().to_string().replace('\'', "''");
-        let script = format!(
-            concat!(
-                "Add-Type -AssemblyName System.Drawing;",
-                "Add-Type @\"using System; using System.Runtime.InteropServices; public static class Win32 {{",
-                "[DllImport(\"user32.dll\")] public static extern IntPtr GetForegroundWindow();",
-                "[DllImport(\"user32.dll\")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);",
-                "public struct RECT {{ public int Left; public int Top; public int Right; public int Bottom; }} }}\"@;",
-                "$hwnd=[Win32]::GetForegroundWindow();",
-                "if ($hwnd -eq [IntPtr]::Zero) {{ throw 'No foreground window available'; }};",
-                "$rect=New-Object Win32+RECT; [Win32]::GetWindowRect($hwnd, [ref]$rect) | Out-Null;",
-                "$width=$rect.Right-$rect.Left; $height=$rect.Bottom-$rect.Top;",
-                "if ($width -le 0 -or $height -le 0) {{ throw 'Foreground window has invalid bounds'; }};",
-                "$bitmap=New-Object System.Drawing.Bitmap $width, $height;",
-                "$graphics=[System.Drawing.Graphics]::FromImage($bitmap);",
-                "$graphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bitmap.Size);",
-                "$bitmap.Save('{}', [System.Drawing.Imaging.ImageFormat]::Png);",
-                "$graphics.Dispose(); $bitmap.Dispose();"
-            ),
-            escaped_path,
+        let script_template = concat!(
+            "Add-Type -AssemblyName System.Drawing;",
+            "Add-Type @\"using System; using System.Runtime.InteropServices; public static class Win32 {{",
+            "[DllImport(\"user32.dll\")] public static extern bool GetClientRect(IntPtr hWnd, out RECT rect);",
+            "[DllImport(\"user32.dll\")] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, int nFlags);",
+            "[DllImport(\"user32.dll\")] public static extern bool IsIconic(IntPtr hWnd);",
+            "[DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);",
+            "[DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr hWnd);",
+            "public struct RECT {{ public int Left; public int Top; public int Right; public int Bottom; }} }}\"@;",
+            "$studioHwnd=[IntPtr]::new(__STUDIO_HWND__);",
+            "$viewportHwnd=[IntPtr]::new(__VIEWPORT_HWND__);",
+            "$rect=New-Object Win32+RECT; [Win32]::GetClientRect($viewportHwnd, [ref]$rect) | Out-Null;",
+            "$width=$rect.Right-$rect.Left; $height=$rect.Bottom-$rect.Top;",
+            "if ($width -le 0 -or $height -le 0) {{ throw 'Selected Studio viewport has invalid bounds'; }};",
+            "$capture = {{ param($windowHandle, $w, $h);",
+            "$bitmap=New-Object System.Drawing.Bitmap $w, $h;",
+            "$graphics=[System.Drawing.Graphics]::FromImage($bitmap);",
+            "$hdc=$graphics.GetHdc();",
+            "$ok=[Win32]::PrintWindow($windowHandle, $hdc, 2);",
+            "$graphics.ReleaseHdc($hdc);",
+            "return @{{ ok=$ok; bitmap=$bitmap; graphics=$graphics }}; }};",
+            "$result = & $capture $viewportHwnd $width $height;",
+            "if (-not $result.ok -or $result.bitmap.GetPixel([Math]::Min(10, [Math]::Max($width - 1, 0)), [Math]::Min(10, [Math]::Max($height - 1, 0))).ToArgb() -eq [System.Drawing.Color]::Black.ToArgb()) {{",
+            "  if ([Win32]::IsIconic($studioHwnd)) {{ [Win32]::ShowWindow($studioHwnd, 9) | Out-Null }};",
+            "  [Win32]::SetForegroundWindow($studioHwnd) | Out-Null; Start-Sleep -Milliseconds 300;",
+            "  $result.graphics.Dispose(); $result.bitmap.Dispose();",
+            "  $result = & $capture $viewportHwnd $width $height;",
+            "}};",
+            "if (-not $result.ok) {{ throw 'PrintWindow failed for the selected Studio viewport'; }};",
+            "$bitmap=New-Object System.Drawing.Bitmap $width, $height;",
+            "$graphics=[System.Drawing.Graphics]::FromImage($bitmap);",
+            "$graphics.DrawImage($result.bitmap, 0, 0);",
+            "$bitmap.Save('__OUTPUT_PATH__', [System.Drawing.Imaging.ImageFormat]::Png);",
+            "$result.graphics.Dispose(); $result.bitmap.Dispose(); $graphics.Dispose(); $bitmap.Dispose();"
         );
+        let script = script_template
+            .replace("__STUDIO_HWND__", &(studio_hwnd as usize).to_string())
+            .replace("__VIEWPORT_HWND__", &(viewport_hwnd as usize).to_string())
+            .replace("__OUTPUT_PATH__", &escaped_path);
         let output = std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .output()
@@ -767,12 +1104,13 @@ async fn take_screenshot(place_id: Option<&str>) -> Result<String> {
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
-        tracing::info!(path = %output_path.display(), "captured Studio screenshot from helper");
+        tracing::info!(path = %output_path.display(), studio_pid, window_title, "captured Studio screenshot from helper");
         return Ok(output_path.display().to_string());
     }
 
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = app;
         let _ = place_id;
         Err(eyre!("take_screenshot is only available on Windows helper builds"))
     }
@@ -922,6 +1260,6 @@ async fn main() -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, args.port)).await?;
     tracing::info!(port = args.port, "Studio helper listening on 127.0.0.1");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
