@@ -193,9 +193,11 @@ local currentClient: MockWebSocketService.MockWebSocketClient?
 local currentInstanceId: string? = nil
 local currentHelperBaseUrl: string? = nil
 local readyAnnounced = false
+local staleReconnectInFlight = false
 local currentStatusKind = "warning"
 local currentStatusMessage = "Not connected"
 local currentStatusDetail = "Connect to the local helper. The helper derives place URLs automatically from the current PlaceId."
+local connectCurrentClient = nil
 
 local panel = Instance.new("Frame")
 panel.Size = UDim2.fromScale(1, 1)
@@ -480,6 +482,22 @@ local function unregisterCurrentInstance()
 end
 
 local function handleClientStatus(kind: string, message: string)
+	local function tryRecoverExpiredRegistration()
+		if staleReconnectInFlight then
+			return
+		end
+
+		staleReconnectInFlight = true
+		task.defer(function()
+			setStatus("info", "Reconnecting", "The helper forgot this plugin instance. Re-registering with the local helper.")
+			local connected = if connectCurrentClient ~= nil then connectCurrentClient() else false
+			staleReconnectInFlight = false
+			if not connected then
+				setStatus("error", "Failed to reconnect to helper", "The helper instance expired and the automatic re-register attempt failed.")
+			end
+		end)
+	end
+
 	if kind == "error" then
 		logWarn(message)
 		setStatus("error", "Helper request failed", message)
@@ -500,6 +518,10 @@ local function handleClientStatus(kind: string, message: string)
 	logInfo(message)
 	setStatus("info", "Waiting on helper", message)
 	if kind == "warning" then
+		if string.find(string.lower(message), "expired") then
+			tryRecoverExpiredRegistration()
+			return
+		end
 		readyAnnounced = false
 	end
 end
@@ -521,7 +543,7 @@ local function connectToHelper(helperPort: string)
 	client.Opened:Connect(function()
 		if isCurrentClient(client) then
 			logInfo("Started local long polling against helper on port " .. helperPort)
-			setStatus("info", "Connected to helper", "Registered place " .. tostring(game.PlaceId) .. " as instance " .. instanceId)
+			setStatus("info", "Waiting on helper", "Registered place " .. tostring(game.PlaceId) .. " as instance " .. instanceId .. ". Waiting for a healthy poll response.")
 		end
 	end)
 
@@ -608,13 +630,14 @@ local function disconnectCurrentClient()
 	setStatus("warning", "Disconnected", "Stopped polling the local helper")
 end
 
-local function connectCurrentClient()
+connectCurrentClient = function()
 	persistCurrentInputs()
 	if currentClient ~= nil then
 		disconnectCurrentClient()
 	end
 
 	readyAnnounced = false
+	staleReconnectInFlight = false
 	logInfo("Connecting to local helper on port " .. currentHelperPort)
 	setStatus("info", "Connecting", "Registering PlaceId " .. tostring(game.PlaceId) .. " with the local helper on port " .. currentHelperPort)
 
@@ -629,7 +652,7 @@ local function connectCurrentClient()
 	end
 
 	currentClient = clientOrError
-	setStatus("connected", "Connected to helper", "Registered helper instance " .. tostring(instanceId) .. " for PlaceId " .. tostring(game.PlaceId))
+	setStatus("info", "Waiting on helper", "Registered helper instance " .. tostring(instanceId) .. " for PlaceId " .. tostring(game.PlaceId) .. ". Waiting for helper poll readiness.")
 	return true
 end
 

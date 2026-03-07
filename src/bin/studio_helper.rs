@@ -350,6 +350,7 @@ async fn mcp_register_handler(
     let place_id = sanitize_place_id(&payload.place_id)?;
     let instance_id = Uuid::new_v4().to_string();
     let remote_base_url = derive_public_base_url("mcp", &place_id, &app.helper);
+    probe_remote_mcp(&app.helper, &remote_base_url).await?;
     {
         let mut state = app.state.lock().await;
         state.instances.insert(
@@ -408,14 +409,14 @@ async fn mcp_plugin_request_handler(
         loop {
             let notify = {
                 let mut state = app.state.lock().await;
-                let instance = state
-                    .instances
-                    .get_mut(&query.instance_id)
-                    .ok_or_else(|| eyre!("unknown instance_id"))?;
+                let Some(instance) = state.instances.get_mut(&query.instance_id) else {
+                    tracing::info!(instance_id = query.instance_id, "plugin polled helper with expired instance_id");
+                    return Ok::<Option<Value>, color_eyre::Report>(None);
+                };
                 instance.last_seen_at = Instant::now();
                 if let Some(command) = instance.queue.pop_front() {
                     tracing::info!(instance_id = query.instance_id, "helper delivered queued MCP command to plugin");
-                    return Ok::<Value, color_eyre::Report>(command);
+                    return Ok::<Option<Value>, color_eyre::Report>(Some(command));
                 }
                 Arc::clone(&instance.notify)
             };
@@ -424,7 +425,10 @@ async fn mcp_plugin_request_handler(
     })
     .await;
     match timeout {
-        Ok(result) => Ok(Json(result?).into_response()),
+        Ok(result) => match result? {
+            Some(command) => Ok(Json(command).into_response()),
+            None => Ok((StatusCode::GONE, "instance expired").into_response()),
+        },
         Err(_) => Ok((StatusCode::LOCKED, String::new()).into_response()),
     }
 }
@@ -533,6 +537,20 @@ async fn poll_remote_command(helper: &HelperConfig, base_url: &str) -> Result<Op
         StatusCode::LOCKED => Ok(None),
         status => Err(eyre!("remote request poll returned {status}")),
     }
+}
+
+async fn probe_remote_mcp(helper: &HelperConfig, base_url: &str) -> Result<()> {
+    let response = helper
+        .client
+        .get(format!("{base_url}/status"))
+        .header(AUTHORIZATION, format!("Bearer {}", helper.bearer_token))
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(eyre!("remote MCP status probe returned {status}"));
+    }
+    Ok(())
 }
 
 async fn post_remote_response(

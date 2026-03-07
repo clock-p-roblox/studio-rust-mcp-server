@@ -155,6 +155,15 @@ function MockWebSocketClient._OpenImpl(self: MockWebSocketClientPrivate)
 						self:_EmitStatus(ConnectionHealth.Connected, "Connected to " .. self._uri)
 					end
 					continue
+				elseif response.StatusCode == 410 then
+					self._lastHealthy = false
+					self:_EmitStatus(ConnectionHealth.Warning, "Helper registration expired; reconnect required")
+					task.defer(function()
+						if self.ConnectionState == EnumWebSocketState.Open then
+							self:Close()
+						end
+					end)
+					break
 				end
 
 				self._lastHealthy = false

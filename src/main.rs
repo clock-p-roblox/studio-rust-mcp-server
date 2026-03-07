@@ -247,6 +247,9 @@ async fn main() -> Result<()> {
             );
 
         let http_app = axum::Router::new()
+            .route("/request", get(request_handler))
+            .route("/response", post(response_handler))
+            .route("/proxy", post(proxy_handler))
             .route("/status", get(status_handler))
             .nest_service("/mcp", streamable_http_service)
             .with_state(Arc::clone(&server_state))
