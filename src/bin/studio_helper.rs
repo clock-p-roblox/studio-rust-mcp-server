@@ -1091,41 +1091,90 @@ async fn take_screenshot(app: AppState, place_id: Option<&str>) -> Result<String
         };
         let output_path = output_dir.join(file_name);
         let escaped_path = output_path.display().to_string().replace('\'', "''");
-        let script_template = concat!(
-            "Add-Type -AssemblyName System.Drawing;",
-            "Add-Type @\"using System; using System.Runtime.InteropServices; public static class Win32 {{",
-            "[DllImport(\"user32.dll\")] public static extern bool GetClientRect(IntPtr hWnd, out RECT rect);",
-            "[DllImport(\"user32.dll\")] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, int nFlags);",
-            "[DllImport(\"user32.dll\")] public static extern bool IsIconic(IntPtr hWnd);",
-            "[DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);",
-            "[DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr hWnd);",
-            "public struct RECT {{ public int Left; public int Top; public int Right; public int Bottom; }} }}\"@;",
-            "$studioHwnd=[IntPtr]::new(__STUDIO_HWND__);",
-            "$viewportHwnd=[IntPtr]::new(__VIEWPORT_HWND__);",
-            "$rect=New-Object Win32+RECT; [Win32]::GetClientRect($viewportHwnd, [ref]$rect) | Out-Null;",
-            "$width=$rect.Right-$rect.Left; $height=$rect.Bottom-$rect.Top;",
-            "if ($width -le 0 -or $height -le 0) {{ throw 'Selected Studio viewport has invalid bounds'; }};",
-            "$capture = {{ param($windowHandle, $w, $h);",
-            "$bitmap=New-Object System.Drawing.Bitmap $w, $h;",
-            "$graphics=[System.Drawing.Graphics]::FromImage($bitmap);",
-            "$hdc=$graphics.GetHdc();",
-            "$ok=[Win32]::PrintWindow($windowHandle, $hdc, 2);",
-            "$graphics.ReleaseHdc($hdc);",
-            "return @{{ ok=$ok; bitmap=$bitmap; graphics=$graphics }}; }};",
-            "$result = & $capture $viewportHwnd $width $height;",
-            "if (-not $result.ok -or $result.bitmap.GetPixel([Math]::Min(10, [Math]::Max($width - 1, 0)), [Math]::Min(10, [Math]::Max($height - 1, 0))).ToArgb() -eq [System.Drawing.Color]::Black.ToArgb()) {{",
-            "  if ([Win32]::IsIconic($studioHwnd)) {{ [Win32]::ShowWindow($studioHwnd, 9) | Out-Null }};",
-            "  [Win32]::SetForegroundWindow($studioHwnd) | Out-Null; Start-Sleep -Milliseconds 300;",
-            "  $result.graphics.Dispose(); $result.bitmap.Dispose();",
-            "  $result = & $capture $viewportHwnd $width $height;",
-            "}};",
-            "if (-not $result.ok) {{ throw 'PrintWindow failed for the selected Studio viewport'; }};",
-            "$bitmap=New-Object System.Drawing.Bitmap $width, $height;",
-            "$graphics=[System.Drawing.Graphics]::FromImage($bitmap);",
-            "$graphics.DrawImage($result.bitmap, 0, 0);",
-            "$bitmap.Save('__OUTPUT_PATH__', [System.Drawing.Imaging.ImageFormat]::Png);",
-            "$result.graphics.Dispose(); $result.bitmap.Dispose(); $graphics.Dispose(); $bitmap.Dispose();"
-        );
+        let script_template = r#"
+Add-Type -AssemblyName System.Drawing
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class Win32 {
+    [DllImport("user32.dll")]
+    public static extern bool GetClientRect(IntPtr hWnd, out RECT rect);
+
+    [DllImport("user32.dll")]
+    public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, int nFlags);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    public struct RECT {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+}
+"@
+
+$studioHwnd = [IntPtr]::new(__STUDIO_HWND__)
+$viewportHwnd = [IntPtr]::new(__VIEWPORT_HWND__)
+
+$rect = New-Object Win32+RECT
+[Win32]::GetClientRect($viewportHwnd, [ref]$rect) | Out-Null
+$width = $rect.Right - $rect.Left
+$height = $rect.Bottom - $rect.Top
+if ($width -le 0 -or $height -le 0) {
+    throw 'Selected Studio viewport has invalid bounds'
+}
+
+$capture = {
+    param($windowHandle, $w, $h)
+
+    $bitmap = New-Object System.Drawing.Bitmap $w, $h
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    $hdc = $graphics.GetHdc()
+    $ok = [Win32]::PrintWindow($windowHandle, $hdc, 2)
+    $graphics.ReleaseHdc($hdc)
+
+    return @{
+        ok = $ok
+        bitmap = $bitmap
+        graphics = $graphics
+    }
+}
+
+$result = & $capture $viewportHwnd $width $height
+$sampleX = [Math]::Min(10, [Math]::Max($width - 1, 0))
+$sampleY = [Math]::Min(10, [Math]::Max($height - 1, 0))
+if (-not $result.ok -or $result.bitmap.GetPixel($sampleX, $sampleY).ToArgb() -eq [System.Drawing.Color]::Black.ToArgb()) {
+    if ([Win32]::IsIconic($studioHwnd)) {
+        [Win32]::ShowWindow($studioHwnd, 9) | Out-Null
+    }
+    [Win32]::SetForegroundWindow($studioHwnd) | Out-Null
+    Start-Sleep -Milliseconds 300
+    $result.graphics.Dispose()
+    $result.bitmap.Dispose()
+    $result = & $capture $viewportHwnd $width $height
+}
+
+if (-not $result.ok) {
+    throw 'PrintWindow failed for the selected Studio viewport'
+}
+
+$bitmap = New-Object System.Drawing.Bitmap $width, $height
+$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+$graphics.DrawImage($result.bitmap, 0, 0)
+$bitmap.Save('__OUTPUT_PATH__', [System.Drawing.Imaging.ImageFormat]::Png)
+$result.graphics.Dispose()
+$result.bitmap.Dispose()
+$graphics.Dispose()
+$bitmap.Dispose()
+"#;
         let script = script_template
             .replace("__STUDIO_HWND__", &(studio_hwnd as usize).to_string())
             .replace("__VIEWPORT_HWND__", &(viewport_hwnd as usize).to_string())
