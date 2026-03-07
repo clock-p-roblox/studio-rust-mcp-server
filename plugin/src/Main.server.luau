@@ -430,6 +430,7 @@ local function persistCurrentInputs()
 	currentUri = normalizeBaseUri(uriInput.Text)
 	currentToken = tokenInput.Text
 	uriInput.Text = currentUri
+	tokenInput.Text = currentToken
 	saveConnectionConfig(currentUri, currentToken)
 	setStatus(currentStatusKind, currentStatusMessage, "Saved settings for " .. currentUri)
 end
@@ -587,12 +588,12 @@ end)
 uriInput.FocusLost:Connect(function()
 	currentUri = normalizeBaseUri(uriInput.Text)
 	uriInput.Text = currentUri
-	updateStatusViews()
+	persistCurrentInputs()
 end)
 
 tokenInput.FocusLost:Connect(function()
 	currentToken = tokenInput.Text
-	updateStatusViews()
+	persistCurrentInputs()
 end)
 
 saveButton.MouseButton1Click:Connect(function()
