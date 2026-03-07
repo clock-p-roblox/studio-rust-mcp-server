@@ -2355,6 +2355,7 @@ dependencies = [
  "color-eyre",
  "core-foundation 0.10.1",
  "native-dialog",
+ "regex",
  "reqwest 0.13.1",
  "rmcp",
  "roblox_install",

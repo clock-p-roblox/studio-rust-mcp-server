@@ -124,6 +124,62 @@ Useful flags:
 - `--stdio`: run stdio MCP mode (can be combined with `--http`)
 - `--write-plugin <path>`: export bundled `MCPStudioPlugin.rbxm` and exit
 
+### Clock-p helper mode
+
+`clock-p` 当前的 Studio 联调架构额外引入了一个本地 helper：
+
+- `Rojo plugin -> helper -> helper 返回公网 Rojo 配置 -> plugin 直连 Rojo 公网域名`
+- `MCP plugin -> helper -> helper 代理公网 MCP /request /response`
+
+helper 二进制是本仓库里的 `studio_helper`：
+
+```sh
+cargo run --bin studio_helper -- --port 44750
+```
+
+默认行为：
+
+- helper 自己读取 `feishu-user_name` 和 `feishu-token`
+- helper 根据 `placeId` 推导域名：
+  - `https://{placeId}-rojo-{user_name}-user.dev.clock-p.com`
+  - `https://{placeId}-mcp-{user_name}-user.dev.clock-p.com`
+- plugin 侧只需要配置 helper 端口
+- helper 还额外提供：
+  - `GET /status`
+  - `GET /v1/rojo/config?placeId=...`
+  - `POST /v1/mcp/register`
+  - `GET /v1/mcp/plugin/request?instance_id=...`
+  - `POST /v1/mcp/plugin/response`
+  - `POST /v1/helper/screenshot`
+  - `GET /v1/helper/studio-log`
+
+### Ubuntu 交叉编译 Windows helper
+
+如果你要在 Ubuntu 上产出 `studio_helper.exe`，先安装交叉编译依赖：
+
+```sh
+sudo ./util/install-ubuntu-windows-cross.sh
+```
+
+这个脚本会安装：
+
+- `binutils-mingw-w64-x86-64`
+- `gcc-mingw-w64-x86-64-posix`
+- `g++-mingw-w64-x86-64-posix`
+- Rust target `x86_64-pc-windows-gnu`
+
+然后执行：
+
+```sh
+cargo build --release --bin studio_helper --target x86_64-pc-windows-gnu
+```
+
+产物路径：
+
+```text
+target/x86_64-pc-windows-gnu/release/studio_helper.exe
+```
+
 ## Verify setup
 
 To make sure everything is set up correctly, follow these steps:

@@ -153,6 +153,19 @@ struct GetConsoleOutput {}
 struct GetStudioMode {}
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
+struct TakeScreenshot {}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
+struct ReadStudioLog {
+    #[schemars(description = "Optional starting line (1-indexed). Negative values count from the end.")]
+    start_line: Option<i64>,
+    #[schemars(description = "Optional number of lines to return.")]
+    line_count: Option<u32>,
+    #[schemars(description = "Optional regex used to filter matching lines.")]
+    regex: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct StartStopPlay {
     #[schemars(
         description = "Mode to start or stop, must be start_play, stop, or run_server. Don't use run_server unless you are sure no client/player is needed."
@@ -178,6 +191,8 @@ enum ToolArgumentValues {
     StartStopPlay(StartStopPlay),
     RunScriptInPlayMode(RunScriptInPlayMode),
     GetStudioMode(GetStudioMode),
+    TakeScreenshot(TakeScreenshot),
+    ReadStudioLog(ReadStudioLog),
 }
 
 impl ToolArgumentValues {
@@ -189,6 +204,8 @@ impl ToolArgumentValues {
             ToolArgumentValues::StartStopPlay(_) => "start_stop_play",
             ToolArgumentValues::RunScriptInPlayMode(_) => "run_script_in_play_mode",
             ToolArgumentValues::GetStudioMode(_) => "get_studio_mode",
+            ToolArgumentValues::TakeScreenshot(_) => "take_screenshot",
+            ToolArgumentValues::ReadStudioLog(_) => "read_studio_log",
         }
     }
 }
@@ -266,6 +283,24 @@ impl RBXStudioServer {
         Parameters(args): Parameters<GetStudioMode>,
     ) -> Result<CallToolResult, ErrorData> {
         self.generic_tool_run(ToolArgumentValues::GetStudioMode(args))
+            .await
+    }
+
+    #[tool(description = "Capture a screenshot of the active Roblox Studio window through the Windows helper.")]
+    async fn take_screenshot(
+        &self,
+        Parameters(args): Parameters<TakeScreenshot>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.generic_tool_run(ToolArgumentValues::TakeScreenshot(args))
+            .await
+    }
+
+    #[tool(description = "Read the latest Roblox Studio desktop log through the Windows helper.")]
+    async fn read_studio_log(
+        &self,
+        Parameters(args): Parameters<ReadStudioLog>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.generic_tool_run(ToolArgumentValues::ReadStudioLog(args))
             .await
     }
 

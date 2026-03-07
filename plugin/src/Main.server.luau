@@ -12,13 +12,9 @@ local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 local StudioService = game:GetService("StudioService")
 
-local DEFAULT_URI = "https://localhost"
-local URI_PLACEHOLDER = "game1-studio-mcp-your-user.dev.clock-p.com"
-local RECEIVE_ENDPOINT = "/request"
-local SEND_ENDPOINT = "/response"
-local PLUGIN_DISABLED_SETTING_KEY = "Disabled-MCP-plugin-setting"
-local URI_SETTING_KEY = "MCP-plugin-uri"
-local TOKEN_SETTING_KEY = "MCP-plugin-token"
+local DEFAULT_HELPER_PORT = "44750"
+local HELPER_PORT_SETTING_KEY = "MCP-helper-port"
+local AUTO_CONNECT_SETTING_KEY = "MCP-auto-connect"
 local LOG_PREFIX = "[MCP Plugin]"
 
 local STATUS_THEME = {
@@ -47,7 +43,6 @@ local STATUS_THEME = {
 PluginUtils.plugin = plugin
 
 local datamodelType = DataModelType.getDataModelType()
-
 if datamodelType == "Server" then
 	task.spawn(GameStopUtil.monitorForStopPlay)
 end
@@ -85,48 +80,70 @@ local function logWarn(message: string)
 	warn(LOG_PREFIX, message)
 end
 
-local function normalizeBaseUri(value: string): string
-	local uri = trim(value)
-	if uri == "" then
-		return DEFAULT_URI
+local function normalizeHelperPort(value: string): string
+	local digits = trim(value):gsub("%D", "")
+	if digits == "" then
+		return DEFAULT_HELPER_PORT
 	end
-
-	uri = uri:gsub("/+$", "")
-	if not string.find(uri, "^https?://") then
-		uri = "https://" .. uri
-	end
-
-	return uri
+	return digits
 end
 
-local function normalizeAuthHeader(value: string): string?
-	local token = trim(value)
-	if token == "" then
-		return nil
-	end
-
-	if string.find(token, "%s") then
-		return token
-	end
-
-	return "Bearer " .. token
+local function helperBaseUrl(port: string): string
+	return "http://127.0.0.1:" .. normalizeHelperPort(port)
 end
 
-local function loadConnectionConfig(): (string, string)
-	local savedUri = PluginUtils.getSettings(URI_SETTING_KEY)
-	local savedToken = PluginUtils.getSettings(TOKEN_SETTING_KEY)
-
-	local uri = if type(savedUri) == "string" then savedUri else DEFAULT_URI
-	local token = if type(savedToken) == "string" then savedToken else ""
-
-	return normalizeBaseUri(uri), token
+local function loadConnectionConfig(): (string, boolean)
+	local savedPort = PluginUtils.getSettings(HELPER_PORT_SETTING_KEY)
+	local savedAutoConnect = PluginUtils.getSettings(AUTO_CONNECT_SETTING_KEY)
+	local helperPort = if type(savedPort) == "string" then savedPort else DEFAULT_HELPER_PORT
+	local autoConnect = if type(savedAutoConnect) == "boolean" then savedAutoConnect else false
+	return normalizeHelperPort(helperPort), autoConnect
 end
 
-local function saveConnectionConfig(uri: string, token: string)
-	local normalizedUri = normalizeBaseUri(uri)
-	PluginUtils.setSettings(URI_SETTING_KEY, normalizedUri)
-	PluginUtils.setSettings(TOKEN_SETTING_KEY, token)
-	logInfo("Saved connection settings for " .. normalizedUri)
+local function saveConnectionConfig(helperPort: string, autoConnect: boolean)
+	local normalizedPort = normalizeHelperPort(helperPort)
+	PluginUtils.setSettings(HELPER_PORT_SETTING_KEY, normalizedPort)
+	PluginUtils.setSettings(AUTO_CONNECT_SETTING_KEY, autoConnect)
+	logInfo("Saved helper settings for port " .. normalizedPort)
+	return normalizedPort
+end
+
+local function requestJson(baseUrl: string, method: string, path: string, body: any?)
+	local request: { [string]: any } = {
+		Url = baseUrl .. path,
+		Method = method,
+		Headers = {
+			["Content-Type"] = "application/json",
+		},
+	}
+
+	if body ~= nil then
+		request.Body = HttpService:JSONEncode(body)
+	end
+
+	local ok, result = pcall(function()
+		return HttpService:RequestAsync(request)
+	end)
+	if not ok then
+		error("Request to helper failed: " .. tostring(result))
+	end
+
+	local response = result
+	if not response.Success then
+		error(string.format("Helper request %s %s failed with status %d: %s", method, path, response.StatusCode, summarizeText(response.Body)))
+	end
+
+	if response.Body == "" then
+		return {}
+	end
+
+	local decodeOk, decoded = pcall(function()
+		return HttpService:JSONDecode(response.Body)
+	end)
+	if not decodeOk then
+		error("Failed to decode helper JSON response: " .. tostring(decoded))
+	end
+	return decoded
 end
 
 local function toolCallHandler(args: Types.ToolArgs): string
@@ -164,27 +181,21 @@ local function getButtonImage()
 end
 
 local toolbar = plugin:CreateToolbar("MCP")
-local toggleButton = toolbar:CreateButton("MCP", "Show MCP connection panel", getButtonImage())
+local toggleButton = toolbar:CreateButton("MCP", "Show MCP helper connection panel", getButtonImage())
 toggleButton.ClickableWhenViewportHidden = true
 
-local widgetInfo = DockWidgetPluginGuiInfo.new(
-	Enum.InitialDockState.Right,
-	false,
-	false,
-	420,
-	320,
-	360,
-	260
-)
+local widgetInfo = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 420, 300, 360, 240)
 local widget = plugin:CreateDockWidgetPluginGui("MCPConnectionPanel", widgetInfo)
 widget.Title = "Studio MCP"
 
-local currentUri, currentToken = loadConnectionConfig()
+local currentHelperPort, currentAutoConnect = loadConnectionConfig()
 local currentClient: MockWebSocketService.MockWebSocketClient?
+local currentInstanceId: string? = nil
+local currentHelperBaseUrl: string? = nil
 local readyAnnounced = false
 local currentStatusKind = "warning"
 local currentStatusMessage = "Not connected"
-local currentStatusDetail = "Click Connect after saving a Studio MCP domain and token."
+local currentStatusDetail = "Connect to the local helper. The helper derives place URLs automatically from the current PlaceId."
 
 local panel = Instance.new("Frame")
 panel.Size = UDim2.fromScale(1, 1)
@@ -231,7 +242,7 @@ subtitleLabel.Font = Enum.Font.Gotham
 subtitleLabel.TextSize = 12
 subtitleLabel.TextColor3 = Color3.fromRGB(156, 169, 181)
 subtitleLabel.TextWrapped = true
-subtitleLabel.Text = "Bare hostnames use HTTPS on port 443. Successes and failures are logged to the Studio console."
+subtitleLabel.Text = "Only the local helper port is configurable. The helper owns tokens, derives public MCP domains, and routes requests for this PlaceId."
 subtitleLabel.Parent = header
 
 local function createCard(height: number)
@@ -279,7 +290,7 @@ local function createCardHeader(parent: Instance, title: string, detail: string)
 	detailLabel.Parent = parent
 end
 
-local function createInput(parent: Instance, top: number, placeholder: string, value: string, hidden: boolean?)
+local function createInput(parent: Instance, top: number, placeholder: string, value: string)
 	local input = Instance.new("TextBox")
 	input.Position = UDim2.new(0, 14, 0, top)
 	input.Size = UDim2.new(1, -28, 0, 34)
@@ -295,10 +306,6 @@ local function createInput(parent: Instance, top: number, placeholder: string, v
 	input.Text = value
 	input.TextEditable = true
 	input.Parent = parent
-	input.TextWrapped = false
-	if hidden then
-		input.Text = value
-	end
 
 	local corner = Instance.new("UICorner")
 	corner.CornerRadius = UDim.new(0, 8)
@@ -313,24 +320,43 @@ local function createInput(parent: Instance, top: number, placeholder: string, v
 end
 
 local connectionCard = createCard(102)
-createCardHeader(connectionCard, "Base URL", "Use the public Studio MCP domain. If you omit a scheme, the plugin assumes HTTPS on port 443.")
-local uriInput = createInput(connectionCard, 60, URI_PLACEHOLDER, currentUri)
+createCardHeader(connectionCard, "Helper Port", "The helper must be running locally. The plugin asks the helper to register this PlaceId and receive tool requests.")
+local helperPortInput = createInput(connectionCard, 60, DEFAULT_HELPER_PORT, currentHelperPort)
 
-local authCard = createCard(102)
-createCardHeader(authCard, "Authorization", "Paste either the raw feishu token or the full Bearer header. The token is stored in the plugin settings.")
-local tokenInput = createInput(authCard, 60, "feishu token or Bearer <token>", currentToken, true)
+local autoConnectCard = createCard(86)
+createCardHeader(autoConnectCard, "Auto Connect", "When enabled, the plugin attempts a single helper connection during load. Failures stop immediately until you click Connect again.")
+
+local autoConnectLabel = Instance.new("TextLabel")
+autoConnectLabel.Position = UDim2.new(0, 14, 0, 56)
+autoConnectLabel.Size = UDim2.new(0.65, 0, 0, 20)
+autoConnectLabel.BackgroundTransparency = 1
+autoConnectLabel.TextXAlignment = Enum.TextXAlignment.Left
+autoConnectLabel.Font = Enum.Font.GothamSemibold
+autoConnectLabel.TextSize = 13
+autoConnectLabel.TextColor3 = Color3.fromRGB(237, 242, 247)
+autoConnectLabel.Parent = autoConnectCard
+
+local autoConnectButton = Instance.new("TextButton")
+autoConnectButton.Position = UDim2.new(1, -124, 0, 48)
+autoConnectButton.Size = UDim2.new(0, 110, 0, 28)
+autoConnectButton.AutoButtonColor = true
+autoConnectButton.BorderSizePixel = 0
+autoConnectButton.Font = Enum.Font.GothamSemibold
+autoConnectButton.TextSize = 13
+autoConnectButton.Parent = autoConnectCard
+
+local autoConnectButtonCorner = Instance.new("UICorner")
+autoConnectButtonCorner.CornerRadius = UDim.new(0, 999)
+autoConnectButtonCorner.Parent = autoConnectButton
 
 local statusCard = createCard(94)
 
 local statusPill = Instance.new("TextLabel")
 statusPill.Position = UDim2.new(0, 14, 0, 12)
 statusPill.Size = UDim2.new(0, 110, 0, 24)
-statusPill.BackgroundColor3 = Color3.fromRGB(48, 38, 18)
 statusPill.BorderSizePixel = 0
 statusPill.Font = Enum.Font.GothamSemibold
 statusPill.TextSize = 12
-statusPill.TextColor3 = Color3.fromRGB(255, 196, 87)
-statusPill.Text = "Disconnected"
 statusPill.Parent = statusCard
 
 local statusPillCorner = Instance.new("UICorner")
@@ -345,7 +371,6 @@ statusTitle.TextXAlignment = Enum.TextXAlignment.Left
 statusTitle.Font = Enum.Font.GothamSemibold
 statusTitle.TextSize = 14
 statusTitle.TextColor3 = Color3.fromRGB(243, 247, 250)
-statusTitle.Text = currentStatusMessage
 statusTitle.Parent = statusCard
 
 local statusDetail = Instance.new("TextLabel")
@@ -358,7 +383,6 @@ statusDetail.Font = Enum.Font.Gotham
 statusDetail.TextSize = 12
 statusDetail.TextColor3 = Color3.fromRGB(156, 169, 181)
 statusDetail.TextWrapped = true
-statusDetail.Text = currentStatusDetail
 statusDetail.Parent = statusCard
 
 local buttonRow = Instance.new("Frame")
@@ -395,6 +419,13 @@ local resetButton = createButton("Reset", Color3.fromRGB(52, 63, 76), Color3.fro
 local saveButton = createButton("Save", Color3.fromRGB(44, 93, 153), Color3.fromRGB(245, 248, 252))
 local connectButton = createButton("Connect", Color3.fromRGB(66, 188, 120), Color3.fromRGB(18, 24, 31))
 
+local function updateAutoConnectViews()
+	autoConnectLabel.Text = if currentAutoConnect then "Auto connect once is enabled" else "Auto connect once is disabled"
+	autoConnectButton.Text = if currentAutoConnect then "Enabled" else "Disabled"
+	autoConnectButton.BackgroundColor3 = if currentAutoConnect then Color3.fromRGB(66, 188, 120) else Color3.fromRGB(52, 63, 76)
+	autoConnectButton.TextColor3 = if currentAutoConnect then Color3.fromRGB(18, 24, 31) else Color3.fromRGB(230, 236, 241)
+end
+
 local function updateStatusViews()
 	local theme = STATUS_THEME[currentStatusKind] or STATUS_THEME.warning
 	statusPill.BackgroundColor3 = theme.background
@@ -402,6 +433,8 @@ local function updateStatusViews()
 	statusPill.Text = theme.label
 	statusTitle.Text = currentStatusMessage
 	statusDetail.Text = currentStatusDetail
+	helperPortInput.Text = currentHelperPort
+	updateAutoConnectViews()
 	if currentClient ~= nil then
 		connectButton.Text = "Disconnect"
 		connectButton.BackgroundColor3 = Color3.fromRGB(255, 107, 107)
@@ -413,8 +446,6 @@ local function updateStatusViews()
 		connectButton.TextColor3 = Color3.fromRGB(18, 24, 31)
 		toggleButton:SetActive(widget.Enabled)
 	end
-	uriInput.Text = currentUri
-	tokenInput.Text = currentToken
 end
 
 local function setStatus(kind: string, message: string, detail: string?)
@@ -427,22 +458,31 @@ local function setStatus(kind: string, message: string, detail: string?)
 end
 
 local function persistCurrentInputs()
-	currentUri = normalizeBaseUri(uriInput.Text)
-	currentToken = tokenInput.Text
-	uriInput.Text = currentUri
-	tokenInput.Text = currentToken
-	saveConnectionConfig(currentUri, currentToken)
-	setStatus(currentStatusKind, currentStatusMessage, "Saved settings for " .. currentUri)
+	currentHelperPort = saveConnectionConfig(helperPortInput.Text, currentAutoConnect)
+	helperPortInput.Text = currentHelperPort
+	setStatus(currentStatusKind, currentStatusMessage, "Saved helper settings for port " .. currentHelperPort)
 end
 
 local function isCurrentClient(client: MockWebSocketService.MockWebSocketClient): boolean
 	return currentClient == client
 end
 
+local function unregisterCurrentInstance()
+	if currentHelperBaseUrl ~= nil and currentInstanceId ~= nil then
+		pcall(function()
+			requestJson(currentHelperBaseUrl, "POST", "/v1/mcp/unregister", {
+				instance_id = currentInstanceId,
+			})
+		end)
+	end
+	currentInstanceId = nil
+	currentHelperBaseUrl = nil
+end
+
 local function handleClientStatus(kind: string, message: string)
 	if kind == "error" then
 		logWarn(message)
-		setStatus("error", "Connection error", message)
+		setStatus("error", "Helper request failed", message)
 		readyAnnounced = false
 		return
 	end
@@ -453,43 +493,42 @@ local function handleClientStatus(kind: string, message: string)
 			readyAnnounced = true
 		end
 		logInfo(message)
-		setStatus("connected", "Ready for prompts", message)
+		setStatus("connected", "Connected to helper", message)
 		return
 	end
 
 	logInfo(message)
-	setStatus("info", "Connection active", message)
+	setStatus("info", "Waiting on helper", message)
 	if kind == "warning" then
 		readyAnnounced = false
 	end
 end
 
-local function connectWebSocket(uri: string, token: string)
-	local client = MockWebSocketService:CreateClient(uri)
-	client:SetReceiveEndpoint(RECEIVE_ENDPOINT)
-	client:SetSendEndpoint(SEND_ENDPOINT)
-
-	local authHeader = normalizeAuthHeader(token)
-	if authHeader ~= nil then
-		client:SetHeaders({
-			Authorization = authHeader,
-		})
-		logInfo("Using Authorization header for " .. uri)
-	else
-		logWarn("No Authorization header configured for " .. uri)
+local function connectToHelper(helperPort: string)
+	local baseUrl = helperBaseUrl(helperPort)
+	local registration = requestJson(baseUrl, "POST", "/v1/mcp/register", {
+		place_id = tostring(game.PlaceId),
+	})
+	local instanceId = registration.instance_id
+	if type(instanceId) ~= "string" or instanceId == "" then
+		error("Helper register did not return an instance_id")
 	end
+
+	local client = MockWebSocketService:CreateClient(baseUrl)
+	client:SetReceiveEndpoint("/v1/mcp/plugin/request?instance_id=" .. instanceId)
+	client:SetSendEndpoint("/v1/mcp/plugin/response")
 
 	client.Opened:Connect(function()
 		if isCurrentClient(client) then
-			logInfo("Started long polling against " .. uri)
-			setStatus("info", "Connecting", "Waiting for a successful response from " .. uri)
+			logInfo("Started local long polling against helper on port " .. helperPort)
+			setStatus("info", "Connected to helper", "Registered place " .. tostring(game.PlaceId) .. " as instance " .. instanceId)
 		end
 	end)
 
 	client.Closed:Connect(function()
 		if isCurrentClient(client) then
-			logWarn("Connection closed for " .. uri)
-			setStatus("warning", "Disconnected", "Long polling stopped for " .. uri)
+			logWarn("Helper connection closed for port " .. helperPort)
+			setStatus("warning", "Disconnected", "Stopped polling the local helper on port " .. helperPort)
 			readyAnnounced = false
 		end
 	end)
@@ -509,14 +548,14 @@ local function connectWebSocket(uri: string, token: string)
 			return HttpService:JSONDecode(message)
 		end)
 		if not decodeOk then
-			local decodeError = "Failed to decode request payload: " .. tostring(body)
+			local decodeError = "Failed to decode helper request payload: " .. tostring(body)
 			logWarn(decodeError)
 			setStatus("error", "Invalid request payload", decodeError)
 			return
 		end
 
 		if type(body) ~= "table" or body.id == nil or body.args == nil then
-			local invalidError = "Received malformed request payload from " .. uri
+			local invalidError = "Received malformed helper request payload"
 			logWarn(invalidError)
 			setStatus("error", "Malformed request payload", invalidError)
 			return
@@ -531,6 +570,7 @@ local function connectWebSocket(uri: string, token: string)
 
 			responseSent = true
 			client:Send({
+				instance_id = instanceId,
 				id = id,
 				success = success,
 				response = response,
@@ -539,12 +579,12 @@ local function connectWebSocket(uri: string, token: string)
 
 		local args = body.args :: Types.ToolArgs
 		local toolName = next(args)
-		logInfo("Received tool request " .. tostring(toolName) .. " (id=" .. id .. ")")
+		logInfo("Received helper tool request " .. tostring(toolName) .. " (id=" .. id .. ")")
 
 		local success, response = pcall(toolCallHandler, args)
 		if success then
 			sendResponseOnce(true, response)
-			setStatus("connected", "Ready for prompts", "Handled tool " .. tostring(toolName))
+			setStatus("connected", "Connected to helper", "Handled tool " .. tostring(toolName))
 		else
 			local errorMessage = tostring(response)
 			sendResponseOnce(false, errorMessage)
@@ -552,18 +592,20 @@ local function connectWebSocket(uri: string, token: string)
 		end
 	end)
 
-	return client
+	currentInstanceId = instanceId
+	currentHelperBaseUrl = baseUrl
+	return client, instanceId
 end
 
 local function disconnectCurrentClient()
 	if currentClient ~= nil then
 		currentClient:Close()
 		currentClient = nil
-		readyAnnounced = false
-		PluginUtils.setSettings(PLUGIN_DISABLED_SETTING_KEY, true)
-		logInfo("The MCP Studio plugin is stopped.")
-		setStatus("warning", "Disconnected", "Stopped polling " .. currentUri)
 	end
+	unregisterCurrentInstance()
+	readyAnnounced = false
+	logInfo("The MCP Studio plugin is stopped.")
+	setStatus("warning", "Disconnected", "Stopped polling the local helper")
 end
 
 local function connectCurrentClient()
@@ -573,10 +615,22 @@ local function connectCurrentClient()
 	end
 
 	readyAnnounced = false
-	logInfo("Connecting to " .. currentUri)
-	currentClient = connectWebSocket(currentUri, currentToken)
-	PluginUtils.setSettings(PLUGIN_DISABLED_SETTING_KEY, false)
-	setStatus("info", "Connecting", "Opening a long-poll connection to " .. currentUri)
+	logInfo("Connecting to local helper on port " .. currentHelperPort)
+	setStatus("info", "Connecting", "Registering PlaceId " .. tostring(game.PlaceId) .. " with the local helper on port " .. currentHelperPort)
+
+	local ok, clientOrError, instanceId = pcall(function()
+		return connectToHelper(currentHelperPort)
+	end)
+	if not ok then
+		local errorMessage = tostring(clientOrError)
+		logWarn(errorMessage)
+		setStatus("error", "Failed to connect to helper", errorMessage)
+		return false
+	end
+
+	currentClient = clientOrError
+	setStatus("connected", "Connected to helper", "Registered helper instance " .. tostring(instanceId) .. " for PlaceId " .. tostring(game.PlaceId))
+	return true
 end
 
 widget:GetPropertyChangedSignal("Enabled"):Connect(function()
@@ -585,15 +639,16 @@ widget:GetPropertyChangedSignal("Enabled"):Connect(function()
 	end
 end)
 
-uriInput.FocusLost:Connect(function()
-	currentUri = normalizeBaseUri(uriInput.Text)
-	uriInput.Text = currentUri
+helperPortInput.FocusLost:Connect(function()
+	currentHelperPort = normalizeHelperPort(helperPortInput.Text)
+	helperPortInput.Text = currentHelperPort
 	persistCurrentInputs()
 end)
 
-tokenInput.FocusLost:Connect(function()
-	currentToken = tokenInput.Text
+autoConnectButton.MouseButton1Click:Connect(function()
+	currentAutoConnect = not currentAutoConnect
 	persistCurrentInputs()
+	updateStatusViews()
 end)
 
 saveButton.MouseButton1Click:Connect(function()
@@ -601,12 +656,11 @@ saveButton.MouseButton1Click:Connect(function()
 end)
 
 resetButton.MouseButton1Click:Connect(function()
-	currentUri = DEFAULT_URI
-	currentToken = ""
-	uriInput.Text = currentUri
-	tokenInput.Text = currentToken
-	saveConnectionConfig(currentUri, currentToken)
-	setStatus("warning", "Reset settings", "Reset the connection form to the HTTPS/443 default.")
+	currentHelperPort = DEFAULT_HELPER_PORT
+	currentAutoConnect = false
+	helperPortInput.Text = currentHelperPort
+	saveConnectionConfig(currentHelperPort, currentAutoConnect)
+	setStatus("warning", "Reset settings", "Reset helper settings to the default local port and disabled auto connect.")
 end)
 
 connectButton.MouseButton1Click:Connect(function()
@@ -617,9 +671,13 @@ connectButton.MouseButton1Click:Connect(function()
 	end
 end)
 
-if not plugin:GetSetting(PLUGIN_DISABLED_SETTING_KEY) then
-	connectCurrentClient()
-	widget.Enabled = false
+if currentAutoConnect then
+	task.defer(function()
+		local connected = connectCurrentClient()
+		if connected then
+			widget.Enabled = false
+		end
+	end)
 end
 
 updateStatusViews()

@@ -41,13 +41,23 @@ jobs:
           cp target/release/rbx-studio-mcp output/rbx-studio-mcp-linux-x86_64
           chmod +x output/rbx-studio-mcp-linux-x86_64
           ./target/release/rbx-studio-mcp --write-plugin output/MCPStudioPlugin.rbxm
+
+      - name: Install Windows cross toolchain
+        run: sudo ./util/install-ubuntu-windows-cross.sh
+
+      - name: Build Windows helper
+        run: |
+          cargo build --release --bin studio_helper --target x86_64-pc-windows-gnu
+          cp target/x86_64-pc-windows-gnu/release/studio_helper.exe output/studio_helper-windows-x86_64.exe
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Linux-rbx-studio-mcp-and-plugin
+          name: Linux-rbx-studio-mcp-plugin-and-helper
           path: |
             output/rbx-studio-mcp-linux-x86_64
             output/MCPStudioPlugin.rbxm
+            output/studio_helper-windows-x86_64.exe
 
   release:
     runs-on: ubuntu-latest
