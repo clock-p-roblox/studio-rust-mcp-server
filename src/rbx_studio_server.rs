@@ -79,6 +79,8 @@ pub struct StatusResponse {
     pending_responses: usize,
     helper_connected: bool,
     helper_place_id: Option<String>,
+    helper_connection_id: Option<String>,
+    helper_last_message_age_ms: Option<u128>,
 }
 
 struct ActiveHelperConnection {
@@ -140,6 +142,10 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
         .as_ref()
         .map(|helper| helper.last_message_at.elapsed() <= HELPER_HEARTBEAT_TIMEOUT)
         .unwrap_or(false);
+    let helper_last_message_age_ms = state
+        .active_helper
+        .as_ref()
+        .map(|helper| helper.last_message_at.elapsed().as_millis());
     Json(StatusResponse {
         service: "rbx-studio-mcp",
         queued_requests: state.process_queue.len(),
@@ -153,6 +159,11 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
         } else {
             None
         },
+        helper_connection_id: state
+            .active_helper
+            .as_ref()
+            .map(|helper| helper.connection_id.to_string()),
+        helper_last_message_age_ms,
     })
 }
 
@@ -645,7 +656,16 @@ fn abort_uploads_for_request(uploads: &UploadRegistry, request_id: Uuid) {
 fn touch_active_helper(state: &mut AppState, connection_id: Uuid) -> bool {
     match state.active_helper.as_mut() {
         Some(helper) if helper.connection_id == connection_id => {
+            let idle_for = helper.last_message_at.elapsed();
             helper.last_message_at = Instant::now();
+            if idle_for >= Duration::from_secs(10) {
+                tracing::info!(
+                    %connection_id,
+                    place_id = helper.place_id,
+                    idle_for_ms = idle_for.as_millis(),
+                    "helper websocket traffic resumed after idle gap"
+                );
+            }
             true
         }
         _ => false,
@@ -1234,10 +1254,16 @@ pub async fn helper_health_loop(state: PackedState) {
                 })
                 .unwrap(),
             ));
+            let (queued_requests, pending_responses) = {
+                let state = state.lock().await;
+                (state.process_queue.len(), state.output_map.len())
+            };
             tracing::warn!(
                 %connection_id,
                 place_id,
                 timeout_secs = HELPER_HEARTBEAT_TIMEOUT.as_secs(),
+                queued_requests,
+                pending_responses,
                 "helper websocket heartbeat timed out"
             );
         }

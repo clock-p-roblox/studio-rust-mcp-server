@@ -1394,6 +1394,9 @@ async fn run_remote_ws_session(
     let stream = connect_remote_ws(&app.helper, ws_url).await?;
     let (mut writer, mut reader) = stream.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<RemoteOutgoingFrame>();
+    let mut last_server_message_at = Instant::now();
+    let mut last_heartbeat_sent_at = Instant::now();
+    let mut heartbeat_count: u64 = 0;
     {
         let mut state = app.state.lock().await;
         if let Some(connection) = state.remote_connections.get_mut(place_id) {
@@ -1407,7 +1410,11 @@ async fn run_remote_ws_session(
                 RemoteOutgoingFrame::Text(text) => WsMessage::Text(text.into()),
                 RemoteOutgoingFrame::Pong(payload) => WsMessage::Pong(payload.into()),
             };
-            if writer.send(message).await.is_err() {
+            if let Err(error) = writer.send(message).await {
+                tracing::warn!(
+                    error = summarize_error(&error.to_string()),
+                    "helper remote websocket writer failed"
+                );
                 break;
             }
         }
@@ -1453,10 +1460,22 @@ async fn run_remote_ws_session(
                     let state = app.state.lock().await;
                     state.instances.values().filter(|instance| instance.place_id == place_id).count()
                 };
+                heartbeat_count += 1;
+                last_heartbeat_sent_at = Instant::now();
+                if heartbeat_count == 1 || heartbeat_count % 12 == 0 {
+                    tracing::info!(
+                        place_id,
+                        heartbeat_count,
+                        plugin_instance_count,
+                        idle_from_server_ms = last_server_message_at.elapsed().as_millis(),
+                        "sending helper remote websocket heartbeat"
+                    );
+                }
                 if out_tx.send(RemoteOutgoingFrame::Text(encode_remote_message(&HelperToServerMessage::Heartbeat {
                     place_id: place_id.to_owned(),
                     plugin_instance_count,
                 })?)).is_err() {
+                    tracing::warn!(place_id, heartbeat_count, "failed to queue helper remote websocket heartbeat");
                     break;
                 }
             }
@@ -1466,6 +1485,7 @@ async fn run_remote_ws_session(
                 };
                 match message? {
                     WsMessage::Text(text) => {
+                        last_server_message_at = Instant::now();
                         match serde_json::from_str::<ServerToHelperMessage>(&text)? {
                             ServerToHelperMessage::ReadyAck { connection_id, .. } => {
                                 tracing::info!(place_id, connection_id, "helper websocket acknowledged by MCP server");
@@ -1502,10 +1522,13 @@ async fn run_remote_ws_session(
                         }
                     }
                     WsMessage::Ping(payload) => {
+                        last_server_message_at = Instant::now();
                         let _ = out_tx.send(RemoteOutgoingFrame::Pong(payload));
                     }
                     WsMessage::Close(_) => break,
-                    WsMessage::Binary(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => {}
+                    WsMessage::Binary(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => {
+                        last_server_message_at = Instant::now();
+                    }
                 }
             }
         }
@@ -1517,6 +1540,14 @@ async fn run_remote_ws_session(
             "remote websocket session closed before artifact commit"
         )));
     }
+    tracing::warn!(
+        place_id,
+        heartbeat_count,
+        last_server_message_age_ms = last_server_message_at.elapsed().as_millis(),
+        last_heartbeat_sent_age_ms = last_heartbeat_sent_at.elapsed().as_millis(),
+        pending_upload_waiters = pending.len(),
+        "helper remote websocket session ended"
+    );
     Ok(())
 }
 
