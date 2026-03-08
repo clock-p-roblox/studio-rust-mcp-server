@@ -1863,9 +1863,7 @@ fn read_studio_log(args: ReadStudioLogArgs) -> Result<ReadStudioLogResponse> {
             .map(PathBuf::from)
             .ok_or_else(|| eyre!("LOCALAPPDATA is not set"))?;
         let logs_dir = local_app_data.join("Roblox").join("logs");
-        let log_path = find_latest_log_file(&logs_dir)?;
-        let content = fs::read_to_string(&log_path)
-            .wrap_err_with(|| format!("failed to read {}", log_path.display()))?;
+        let (log_path, content) = read_latest_studio_log(&logs_dir)?;
         let mut all_lines: Vec<String> = content.lines().map(ToOwned::to_owned).collect();
         if let Some(pattern) = args.regex.as_ref() {
             let regex = Regex::new(pattern)?;
@@ -1907,8 +1905,10 @@ fn read_studio_log(args: ReadStudioLogArgs) -> Result<ReadStudioLogResponse> {
 }
 
 #[cfg(target_os = "windows")]
-fn find_latest_log_file(logs_dir: &Path) -> Result<PathBuf> {
-    let mut files: Vec<_> = fs::read_dir(logs_dir)
+fn list_candidate_log_files(logs_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut studio_files = Vec::new();
+    let mut other_files = Vec::new();
+    let mut entries: Vec<_> = fs::read_dir(logs_dir)
         .wrap_err_with(|| format!("failed to read {}", logs_dir.display()))?
         .flatten()
         .filter_map(|entry| {
@@ -1921,11 +1921,63 @@ fn find_latest_log_file(logs_dir: &Path) -> Result<PathBuf> {
             }
         })
         .collect();
-    files.sort_by_key(|(_, modified)| *modified);
-    files
-        .pop()
-        .map(|(path, _)| path)
-        .ok_or_else(|| eyre!("no Studio log file found in {}", logs_dir.display()))
+    entries.sort_by_key(|(_, modified)| *modified);
+    entries.reverse();
+    for (path, _) in entries {
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        if file_name.contains("_Studio_") {
+            studio_files.push(path);
+        } else {
+            other_files.push(path);
+        }
+    }
+    if !studio_files.is_empty() {
+        return Ok(studio_files);
+    }
+    if !other_files.is_empty() {
+        tracing::warn!(
+            path = %logs_dir.display(),
+            "no explicit Studio log file matched '_Studio_', falling back to latest .log files"
+        );
+        return Ok(other_files);
+    }
+    Err(eyre!("no Studio log file found in {}", logs_dir.display()))
+}
+
+#[cfg(target_os = "windows")]
+fn read_latest_studio_log(logs_dir: &Path) -> Result<(PathBuf, String)> {
+    let candidates = list_candidate_log_files(logs_dir)?;
+    let mut last_error = None;
+    for path in candidates {
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let content = String::from_utf8_lossy(&bytes).into_owned();
+                return Ok((path, content));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(path = %path.display(), "Studio log candidate disappeared before read; trying next file");
+                last_error = Some(format!("{}: {}", path.display(), error));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                tracing::warn!(path = %path.display(), "Studio log candidate was not readable; trying next file");
+                last_error = Some(format!("{}: {}", path.display(), error));
+            }
+            Err(error) => {
+                last_error = Some(format!("{}: {}", path.display(), error));
+            }
+        }
+    }
+    Err(eyre!(
+        "failed to read any Studio log file in {}{}",
+        logs_dir.display(),
+        last_error
+            .as_deref()
+            .map(|value| format!("; last error: {value}"))
+            .unwrap_or_default()
+    ))
 }
 
 #[derive(Debug)]
