@@ -7,6 +7,7 @@ use axum::{
 };
 use clap::Parser;
 use color_eyre::eyre::{eyre, Result, WrapErr};
+use helper_ws::HELPER_WS_PATH;
 use rbx_studio_server::*;
 use rmcp::{
     transport::streamable_http_server::{
@@ -22,6 +23,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing_subscriber::{self, EnvFilter};
 mod error;
+mod helper_ws;
 mod install;
 mod rbx_studio_server;
 
@@ -174,7 +176,9 @@ async fn main() -> Result<()> {
 
     tracing::info!("initialized server state");
 
-    let server_state = Arc::new(Mutex::new(AppState::new()));
+    let workspace = std::env::current_dir()?;
+    let server_state = Arc::new(Mutex::new(AppState::new(workspace)));
+    tokio::spawn(helper_health_loop(Arc::clone(&server_state)));
 
     let (close_tx, close_rx) = tokio::sync::oneshot::channel();
 
@@ -251,6 +255,7 @@ async fn main() -> Result<()> {
             .route("/response", post(response_handler))
             .route("/proxy", post(proxy_handler))
             .route("/status", get(status_handler))
+            .route(HELPER_WS_PATH, get(helper_ws_handler))
             .nest_service("/mcp", streamable_http_service)
             .with_state(Arc::clone(&server_state))
             .layer(middleware::from_fn_with_state(
