@@ -201,6 +201,45 @@ struct ScreenshotResponse {
     path: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct RuntimeScreenshotRequest {
+    #[serde(rename = "placeId")]
+    place_id: Option<String>,
+    session_id: String,
+    runtime_id: String,
+    tag: Option<String>,
+    upload_url: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RuntimeScreenshotSinkResponse {
+    ok: bool,
+    session_id: String,
+    runtime_id: String,
+    artifact_dir: String,
+    screenshot_path: String,
+    session_metadata_path: String,
+    bytes_written: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeScreenshotResponse {
+    session_id: String,
+    runtime_id: String,
+    place_id: String,
+    screenshot_path: String,
+    artifact_dir: String,
+    session_metadata_path: String,
+    bytes_written: usize,
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+struct CapturedScreenshot {
+    resolved_place_id: Option<String>,
+    png_bytes: Vec<u8>,
+    window_title: String,
+}
+
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 #[derive(Debug, Deserialize, Clone)]
 struct ReadStudioLogArgs {
@@ -361,6 +400,13 @@ fn derive_public_base_url(kind: &str, place_id: &str, helper: &HelperConfig) -> 
     )
 }
 
+fn derive_runtime_screenshot_upload_url(place_id: &str, helper: &HelperConfig) -> String {
+    format!(
+        "{}/v1/runtime-screenshots",
+        derive_public_base_url("runtime-log", place_id, helper)
+    )
+}
+
 #[cfg(target_os = "windows")]
 fn helper_data_dir() -> Result<PathBuf> {
     if let Some(appdata) = windows_appdata_dir() {
@@ -387,6 +433,118 @@ fn sanitize_place_id(value: &str) -> Result<String> {
         return Err(eyre!("placeId must be digits only"));
     }
     Ok(trimmed)
+}
+
+fn sanitize_identifier(label: &str, value: &str) -> Result<String> {
+    let trimmed = trim(value);
+    if trimmed.is_empty()
+        || !trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return Err(eyre!("{label} must use [A-Za-z0-9_-] only"));
+    }
+    Ok(trimmed)
+}
+
+fn validate_runtime_screenshot_upload_url(
+    upload_url: &str,
+    place_id: &str,
+    helper: &HelperConfig,
+) -> Result<String> {
+    let trimmed = trim(upload_url);
+    if trimmed.is_empty() {
+        return Err(eyre!("upload_url must not be empty"));
+    }
+
+    let expected = derive_runtime_screenshot_upload_url(place_id, helper);
+    if trimmed != expected {
+        return Err(eyre!(
+            "upload_url must match runtime screenshot sink for placeId {place_id}: {expected}"
+        ));
+    }
+
+    Ok(expected)
+}
+
+async fn post_runtime_screenshot(
+    helper: &HelperConfig,
+    upload_url: &str,
+    session_id: &str,
+    runtime_id: &str,
+    place_id: &str,
+    tag: Option<&str>,
+    png_bytes: &[u8],
+) -> Result<RuntimeScreenshotSinkResponse> {
+    let current_token = helper.bearer_token.lock().await.clone();
+    let current_source = helper.bearer_token_source.lock().await.clone();
+    let mut attempts = vec![ResolvedToken {
+        value: current_token.clone(),
+        source: current_source,
+    }];
+    for candidate in helper.bearer_token_candidates.iter() {
+        if candidate.value != current_token {
+            attempts.push(candidate.clone());
+        }
+    }
+
+    let normalized_tag = tag.map(trim).filter(|value| !value.is_empty());
+    let mut saw_unauthorized = false;
+    for candidate in attempts {
+        let mut request = helper
+            .client
+            .post(upload_url)
+            .header(AUTHORIZATION, format!("Bearer {}", candidate.value))
+            .header(CONTENT_TYPE, "image/png")
+            .header("X-Session-Id", session_id)
+            .header("X-Runtime-Id", runtime_id)
+            .header("X-Place-Id", place_id);
+        if let Some(tag) = normalized_tag.as_deref() {
+            request = request.header("X-Screenshot-Tag", tag);
+        }
+
+        let response = request.body(png_bytes.to_vec()).send().await?;
+        let status = response.status();
+        let response_body = response.text().await?;
+        if status == StatusCode::UNAUTHORIZED {
+            saw_unauthorized = true;
+            tracing::warn!(source = candidate.source, "runtime screenshot upload was unauthorized; trying next token candidate");
+            continue;
+        }
+        if !status.is_success() {
+            return Err(eyre!("runtime screenshot upload returned {status}: {response_body}"));
+        }
+
+        let sink_response: RuntimeScreenshotSinkResponse = serde_json::from_str(&response_body)
+            .wrap_err("runtime screenshot upload returned invalid JSON")?;
+        if !sink_response.ok {
+            return Err(eyre!("runtime screenshot upload returned ok=false: {response_body}"));
+        }
+        if sink_response.session_id != session_id {
+            return Err(eyre!(
+                "runtime screenshot upload returned mismatched session_id: expected {session_id}, got {}",
+                sink_response.session_id
+            ));
+        }
+        if sink_response.runtime_id != runtime_id {
+            return Err(eyre!(
+                "runtime screenshot upload returned mismatched runtime_id: expected {runtime_id}, got {}",
+                sink_response.runtime_id
+            ));
+        }
+
+        if candidate.value != current_token {
+            *helper.bearer_token.lock().await = candidate.value.clone();
+            *helper.bearer_token_source.lock().await = candidate.source.clone();
+            tracing::warn!(source = candidate.source, "helper switched bearer token after runtime screenshot upload unauthorized");
+        }
+        return Ok(sink_response);
+    }
+
+    if saw_unauthorized {
+        return Err(eyre!("runtime screenshot upload returned unauthorized for all token candidates"));
+    }
+    Err(eyre!("runtime screenshot upload could not complete"))
 }
 
 fn extract_command_id(command: &Value) -> Result<String> {
@@ -833,6 +991,14 @@ async fn screenshot_debug_handler(
     Ok(Json(ScreenshotResponse { path }))
 }
 
+async fn runtime_screenshot_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<RuntimeScreenshotRequest>,
+) -> Result<Json<RuntimeScreenshotResponse>, HelperError> {
+    let response = upload_runtime_screenshot(app, payload).await?;
+    Ok(Json(response))
+}
+
 async fn read_studio_log_debug_handler(
     Query(query): Query<ReadStudioLogArgs>,
 ) -> Result<Json<ReadStudioLogResponse>, HelperError> {
@@ -1076,21 +1242,12 @@ async fn resolve_capture_pid(app: &AppState, place_id: Option<&str>) -> Result<(
     Ok((selected.0, studio_pid))
 }
 
-async fn take_screenshot(app: AppState, place_id: Option<&str>) -> Result<String> {
+async fn capture_screenshot_png(app: AppState, place_id: Option<&str>) -> Result<CapturedScreenshot> {
     #[cfg(target_os = "windows")]
     {
         let (resolved_place_id, studio_pid) = resolve_capture_pid(&app, place_id).await?;
         let (studio_hwnd, viewport_hwnd, window_title) =
             find_studio_capture_target_for_pid(studio_pid)?;
-        let output_dir = helper_data_dir()?.join("screenshots");
-        fs::create_dir_all(&output_dir)?;
-        let file_name = if let Some(place_id) = resolved_place_id.as_deref() {
-            format!("studio-{place_id}-{}.png", now_stamp())
-        } else {
-            format!("studio-{}.png", now_stamp())
-        };
-        let output_path = output_dir.join(file_name);
-        let escaped_path = output_path.display().to_string().replace('\'', "''");
         let script_template = r#"
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
@@ -1169,16 +1326,19 @@ if (-not $result.ok) {
 $bitmap = New-Object System.Drawing.Bitmap $width, $height
 $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
 $graphics.DrawImage($result.bitmap, 0, 0)
-$bitmap.Save('__OUTPUT_PATH__', [System.Drawing.Imaging.ImageFormat]::Png)
+$memory = New-Object System.IO.MemoryStream
+$bitmap.Save($memory, [System.Drawing.Imaging.ImageFormat]::Png)
+$bytes = $memory.ToArray()
+[Console]::OpenStandardOutput().Write($bytes, 0, $bytes.Length)
 $result.graphics.Dispose()
 $result.bitmap.Dispose()
 $graphics.Dispose()
 $bitmap.Dispose()
+$memory.Dispose()
 "#;
         let script = script_template
             .replace("__STUDIO_HWND__", &(studio_hwnd as usize).to_string())
-            .replace("__VIEWPORT_HWND__", &(viewport_hwnd as usize).to_string())
-            .replace("__OUTPUT_PATH__", &escaped_path);
+            .replace("__VIEWPORT_HWND__", &(viewport_hwnd as usize).to_string());
         let output = std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .output()
@@ -1189,7 +1349,36 @@ $bitmap.Dispose()
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
-        tracing::info!(path = %output_path.display(), studio_pid, window_title, "captured Studio screenshot from helper");
+        tracing::info!(studio_pid, window_title, byte_len = output.stdout.len(), "captured Studio screenshot bytes from helper");
+        return Ok(CapturedScreenshot {
+            resolved_place_id,
+            png_bytes: output.stdout,
+            window_title,
+        });
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        let _ = place_id;
+        Err(eyre!("take_screenshot is only available on Windows helper builds"))
+    }
+}
+
+async fn take_screenshot(app: AppState, place_id: Option<&str>) -> Result<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let captured = capture_screenshot_png(app, place_id).await?;
+        let output_dir = helper_data_dir()?.join("screenshots");
+        fs::create_dir_all(&output_dir)?;
+        let file_name = if let Some(place_id) = captured.resolved_place_id.as_deref() {
+            format!("studio-{place_id}-{}.png", now_stamp())
+        } else {
+            format!("studio-{}.png", now_stamp())
+        };
+        let output_path = output_dir.join(file_name);
+        fs::write(&output_path, captured.png_bytes)?;
+        tracing::info!(path = %output_path.display(), window_title = captured.window_title, "saved Studio screenshot debug file from helper");
         return Ok(output_path.display().to_string());
     }
 
@@ -1199,6 +1388,53 @@ $bitmap.Dispose()
         let _ = place_id;
         Err(eyre!("take_screenshot is only available on Windows helper builds"))
     }
+}
+
+async fn upload_runtime_screenshot(
+    app: AppState,
+    payload: RuntimeScreenshotRequest,
+) -> Result<RuntimeScreenshotResponse> {
+    let place_id = match payload.place_id.as_deref() {
+        Some(value) => Some(sanitize_place_id(value)?),
+        None => None,
+    };
+    let session_id = sanitize_identifier("session_id", &payload.session_id)?;
+    let runtime_id = sanitize_identifier("runtime_id", &payload.runtime_id)?;
+
+    let captured = capture_screenshot_png(app.clone(), place_id.as_deref()).await?;
+    let final_place_id = captured
+        .resolved_place_id
+        .clone()
+        .or(place_id)
+        .ok_or_else(|| eyre!("helper could not resolve placeId for runtime screenshot upload"))?;
+    let upload_url = validate_runtime_screenshot_upload_url(&payload.upload_url, &final_place_id, &app.helper)?;
+    let sink_response = post_runtime_screenshot(
+        &app.helper,
+        &upload_url,
+        &session_id,
+        &runtime_id,
+        &final_place_id,
+        payload.tag.as_deref(),
+        &captured.png_bytes,
+    )
+    .await?;
+    tracing::info!(
+        session_id,
+        runtime_id,
+        place_id = final_place_id,
+        screenshot_path = sink_response.screenshot_path,
+        window_title = captured.window_title,
+        "uploaded runtime screenshot through helper"
+    );
+    Ok(RuntimeScreenshotResponse {
+        session_id: sink_response.session_id,
+        runtime_id: sink_response.runtime_id,
+        place_id: final_place_id,
+        screenshot_path: sink_response.screenshot_path,
+        artifact_dir: sink_response.artifact_dir,
+        session_metadata_path: sink_response.session_metadata_path,
+        bytes_written: sink_response.bytes_written,
+    })
 }
 
 fn read_studio_log(args: ReadStudioLogArgs) -> Result<ReadStudioLogResponse> {
@@ -1340,6 +1576,7 @@ async fn main() -> Result<()> {
         .route("/v1/mcp/plugin/request", get(mcp_plugin_request_handler))
         .route("/v1/mcp/plugin/response", post(mcp_plugin_response_handler))
         .route("/v1/helper/screenshot", post(screenshot_debug_handler))
+        .route("/v1/helper/runtime-screenshot", post(runtime_screenshot_handler))
         .route("/v1/helper/studio-log", get(read_studio_log_debug_handler))
         .with_state(app_state);
 

@@ -151,6 +151,7 @@ cargo run --bin studio_helper -- --port 44750
   - `GET /v1/mcp/plugin/request?instance_id=...`
   - `POST /v1/mcp/plugin/response`
   - `POST /v1/helper/screenshot`
+  - `POST /v1/helper/runtime-screenshot`
   - `GET /v1/helper/studio-log`
 
 ### Ubuntu 交叉编译 Windows helper
