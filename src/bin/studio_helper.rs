@@ -1533,11 +1533,11 @@ async fn handle_remote_command(
         "helper received remote MCP command"
     );
     match tool_name.as_str() {
-        "TakeScreenshot" => {
+        "TakeScreenshot" | "take_screenshot" => {
             let args: TakeScreenshotToolArgs = serde_json::from_value(payload)?;
             stream_runtime_screenshot(app, place_id, args, sender, upload_waiters, request_id).await
         }
-        "ReadStudioLog" => {
+        "ReadStudioLog" | "read_studio_log" => {
             let args: ReadStudioLogArgs = serde_json::from_value(payload)?;
             Ok(serde_json::to_string(&read_studio_log(args)?)?)
         }
