@@ -203,7 +203,7 @@ struct ScreenshotResponse {
 
 #[derive(Debug, Deserialize)]
 struct RuntimeScreenshotRequest {
-    #[serde(rename = "placeId")]
+    #[serde(rename = "placeId", alias = "place_id")]
     place_id: Option<String>,
     session_id: String,
     runtime_id: String,
