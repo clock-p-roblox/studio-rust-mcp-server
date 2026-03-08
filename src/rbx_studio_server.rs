@@ -23,15 +23,20 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot::Receiver;
 use tokio::sync::{mpsc, watch, Mutex};
-use tokio::time::Duration;
 use uuid::Uuid;
 
 pub const STUDIO_PLUGIN_PORT: u16 = 44755;
 const LONG_POLL_DURATION: Duration = Duration::from_secs(15);
+const HELPER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const HELPER_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+const HELPER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(20);
+
+type UploadHandle = Arc<StdMutex<ArtifactUploadState>>;
+type UploadRegistry = Arc<StdMutex<HashMap<Uuid, UploadHandle>>>;
 
 fn summarize_text(value: &str) -> String {
     const LIMIT: usize = 180;
@@ -61,7 +66,7 @@ pub struct AppState {
     process_queue: VecDeque<ToolArguments>,
     output_map: HashMap<Uuid, mpsc::UnboundedSender<Result<String>>>,
     active_helper: Option<ActiveHelperConnection>,
-    uploads: HashMap<Uuid, ArtifactUploadState>,
+    uploads: UploadRegistry,
     waiter: watch::Receiver<()>,
     trigger: watch::Sender<()>,
 }
@@ -80,6 +85,7 @@ struct ActiveHelperConnection {
     connection_id: Uuid,
     place_id: String,
     sender: mpsc::UnboundedSender<OutgoingHelperFrame>,
+    last_message_at: Instant,
 }
 
 #[derive(Clone)]
@@ -102,6 +108,11 @@ struct ArtifactUploadState {
     expected_seq: u32,
 }
 
+struct PreparedArtifactUpload {
+    upload_id: Uuid,
+    upload: ArtifactUploadState,
+}
+
 impl AppState {
     pub fn new(workspace: PathBuf) -> Self {
         let (trigger, waiter) = watch::channel(());
@@ -110,7 +121,7 @@ impl AppState {
             process_queue: VecDeque::new(),
             output_map: HashMap::new(),
             active_helper: None,
-            uploads: HashMap::new(),
+            uploads: Arc::new(StdMutex::new(HashMap::new())),
             waiter,
             trigger,
         }
@@ -124,15 +135,24 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
         pending_responses = state.output_map.len(),
         "status requested"
     );
+    let helper_connected = state
+        .active_helper
+        .as_ref()
+        .map(|helper| helper.last_message_at.elapsed() <= HELPER_HEARTBEAT_TIMEOUT)
+        .unwrap_or(false);
     Json(StatusResponse {
         service: "rbx-studio-mcp",
         queued_requests: state.process_queue.len(),
         pending_responses: state.output_map.len(),
-        helper_connected: state.active_helper.is_some(),
-        helper_place_id: state
-            .active_helper
-            .as_ref()
-            .map(|helper| helper.place_id.clone()),
+        helper_connected,
+        helper_place_id: if helper_connected {
+            state
+                .active_helper
+                .as_ref()
+                .map(|helper| helper.place_id.clone())
+        } else {
+            None
+        },
     })
 }
 
@@ -384,7 +404,7 @@ impl RBXStudioServer {
         let (command, id) = ToolArguments::new(normalized_args);
         let tool_name = command.tool_name();
         let (tx, mut rx) = mpsc::unbounded_channel::<Result<String>>();
-        let (trigger, queued_requests, pending_responses) = {
+        let (trigger, uploads, queued_requests, pending_responses) = {
             let mut state = self.state.lock().await;
             if state.active_helper.is_none() {
                 return Err(ErrorData::internal_error(
@@ -396,6 +416,7 @@ impl RBXStudioServer {
             state.output_map.insert(id, tx);
             (
                 state.trigger.clone(),
+                Arc::clone(&state.uploads),
                 state.process_queue.len(),
                 state.output_map.len(),
             )
@@ -410,10 +431,20 @@ impl RBXStudioServer {
         trigger
             .send(())
             .map_err(|e| ErrorData::internal_error(format!("Unable to trigger send {e}"), None))?;
-        let result = rx
-            .recv()
-            .await
-            .ok_or(ErrorData::internal_error("Couldn't receive response", None))?;
+        let result = rx.recv();
+        let result = match tokio::time::timeout(HELPER_REQUEST_TIMEOUT, result).await {
+            Ok(Some(result)) => result,
+            Ok(None) => return Err(ErrorData::internal_error("Couldn't receive response", None)),
+            Err(_) => {
+                let mut state = self.state.lock().await;
+                remove_request_tracking(&mut state, id);
+                abort_uploads_for_request(&uploads, id);
+                return Err(ErrorData::internal_error(
+                    format!("Timed out waiting for {tool_name} response from Studio helper"),
+                    None,
+                ));
+            }
+        };
         {
             let mut state = self.state.lock().await;
             state.output_map.remove_entry(&id);
@@ -556,8 +587,19 @@ fn ensure_session_metadata(
     Ok((artifact_dir, log_dir, screenshot_dir, metadata_path))
 }
 
+fn remove_request_tracking(state: &mut AppState, request_id: Uuid) {
+    state.output_map.remove(&request_id);
+    state
+        .process_queue
+        .retain(|command| command.id != Some(request_id));
+}
+
 fn fail_request(state: &mut AppState, request_id: Uuid, message: &str) {
-    if let Some(tx) = state.output_map.remove(&request_id) {
+    let tx = state.output_map.remove(&request_id);
+    state
+        .process_queue
+        .retain(|command| command.id != Some(request_id));
+    if let Some(tx) = tx {
         let _ = tx.send(Err(Report::from(eyre!(message.to_owned()))));
     }
 }
@@ -569,9 +611,44 @@ fn fail_all_pending(state: &mut AppState, message: &str) {
     state.process_queue.clear();
 }
 
-fn abort_all_uploads(state: &mut AppState) {
-    for (_, upload) in state.uploads.drain() {
-        let _ = fs::remove_file(upload.temp_path);
+fn abort_all_uploads(uploads: &UploadRegistry) {
+    let drained: Vec<UploadHandle> = {
+        let mut uploads = uploads.lock().unwrap();
+        uploads.drain().map(|(_, upload)| upload).collect()
+    };
+    for upload in drained {
+        let temp_path = upload.lock().unwrap().temp_path.clone();
+        let _ = fs::remove_file(temp_path);
+    }
+}
+
+fn abort_uploads_for_request(uploads: &UploadRegistry, request_id: Uuid) {
+    let removed: Vec<UploadHandle> = {
+        let mut uploads = uploads.lock().unwrap();
+        let upload_ids: Vec<Uuid> = uploads
+            .iter()
+            .filter_map(|(upload_id, upload)| {
+                (upload.lock().unwrap().request_id == request_id).then_some(*upload_id)
+            })
+            .collect();
+        upload_ids
+            .into_iter()
+            .filter_map(|upload_id| uploads.remove(&upload_id))
+            .collect()
+    };
+    for upload in removed {
+        let temp_path = upload.lock().unwrap().temp_path.clone();
+        let _ = fs::remove_file(temp_path);
+    }
+}
+
+fn touch_active_helper(state: &mut AppState, connection_id: Uuid) -> bool {
+    match state.active_helper.as_mut() {
+        Some(helper) if helper.connection_id == connection_id => {
+            helper.last_message_at = Instant::now();
+            true
+        }
+        _ => false,
     }
 }
 
@@ -646,7 +723,10 @@ fn parse_request_uuid(value: &str) -> Result<Uuid> {
     Ok(Uuid::parse_str(value).map_err(|error| eyre!("invalid request_id {value}: {error}"))?)
 }
 
-fn handle_artifact_begin(state: &mut AppState, begin: ArtifactBegin) -> Result<()> {
+fn prepare_artifact_upload(
+    workspace: &Path,
+    begin: ArtifactBegin,
+) -> Result<PreparedArtifactUpload> {
     let upload_id = Uuid::parse_str(&begin.upload_id)
         .map_err(|error| eyre!("invalid upload_id {}: {error}", begin.upload_id))?;
     let request_id = parse_request_uuid(&begin.request_id)?;
@@ -656,24 +736,17 @@ fn handle_artifact_begin(state: &mut AppState, begin: ArtifactBegin) -> Result<(
     if begin.content_type != "image/png" {
         return Err(eyre!("artifact upload only supports image/png").into());
     }
-    if !state.output_map.contains_key(&request_id) {
-        return Err(eyre!(
-            "artifact upload request is not pending: {}",
-            begin.request_id
-        )
-        .into());
-    }
     let (artifact_dir, _log_dir, screenshot_root, session_metadata_path) =
-        ensure_session_metadata(&state.workspace, &session_id, &place_id)?;
+        ensure_session_metadata(workspace, &session_id, &place_id)?;
     let screenshot_dir = screenshot_root.join(&runtime_id);
     fs::create_dir_all(&screenshot_dir)?;
     let temp_path = screenshot_dir.join(format!(".upload-{upload_id}.part"));
     if temp_path.exists() {
         fs::remove_file(&temp_path)?;
     }
-    state.uploads.insert(
+    Ok(PreparedArtifactUpload {
         upload_id,
-        ArtifactUploadState {
+        upload: ArtifactUploadState {
             request_id,
             session_id,
             runtime_id,
@@ -687,11 +760,27 @@ fn handle_artifact_begin(state: &mut AppState, begin: ArtifactBegin) -> Result<(
             bytes_written: 0,
             expected_seq: 0,
         },
-    );
+    })
+}
+
+fn register_artifact_upload(state: &AppState, prepared: PreparedArtifactUpload) -> Result<()> {
+    if !state.output_map.contains_key(&prepared.upload.request_id) {
+        let _ = fs::remove_file(&prepared.upload.temp_path);
+        return Err(eyre!(
+            "artifact upload request is not pending: {}",
+            prepared.upload.request_id
+        )
+        .into());
+    }
+    state
+        .uploads
+        .lock()
+        .unwrap()
+        .insert(prepared.upload_id, Arc::new(StdMutex::new(prepared.upload)));
     Ok(())
 }
 
-fn handle_artifact_chunk(state: &mut AppState, payload: ArtifactChunk) -> Result<()> {
+fn handle_artifact_chunk(uploads: &UploadRegistry, payload: ArtifactChunk) -> Result<()> {
     if payload.data_base64.len() > MAX_ARTIFACT_CHUNK_MESSAGE_BYTES {
         return Err(eyre!(
             "artifact chunk exceeds {} encoded bytes",
@@ -705,10 +794,13 @@ fn handle_artifact_chunk(state: &mut AppState, payload: ArtifactChunk) -> Result
     let chunk = base64::engine::general_purpose::STANDARD
         .decode(payload.data_base64)
         .map_err(|error| eyre!("artifact chunk base64 decode failed: {error}"))?;
-    let upload = state
-        .uploads
-        .get_mut(&upload_id)
+    let upload = uploads
+        .lock()
+        .unwrap()
+        .get(&upload_id)
+        .cloned()
         .ok_or_else(|| eyre!("artifact chunk references unknown upload {upload_id}"))?;
+    let mut upload = upload.lock().unwrap();
     if seq != upload.expected_seq {
         return Err(eyre!(
             "artifact chunk sequence mismatch for {upload_id}: expected {}, got {seq}",
@@ -727,21 +819,35 @@ fn handle_artifact_chunk(state: &mut AppState, payload: ArtifactChunk) -> Result
 }
 
 fn finalize_artifact_upload(
-    state: &mut AppState,
+    workspace: &Path,
+    uploads: &UploadRegistry,
     finish: ArtifactFinish,
 ) -> Result<ArtifactCommitted> {
     let upload_id = Uuid::parse_str(&finish.upload_id)
         .map_err(|error| eyre!("invalid upload_id {}: {error}", finish.upload_id))?;
-    let upload = state.uploads.remove(&upload_id).ok_or_else(|| {
+    let upload = uploads.lock().unwrap().remove(&upload_id).ok_or_else(|| {
         eyre!(
             "artifact finish references unknown upload {}",
             finish.upload_id
         )
     })?;
-    if upload.request_id != parse_request_uuid(&finish.request_id)? {
+    let upload = upload.lock().unwrap();
+    let cleanup_temp = || {
+        let _ = fs::remove_file(&upload.temp_path);
+    };
+    let finish_request_id = match parse_request_uuid(&finish.request_id) {
+        Ok(request_id) => request_id,
+        Err(error) => {
+            cleanup_temp();
+            return Err(error);
+        }
+    };
+    if upload.request_id != finish_request_id {
+        cleanup_temp();
         return Err(eyre!("artifact finish request_id mismatch").into());
     }
     if upload.expected_seq != finish.total_chunks {
+        cleanup_temp();
         return Err(eyre!(
             "artifact finish chunk mismatch: expected {}, got {}",
             upload.expected_seq,
@@ -750,6 +856,7 @@ fn finalize_artifact_upload(
         .into());
     }
     if upload.bytes_written != upload.total_bytes {
+        cleanup_temp();
         return Err(eyre!(
             "artifact byte mismatch: expected {}, got {}",
             upload.total_bytes,
@@ -764,25 +871,42 @@ fn finalize_artifact_upload(
     }
     file_name.push_str(".png");
     let final_path = upload.screenshot_dir.join(file_name);
-    fs::rename(&upload.temp_path, &final_path)?;
+    if let Err(error) = fs::rename(&upload.temp_path, &final_path) {
+        cleanup_temp();
+        return Err(error.into());
+    }
     Ok(ArtifactCommitted {
         upload_id: finish.upload_id,
         request_id: finish.request_id,
-        session_id: upload.session_id,
-        runtime_id: upload.runtime_id,
-        place_id: upload.place_id,
+        session_id: upload.session_id.clone(),
+        runtime_id: upload.runtime_id.clone(),
+        place_id: upload.place_id.clone(),
         screenshot_path: final_path.to_string_lossy().into_owned(),
-        screenshot_rel_path: workspace_relative_path(&state.workspace, &final_path),
+        screenshot_rel_path: workspace_relative_path(workspace, &final_path),
         artifact_dir: upload.artifact_dir.to_string_lossy().into_owned(),
         session_metadata_path: upload.session_metadata_path.to_string_lossy().into_owned(),
         bytes_written: upload.bytes_written,
     })
 }
 
-fn remove_upload_by_id(state: &mut AppState, upload_id: &str) {
+fn committed_response_body(committed: &ArtifactCommitted) -> Result<String> {
+    Ok(serde_json::to_string(&serde_json::json!({
+        "session_id": committed.session_id,
+        "runtime_id": committed.runtime_id,
+        "place_id": committed.place_id,
+        "screenshot_path": committed.screenshot_path,
+        "screenshot_rel_path": committed.screenshot_rel_path,
+        "artifact_dir": committed.artifact_dir,
+        "session_metadata_path": committed.session_metadata_path,
+        "bytes_written": committed.bytes_written,
+    }))?)
+}
+
+fn remove_upload_by_id(uploads: &UploadRegistry, upload_id: &str) {
     if let Ok(parsed) = Uuid::parse_str(upload_id) {
-        if let Some(upload) = state.uploads.remove(&parsed) {
-            let _ = fs::remove_file(upload.temp_path);
+        if let Some(upload) = uploads.lock().unwrap().remove(&parsed) {
+            let temp_path = upload.lock().unwrap().temp_path.clone();
+            let _ = fs::remove_file(temp_path);
         }
     }
 }
@@ -840,14 +964,17 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
     };
 
     tracing::info!(connection_id = %connection_id, place_id = hello.place_id, capabilities = ?hello.capabilities, "helper websocket connected");
+    let uploads = { Arc::clone(&state.lock().await.uploads) };
+    let workspace = { state.lock().await.workspace.clone() };
     {
         let mut state = state.lock().await;
         if let Some(previous) = state.active_helper.replace(ActiveHelperConnection {
             connection_id,
             place_id: hello.place_id.clone(),
             sender: out_tx.clone(),
+            last_message_at: Instant::now(),
         }) {
-            abort_all_uploads(&mut state);
+            abort_all_uploads(&uploads);
             fail_all_pending(
                 &mut state,
                 "Studio helper connection was replaced by a newer session",
@@ -877,6 +1004,11 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
     while let Some(message) = reader.next().await {
         match message {
             Ok(Message::Text(text)) => {
+                let mut active_state = state.lock().await;
+                if !touch_active_helper(&mut active_state, connection_id) {
+                    break;
+                }
+                drop(active_state);
                 let parsed = serde_json::from_str::<HelperToServerMessage>(&text);
                 match parsed {
                     Ok(HelperToServerMessage::Heartbeat {
@@ -915,9 +1047,16 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
                         }
                     }
                     Ok(HelperToServerMessage::ArtifactBegin(begin)) => {
-                        let mut state = state.lock().await;
-                        if let Err(error) = handle_artifact_begin(&mut state, begin.clone()) {
-                            remove_upload_by_id(&mut state, &begin.upload_id);
+                        let prepared = prepare_artifact_upload(&workspace, begin.clone());
+                        let result = match prepared {
+                            Ok(prepared) => {
+                                let state = state.lock().await;
+                                register_artifact_upload(&state, prepared)
+                            }
+                            Err(error) => Err(error),
+                        };
+                        if let Err(error) = result {
+                            remove_upload_by_id(&uploads, &begin.upload_id);
                             let _ = out_tx.send(OutgoingHelperFrame::Text(
                                 serde_json::to_string(&ServerToHelperMessage::ArtifactFailed {
                                     upload_id: begin.upload_id,
@@ -929,16 +1068,18 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
                         }
                     }
                     Ok(HelperToServerMessage::ArtifactChunk(chunk)) => {
-                        let mut state = state.lock().await;
-                        if let Err(error) = handle_artifact_chunk(&mut state, chunk.clone()) {
+                        if let Err(error) = handle_artifact_chunk(&uploads, chunk.clone()) {
                             if let Ok(upload_id) = Uuid::parse_str(&chunk.upload_id) {
-                                if let Some(upload) = state.uploads.remove(&upload_id) {
-                                    let _ = fs::remove_file(upload.temp_path);
+                                if let Some(upload) = uploads.lock().unwrap().remove(&upload_id) {
+                                    let upload = upload.lock().unwrap();
+                                    let request_id = upload.request_id;
+                                    let temp_path = upload.temp_path.clone();
+                                    let _ = fs::remove_file(temp_path);
                                     let _ = out_tx.send(OutgoingHelperFrame::Text(
                                         serde_json::to_string(
                                             &ServerToHelperMessage::ArtifactFailed {
                                                 upload_id: upload_id.to_string(),
-                                                request_id: upload.request_id.to_string(),
+                                                request_id: request_id.to_string(),
                                                 error: error.to_string(),
                                             },
                                         )
@@ -953,22 +1094,60 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
                         }
                     }
                     Ok(HelperToServerMessage::ArtifactFinish(finish)) => {
-                        let result = {
-                            let mut state = state.lock().await;
-                            finalize_artifact_upload(&mut state, finish.clone())
-                        };
+                        let result = finalize_artifact_upload(&workspace, &uploads, finish.clone());
                         match result {
                             Ok(committed) => {
-                                let _ = out_tx.send(OutgoingHelperFrame::Text(
-                                    serde_json::to_string(
-                                        &ServerToHelperMessage::ArtifactCommitted(committed),
-                                    )
-                                    .unwrap(),
-                                ));
+                                let response_body = committed_response_body(&committed);
+                                let request_id = parse_request_uuid(&committed.request_id);
+                                match (request_id, response_body) {
+                                    (Ok(request_id), Ok(response_body)) => {
+                                        let pending_tx = {
+                                            let mut state = state.lock().await;
+                                            state.output_map.remove(&request_id)
+                                        };
+                                        if let Some(tx) = pending_tx {
+                                            let _ = tx.send(Ok(response_body));
+                                            let _ = out_tx.send(OutgoingHelperFrame::Text(
+                                                serde_json::to_string(
+                                                    &ServerToHelperMessage::ArtifactCommitted(
+                                                        committed,
+                                                    ),
+                                                )
+                                                .unwrap(),
+                                            ));
+                                        } else {
+                                            let _ = fs::remove_file(&committed.screenshot_path);
+                                            let _ = out_tx.send(OutgoingHelperFrame::Text(
+                                                serde_json::to_string(
+                                                    &ServerToHelperMessage::ArtifactFailed {
+                                                        upload_id: finish.upload_id,
+                                                        request_id: finish.request_id,
+                                                        error:
+                                                            "artifact request is no longer pending"
+                                                                .to_owned(),
+                                                    },
+                                                )
+                                                .unwrap(),
+                                            ));
+                                        }
+                                    }
+                                    (Err(error), _) | (_, Err(error)) => {
+                                        let _ = fs::remove_file(&committed.screenshot_path);
+                                        let _ = out_tx.send(OutgoingHelperFrame::Text(
+                                            serde_json::to_string(
+                                                &ServerToHelperMessage::ArtifactFailed {
+                                                    upload_id: finish.upload_id,
+                                                    request_id: finish.request_id,
+                                                    error: error.to_string(),
+                                                },
+                                            )
+                                            .unwrap(),
+                                        ));
+                                    }
+                                }
                             }
                             Err(error) => {
-                                let mut state = state.lock().await;
-                                remove_upload_by_id(&mut state, &finish.upload_id);
+                                remove_upload_by_id(&uploads, &finish.upload_id);
                                 let _ = out_tx.send(OutgoingHelperFrame::Text(
                                     serde_json::to_string(&ServerToHelperMessage::ArtifactFailed {
                                         upload_id: finish.upload_id,
@@ -981,8 +1160,8 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
                         }
                     }
                     Ok(HelperToServerMessage::ArtifactAbort(abort)) => {
+                        remove_upload_by_id(&uploads, &abort.upload_id);
                         let mut state = state.lock().await;
-                        remove_upload_by_id(&mut state, &abort.upload_id);
                         if let Ok(request_id) = parse_request_uuid(&abort.request_id) {
                             fail_request(&mut state, request_id, &abort.error);
                         }
@@ -998,7 +1177,12 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
             }
             Ok(Message::Binary(_)) => {}
             Ok(Message::Close(_)) => break,
-            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
+                let mut state = state.lock().await;
+                if !touch_active_helper(&mut state, connection_id) {
+                    break;
+                }
+            }
             Err(error) => {
                 tracing::warn!(connection_id = %connection_id, error = summarize_text(&error.to_string()), "helper websocket errored");
                 break;
@@ -1016,10 +1200,48 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
         .unwrap_or(false)
     {
         state.active_helper = None;
-        abort_all_uploads(&mut state);
+        abort_all_uploads(&uploads);
         fail_all_pending(&mut state, "Studio helper WebSocket disconnected");
     }
     tracing::info!(connection_id = %connection_id, "helper websocket disconnected");
+}
+
+pub async fn helper_health_loop(state: PackedState) {
+    let mut interval = tokio::time::interval(HELPER_HEALTH_CHECK_INTERVAL);
+    loop {
+        interval.tick().await;
+        let stale_helper = {
+            let mut state = state.lock().await;
+            let Some(helper) = state.active_helper.as_ref() else {
+                continue;
+            };
+            if helper.last_message_at.elapsed() <= HELPER_HEARTBEAT_TIMEOUT {
+                continue;
+            }
+            let sender = helper.sender.clone();
+            let uploads = Arc::clone(&state.uploads);
+            let connection_id = helper.connection_id;
+            let place_id = helper.place_id.clone();
+            state.active_helper = None;
+            fail_all_pending(&mut state, "Studio helper heartbeat timed out");
+            Some((sender, uploads, connection_id, place_id))
+        };
+        if let Some((sender, uploads, connection_id, place_id)) = stale_helper {
+            abort_all_uploads(&uploads);
+            let _ = sender.send(OutgoingHelperFrame::Text(
+                serde_json::to_string(&ServerToHelperMessage::CloseReason {
+                    reason: "helper heartbeat timed out".to_owned(),
+                })
+                .unwrap(),
+            ));
+            tracing::warn!(
+                %connection_id,
+                place_id,
+                timeout_secs = HELPER_HEARTBEAT_TIMEOUT.as_secs(),
+                "helper websocket heartbeat timed out"
+            );
+        }
+    }
 }
 
 pub async fn request_handler(State(state): State<PackedState>) -> Result<impl IntoResponse> {
@@ -1082,14 +1304,28 @@ pub async fn proxy_handler(
     let id = command.id.ok_or_eyre("Got proxy command with no id")?;
     tracing::info!(%id, tool = command.tool_name(), "proxy received tool request");
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let trigger = {
+    let (trigger, uploads) = {
         let mut state = state.lock().await;
         state.process_queue.push_back(command);
         state.output_map.insert(id, tx);
-        state.trigger.clone()
+        (state.trigger.clone(), Arc::clone(&state.uploads))
     };
     trigger.send(()).ok();
-    let result = rx.recv().await.ok_or_eyre("Couldn't receive response")?;
+    let result = match tokio::time::timeout(HELPER_REQUEST_TIMEOUT, rx.recv()).await {
+        Ok(Some(result)) => result,
+        Ok(None) => return Err(eyre!("Couldn't receive response").into()),
+        Err(_) => {
+            let mut state = state.lock().await;
+            remove_request_tracking(&mut state, id);
+            abort_uploads_for_request(&uploads, id);
+            tracing::warn!(%id, "proxy timed out waiting for helper response");
+            return Ok(Json(RunCommandResponse {
+                success: false,
+                response: "Timed out waiting for Studio helper response".to_owned(),
+                id,
+            }));
+        }
+    };
     {
         let mut state = state.lock().await;
         state.output_map.remove_entry(&id);

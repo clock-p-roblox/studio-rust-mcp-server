@@ -178,6 +178,7 @@ async fn main() -> Result<()> {
 
     let workspace = std::env::current_dir()?;
     let server_state = Arc::new(Mutex::new(AppState::new(workspace)));
+    tokio::spawn(helper_health_loop(Arc::clone(&server_state)));
 
     let (close_tx, close_rx) = tokio::sync::oneshot::channel();
 
