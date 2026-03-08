@@ -3,6 +3,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine as _;
 use clap::Parser;
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use futures_util::{SinkExt, StreamExt};
@@ -27,8 +28,8 @@ use uuid::Uuid;
 mod helper_ws;
 
 use helper_ws::{
-    ArtifactAbort, ArtifactBegin, ArtifactCommitted, ArtifactFinish, HelperHello,
-    HelperToServerMessage, ServerToHelperMessage, HELPER_WS_PATH, MAX_ARTIFACT_PAYLOAD_BYTES,
+    ArtifactAbort, ArtifactBegin, ArtifactChunk, ArtifactCommitted, ArtifactFinish, HelperHello,
+    HelperToServerMessage, ServerToHelperMessage, HELPER_WS_PATH, MAX_ARTIFACT_CHUNK_PAYLOAD_BYTES,
 };
 
 #[cfg(target_os = "windows")]
@@ -113,7 +114,6 @@ struct RemoteConnectionHandle {
 #[derive(Clone)]
 enum RemoteOutgoingFrame {
     Text(String),
-    Binary(Vec<u8>),
     Pong(Vec<u8>),
 }
 
@@ -1225,12 +1225,12 @@ fn encode_remote_message(message: &HelperToServerMessage) -> Result<String> {
     Ok(serde_json::to_string(message)?)
 }
 
-fn build_artifact_chunk_frame(upload_id: Uuid, seq: u32, chunk: &[u8]) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(20 + chunk.len());
-    payload.extend_from_slice(upload_id.as_bytes());
-    payload.extend_from_slice(&seq.to_be_bytes());
-    payload.extend_from_slice(chunk);
-    payload
+fn build_artifact_chunk_message(upload_id: Uuid, seq: u32, chunk: &[u8]) -> Result<String> {
+    encode_remote_message(&HelperToServerMessage::ArtifactChunk(ArtifactChunk {
+        upload_id: upload_id.to_string(),
+        seq,
+        data_base64: base64::engine::general_purpose::STANDARD.encode(chunk),
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1309,13 +1309,13 @@ async fn stream_runtime_screenshot(
 
     for (seq, chunk) in captured
         .png_bytes
-        .chunks(MAX_ARTIFACT_PAYLOAD_BYTES)
+        .chunks(MAX_ARTIFACT_CHUNK_PAYLOAD_BYTES)
         .enumerate()
     {
         if sender
-            .send(RemoteOutgoingFrame::Binary(build_artifact_chunk_frame(
+            .send(RemoteOutgoingFrame::Text(build_artifact_chunk_message(
                 upload_id, seq as u32, chunk,
-            )))
+            )?))
             .is_err()
         {
             upload_waiters.lock().await.remove(&upload_id.to_string());
@@ -1336,7 +1336,10 @@ async fn stream_runtime_screenshot(
             &HelperToServerMessage::ArtifactFinish(ArtifactFinish {
                 upload_id: upload_id.to_string(),
                 request_id: request_id.clone(),
-                total_chunks: captured.png_bytes.chunks(MAX_ARTIFACT_PAYLOAD_BYTES).len() as u32,
+                total_chunks: captured
+                    .png_bytes
+                    .chunks(MAX_ARTIFACT_CHUNK_PAYLOAD_BYTES)
+                    .len() as u32,
             }),
         )?))
         .is_err()
@@ -1402,7 +1405,6 @@ async fn run_remote_ws_session(
         while let Some(frame) = out_rx.recv().await {
             let message = match frame {
                 RemoteOutgoingFrame::Text(text) => WsMessage::Text(text.into()),
-                RemoteOutgoingFrame::Binary(binary) => WsMessage::Binary(binary.into()),
                 RemoteOutgoingFrame::Pong(payload) => WsMessage::Pong(payload.into()),
             };
             if writer.send(message).await.is_err() {

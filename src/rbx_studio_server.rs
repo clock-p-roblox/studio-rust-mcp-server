@@ -1,12 +1,13 @@
 use crate::error::{Report, Result};
 use crate::helper_ws::{
-    ArtifactBegin, ArtifactCommitted, ArtifactFinish, HelperToServerMessage, ServerToHelperMessage,
-    MAX_ARTIFACT_CHUNK_BYTES,
+    ArtifactBegin, ArtifactChunk, ArtifactCommitted, ArtifactFinish, HelperToServerMessage,
+    ServerToHelperMessage, MAX_ARTIFACT_CHUNK_MESSAGE_BYTES,
 };
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{extract::State, Json};
+use base64::Engine as _;
 use color_eyre::eyre::{eyre, Error, OptionExt};
 use futures_util::{SinkExt, StreamExt};
 use rmcp::{
@@ -690,16 +691,20 @@ fn handle_artifact_begin(state: &mut AppState, begin: ArtifactBegin) -> Result<(
     Ok(())
 }
 
-fn handle_artifact_chunk(state: &mut AppState, payload: &[u8]) -> Result<()> {
-    if payload.len() < 20 {
-        return Err(eyre!("artifact chunk shorter than header").into());
+fn handle_artifact_chunk(state: &mut AppState, payload: ArtifactChunk) -> Result<()> {
+    if payload.data_base64.len() > MAX_ARTIFACT_CHUNK_MESSAGE_BYTES {
+        return Err(eyre!(
+            "artifact chunk exceeds {} encoded bytes",
+            MAX_ARTIFACT_CHUNK_MESSAGE_BYTES
+        )
+        .into());
     }
-    if payload.len() > MAX_ARTIFACT_CHUNK_BYTES {
-        return Err(eyre!("artifact chunk exceeds {} bytes", MAX_ARTIFACT_CHUNK_BYTES).into());
-    }
-    let upload_id = Uuid::from_slice(&payload[..16])?;
-    let seq = u32::from_be_bytes(payload[16..20].try_into().unwrap());
-    let chunk = &payload[20..];
+    let upload_id = Uuid::parse_str(&payload.upload_id)
+        .map_err(|error| eyre!("invalid upload_id {}: {error}", payload.upload_id))?;
+    let seq = payload.seq;
+    let chunk = base64::engine::general_purpose::STANDARD
+        .decode(payload.data_base64)
+        .map_err(|error| eyre!("artifact chunk base64 decode failed: {error}"))?;
     let upload = state
         .uploads
         .get_mut(&upload_id)
@@ -715,7 +720,7 @@ fn handle_artifact_chunk(state: &mut AppState, payload: &[u8]) -> Result<()> {
         .create(true)
         .append(true)
         .open(&upload.temp_path)?;
-    file.write_all(chunk)?;
+    file.write_all(&chunk)?;
     upload.bytes_written += chunk.len();
     upload.expected_seq += 1;
     Ok(())
@@ -923,6 +928,30 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
                             ));
                         }
                     }
+                    Ok(HelperToServerMessage::ArtifactChunk(chunk)) => {
+                        let mut state = state.lock().await;
+                        if let Err(error) = handle_artifact_chunk(&mut state, chunk.clone()) {
+                            if let Ok(upload_id) = Uuid::parse_str(&chunk.upload_id) {
+                                if let Some(upload) = state.uploads.remove(&upload_id) {
+                                    let _ = fs::remove_file(upload.temp_path);
+                                    let _ = out_tx.send(OutgoingHelperFrame::Text(
+                                        serde_json::to_string(
+                                            &ServerToHelperMessage::ArtifactFailed {
+                                                upload_id: upload_id.to_string(),
+                                                request_id: upload.request_id.to_string(),
+                                                error: error.to_string(),
+                                            },
+                                        )
+                                        .unwrap(),
+                                    ));
+                                }
+                            }
+                            tracing::warn!(
+                                error = summarize_text(&error.to_string()),
+                                "failed to process artifact chunk"
+                            );
+                        }
+                    }
                     Ok(HelperToServerMessage::ArtifactFinish(finish)) => {
                         let result = {
                             let mut state = state.lock().await;
@@ -967,33 +996,7 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
                     }
                 }
             }
-            Ok(Message::Binary(binary)) => {
-                let mut state = state.lock().await;
-                if let Err(error) = handle_artifact_chunk(&mut state, &binary) {
-                    let upload_id = if binary.len() >= 16 {
-                        Uuid::from_slice(&binary[..16]).ok()
-                    } else {
-                        None
-                    };
-                    if let Some(upload_id) = upload_id {
-                        if let Some(upload) = state.uploads.remove(&upload_id) {
-                            let _ = fs::remove_file(upload.temp_path);
-                            let _ = out_tx.send(OutgoingHelperFrame::Text(
-                                serde_json::to_string(&ServerToHelperMessage::ArtifactFailed {
-                                    upload_id: upload_id.to_string(),
-                                    request_id: upload.request_id.to_string(),
-                                    error: error.to_string(),
-                                })
-                                .unwrap(),
-                            ));
-                        }
-                    }
-                    tracing::warn!(
-                        error = summarize_text(&error.to_string()),
-                        "failed to process artifact chunk"
-                    );
-                }
-            }
+            Ok(Message::Binary(_)) => {}
             Ok(Message::Close(_)) => break,
             Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
             Err(error) => {
@@ -1079,11 +1082,13 @@ pub async fn proxy_handler(
     let id = command.id.ok_or_eyre("Got proxy command with no id")?;
     tracing::info!(%id, tool = command.tool_name(), "proxy received tool request");
     let (tx, mut rx) = mpsc::unbounded_channel();
-    {
+    let trigger = {
         let mut state = state.lock().await;
         state.process_queue.push_back(command);
         state.output_map.insert(id, tx);
-    }
+        state.trigger.clone()
+    };
+    trigger.send(()).ok();
     let result = rx.recv().await.ok_or_eyre("Couldn't receive response")?;
     {
         let mut state = state.lock().await;

@@ -2,11 +2,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const HELPER_WS_PATH: &str = "/ws/helper";
-pub const MAX_ARTIFACT_CHUNK_BYTES: usize = 500 * 1024;
 #[allow(dead_code)]
-pub const BINARY_CHUNK_HEADER_BYTES: usize = 20;
+pub const MAX_ARTIFACT_CHUNK_MESSAGE_BYTES: usize = 500 * 1024;
 #[allow(dead_code)]
-pub const MAX_ARTIFACT_PAYLOAD_BYTES: usize = MAX_ARTIFACT_CHUNK_BYTES - BINARY_CHUNK_HEADER_BYTES;
+pub const MAX_ARTIFACT_CHUNK_PAYLOAD_BYTES: usize = 360 * 1024;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct HelperHello {
@@ -33,6 +32,13 @@ pub struct ArtifactFinish {
     pub upload_id: String,
     pub request_id: String,
     pub total_chunks: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ArtifactChunk {
+    pub upload_id: String,
+    pub seq: u32,
+    pub data_base64: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -73,6 +79,7 @@ pub enum HelperToServerMessage {
         error: String,
     },
     ArtifactBegin(ArtifactBegin),
+    ArtifactChunk(ArtifactChunk),
     ArtifactFinish(ArtifactFinish),
     ArtifactAbort(ArtifactAbort),
 }
