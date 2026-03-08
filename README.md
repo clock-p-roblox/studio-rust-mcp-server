@@ -129,7 +129,8 @@ Useful flags:
 `clock-p` 当前的 Studio 联调架构额外引入了一个本地 helper：
 
 - `Rojo plugin -> helper -> helper 返回公网 Rojo 配置 -> plugin 直连 Rojo 公网域名`
-- `MCP plugin -> helper -> helper 代理公网 MCP /request /response`
+- `MCP plugin -> helper -> helper 通过公网 MCP WebSocket 收发工具调用`
+- `take_screenshot -> helper 截图 -> helper 通过 MCP WebSocket 分片上传 -> MCP server 落盘到 workspace artifacts`
 
 helper 二进制是本仓库里的 `studio_helper`：
 
@@ -153,6 +154,12 @@ cargo run --bin studio_helper -- --port 44750
   - `POST /v1/helper/screenshot`
   - `POST /v1/helper/runtime-screenshot`
   - `GET /v1/helper/studio-log`
+
+MCP HTTP 服务额外开放：
+
+- `GET /ws/helper`
+
+这个 WebSocket 由 Windows helper 主动连接。插件与 helper 断开后，helper 也会主动关闭对应的远程 MCP WebSocket。
 
 ### Ubuntu 交叉编译 Windows helper
 

@@ -1,8 +1,14 @@
 use crate::error::{Report, Result};
+use crate::helper_ws::{
+    ArtifactBegin, ArtifactCommitted, ArtifactFinish, HelperToServerMessage, ServerToHelperMessage,
+    MAX_ARTIFACT_CHUNK_BYTES,
+};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{extract::State, Json};
 use color_eyre::eyre::{eyre, Error, OptionExt};
+use futures_util::{SinkExt, StreamExt};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
@@ -11,8 +17,13 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router, ErrorData, ServerHandler,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot::Receiver;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::Duration;
@@ -45,8 +56,11 @@ pub struct RunCommandResponse {
 }
 
 pub struct AppState {
+    workspace: PathBuf,
     process_queue: VecDeque<ToolArguments>,
     output_map: HashMap<Uuid, mpsc::UnboundedSender<Result<String>>>,
+    active_helper: Option<ActiveHelperConnection>,
+    uploads: HashMap<Uuid, ArtifactUploadState>,
     waiter: watch::Receiver<()>,
     trigger: watch::Sender<()>,
 }
@@ -57,14 +71,45 @@ pub struct StatusResponse {
     service: &'static str,
     queued_requests: usize,
     pending_responses: usize,
+    helper_connected: bool,
+    helper_place_id: Option<String>,
+}
+
+struct ActiveHelperConnection {
+    connection_id: Uuid,
+    place_id: String,
+    sender: mpsc::UnboundedSender<OutgoingHelperFrame>,
+}
+
+#[derive(Clone)]
+enum OutgoingHelperFrame {
+    Text(String),
+}
+
+struct ArtifactUploadState {
+    request_id: Uuid,
+    session_id: String,
+    runtime_id: String,
+    place_id: String,
+    tag: Option<String>,
+    temp_path: PathBuf,
+    artifact_dir: PathBuf,
+    screenshot_dir: PathBuf,
+    session_metadata_path: PathBuf,
+    total_bytes: usize,
+    bytes_written: usize,
+    expected_seq: u32,
 }
 
 impl AppState {
-    pub fn new() -> Self {
+    pub fn new(workspace: PathBuf) -> Self {
         let (trigger, waiter) = watch::channel(());
         Self {
+            workspace,
             process_queue: VecDeque::new(),
             output_map: HashMap::new(),
+            active_helper: None,
+            uploads: HashMap::new(),
             waiter,
             trigger,
         }
@@ -82,6 +127,11 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
         service: "rbx-studio-mcp",
         queued_requests: state.process_queue.len(),
         pending_responses: state.output_map.len(),
+        helper_connected: state.active_helper.is_some(),
+        helper_place_id: state
+            .active_helper
+            .as_ref()
+            .map(|helper| helper.place_id.clone()),
     })
 }
 
@@ -153,11 +203,22 @@ struct GetConsoleOutput {}
 struct GetStudioMode {}
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
-struct TakeScreenshot {}
+struct TakeScreenshot {
+    #[schemars(
+        description = "Optional session_id. When omitted, the MCP server will try to read .clock-p/current_session.json from the workspace."
+    )]
+    session_id: Option<String>,
+    #[schemars(description = "Optional runtime_id. Defaults to server.")]
+    runtime_id: Option<String>,
+    #[schemars(description = "Optional screenshot tag used in the final file name.")]
+    tag: Option<String>,
+}
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct ReadStudioLog {
-    #[schemars(description = "Optional starting line (1-indexed). Negative values count from the end.")]
+    #[schemars(
+        description = "Optional starting line (1-indexed). Negative values count from the end."
+    )]
     start_line: Option<i64>,
     #[schemars(description = "Optional number of lines to return.")]
     line_count: Option<u32>,
@@ -286,7 +347,9 @@ impl RBXStudioServer {
             .await
     }
 
-    #[tool(description = "Capture a screenshot of the active Roblox Studio window through the Windows helper.")]
+    #[tool(
+        description = "Capture a screenshot of the active Roblox Studio window through the Windows helper, store it under the current workspace artifacts directory, and return the final file path."
+    )]
     async fn take_screenshot(
         &self,
         Parameters(args): Parameters<TakeScreenshot>,
@@ -308,11 +371,26 @@ impl RBXStudioServer {
         &self,
         args: ToolArgumentValues,
     ) -> Result<CallToolResult, ErrorData> {
-        let (command, id) = ToolArguments::new(args);
+        let normalized_args = {
+            let workspace = { self.state.lock().await.workspace.clone() };
+            normalize_tool_arguments_for_workspace(&workspace, args).map_err(|error| {
+                ErrorData::internal_error(
+                    format!("Unable to normalize tool arguments: {error}"),
+                    None,
+                )
+            })?
+        };
+        let (command, id) = ToolArguments::new(normalized_args);
         let tool_name = command.tool_name();
         let (tx, mut rx) = mpsc::unbounded_channel::<Result<String>>();
         let (trigger, queued_requests, pending_responses) = {
             let mut state = self.state.lock().await;
+            if state.active_helper.is_none() {
+                return Err(ErrorData::internal_error(
+                    "No active Studio helper WebSocket connection",
+                    None,
+                ));
+            }
             state.process_queue.push_back(command);
             state.output_map.insert(id, tx);
             (
@@ -360,6 +438,585 @@ impl RBXStudioServer {
             }
         }
     }
+}
+
+fn sanitize_identifier(label: &str, value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || !trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return Err(eyre!("{label} must use [A-Za-z0-9_-] only").into());
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn read_current_session_id(workspace: &Path) -> Result<String> {
+    let path = workspace.join(".clock-p").join("current_session.json");
+    let value = fs::read_to_string(&path)
+        .map_err(|error| eyre!("failed to read {}: {error}", path.display()))?;
+    let payload: Value = serde_json::from_str(&value)
+        .map_err(|error| eyre!("invalid JSON in {}: {error}", path.display()))?;
+    let session_id = payload
+        .get("session_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| eyre!("current_session.json missing session_id"))?;
+    sanitize_identifier("session_id", session_id)
+}
+
+fn normalize_tool_arguments_for_workspace(
+    workspace: &Path,
+    args: ToolArgumentValues,
+) -> Result<ToolArgumentValues> {
+    match args {
+        ToolArgumentValues::TakeScreenshot(mut payload) => {
+            let session_id = match payload.session_id.as_deref() {
+                Some(value) => sanitize_identifier("session_id", value)?,
+                None => read_current_session_id(workspace)?,
+            };
+            let runtime_id = match payload.runtime_id.as_deref() {
+                Some(value) => sanitize_identifier("runtime_id", value)?,
+                None => "server".to_owned(),
+            };
+            let tag = payload
+                .tag
+                .take()
+                .map(|value| sanitize_identifier("tag", &value))
+                .transpose()?;
+            payload.session_id = Some(session_id);
+            payload.runtime_id = Some(runtime_id);
+            payload.tag = tag;
+            Ok(ToolArgumentValues::TakeScreenshot(payload))
+        }
+        other => Ok(other),
+    }
+}
+
+fn now_unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn sanitize_file_component(value: &str, fallback: &str) -> String {
+    let mut result = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            result.push(ch);
+        } else if !result.ends_with('-') {
+            result.push('-');
+        }
+    }
+    let trimmed = result.trim_matches('-');
+    if trimmed.is_empty() {
+        fallback.to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn workspace_relative_path(workspace: &Path, path: &Path) -> String {
+    path.strip_prefix(workspace)
+        .map(|value| value.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+}
+
+fn ensure_session_metadata(
+    workspace: &Path,
+    session_id: &str,
+    place_id: &str,
+) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf)> {
+    let artifact_dir = workspace
+        .join(".clock-p")
+        .join("artifacts")
+        .join(session_id);
+    let log_dir = artifact_dir.join("logs");
+    let screenshot_dir = artifact_dir.join("screenshots");
+    fs::create_dir_all(&log_dir)?;
+    fs::create_dir_all(&screenshot_dir)?;
+    let metadata_path = artifact_dir.join("session.json");
+    if !metadata_path.exists() {
+        let payload = serde_json::json!({
+            "session_id": session_id,
+            "place_id": place_id,
+            "workspace": workspace.to_string_lossy(),
+            "created_at_unix_ms": now_unix_ms(),
+            "artifact_dir": artifact_dir.to_string_lossy(),
+            "log_dir": log_dir.to_string_lossy(),
+            "screenshot_dir": screenshot_dir.to_string_lossy(),
+        });
+        fs::write(
+            &metadata_path,
+            format!("{}\n", serde_json::to_string_pretty(&payload)?),
+        )?;
+    }
+    Ok((artifact_dir, log_dir, screenshot_dir, metadata_path))
+}
+
+fn fail_request(state: &mut AppState, request_id: Uuid, message: &str) {
+    if let Some(tx) = state.output_map.remove(&request_id) {
+        let _ = tx.send(Err(Report::from(eyre!(message.to_owned()))));
+    }
+}
+
+fn fail_all_pending(state: &mut AppState, message: &str) {
+    for (_, tx) in state.output_map.drain() {
+        let _ = tx.send(Err(Report::from(eyre!(message.to_owned()))));
+    }
+    state.process_queue.clear();
+}
+
+fn abort_all_uploads(state: &mut AppState) {
+    for (_, upload) in state.uploads.drain() {
+        let _ = fs::remove_file(upload.temp_path);
+    }
+}
+
+async fn helper_queue_loop(
+    state: PackedState,
+    connection_id: Uuid,
+    sender: mpsc::UnboundedSender<OutgoingHelperFrame>,
+) {
+    let mut waiter = { state.lock().await.waiter.clone() };
+    loop {
+        let task = {
+            let mut state = state.lock().await;
+            match state.active_helper.as_ref() {
+                Some(helper) if helper.connection_id == connection_id => {
+                    state.process_queue.pop_front()
+                }
+                _ => return,
+            }
+        };
+
+        if let Some(task) = task {
+            let Some(id) = task.id else {
+                continue;
+            };
+            let payload = match serde_json::to_value(&task) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    let mut state = state.lock().await;
+                    fail_request(
+                        &mut state,
+                        id,
+                        &format!("failed to encode tool call: {error}"),
+                    );
+                    continue;
+                }
+            };
+            let message = ServerToHelperMessage::ToolCall {
+                request_id: id.to_string(),
+                command: payload,
+            };
+            let encoded = match serde_json::to_string(&message) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    let mut state = state.lock().await;
+                    fail_request(
+                        &mut state,
+                        id,
+                        &format!("failed to encode helper message: {error}"),
+                    );
+                    continue;
+                }
+            };
+            if sender.send(OutgoingHelperFrame::Text(encoded)).is_err() {
+                let mut state = state.lock().await;
+                fail_request(
+                    &mut state,
+                    id,
+                    "helper WebSocket sender dropped before tool dispatch",
+                );
+                return;
+            }
+            continue;
+        }
+
+        if waiter.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+fn parse_request_uuid(value: &str) -> Result<Uuid> {
+    Ok(Uuid::parse_str(value).map_err(|error| eyre!("invalid request_id {value}: {error}"))?)
+}
+
+fn handle_artifact_begin(state: &mut AppState, begin: ArtifactBegin) -> Result<()> {
+    let upload_id = Uuid::parse_str(&begin.upload_id)
+        .map_err(|error| eyre!("invalid upload_id {}: {error}", begin.upload_id))?;
+    let request_id = parse_request_uuid(&begin.request_id)?;
+    let session_id = sanitize_identifier("session_id", &begin.session_id)?;
+    let runtime_id = sanitize_identifier("runtime_id", &begin.runtime_id)?;
+    let place_id = sanitize_identifier("place_id", &begin.place_id)?;
+    if begin.content_type != "image/png" {
+        return Err(eyre!("artifact upload only supports image/png").into());
+    }
+    if !state.output_map.contains_key(&request_id) {
+        return Err(eyre!(
+            "artifact upload request is not pending: {}",
+            begin.request_id
+        )
+        .into());
+    }
+    let (artifact_dir, _log_dir, screenshot_root, session_metadata_path) =
+        ensure_session_metadata(&state.workspace, &session_id, &place_id)?;
+    let screenshot_dir = screenshot_root.join(&runtime_id);
+    fs::create_dir_all(&screenshot_dir)?;
+    let temp_path = screenshot_dir.join(format!(".upload-{upload_id}.part"));
+    if temp_path.exists() {
+        fs::remove_file(&temp_path)?;
+    }
+    state.uploads.insert(
+        upload_id,
+        ArtifactUploadState {
+            request_id,
+            session_id,
+            runtime_id,
+            place_id,
+            tag: begin.tag,
+            temp_path,
+            artifact_dir,
+            screenshot_dir,
+            session_metadata_path,
+            total_bytes: begin.total_bytes,
+            bytes_written: 0,
+            expected_seq: 0,
+        },
+    );
+    Ok(())
+}
+
+fn handle_artifact_chunk(state: &mut AppState, payload: &[u8]) -> Result<()> {
+    if payload.len() < 20 {
+        return Err(eyre!("artifact chunk shorter than header").into());
+    }
+    if payload.len() > MAX_ARTIFACT_CHUNK_BYTES {
+        return Err(eyre!("artifact chunk exceeds {} bytes", MAX_ARTIFACT_CHUNK_BYTES).into());
+    }
+    let upload_id = Uuid::from_slice(&payload[..16])?;
+    let seq = u32::from_be_bytes(payload[16..20].try_into().unwrap());
+    let chunk = &payload[20..];
+    let upload = state
+        .uploads
+        .get_mut(&upload_id)
+        .ok_or_else(|| eyre!("artifact chunk references unknown upload {upload_id}"))?;
+    if seq != upload.expected_seq {
+        return Err(eyre!(
+            "artifact chunk sequence mismatch for {upload_id}: expected {}, got {seq}",
+            upload.expected_seq
+        )
+        .into());
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&upload.temp_path)?;
+    file.write_all(chunk)?;
+    upload.bytes_written += chunk.len();
+    upload.expected_seq += 1;
+    Ok(())
+}
+
+fn finalize_artifact_upload(
+    state: &mut AppState,
+    finish: ArtifactFinish,
+) -> Result<ArtifactCommitted> {
+    let upload_id = Uuid::parse_str(&finish.upload_id)
+        .map_err(|error| eyre!("invalid upload_id {}: {error}", finish.upload_id))?;
+    let upload = state.uploads.remove(&upload_id).ok_or_else(|| {
+        eyre!(
+            "artifact finish references unknown upload {}",
+            finish.upload_id
+        )
+    })?;
+    if upload.request_id != parse_request_uuid(&finish.request_id)? {
+        return Err(eyre!("artifact finish request_id mismatch").into());
+    }
+    if upload.expected_seq != finish.total_chunks {
+        return Err(eyre!(
+            "artifact finish chunk mismatch: expected {}, got {}",
+            upload.expected_seq,
+            finish.total_chunks
+        )
+        .into());
+    }
+    if upload.bytes_written != upload.total_bytes {
+        return Err(eyre!(
+            "artifact byte mismatch: expected {}, got {}",
+            upload.total_bytes,
+            upload.bytes_written
+        )
+        .into());
+    }
+    let mut file_name = format!("{}-{}", now_unix_ms(), &upload_id.to_string()[..8]);
+    if let Some(tag) = upload.tag.as_deref() {
+        file_name.push('-');
+        file_name.push_str(&sanitize_file_component(tag, "shot"));
+    }
+    file_name.push_str(".png");
+    let final_path = upload.screenshot_dir.join(file_name);
+    fs::rename(&upload.temp_path, &final_path)?;
+    Ok(ArtifactCommitted {
+        upload_id: finish.upload_id,
+        request_id: finish.request_id,
+        session_id: upload.session_id,
+        runtime_id: upload.runtime_id,
+        place_id: upload.place_id,
+        screenshot_path: final_path.to_string_lossy().into_owned(),
+        screenshot_rel_path: workspace_relative_path(&state.workspace, &final_path),
+        artifact_dir: upload.artifact_dir.to_string_lossy().into_owned(),
+        session_metadata_path: upload.session_metadata_path.to_string_lossy().into_owned(),
+        bytes_written: upload.bytes_written,
+    })
+}
+
+fn remove_upload_by_id(state: &mut AppState, upload_id: &str) {
+    if let Ok(parsed) = Uuid::parse_str(upload_id) {
+        if let Some(upload) = state.uploads.remove(&parsed) {
+            let _ = fs::remove_file(upload.temp_path);
+        }
+    }
+}
+
+pub async fn helper_ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<PackedState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| helper_ws_session(socket, state))
+}
+
+async fn helper_ws_session(socket: WebSocket, state: PackedState) {
+    let connection_id = Uuid::new_v4();
+    let (mut writer, mut reader) = socket.split();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<OutgoingHelperFrame>();
+    let writer_task = tokio::spawn(async move {
+        while let Some(frame) = out_rx.recv().await {
+            let message = match frame {
+                OutgoingHelperFrame::Text(text) => Message::Text(text.into()),
+            };
+            if writer.send(message).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let first_message = reader.next().await;
+    let hello = match first_message {
+        Some(Ok(Message::Text(text))) => match serde_json::from_str::<HelperToServerMessage>(&text)
+        {
+            Ok(HelperToServerMessage::Hello(hello)) => hello,
+            Ok(_) => {
+                let _ = out_tx.send(OutgoingHelperFrame::Text(
+                    serde_json::to_string(&ServerToHelperMessage::CloseReason {
+                        reason: "expected hello as first helper message".to_owned(),
+                    })
+                    .unwrap(),
+                ));
+                writer_task.abort();
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = summarize_text(&error.to_string()),
+                    "failed to decode helper hello"
+                );
+                writer_task.abort();
+                return;
+            }
+        },
+        _ => {
+            writer_task.abort();
+            return;
+        }
+    };
+
+    tracing::info!(connection_id = %connection_id, place_id = hello.place_id, capabilities = ?hello.capabilities, "helper websocket connected");
+    {
+        let mut state = state.lock().await;
+        if let Some(previous) = state.active_helper.replace(ActiveHelperConnection {
+            connection_id,
+            place_id: hello.place_id.clone(),
+            sender: out_tx.clone(),
+        }) {
+            abort_all_uploads(&mut state);
+            fail_all_pending(
+                &mut state,
+                "Studio helper connection was replaced by a newer session",
+            );
+            let _ = previous.sender.send(OutgoingHelperFrame::Text(
+                serde_json::to_string(&ServerToHelperMessage::CloseReason {
+                    reason: "replaced by newer helper connection".to_owned(),
+                })
+                .unwrap(),
+            ));
+        }
+    }
+
+    let _ = out_tx.send(OutgoingHelperFrame::Text(
+        serde_json::to_string(&ServerToHelperMessage::ReadyAck {
+            connection_id: connection_id.to_string(),
+            place_id: hello.place_id.clone(),
+        })
+        .unwrap(),
+    ));
+    let queue_task = tokio::spawn(helper_queue_loop(
+        Arc::clone(&state),
+        connection_id,
+        out_tx.clone(),
+    ));
+
+    while let Some(message) = reader.next().await {
+        match message {
+            Ok(Message::Text(text)) => {
+                let parsed = serde_json::from_str::<HelperToServerMessage>(&text);
+                match parsed {
+                    Ok(HelperToServerMessage::Heartbeat {
+                        place_id,
+                        plugin_instance_count,
+                    }) => {
+                        tracing::debug!(connection_id = %connection_id, place_id, plugin_instance_count, "received helper heartbeat");
+                    }
+                    Ok(HelperToServerMessage::ToolResult {
+                        request_id,
+                        response,
+                    }) => match parse_request_uuid(&request_id) {
+                        Ok(parsed_id) => {
+                            let mut state = state.lock().await;
+                            if let Some(tx) = state.output_map.remove(&parsed_id) {
+                                let _ = tx.send(Ok(response));
+                            }
+                        }
+                        Err(error) => tracing::warn!(
+                            error = summarize_text(&error.to_string()),
+                            "invalid helper tool result request_id"
+                        ),
+                    },
+                    Ok(HelperToServerMessage::ToolError { request_id, error }) => {
+                        match parse_request_uuid(&request_id) {
+                            Ok(parsed_id) => {
+                                let mut state = state.lock().await;
+                                if let Some(tx) = state.output_map.remove(&parsed_id) {
+                                    let _ = tx.send(Err(Report::from(eyre!(error))));
+                                }
+                            }
+                            Err(error) => tracing::warn!(
+                                error = summarize_text(&error.to_string()),
+                                "invalid helper tool error request_id"
+                            ),
+                        }
+                    }
+                    Ok(HelperToServerMessage::ArtifactBegin(begin)) => {
+                        let mut state = state.lock().await;
+                        if let Err(error) = handle_artifact_begin(&mut state, begin.clone()) {
+                            remove_upload_by_id(&mut state, &begin.upload_id);
+                            let _ = out_tx.send(OutgoingHelperFrame::Text(
+                                serde_json::to_string(&ServerToHelperMessage::ArtifactFailed {
+                                    upload_id: begin.upload_id,
+                                    request_id: begin.request_id,
+                                    error: error.to_string(),
+                                })
+                                .unwrap(),
+                            ));
+                        }
+                    }
+                    Ok(HelperToServerMessage::ArtifactFinish(finish)) => {
+                        let result = {
+                            let mut state = state.lock().await;
+                            finalize_artifact_upload(&mut state, finish.clone())
+                        };
+                        match result {
+                            Ok(committed) => {
+                                let _ = out_tx.send(OutgoingHelperFrame::Text(
+                                    serde_json::to_string(
+                                        &ServerToHelperMessage::ArtifactCommitted(committed),
+                                    )
+                                    .unwrap(),
+                                ));
+                            }
+                            Err(error) => {
+                                let mut state = state.lock().await;
+                                remove_upload_by_id(&mut state, &finish.upload_id);
+                                let _ = out_tx.send(OutgoingHelperFrame::Text(
+                                    serde_json::to_string(&ServerToHelperMessage::ArtifactFailed {
+                                        upload_id: finish.upload_id,
+                                        request_id: finish.request_id,
+                                        error: error.to_string(),
+                                    })
+                                    .unwrap(),
+                                ));
+                            }
+                        }
+                    }
+                    Ok(HelperToServerMessage::ArtifactAbort(abort)) => {
+                        let mut state = state.lock().await;
+                        remove_upload_by_id(&mut state, &abort.upload_id);
+                        if let Ok(request_id) = parse_request_uuid(&abort.request_id) {
+                            fail_request(&mut state, request_id, &abort.error);
+                        }
+                    }
+                    Ok(HelperToServerMessage::Hello(_)) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            error = summarize_text(&error.to_string()),
+                            "failed to decode helper ws message"
+                        );
+                    }
+                }
+            }
+            Ok(Message::Binary(binary)) => {
+                let mut state = state.lock().await;
+                if let Err(error) = handle_artifact_chunk(&mut state, &binary) {
+                    let upload_id = if binary.len() >= 16 {
+                        Uuid::from_slice(&binary[..16]).ok()
+                    } else {
+                        None
+                    };
+                    if let Some(upload_id) = upload_id {
+                        if let Some(upload) = state.uploads.remove(&upload_id) {
+                            let _ = fs::remove_file(upload.temp_path);
+                            let _ = out_tx.send(OutgoingHelperFrame::Text(
+                                serde_json::to_string(&ServerToHelperMessage::ArtifactFailed {
+                                    upload_id: upload_id.to_string(),
+                                    request_id: upload.request_id.to_string(),
+                                    error: error.to_string(),
+                                })
+                                .unwrap(),
+                            ));
+                        }
+                    }
+                    tracing::warn!(
+                        error = summarize_text(&error.to_string()),
+                        "failed to process artifact chunk"
+                    );
+                }
+            }
+            Ok(Message::Close(_)) => break,
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
+            Err(error) => {
+                tracing::warn!(connection_id = %connection_id, error = summarize_text(&error.to_string()), "helper websocket errored");
+                break;
+            }
+        }
+    }
+
+    queue_task.abort();
+    writer_task.abort();
+    let mut state = state.lock().await;
+    if state
+        .active_helper
+        .as_ref()
+        .map(|helper| helper.connection_id == connection_id)
+        .unwrap_or(false)
+    {
+        state.active_helper = None;
+        abort_all_uploads(&mut state);
+        fail_all_pending(&mut state, "Studio helper WebSocket disconnected");
+    }
+    tracing::info!(connection_id = %connection_id, "helper websocket disconnected");
 }
 
 pub async fn request_handler(State(state): State<PackedState>) -> Result<impl IntoResponse> {

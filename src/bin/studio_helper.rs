@@ -5,6 +5,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use color_eyre::eyre::{eyre, Result, WrapErr};
+use futures_util::{SinkExt, StreamExt};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -15,9 +16,20 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify, oneshot};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify};
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
+
+#[path = "../helper_ws.rs"]
+mod helper_ws;
+
+use helper_ws::{
+    ArtifactAbort, ArtifactBegin, ArtifactCommitted, ArtifactFinish, HelperHello,
+    HelperToServerMessage, ServerToHelperMessage, HELPER_WS_PATH, MAX_ARTIFACT_PAYLOAD_BYTES,
+};
 
 #[cfg(target_os = "windows")]
 use regex::Regex;
@@ -89,8 +101,20 @@ struct PluginInstance {
 struct HelperState {
     instances: HashMap<String, PluginInstance>,
     waiting_for_plugin: HashMap<String, oneshot::Sender<PluginResponsePayload>>,
-    active_remote_places: HashSet<String>,
+    remote_connections: HashMap<String, RemoteConnectionHandle>,
     last_remote_errors: HashMap<String, String>,
+}
+
+struct RemoteConnectionHandle {
+    stop_tx: watch::Sender<bool>,
+    sender: mpsc::UnboundedSender<RemoteOutgoingFrame>,
+}
+
+#[derive(Clone)]
+enum RemoteOutgoingFrame {
+    Text(String),
+    Binary(Vec<u8>),
+    Pong(Vec<u8>),
 }
 
 type SharedState = Arc<Mutex<HelperState>>;
@@ -228,6 +252,7 @@ struct RuntimeScreenshotResponse {
     runtime_id: String,
     place_id: String,
     screenshot_path: String,
+    screenshot_rel_path: Option<String>,
     artifact_dir: String,
     session_metadata_path: String,
     bytes_written: usize,
@@ -508,17 +533,24 @@ async fn post_runtime_screenshot(
         let response_body = response.text().await?;
         if status == StatusCode::UNAUTHORIZED {
             saw_unauthorized = true;
-            tracing::warn!(source = candidate.source, "runtime screenshot upload was unauthorized; trying next token candidate");
+            tracing::warn!(
+                source = candidate.source,
+                "runtime screenshot upload was unauthorized; trying next token candidate"
+            );
             continue;
         }
         if !status.is_success() {
-            return Err(eyre!("runtime screenshot upload returned {status}: {response_body}"));
+            return Err(eyre!(
+                "runtime screenshot upload returned {status}: {response_body}"
+            ));
         }
 
         let sink_response: RuntimeScreenshotSinkResponse = serde_json::from_str(&response_body)
             .wrap_err("runtime screenshot upload returned invalid JSON")?;
         if !sink_response.ok {
-            return Err(eyre!("runtime screenshot upload returned ok=false: {response_body}"));
+            return Err(eyre!(
+                "runtime screenshot upload returned ok=false: {response_body}"
+            ));
         }
         if sink_response.session_id != session_id {
             return Err(eyre!(
@@ -536,13 +568,18 @@ async fn post_runtime_screenshot(
         if candidate.value != current_token {
             *helper.bearer_token.lock().await = candidate.value.clone();
             *helper.bearer_token_source.lock().await = candidate.source.clone();
-            tracing::warn!(source = candidate.source, "helper switched bearer token after runtime screenshot upload unauthorized");
+            tracing::warn!(
+                source = candidate.source,
+                "helper switched bearer token after runtime screenshot upload unauthorized"
+            );
         }
         return Ok(sink_response);
     }
 
     if saw_unauthorized {
-        return Err(eyre!("runtime screenshot upload returned unauthorized for all token candidates"));
+        return Err(eyre!(
+            "runtime screenshot upload returned unauthorized for all token candidates"
+        ));
     }
     Err(eyre!("runtime screenshot upload could not complete"))
 }
@@ -641,7 +678,11 @@ unsafe extern "system" fn enum_child_windows_callback(hwnd: HWND, lparam: LPARAM
         return 1;
     }
 
-    search.candidates.push(ChildWindowCandidate { hwnd, width, height });
+    search.candidates.push(ChildWindowCandidate {
+        hwnd,
+        width,
+        height,
+    });
     1
 }
 
@@ -682,7 +723,8 @@ fn resolve_peer_process_id(peer_addr: SocketAddr, helper_port: u16) -> Result<Op
     }
 
     let table = unsafe { &*(buffer.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>()) };
-    let rows = unsafe { std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize) };
+    let rows =
+        unsafe { std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize) };
     let peer_ip = *peer_v4.ip();
     let peer_port = peer_v4.port();
     let helper_ip = Ipv4Addr::LOCALHOST;
@@ -708,7 +750,10 @@ fn resolve_peer_process_id(_peer_addr: SocketAddr, _helper_port: u16) -> Result<
     Ok(None)
 }
 
-async fn resolve_peer_process_id_with_retry(peer_addr: SocketAddr, helper_port: u16) -> Result<Option<u32>> {
+async fn resolve_peer_process_id_with_retry(
+    peer_addr: SocketAddr,
+    helper_port: u16,
+) -> Result<Option<u32>> {
     for attempt in 0..10 {
         if let Some(pid) = resolve_peer_process_id(peer_addr, helper_port)? {
             return Ok(Some(pid));
@@ -721,7 +766,11 @@ async fn resolve_peer_process_id_with_retry(peer_addr: SocketAddr, helper_port: 
 }
 
 #[cfg(target_os = "windows")]
-fn collect_visible_child_windows(parent_hwnd: HWND, min_width: i32, min_height: i32) -> Vec<ChildWindowCandidate> {
+fn collect_visible_child_windows(
+    parent_hwnd: HWND,
+    min_width: i32,
+    min_height: i32,
+) -> Vec<ChildWindowCandidate> {
     let mut search = ChildWindowSearch {
         min_width,
         min_height,
@@ -739,7 +788,9 @@ fn collect_visible_child_windows(parent_hwnd: HWND, min_width: i32, min_height: 
 
 #[cfg(target_os = "windows")]
 fn find_studio_capture_target_for_pid(studio_pid: u32) -> Result<(HWND, HWND, String)> {
-    let mut search = TopWindowSearch { candidates: Vec::new() };
+    let mut search = TopWindowSearch {
+        candidates: Vec::new(),
+    };
     unsafe {
         EnumWindows(
             Some(enum_top_windows_callback),
@@ -796,7 +847,9 @@ fn find_studio_capture_target_for_pid(studio_pid: u32) -> Result<(HWND, HWND, St
     let descendants = collect_visible_child_windows(studio_window.hwnd, 500, 400);
     let content_area = descendants
         .iter()
-        .find(|candidate| candidate.height > 600 && candidate.height < 750 && candidate.width > 2000)
+        .find(|candidate| {
+            candidate.height > 600 && candidate.height < 750 && candidate.width > 2000
+        })
         .map(|candidate| candidate.hwnd)
         .or_else(|| {
             descendants
@@ -831,8 +884,8 @@ fn find_studio_capture_target_for_pid(studio_pid: u32) -> Result<(HWND, HWND, St
 async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse> {
     let mut state = app.state.lock().await;
     cleanup_stale_instances(&mut state.instances);
-    refresh_active_places(&mut state);
-    let mut active_places: Vec<_> = state.active_remote_places.iter().cloned().collect();
+    sync_remote_connections(&app, &mut state);
+    let mut active_places: Vec<_> = state.remote_connections.keys().cloned().collect();
     active_places.sort();
     let mut instances: Vec<_> = state
         .instances
@@ -877,7 +930,6 @@ async fn mcp_register_handler(
     let place_id = sanitize_place_id(&payload.place_id)?;
     let instance_id = Uuid::new_v4().to_string();
     let remote_base_url = derive_public_base_url("mcp", &place_id, &app.helper);
-    probe_remote_mcp(&app.helper, &remote_base_url).await?;
     let studio_pid = resolve_peer_process_id_with_retry(peer_addr, app.helper.port).await?;
     {
         let mut state = app.state.lock().await;
@@ -891,15 +943,15 @@ async fn mcp_register_handler(
                 notify: Arc::new(Notify::new()),
             },
         );
-        if state.active_remote_places.insert(place_id.clone()) {
-            let worker_app = app.clone();
-            let worker_place = place_id.clone();
-            tokio::spawn(async move {
-                remote_poll_loop(worker_app, worker_place).await;
-            });
-        }
+        sync_remote_connections(&app, &mut state);
     }
-    tracing::info!(instance_id, place_id, studio_pid, remote_base_url, "registered MCP plugin instance with helper");
+    tracing::info!(
+        instance_id,
+        place_id,
+        studio_pid,
+        remote_base_url,
+        "registered MCP plugin instance with helper"
+    );
     Ok(Json(RegisterPluginResponse {
         instance_id,
         place_id,
@@ -925,8 +977,11 @@ async fn mcp_unregister_handler(
             state.last_remote_errors.remove(place_id);
         }
     }
-    refresh_active_places(&mut state);
-    tracing::info!(instance_id = payload.instance_id, "unregistered MCP plugin instance");
+    sync_remote_connections(&app, &mut state);
+    tracing::info!(
+        instance_id = payload.instance_id,
+        "unregistered MCP plugin instance"
+    );
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -939,12 +994,18 @@ async fn mcp_plugin_request_handler(
             let notify = {
                 let mut state = app.state.lock().await;
                 let Some(instance) = state.instances.get_mut(&query.instance_id) else {
-                    tracing::info!(instance_id = query.instance_id, "plugin polled helper with expired instance_id");
+                    tracing::info!(
+                        instance_id = query.instance_id,
+                        "plugin polled helper with expired instance_id"
+                    );
                     return Ok::<Option<Value>, color_eyre::Report>(None);
                 };
                 instance.last_seen_at = Instant::now();
                 if let Some(command) = instance.queue.pop_front() {
-                    tracing::info!(instance_id = query.instance_id, "helper delivered queued MCP command to plugin");
+                    tracing::info!(
+                        instance_id = query.instance_id,
+                        "helper delivered queued MCP command to plugin"
+                    );
                     return Ok::<Option<Value>, color_eyre::Report>(Some(command));
                 }
                 Arc::clone(&instance.notify)
@@ -972,9 +1033,16 @@ async fn mcp_plugin_response_handler(
     };
     if let Some(tx) = tx {
         let _ = tx.send(payload.clone());
-        tracing::info!(id = payload.id, success = payload.success, "helper received plugin tool response");
+        tracing::info!(
+            id = payload.id,
+            success = payload.success,
+            "helper received plugin tool response"
+        );
     } else {
-        tracing::warn!(id = payload.id, "received late or unknown plugin tool response");
+        tracing::warn!(
+            id = payload.id,
+            "received late or unknown plugin tool response"
+        );
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -1005,144 +1073,470 @@ async fn read_studio_log_debug_handler(
     Ok(Json(read_studio_log(query)?))
 }
 
-async fn remote_poll_loop(app: AppState, place_id: String) {
-    let base_url = derive_public_base_url("mcp", &place_id, &app.helper);
-    tracing::info!(place_id, base_url, "started helper remote poll loop");
+fn derive_remote_helper_ws_url(place_id: &str, helper: &HelperConfig) -> String {
+    let base_url = derive_public_base_url("mcp", place_id, helper);
+    format!(
+        "{}{}",
+        base_url.replacen("https://", "wss://", 1),
+        HELPER_WS_PATH
+    )
+}
+
+fn place_is_active(state: &HelperState, place_id: &str) -> bool {
+    state
+        .instances
+        .values()
+        .any(|instance| instance.place_id == place_id)
+}
+
+fn sync_remote_connections(app: &AppState, state: &mut HelperState) {
+    let active_places: HashSet<String> = state
+        .instances
+        .values()
+        .map(|instance| instance.place_id.clone())
+        .collect();
+    let stale_places: Vec<String> = state
+        .remote_connections
+        .keys()
+        .filter(|place_id| !active_places.contains(*place_id))
+        .cloned()
+        .collect();
+    for place_id in stale_places {
+        if let Some(handle) = state.remote_connections.remove(&place_id) {
+            let _ = handle.stop_tx.send(true);
+            tracing::info!(
+                place_id,
+                "stopping helper remote websocket because plugin is gone"
+            );
+        }
+    }
+    for place_id in active_places {
+        if state.remote_connections.contains_key(&place_id) {
+            continue;
+        }
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (sender, _receiver) = mpsc::unbounded_channel::<RemoteOutgoingFrame>();
+        state
+            .remote_connections
+            .insert(place_id.clone(), RemoteConnectionHandle { stop_tx, sender });
+        let worker_app = app.clone();
+        let worker_place = place_id.clone();
+        tokio::spawn(async move {
+            remote_ws_loop(worker_app, worker_place, stop_rx).await;
+        });
+    }
+}
+
+async fn remote_ws_loop(app: AppState, place_id: String, mut stop_rx: watch::Receiver<bool>) {
+    let ws_url = derive_remote_helper_ws_url(&place_id, &app.helper);
+    tracing::info!(place_id, ws_url, "starting helper remote websocket loop");
     loop {
+        if *stop_rx.borrow() {
+            break;
+        }
         {
             let mut state = app.state.lock().await;
             cleanup_stale_instances(&mut state.instances);
-            refresh_active_places(&mut state);
-            if !state.active_remote_places.contains(&place_id) {
+            if !place_is_active(&state, &place_id) {
+                state.remote_connections.remove(&place_id);
                 state.last_remote_errors.remove(&place_id);
-                tracing::info!(place_id, "stopped helper remote poll loop because no active plugin remains");
                 break;
             }
         }
-        match poll_remote_command(&app.helper, &base_url).await {
-            Ok(Some(command)) => {
-                let response = match handle_remote_command(app.clone(), &place_id, command.clone()).await {
-                    Ok(body) => PluginResponsePayload {
-                        instance_id: None,
-                        id: extract_command_id(&command).unwrap_or_else(|_| "unknown".to_owned()),
-                        success: true,
-                        response: body,
-                    },
-                    Err(error) => PluginResponsePayload {
-                        instance_id: None,
-                        id: extract_command_id(&command).unwrap_or_else(|_| "unknown".to_owned()),
-                        success: false,
-                        response: error.to_string(),
-                    },
-                };
-                if let Err(error) = post_remote_response(&app.helper, &base_url, &response).await {
-                    tracing::error!(place_id, error = summarize_error(&error.to_string()), "failed to post helper response to MCP server");
-                    let mut state = app.state.lock().await;
-                    refresh_active_places(&mut state);
-                    if state.active_remote_places.contains(&place_id) {
-                        state
-                            .last_remote_errors
-                            .insert(place_id.clone(), summarize_error(&error.to_string()));
+
+        let result = run_remote_ws_session(app.clone(), &place_id, &ws_url, &mut stop_rx).await;
+        if let Err(error) = result {
+            tracing::warn!(
+                place_id,
+                error = summarize_error(&error.to_string()),
+                "helper remote websocket session failed"
+            );
+            let mut state = app.state.lock().await;
+            if place_is_active(&state, &place_id) {
+                state
+                    .last_remote_errors
+                    .insert(place_id.clone(), summarize_error(&error.to_string()));
+            }
+            drop(state);
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                changed = stop_rx.changed() => {
+                    if changed.is_ok() && *stop_rx.borrow() {
+                        break;
                     }
                 }
             }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(place_id, error = summarize_error(&error.to_string()), "helper MCP remote poll failed");
-                let mut state = app.state.lock().await;
-                refresh_active_places(&mut state);
-                if state.active_remote_places.contains(&place_id) {
-                    state
-                        .last_remote_errors
-                        .insert(place_id.clone(), summarize_error(&error.to_string()));
+            continue;
+        }
+    }
+    let mut state = app.state.lock().await;
+    state.remote_connections.remove(&place_id);
+    state.last_remote_errors.remove(&place_id);
+    tracing::info!(place_id, "stopped helper remote websocket loop");
+}
+
+async fn connect_remote_ws(
+    helper: &HelperConfig,
+    ws_url: &str,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+> {
+    let current_token = helper.bearer_token.lock().await.clone();
+    let current_source = helper.bearer_token_source.lock().await.clone();
+    let mut attempts = vec![ResolvedToken {
+        value: current_token.clone(),
+        source: current_source,
+    }];
+    for candidate in helper.bearer_token_candidates.iter() {
+        if candidate.value != current_token {
+            attempts.push(candidate.clone());
+        }
+    }
+    let mut last_error = None;
+    for candidate in attempts {
+        let mut request = ws_url.into_client_request()?;
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            format!("Bearer {}", candidate.value).parse()?,
+        );
+        match connect_async(request).await {
+            Ok((stream, _response)) => {
+                if candidate.value != current_token {
+                    *helper.bearer_token.lock().await = candidate.value.clone();
+                    *helper.bearer_token_source.lock().await = candidate.source.clone();
+                    tracing::warn!(
+                        source = candidate.source,
+                        "helper switched bearer token after websocket connect retry"
+                    );
                 }
-                drop(state);
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                return Ok(stream);
+            }
+            Err(error) => {
+                last_error = Some(error.to_string());
             }
         }
     }
+    Err(eyre!(
+        last_error.unwrap_or_else(|| "websocket connect failed".to_owned())
+    ))
 }
 
-async fn poll_remote_command(helper: &HelperConfig, base_url: &str) -> Result<Option<Value>> {
-    let bearer_token = helper.bearer_token.lock().await.clone();
-    let response = helper
-        .client
-        .get(format!("{base_url}/request"))
-        .header(AUTHORIZATION, format!("Bearer {bearer_token}"))
-        .send()
-        .await?;
-    match response.status() {
-        StatusCode::OK => Ok(Some(response.json::<Value>().await?)),
-        StatusCode::LOCKED => Ok(None),
-        status => Err(eyre!("remote request poll returned {status}")),
+fn encode_remote_message(message: &HelperToServerMessage) -> Result<String> {
+    Ok(serde_json::to_string(message)?)
+}
+
+fn build_artifact_chunk_frame(upload_id: Uuid, seq: u32, chunk: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(20 + chunk.len());
+    payload.extend_from_slice(upload_id.as_bytes());
+    payload.extend_from_slice(&seq.to_be_bytes());
+    payload.extend_from_slice(chunk);
+    payload
+}
+
+#[derive(Debug, Deserialize)]
+struct TakeScreenshotToolArgs {
+    session_id: Option<String>,
+    runtime_id: Option<String>,
+    tag: Option<String>,
+}
+
+fn send_artifact_abort_message(
+    sender: &mpsc::UnboundedSender<RemoteOutgoingFrame>,
+    upload_id: Uuid,
+    request_id: &str,
+    error: &str,
+) {
+    if let Ok(encoded) =
+        encode_remote_message(&HelperToServerMessage::ArtifactAbort(ArtifactAbort {
+            upload_id: upload_id.to_string(),
+            request_id: request_id.to_owned(),
+            error: error.to_owned(),
+        }))
+    {
+        let _ = sender.send(RemoteOutgoingFrame::Text(encoded));
     }
 }
 
-async fn probe_remote_mcp(helper: &HelperConfig, base_url: &str) -> Result<()> {
-    let current_token = helper.bearer_token.lock().await.clone();
-    let status = helper
-        .client
-        .get(format!("{base_url}/status"))
-        .header(AUTHORIZATION, format!("Bearer {current_token}"))
-        .send()
-        .await?
-        .status();
-    if status.is_success() {
-        return Ok(());
-    }
-    if status != StatusCode::UNAUTHORIZED {
-        return Err(eyre!("remote MCP status probe returned {status}"));
+async fn stream_runtime_screenshot(
+    app: AppState,
+    place_id: &str,
+    args: TakeScreenshotToolArgs,
+    sender: mpsc::UnboundedSender<RemoteOutgoingFrame>,
+    upload_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<Result<ArtifactCommitted>>>>>,
+    request_id: String,
+) -> Result<String> {
+    let session_id = sanitize_identifier(
+        "session_id",
+        args.session_id
+            .as_deref()
+            .ok_or_else(|| eyre!("take_screenshot requires session_id"))?,
+    )?;
+    let runtime_id =
+        sanitize_identifier("runtime_id", args.runtime_id.as_deref().unwrap_or("server"))?;
+    let tag = args
+        .tag
+        .as_deref()
+        .map(|value| sanitize_identifier("tag", value))
+        .transpose()?;
+    let captured = capture_screenshot_png(app, Some(place_id)).await?;
+    let upload_id = Uuid::new_v4();
+    let (tx, rx) = oneshot::channel();
+    upload_waiters
+        .lock()
+        .await
+        .insert(upload_id.to_string(), tx);
+
+    if sender
+        .send(RemoteOutgoingFrame::Text(encode_remote_message(
+            &HelperToServerMessage::ArtifactBegin(ArtifactBegin {
+                upload_id: upload_id.to_string(),
+                request_id: request_id.clone(),
+                session_id: session_id.clone(),
+                runtime_id: runtime_id.clone(),
+                place_id: place_id.to_owned(),
+                tag: tag.clone(),
+                content_type: "image/png".to_owned(),
+                total_bytes: captured.png_bytes.len(),
+            }),
+        )?))
+        .is_err()
+    {
+        upload_waiters.lock().await.remove(&upload_id.to_string());
+        return Err(eyre!(
+            "remote websocket sender dropped before artifact begin"
+        ));
     }
 
-    for candidate in helper.bearer_token_candidates.iter() {
-        if candidate.value == current_token {
-            continue;
+    for (seq, chunk) in captured
+        .png_bytes
+        .chunks(MAX_ARTIFACT_PAYLOAD_BYTES)
+        .enumerate()
+    {
+        if sender
+            .send(RemoteOutgoingFrame::Binary(build_artifact_chunk_frame(
+                upload_id, seq as u32, chunk,
+            )))
+            .is_err()
+        {
+            upload_waiters.lock().await.remove(&upload_id.to_string());
+            send_artifact_abort_message(
+                &sender,
+                upload_id,
+                &request_id,
+                "remote websocket sender dropped during artifact upload",
+            );
+            return Err(eyre!(
+                "remote websocket sender dropped during artifact upload"
+            ));
         }
-        tracing::info!(source = candidate.source, "helper is trying alternate bearer token after unauthorized MCP probe");
-        let status = helper
-            .client
-            .get(format!("{base_url}/status"))
-            .header(AUTHORIZATION, format!("Bearer {}", candidate.value))
-            .send()
-            .await?
-            .status();
-        if status.is_success() {
-            *helper.bearer_token.lock().await = candidate.value.clone();
-            *helper.bearer_token_source.lock().await = candidate.source.clone();
-            tracing::warn!(source = candidate.source, "helper switched to alternate bearer token after unauthorized MCP probe");
-            return Ok(());
-        }
     }
 
-    Err(eyre!("remote MCP status probe returned {status}"))
+    if sender
+        .send(RemoteOutgoingFrame::Text(encode_remote_message(
+            &HelperToServerMessage::ArtifactFinish(ArtifactFinish {
+                upload_id: upload_id.to_string(),
+                request_id: request_id.clone(),
+                total_chunks: captured.png_bytes.chunks(MAX_ARTIFACT_PAYLOAD_BYTES).len() as u32,
+            }),
+        )?))
+        .is_err()
+    {
+        upload_waiters.lock().await.remove(&upload_id.to_string());
+        send_artifact_abort_message(
+            &sender,
+            upload_id,
+            &request_id,
+            "remote websocket sender dropped before artifact finish",
+        );
+        return Err(eyre!(
+            "remote websocket sender dropped before artifact finish"
+        ));
+    }
+
+    let committed = match tokio::time::timeout(Duration::from_secs(30), rx).await {
+        Ok(result) => result??,
+        Err(_) => {
+            upload_waiters.lock().await.remove(&upload_id.to_string());
+            send_artifact_abort_message(
+                &sender,
+                upload_id,
+                &request_id,
+                "timed out waiting for artifact commit acknowledgement",
+            );
+            return Err(eyre!(
+                "timed out waiting for artifact commit acknowledgement"
+            ));
+        }
+    };
+
+    let response = RuntimeScreenshotResponse {
+        session_id: committed.session_id,
+        runtime_id: committed.runtime_id,
+        place_id: committed.place_id,
+        screenshot_path: committed.screenshot_path,
+        screenshot_rel_path: Some(committed.screenshot_rel_path),
+        artifact_dir: committed.artifact_dir,
+        session_metadata_path: committed.session_metadata_path,
+        bytes_written: committed.bytes_written,
+    };
+    Ok(serde_json::to_string(&response)?)
 }
 
-async fn post_remote_response(
-    helper: &HelperConfig,
-    base_url: &str,
-    response: &PluginResponsePayload,
+async fn run_remote_ws_session(
+    app: AppState,
+    place_id: &str,
+    ws_url: &str,
+    stop_rx: &mut watch::Receiver<bool>,
 ) -> Result<()> {
-    let bearer_token = helper.bearer_token.lock().await.clone();
-    let status = helper
-        .client
-        .post(format!("{base_url}/response"))
-        .header(AUTHORIZATION, format!("Bearer {bearer_token}"))
-        .header(CONTENT_TYPE, "application/json")
-        .json(response)
-        .send()
-        .await?
-        .status();
-    if !status.is_success() {
-        return Err(eyre!("remote response post returned {status}"));
+    let stream = connect_remote_ws(&app.helper, ws_url).await?;
+    let (mut writer, mut reader) = stream.split();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<RemoteOutgoingFrame>();
+    {
+        let mut state = app.state.lock().await;
+        if let Some(connection) = state.remote_connections.get_mut(place_id) {
+            connection.sender = out_tx.clone();
+        }
+        state.last_remote_errors.remove(place_id);
+    }
+    let writer_task = tokio::spawn(async move {
+        while let Some(frame) = out_rx.recv().await {
+            let message = match frame {
+                RemoteOutgoingFrame::Text(text) => WsMessage::Text(text.into()),
+                RemoteOutgoingFrame::Binary(binary) => WsMessage::Binary(binary.into()),
+                RemoteOutgoingFrame::Pong(payload) => WsMessage::Pong(payload.into()),
+            };
+            if writer.send(message).await.is_err() {
+                break;
+            }
+        }
+    });
+    if out_tx
+        .send(RemoteOutgoingFrame::Text(encode_remote_message(
+            &HelperToServerMessage::Hello(HelperHello {
+                place_id: place_id.to_owned(),
+                helper_version: env!("CARGO_PKG_VERSION").to_owned(),
+                capabilities: vec![
+                    "ws_tool_dispatch_v1".to_owned(),
+                    "runtime_screenshot_stream_v1".to_owned(),
+                    "read_studio_log_v1".to_owned(),
+                ],
+                plugin_instance_count: {
+                    let state = app.state.lock().await;
+                    state
+                        .instances
+                        .values()
+                        .filter(|instance| instance.place_id == place_id)
+                        .count()
+                },
+            }),
+        )?))
+        .is_err()
+    {
+        writer_task.abort();
+        return Err(eyre!("remote websocket sender dropped before hello"));
+    }
+
+    let upload_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<Result<ArtifactCommitted>>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            changed = stop_rx.changed() => {
+                if changed.is_ok() && *stop_rx.borrow() {
+                    break;
+                }
+            }
+            _ = heartbeat.tick() => {
+                let plugin_instance_count = {
+                    let state = app.state.lock().await;
+                    state.instances.values().filter(|instance| instance.place_id == place_id).count()
+                };
+                if out_tx.send(RemoteOutgoingFrame::Text(encode_remote_message(&HelperToServerMessage::Heartbeat {
+                    place_id: place_id.to_owned(),
+                    plugin_instance_count,
+                })?)).is_err() {
+                    break;
+                }
+            }
+            message = reader.next() => {
+                let Some(message) = message else {
+                    break;
+                };
+                match message? {
+                    WsMessage::Text(text) => {
+                        match serde_json::from_str::<ServerToHelperMessage>(&text)? {
+                            ServerToHelperMessage::ReadyAck { connection_id, .. } => {
+                                tracing::info!(place_id, connection_id, "helper websocket acknowledged by MCP server");
+                            }
+                            ServerToHelperMessage::ToolCall { request_id, command } => {
+                                let tool_sender = out_tx.clone();
+                                let tool_waiters = Arc::clone(&upload_waiters);
+                                let tool_app = app.clone();
+                                let tool_place = place_id.to_owned();
+                                tokio::spawn(async move {
+                                    let result = handle_remote_command(tool_app, &tool_place, command, tool_sender.clone(), tool_waiters, request_id.clone()).await;
+                                    let message = match result {
+                                        Ok(body) => HelperToServerMessage::ToolResult { request_id, response: body },
+                                        Err(error) => HelperToServerMessage::ToolError { request_id, error: error.to_string() },
+                                    };
+                                    if let Ok(encoded) = encode_remote_message(&message) {
+                                        let _ = tool_sender.send(RemoteOutgoingFrame::Text(encoded));
+                                    }
+                                });
+                            }
+                            ServerToHelperMessage::ArtifactCommitted(committed) => {
+                                if let Some(tx) = upload_waiters.lock().await.remove(&committed.upload_id) {
+                                    let _ = tx.send(Ok(committed));
+                                }
+                            }
+                            ServerToHelperMessage::ArtifactFailed { upload_id, error, .. } => {
+                                if let Some(tx) = upload_waiters.lock().await.remove(&upload_id) {
+                                    let _ = tx.send(Err(eyre!(error)));
+                                }
+                            }
+                            ServerToHelperMessage::CloseReason { reason } => {
+                                return Err(eyre!("remote MCP server closed helper websocket: {reason}"));
+                            }
+                        }
+                    }
+                    WsMessage::Ping(payload) => {
+                        let _ = out_tx.send(RemoteOutgoingFrame::Pong(payload));
+                    }
+                    WsMessage::Close(_) => break,
+                    WsMessage::Binary(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => {}
+                }
+            }
+        }
+    }
+    writer_task.abort();
+    let mut pending = upload_waiters.lock().await;
+    for (_, tx) in pending.drain() {
+        let _ = tx.send(Err(eyre!(
+            "remote websocket session closed before artifact commit"
+        )));
     }
     Ok(())
 }
 
-async fn handle_remote_command(app: AppState, place_id: &str, command: Value) -> Result<String> {
+async fn handle_remote_command(
+    app: AppState,
+    place_id: &str,
+    command: Value,
+    sender: mpsc::UnboundedSender<RemoteOutgoingFrame>,
+    upload_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<Result<ArtifactCommitted>>>>>,
+    request_id: String,
+) -> Result<String> {
     let (tool_name, payload) = extract_tool_name_and_args(&command)?;
-    tracing::info!(place_id, tool = tool_name, "helper received remote MCP command");
+    tracing::info!(
+        place_id,
+        tool = tool_name,
+        "helper received remote MCP command"
+    );
     match tool_name.as_str() {
-        "TakeScreenshot" => take_screenshot(app, Some(place_id)).await,
+        "TakeScreenshot" => {
+            let args: TakeScreenshotToolArgs = serde_json::from_value(payload)?;
+            stream_runtime_screenshot(app, place_id, args, sender, upload_waiters, request_id).await
+        }
         "ReadStudioLog" => {
             let args: ReadStudioLogArgs = serde_json::from_value(payload)?;
             Ok(serde_json::to_string(&read_studio_log(args)?)?)
@@ -1156,7 +1550,7 @@ async fn forward_to_plugin(app: AppState, place_id: &str, command: Value) -> Res
     let (instance_id, notify) = {
         let mut state = app.state.lock().await;
         cleanup_stale_instances(&mut state.instances);
-        refresh_active_places(&mut state);
+        sync_remote_connections(&app, &mut state);
         let selected_instance_id = select_instance_for_place(place_id, &state.instances)
             .ok_or_else(|| eyre!("no active Studio plugin registered for placeId {place_id}"))?;
         let instance = state
@@ -1170,7 +1564,12 @@ async fn forward_to_plugin(app: AppState, place_id: &str, command: Value) -> Res
         (selected_instance_id, (notify, rx))
     };
     notify.0.notify_waiters();
-    tracing::info!(instance_id, place_id, id = request_id, "forwarded MCP command from helper to local plugin");
+    tracing::info!(
+        instance_id,
+        place_id,
+        id = request_id,
+        "forwarded MCP command from helper to local plugin"
+    );
     let response = match tokio::time::timeout(PLUGIN_REQUEST_TIMEOUT, notify.1).await {
         Ok(result) => result?,
         Err(_) => {
@@ -1190,21 +1589,20 @@ fn cleanup_stale_instances(instances: &mut HashMap<String, PluginInstance>) {
     instances.retain(|instance_id, instance| {
         let keep = instance.last_seen_at.elapsed() <= INSTANCE_STALE_AFTER;
         if !keep {
-            tracing::warn!(instance_id, place_id = instance.place_id, "dropping stale helper plugin instance");
+            tracing::warn!(
+                instance_id,
+                place_id = instance.place_id,
+                "dropping stale helper plugin instance"
+            );
         }
         keep
     });
 }
 
-fn refresh_active_places(state: &mut HelperState) {
-    state.active_remote_places = state
-        .instances
-        .values()
-        .map(|instance| instance.place_id.clone())
-        .collect();
-}
-
-fn select_instance_for_place(place_id: &str, instances: &HashMap<String, PluginInstance>) -> Option<String> {
+fn select_instance_for_place(
+    place_id: &str,
+    instances: &HashMap<String, PluginInstance>,
+) -> Option<String> {
     instances
         .iter()
         .filter(|(_, instance)| instance.place_id == place_id)
@@ -1213,7 +1611,10 @@ fn select_instance_for_place(place_id: &str, instances: &HashMap<String, PluginI
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-async fn resolve_capture_pid(app: &AppState, place_id: Option<&str>) -> Result<(Option<String>, u32)> {
+async fn resolve_capture_pid(
+    app: &AppState,
+    place_id: Option<&str>,
+) -> Result<(Option<String>, u32)> {
     let state = app.state.lock().await;
     let selected = if let Some(place_id) = place_id {
         let instance_id = select_instance_for_place(place_id, &state.instances)
@@ -1233,16 +1634,21 @@ async fn resolve_capture_pid(app: &AppState, place_id: Option<&str>) -> Result<(
     } else if state.instances.is_empty() {
         return Err(eyre!("no active Studio plugin registered"));
     } else {
-        return Err(eyre!("multiple Studio instances are active; pass placeId explicitly"));
+        return Err(eyre!(
+            "multiple Studio instances are active; pass placeId explicitly"
+        ));
     };
 
-    let studio_pid = selected
-        .1
-        .ok_or_else(|| eyre!("helper could not resolve a Studio process id for the selected plugin instance"))?;
+    let studio_pid = selected.1.ok_or_else(|| {
+        eyre!("helper could not resolve a Studio process id for the selected plugin instance")
+    })?;
     Ok((selected.0, studio_pid))
 }
 
-async fn capture_screenshot_png(app: AppState, place_id: Option<&str>) -> Result<CapturedScreenshot> {
+async fn capture_screenshot_png(
+    app: AppState,
+    place_id: Option<&str>,
+) -> Result<CapturedScreenshot> {
     #[cfg(target_os = "windows")]
     {
         let (resolved_place_id, studio_pid) = resolve_capture_pid(&app, place_id).await?;
@@ -1349,7 +1755,12 @@ $memory.Dispose()
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
-        tracing::info!(studio_pid, window_title, byte_len = output.stdout.len(), "captured Studio screenshot bytes from helper");
+        tracing::info!(
+            studio_pid,
+            window_title,
+            byte_len = output.stdout.len(),
+            "captured Studio screenshot bytes from helper"
+        );
         return Ok(CapturedScreenshot {
             resolved_place_id,
             png_bytes: output.stdout,
@@ -1361,7 +1772,9 @@ $memory.Dispose()
     {
         let _ = app;
         let _ = place_id;
-        Err(eyre!("take_screenshot is only available on Windows helper builds"))
+        Err(eyre!(
+            "take_screenshot is only available on Windows helper builds"
+        ))
     }
 }
 
@@ -1386,7 +1799,9 @@ async fn take_screenshot(app: AppState, place_id: Option<&str>) -> Result<String
     {
         let _ = app;
         let _ = place_id;
-        Err(eyre!("take_screenshot is only available on Windows helper builds"))
+        Err(eyre!(
+            "take_screenshot is only available on Windows helper builds"
+        ))
     }
 }
 
@@ -1407,7 +1822,8 @@ async fn upload_runtime_screenshot(
         .clone()
         .or(place_id)
         .ok_or_else(|| eyre!("helper could not resolve placeId for runtime screenshot upload"))?;
-    let upload_url = validate_runtime_screenshot_upload_url(&payload.upload_url, &final_place_id, &app.helper)?;
+    let upload_url =
+        validate_runtime_screenshot_upload_url(&payload.upload_url, &final_place_id, &app.helper)?;
     let sink_response = post_runtime_screenshot(
         &app.helper,
         &upload_url,
@@ -1431,6 +1847,7 @@ async fn upload_runtime_screenshot(
         runtime_id: sink_response.runtime_id,
         place_id: final_place_id,
         screenshot_path: sink_response.screenshot_path,
+        screenshot_rel_path: None,
         artifact_dir: sink_response.artifact_dir,
         session_metadata_path: sink_response.session_metadata_path,
         bytes_written: sink_response.bytes_written,
@@ -1481,7 +1898,9 @@ fn read_studio_log(args: ReadStudioLogArgs) -> Result<ReadStudioLogResponse> {
     #[cfg(not(target_os = "windows"))]
     {
         let _ = args;
-        Err(eyre!("read_studio_log is only available on Windows helper builds"))
+        Err(eyre!(
+            "read_studio_log is only available on Windows helper builds"
+        ))
     }
 }
 
@@ -1521,7 +1940,10 @@ where
 
 impl IntoResponse for HelperError {
     fn into_response(self) -> Response {
-        tracing::warn!(error = summarize_error(&self.0.to_string()), "helper request failed");
+        tracing::warn!(
+            error = summarize_error(&self.0.to_string()),
+            "helper request failed"
+        );
         (StatusCode::BAD_REQUEST, self.0.to_string()).into_response()
     }
 }
@@ -1551,22 +1973,38 @@ async fn main() -> Result<()> {
         bearer_token_source: Arc::new(Mutex::new(initial_bearer_token_source)),
         bearer_token_candidates: Arc::new(bearer_token_candidates),
         domain_suffix: args.domain_suffix.clone(),
-        client: reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?,
+        client: reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()?,
     };
     let token_source = helper.bearer_token_source.lock().await.clone();
-    tracing::info!(user_name = helper.user_name, port = args.port, domain_suffix = helper.domain_suffix, token_source, "starting Studio helper");
+    tracing::info!(
+        user_name = helper.user_name,
+        port = args.port,
+        domain_suffix = helper.domain_suffix,
+        token_source,
+        "starting Studio helper"
+    );
 
     let state = Arc::new(Mutex::new(HelperState {
         instances: HashMap::new(),
         waiting_for_plugin: HashMap::new(),
-        active_remote_places: HashSet::new(),
+        remote_connections: HashMap::new(),
         last_remote_errors: HashMap::new(),
     }));
 
-    let app_state = AppState {
-        helper,
-        state,
-    };
+    let app_state = AppState { helper, state };
+
+    let maintenance_app = app_state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            let mut state = maintenance_app.state.lock().await;
+            cleanup_stale_instances(&mut state.instances);
+            sync_remote_connections(&maintenance_app, &mut state);
+        }
+    });
 
     let app = Router::new()
         .route("/status", get(helper_status))
@@ -1576,12 +2014,19 @@ async fn main() -> Result<()> {
         .route("/v1/mcp/plugin/request", get(mcp_plugin_request_handler))
         .route("/v1/mcp/plugin/response", post(mcp_plugin_response_handler))
         .route("/v1/helper/screenshot", post(screenshot_debug_handler))
-        .route("/v1/helper/runtime-screenshot", post(runtime_screenshot_handler))
+        .route(
+            "/v1/helper/runtime-screenshot",
+            post(runtime_screenshot_handler),
+        )
         .route("/v1/helper/studio-log", get(read_studio_log_debug_handler))
         .with_state(app_state);
 
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, args.port)).await?;
     tracing::info!(port = args.port, "Studio helper listening on 127.0.0.1");
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
