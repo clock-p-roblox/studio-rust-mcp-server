@@ -143,6 +143,8 @@ hub 本身只做 control plane：
 - helper register / heartbeat / claim
 - task create / heartbeat / release / recover
 
+为了覆盖极端故障场景，hub 现在会把 task 状态落盘；helper heartbeat 也会回填和校正 task claim。这样在 hub 重启、helper 重启、supervisor 过期等场景下，Linux 阶段就能先验证控制面的稳定性。
+
 本仓新增 `roblox_hub` 二进制作为 hub server：
 
 ```sh
