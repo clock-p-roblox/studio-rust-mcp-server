@@ -68,6 +68,10 @@ struct Args {
     #[arg(long)]
     task_id: Option<String>,
 
+    /// Optional task generation metadata exposed via /status and helper fencing.
+    #[arg(long)]
+    task_generation: Option<u32>,
+
     /// Explicit workspace path metadata. Defaults to current directory.
     #[arg(long)]
     workspace_path: Option<PathBuf>,
@@ -75,6 +79,18 @@ struct Args {
     /// Optional public base URL metadata exposed via /status.
     #[arg(long)]
     public_base_url: Option<String>,
+
+    /// Optional hub base URL used to validate helper launch fencing.
+    #[arg(long)]
+    hub_base_url: Option<String>,
+
+    /// Optional bearer token used for hub requests.
+    #[arg(long)]
+    hub_bearer_token: Option<String>,
+
+    /// Optional bearer token file used for hub requests.
+    #[arg(long)]
+    hub_bearer_token_file: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -131,6 +147,24 @@ fn resolve_http_bearer_token(args: &Args) -> Result<Option<String>> {
         }
     }
 
+    Ok(None)
+}
+
+fn resolve_optional_bearer_token(
+    token: Option<&str>,
+    token_file: Option<&PathBuf>,
+) -> Result<Option<String>> {
+    if let Some(token) = token.and_then(normalize_bearer_token) {
+        return Ok(Some(token));
+    }
+    if let Some(path) = token_file {
+        return load_token_from_file(path);
+    }
+    if let Some(path) = default_feishu_token_path() {
+        if path.exists() {
+            return load_token_from_file(&path);
+        }
+    }
     Ok(None)
 }
 
@@ -192,10 +226,17 @@ async fn main() -> Result<()> {
         Some(path) => path.clone(),
         None => std::env::current_dir()?,
     };
+    let hub_bearer_token = resolve_optional_bearer_token(
+        args.hub_bearer_token.as_deref(),
+        args.hub_bearer_token_file.as_ref(),
+    )?;
     let server_state = Arc::new(Mutex::new(AppState::new(
         workspace,
         args.task_id.clone(),
+        args.task_generation,
         args.public_base_url.clone(),
+        args.hub_base_url.clone(),
+        hub_bearer_token,
     )));
     tokio::spawn(helper_health_loop(Arc::clone(&server_state)));
 

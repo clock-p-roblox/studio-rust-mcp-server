@@ -9,7 +9,11 @@ pub const MAX_ARTIFACT_CHUNK_PAYLOAD_BYTES: usize = 360 * 1024;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct HelperHello {
+    pub helper_id: String,
     pub place_id: String,
+    pub task_id: Option<String>,
+    pub generation: Option<u32>,
+    pub launch_id: Option<String>,
     pub helper_version: String,
     pub capabilities: Vec<String>,
     pub plugin_instance_count: usize,
@@ -22,6 +26,9 @@ pub struct ArtifactBegin {
     pub session_id: String,
     pub runtime_id: String,
     pub place_id: String,
+    pub task_id: Option<String>,
+    pub generation: Option<u32>,
+    pub launch_id: Option<String>,
     pub tag: Option<String>,
     pub content_type: String,
     pub total_bytes: usize,
@@ -55,6 +62,9 @@ pub struct ArtifactCommitted {
     pub session_id: String,
     pub runtime_id: String,
     pub place_id: String,
+    pub task_id: Option<String>,
+    pub generation: Option<u32>,
+    pub launch_id: Option<String>,
     pub screenshot_path: String,
     pub screenshot_rel_path: String,
     pub artifact_dir: String,
@@ -67,7 +77,11 @@ pub struct ArtifactCommitted {
 pub enum HelperToServerMessage {
     Hello(HelperHello),
     Heartbeat {
+        helper_id: String,
         place_id: String,
+        task_id: Option<String>,
+        generation: Option<u32>,
+        launch_id: Option<String>,
         plugin_instance_count: usize,
     },
     ToolResult {
@@ -90,6 +104,9 @@ pub enum ServerToHelperMessage {
     ReadyAck {
         connection_id: String,
         place_id: String,
+        task_id: Option<String>,
+        generation: Option<u32>,
+        launch_id: Option<String>,
     },
     ToolCall {
         request_id: String,

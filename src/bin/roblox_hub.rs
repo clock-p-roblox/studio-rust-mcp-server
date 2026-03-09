@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Request, State},
+    extract::{Path, Request, State},
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -112,6 +112,7 @@ struct TaskRecord {
     routes: TaskRoutes,
     created_at_unix_ms: u64,
     updated_at_unix_ms: u64,
+    last_task_heartbeat_at_unix_ms: u64,
     last_seen_at: Instant,
     claimed_by_helper_id: Option<String>,
     active_launch_id: Option<String>,
@@ -141,6 +142,8 @@ struct PersistedTaskRecord {
     routes: TaskRoutes,
     created_at_unix_ms: u64,
     updated_at_unix_ms: u64,
+    #[serde(default)]
+    last_task_heartbeat_at_unix_ms: u64,
     claimed_by_helper_id: Option<String>,
     active_launch_id: Option<String>,
     released: bool,
@@ -219,13 +222,14 @@ struct HelperHeartbeatRequest {
 #[derive(Debug, Serialize)]
 struct HelperHeartbeatHubResponse {
     ok: bool,
-    release_task_ids: Vec<String>,
+    release_launches: Vec<HelperLaunchState>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct HelperLaunchState {
     launch_id: String,
     task_id: String,
+    generation: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -293,6 +297,7 @@ struct TaskStatusPayload {
     services: HashMap<String, String>,
     created_at_unix_ms: u64,
     updated_at_unix_ms: u64,
+    last_task_heartbeat_at_unix_ms: u64,
     last_seen_age_ms: u128,
 }
 
@@ -373,7 +378,17 @@ fn load_persisted_tasks(config: &HubConfig) -> Result<HashMap<String, TaskRecord
         format!("failed to parse hub state file {}", config.state_file.display())
     })?;
     let mut tasks = HashMap::new();
+    let now = now_unix_ms();
+    let now_instant = Instant::now();
     for task in persisted.tasks {
+        let last_task_heartbeat_at_unix_ms = if task.last_task_heartbeat_at_unix_ms == 0 {
+            task.updated_at_unix_ms
+        } else {
+            task.last_task_heartbeat_at_unix_ms
+        };
+        let elapsed_ms = now.saturating_sub(last_task_heartbeat_at_unix_ms);
+        let elapsed = Duration::from_millis(elapsed_ms);
+        let restored_last_seen_at = now_instant.checked_sub(elapsed).unwrap_or(now_instant);
         tasks.insert(
             task.task_id.clone(),
             TaskRecord {
@@ -393,9 +408,10 @@ fn load_persisted_tasks(config: &HubConfig) -> Result<HashMap<String, TaskRecord
                 routes: task.routes,
                 created_at_unix_ms: task.created_at_unix_ms,
                 updated_at_unix_ms: task.updated_at_unix_ms,
-                last_seen_at: Instant::now(),
-                claimed_by_helper_id: task.claimed_by_helper_id,
-                active_launch_id: task.active_launch_id,
+                last_task_heartbeat_at_unix_ms,
+                last_seen_at: restored_last_seen_at,
+                claimed_by_helper_id: None,
+                active_launch_id: None,
                 released: task.released,
             },
         );
@@ -431,6 +447,7 @@ fn persist_state(state: &HubState) -> Result<()> {
                 routes: task.routes.clone(),
                 created_at_unix_ms: task.created_at_unix_ms,
                 updated_at_unix_ms: task.updated_at_unix_ms,
+                last_task_heartbeat_at_unix_ms: task.last_task_heartbeat_at_unix_ms,
                 claimed_by_helper_id: task.claimed_by_helper_id.clone(),
                 active_launch_id: task.active_launch_id.clone(),
                 released: task.released,
@@ -565,6 +582,7 @@ async fn status_handler(State(state): State<SharedHubState>) -> Json<HubStatusRe
             services: task.services.clone(),
             created_at_unix_ms: task.created_at_unix_ms,
             updated_at_unix_ms: task.updated_at_unix_ms,
+            last_task_heartbeat_at_unix_ms: task.last_task_heartbeat_at_unix_ms,
             last_seen_age_ms: task.last_seen_at.elapsed().as_millis(),
         })
         .collect::<Vec<_>>();
@@ -576,6 +594,41 @@ async fn status_handler(State(state): State<SharedHubState>) -> Json<HubStatusRe
         helpers,
         tasks,
     })
+}
+
+async fn task_status_handler(
+    Path(task_id): Path<String>,
+    State(state): State<SharedHubState>,
+) -> Result<Json<TaskStatusPayload>, HubError> {
+    let mut state = state.lock().await;
+    if cleanup_stale_state(&mut state) {
+        let _ = persist_state(&state);
+    }
+    let task = state
+        .tasks
+        .get(&task_id)
+        .ok_or_else(|| HubError(eyre!("task not found: {task_id}")))?;
+    Ok(Json(TaskStatusPayload {
+        task_id: task.task_id.clone(),
+        cluster_key: task.cluster_key.clone(),
+        generation: task.generation,
+        place_id: task.place_id.clone(),
+        game_id: task.game_id.clone(),
+        owner_user: task.owner_user.clone(),
+        repo: task.repo.clone(),
+        worktree_name: task.worktree_name.clone(),
+        service_state: task.service_state.clone(),
+        accepting_launches: task.accepting_launches,
+        claimed_by_helper_id: task.claimed_by_helper_id.clone(),
+        active_launch_id: task.active_launch_id.clone(),
+        released: task.released,
+        routes: task.routes.clone(),
+        services: task.services.clone(),
+        created_at_unix_ms: task.created_at_unix_ms,
+        updated_at_unix_ms: task.updated_at_unix_ms,
+        last_task_heartbeat_at_unix_ms: task.last_task_heartbeat_at_unix_ms,
+        last_seen_age_ms: task.last_seen_at.elapsed().as_millis(),
+    }))
 }
 
 async fn create_task_handler(
@@ -615,6 +668,7 @@ async fn create_task_handler(
             routes: TaskRoutes::default(),
             created_at_unix_ms: now,
             updated_at_unix_ms: now,
+            last_task_heartbeat_at_unix_ms: now,
             last_seen_at: Instant::now(),
             claimed_by_helper_id: None,
             active_launch_id: None,
@@ -656,7 +710,9 @@ async fn recover_task_handler(
     task.accepting_launches = false;
     task.claimed_by_helper_id = None;
     task.active_launch_id = None;
-    task.updated_at_unix_ms = now_unix_ms();
+    let now = now_unix_ms();
+    task.updated_at_unix_ms = now;
+    task.last_task_heartbeat_at_unix_ms = now;
     task.last_seen_at = Instant::now();
     let response_task_id = task.task_id.clone();
     let response_generation = task.generation;
@@ -695,7 +751,9 @@ async fn task_heartbeat_handler(
     task.accepting_launches = payload.accepting_launches;
     task.routes = payload.routes;
     task.services = payload.services;
-    task.updated_at_unix_ms = now_unix_ms();
+    let now = now_unix_ms();
+    task.updated_at_unix_ms = now;
+    task.last_task_heartbeat_at_unix_ms = now;
     task.last_seen_at = Instant::now();
     persist_state(&state)?;
     Ok(Json(serde_json::json!({"ok": true})))
@@ -777,11 +835,16 @@ async fn helper_heartbeat_handler(
         persist_state(&state)?;
     }
     let now = now_unix_ms();
-    let mut release_task_ids = Vec::new();
-    let active_launches_by_task: HashMap<String, String> = payload
+    let mut release_launches = Vec::new();
+    let active_launches_by_task: HashMap<String, (String, u32)> = payload
         .active_launches
         .iter()
-        .map(|launch| (launch.task_id.clone(), launch.launch_id.clone()))
+        .map(|launch| {
+            (
+                launch.task_id.clone(),
+                (launch.launch_id.clone(), launch.generation),
+            )
+        })
         .collect();
     let mut changed = false;
 
@@ -790,15 +853,22 @@ async fn helper_heartbeat_handler(
             continue;
         }
         match active_launches_by_task.get(&task.task_id) {
-            Some(launch_id) => {
-                if task.released || task.service_state == "expired" {
-                    release_task_ids.push(task.task_id.clone());
-                    continue;
-                }
-                if task.active_launch_id.as_deref() != Some(launch_id.as_str()) {
-                    task.active_launch_id = Some(launch_id.clone());
+            Some((launch_id, generation)) => {
+                if task.released
+                    || task.service_state == "expired"
+                    || task.generation != *generation
+                    || task.active_launch_id.as_deref() != Some(launch_id.as_str())
+                {
+                    release_launches.push(HelperLaunchState {
+                        launch_id: launch_id.clone(),
+                        task_id: task.task_id.clone(),
+                        generation: *generation,
+                    });
+                    task.claimed_by_helper_id = None;
+                    task.active_launch_id = None;
                     task.updated_at_unix_ms = now;
                     changed = true;
+                    continue;
                 }
             }
             None => {
@@ -813,25 +883,26 @@ async fn helper_heartbeat_handler(
     for launch in &payload.active_launches {
         let should_release = match state.tasks.get_mut(&launch.task_id) {
             Some(task) => {
-                if task.released || task.service_state == "expired" {
+                if task.released
+                    || task.service_state == "expired"
+                    || task.generation != launch.generation
+                    || task.claimed_by_helper_id.as_deref() != Some(payload.helper_id.as_str())
+                    || task.active_launch_id.as_deref() != Some(launch.launch_id.as_str())
+                {
                     true
                 } else {
-                    if task.claimed_by_helper_id.as_deref() != Some(payload.helper_id.as_str())
-                        || task.active_launch_id.as_deref() != Some(launch.launch_id.as_str())
-                    {
-                        task.claimed_by_helper_id = Some(payload.helper_id.clone());
-                        task.active_launch_id = Some(launch.launch_id.clone());
-                        task.updated_at_unix_ms = now;
-                        changed = true;
-                    }
                     false
                 }
             }
             None => true,
         };
         if should_release {
-            if !release_task_ids.iter().any(|task_id| task_id == &launch.task_id) {
-                release_task_ids.push(launch.task_id.clone());
+            if !release_launches.iter().any(|item| item.task_id == launch.task_id && item.generation == launch.generation) {
+                release_launches.push(HelperLaunchState {
+                    launch_id: launch.launch_id.clone(),
+                    task_id: launch.task_id.clone(),
+                    generation: launch.generation,
+                });
             }
         }
     }
@@ -842,7 +913,10 @@ async fn helper_heartbeat_handler(
     helper.last_seen_at = Instant::now();
     helper.active_launches.clear();
     for launch in payload.active_launches {
-        if release_task_ids.iter().any(|task_id| task_id == &launch.task_id) {
+        if release_launches
+            .iter()
+            .any(|item| item.task_id == launch.task_id && item.generation == launch.generation)
+        {
             continue;
         }
         helper.active_launches.insert(launch.launch_id, launch.task_id);
@@ -852,7 +926,7 @@ async fn helper_heartbeat_handler(
     }
     Ok(Json(HelperHeartbeatHubResponse {
         ok: true,
-        release_task_ids,
+        release_launches,
     }))
 }
 
@@ -980,6 +1054,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/status", get(status_handler))
+        .route("/v1/tasks/{task_id}", get(task_status_handler))
         .route("/v1/tasks/create", post(create_task_handler))
         .route("/v1/tasks/recover", post(recover_task_handler))
         .route("/v1/tasks/heartbeat", post(task_heartbeat_handler))

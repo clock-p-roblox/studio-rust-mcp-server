@@ -194,6 +194,20 @@ local function findPlaceStatus(statusPayload: any, placeId: string)
 	return nil
 end
 
+local function findClaimedTask(statusPayload: any, taskId: string)
+	if type(statusPayload) ~= "table" or type(statusPayload.claimed_tasks) ~= "table" then
+		return nil
+	end
+
+	for _, taskInfo in statusPayload.claimed_tasks do
+		if type(taskInfo) == "table" and tostring(taskInfo.task_id) == taskId then
+			return taskInfo
+		end
+	end
+
+	return nil
+end
+
 local function requestJson(baseUrl: string, method: string, path: string, body: any?)
 	local request: { [string]: any } = {
 		Url = baseUrl .. path,
@@ -279,11 +293,14 @@ local currentClient: MockWebSocketService.MockWebSocketClient?
 local currentInstanceId: string? = nil
 local currentHelperBaseUrl: string? = nil
 local currentRemoteBaseUrl: string? = nil
+local currentTaskId: string? = nil
+local currentTaskGeneration: number? = nil
+local currentLaunchId: string? = nil
 local readyAnnounced = false
 local staleReconnectInFlight = false
 local currentStatusKind = "warning"
 local currentStatusMessage = "Not connected"
-local currentStatusDetail = "Connect to the local helper. The helper derives place URLs automatically from the current PlaceId."
+local currentStatusDetail = "Connect to the local helper. The helper registers this Studio with a task-scoped remote MCP route."
 local statusSections = createDefaultStatusSections()
 local statusPollToken = 0
 local connectCurrentClient = nil
@@ -338,7 +355,7 @@ subtitleLabel.Font = Enum.Font.Gotham
 subtitleLabel.TextSize = 12
 subtitleLabel.TextColor3 = Color3.fromRGB(156, 169, 181)
 subtitleLabel.TextWrapped = true
-subtitleLabel.Text = "Only the local helper port is configurable. The helper owns tokens, derives public MCP domains, and routes requests for this PlaceId."
+subtitleLabel.Text = "Only the local helper port is configurable. The helper owns tokens, resolves the claimed task, and routes requests for the active Studio task."
 subtitleLabel.Parent = header
 
 local function createCard(height: number)
@@ -416,7 +433,7 @@ local function createInput(parent: Instance, top: number, placeholder: string, v
 end
 
 local connectionCard = createCard(102)
-createCardHeader(connectionCard, "Helper Port", "The helper must be running locally. The plugin asks the helper to register this PlaceId and receive tool requests.")
+createCardHeader(connectionCard, "Helper Port", "The helper must be running locally. The plugin asks the helper to register this Studio against the claimed task and receive tool requests.")
 local helperPortInput = createInput(connectionCard, 60, DEFAULT_HELPER_PORT, currentHelperPort)
 
 local autoConnectCard = createCard(86)
@@ -720,6 +737,9 @@ local function unregisterCurrentInstance()
 	currentInstanceId = nil
 	currentHelperBaseUrl = nil
 	currentRemoteBaseUrl = nil
+	currentTaskId = nil
+	currentTaskGeneration = nil
+	currentLaunchId = nil
 end
 
 local function stopStatusPolling()
@@ -758,11 +778,14 @@ local function refreshStatusFromHelper()
 	setStatusSection("helper", "connected", "Connected", "Local helper reachable on port " .. helperPort .. ".")
 
 	if currentInstanceId ~= nil and findRegisteredInstance(statusPayload, currentInstanceId) ~= nil then
+		local taskSuffix = if currentTaskId ~= nil
+			then " for task " .. currentTaskId .. (currentTaskGeneration ~= nil and (" gen " .. tostring(currentTaskGeneration)) or "") .. "."
+			else "."
 		setStatusSection(
 			"registration",
 			"connected",
 			"Registered",
-			"Helper tracks plugin instance " .. currentInstanceId .. " for PlaceId " .. tostring(game.PlaceId) .. "."
+			"Helper tracks plugin instance " .. currentInstanceId .. " for PlaceId " .. tostring(game.PlaceId) .. taskSuffix
 		)
 	else
 		local registrationDetail = if currentInstanceId ~= nil
@@ -771,8 +794,9 @@ local function refreshStatusFromHelper()
 		setStatusSection("registration", "warning", "Missing", registrationDetail)
 	end
 
-	local placeStatus = findPlaceStatus(statusPayload, tostring(game.PlaceId))
-	if type(placeStatus) ~= "table" then
+	local claimedTask = if currentTaskId ~= nil then findClaimedTask(statusPayload, currentTaskId) else nil
+	local placeStatus = if claimedTask == nil then findPlaceStatus(statusPayload, tostring(game.PlaceId)) else nil
+	if type(claimedTask) ~= "table" and type(placeStatus) ~= "table" then
 		local remoteDetail = if currentRemoteBaseUrl ~= nil
 			then "Helper has not opened the remote MCP bridge at " .. currentRemoteBaseUrl .. "."
 			else "Helper has not opened the remote MCP bridge for this place yet."
@@ -780,22 +804,34 @@ local function refreshStatusFromHelper()
 		return
 	end
 
-	local remoteBaseUrl = if type(placeStatus.remote_base_url) == "string" and placeStatus.remote_base_url ~= ""
-		then placeStatus.remote_base_url
+	local remoteSource = if type(claimedTask) == "table" then claimedTask else placeStatus
+	if type(remoteSource.task_id) == "string" and remoteSource.task_id ~= "" then
+		currentTaskId = remoteSource.task_id
+	end
+	if type(remoteSource.generation) == "number" then
+		currentTaskGeneration = remoteSource.generation
+	end
+	if type(remoteSource.launch_id) == "string" and remoteSource.launch_id ~= "" then
+		currentLaunchId = remoteSource.launch_id
+	end
+	local remoteBaseUrl = if type(remoteSource.remote_base_url) == "string" and remoteSource.remote_base_url ~= ""
+		then remoteSource.remote_base_url
+		elseif type(remoteSource.mcp_base_url) == "string" and remoteSource.mcp_base_url ~= ""
+		then remoteSource.mcp_base_url
 		else currentRemoteBaseUrl
 	if remoteBaseUrl ~= nil then
 		currentRemoteBaseUrl = remoteBaseUrl
 	end
 
-	local remoteState = tostring(placeStatus.remote_state or "disconnected")
-	local remoteConnectionId = if type(placeStatus.remote_connection_id) == "string" and placeStatus.remote_connection_id ~= ""
-		then placeStatus.remote_connection_id
+	local remoteState = tostring(remoteSource.remote_state or "disconnected")
+	local remoteConnectionId = if type(remoteSource.remote_connection_id) == "string" and remoteSource.remote_connection_id ~= ""
+		then remoteSource.remote_connection_id
 		else nil
-	local remoteLastError = if type(placeStatus.remote_last_error) == "string" and placeStatus.remote_last_error ~= ""
-		then placeStatus.remote_last_error
+	local remoteLastError = if type(remoteSource.remote_last_error) == "string" and remoteSource.remote_last_error ~= ""
+		then remoteSource.remote_last_error
 		else nil
-	local lastReadyAge = formatAgeMs(tonumber(placeStatus.remote_last_ready_age_ms))
-	local lastServerAge = formatAgeMs(tonumber(placeStatus.remote_last_server_message_age_ms))
+	local lastReadyAge = formatAgeMs(tonumber(remoteSource.remote_last_ready_age_ms))
+	local lastServerAge = formatAgeMs(tonumber(remoteSource.remote_last_server_message_age_ms))
 
 	if remoteState == "connected" then
 		setStatusSection(
@@ -926,15 +962,32 @@ end
 
 local function connectToHelper(helperPort: string)
 	local baseUrl = helperBaseUrl(helperPort)
-	local registration = requestJson(baseUrl, "POST", "/v1/mcp/register", {
+	local registrationPayload = {
 		place_id = tostring(game.PlaceId),
-	})
+	}
+	if currentTaskId ~= nil then
+		registrationPayload.task_id = currentTaskId
+	end
+	if currentTaskGeneration ~= nil then
+		registrationPayload.generation = currentTaskGeneration
+	end
+	if currentLaunchId ~= nil then
+		registrationPayload.launch_id = currentLaunchId
+	end
+	local registration = requestJson(baseUrl, "POST", "/v1/mcp/register", registrationPayload)
 	local instanceId = registration.instance_id
 	if type(instanceId) ~= "string" or instanceId == "" then
 		error("Helper register did not return an instance_id")
 	end
 	local remoteBaseUrl = if type(registration.remote_base_url) == "string" and registration.remote_base_url ~= ""
 		then registration.remote_base_url
+		else nil
+	local taskId = if type(registration.task_id) == "string" and registration.task_id ~= ""
+		then registration.task_id
+		else nil
+	local generation = if type(registration.generation) == "number" then registration.generation else nil
+	local launchId = if type(registration.launch_id) == "string" and registration.launch_id ~= ""
+		then registration.launch_id
 		else nil
 
 	local client = MockWebSocketService:CreateClient(baseUrl)
@@ -946,11 +999,11 @@ local function connectToHelper(helperPort: string)
 			logInfo("Started local long polling against helper on port " .. helperPort)
 			setStatusSection("helper", "info", "Polling", "Started local long polling against helper on port " .. helperPort .. ".")
 			setStatusSection(
-				"registration",
-				"info",
-				"Registering",
-				"Registered place " .. tostring(game.PlaceId) .. " as helper instance " .. instanceId .. "."
-			)
+			"registration",
+			"info",
+			"Registering",
+			"Registered place " .. tostring(game.PlaceId) .. " as helper instance " .. instanceId .. ((taskId ~= nil) and (" for task " .. taskId .. ".") or ".")
+		)
 			setStatusSection(
 				"remote",
 				"info",
@@ -975,6 +1028,9 @@ local function connectToHelper(helperPort: string)
 			currentInstanceId = nil
 			currentHelperBaseUrl = nil
 			currentRemoteBaseUrl = nil
+			currentTaskId = nil
+			currentTaskGeneration = nil
+			currentLaunchId = nil
 			resetStatusSections("Stopped polling the local helper on port " .. helperPort .. ".")
 			readyAnnounced = false
 		end
@@ -1042,6 +1098,9 @@ local function connectToHelper(helperPort: string)
 	currentInstanceId = instanceId
 	currentHelperBaseUrl = baseUrl
 	currentRemoteBaseUrl = remoteBaseUrl
+	currentTaskId = taskId
+	currentTaskGeneration = generation
+	currentLaunchId = launchId
 	return client, instanceId
 end
 

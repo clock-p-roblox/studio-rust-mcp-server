@@ -102,6 +102,10 @@ struct ResolvedToken {
 
 struct PluginInstance {
     place_id: String,
+    task_id: Option<String>,
+    generation: Option<u32>,
+    launch_id: Option<String>,
+    remote_base_url: String,
     studio_pid: Option<u32>,
     last_seen_at: Instant,
     queue: VecDeque<Value>,
@@ -130,10 +134,17 @@ struct ClaimedTask {
     claimed_at: Instant,
 }
 
+fn runtime_screenshot_upload_url_for_base_url(base_url: &str) -> String {
+    format!("{}/v1/runtime-screenshots", base_url.trim_end_matches('/'))
+}
+
 #[derive(Clone)]
 struct RemoteTarget {
     connection_key: String,
     place_id: String,
+    task_id: Option<String>,
+    generation: Option<u32>,
+    launch_id: Option<String>,
     remote_base_url: String,
 }
 
@@ -150,6 +161,9 @@ struct RemoteConnectionHandle {
     sender: mpsc::UnboundedSender<RemoteOutgoingFrame>,
     remote_base_url: String,
     place_id: String,
+    task_id: Option<String>,
+    generation: Option<u32>,
+    launch_id: Option<String>,
     connection_state: RemoteConnectionState,
     connection_id: Option<String>,
     last_ready_at: Option<Instant>,
@@ -173,12 +187,18 @@ struct AppState {
 #[derive(Debug, Deserialize)]
 struct RegisterPluginRequest {
     place_id: String,
+    task_id: Option<String>,
+    generation: Option<u32>,
+    launch_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct RegisterPluginResponse {
     instance_id: String,
     place_id: String,
+    task_id: Option<String>,
+    generation: Option<u32>,
+    launch_id: Option<String>,
     remote_base_url: String,
 }
 
@@ -257,17 +277,18 @@ struct HelperHeartbeatHubRequest {
     active_launches: Vec<HelperLaunchHubPayload>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct HelperLaunchHubPayload {
     launch_id: String,
     task_id: String,
+    generation: u32,
 }
 
 #[derive(Debug, Deserialize)]
 struct HelperHeartbeatHubResponse {
     ok: bool,
     #[serde(default)]
-    release_task_ids: Vec<String>,
+    release_launches: Vec<HelperLaunchHubPayload>,
 }
 
 #[derive(Debug, Serialize)]
@@ -302,6 +323,10 @@ struct ClaimedTaskRoutes {
 struct HelperInstanceStatus {
     instance_id: String,
     place_id: String,
+    task_id: Option<String>,
+    generation: Option<u32>,
+    launch_id: Option<String>,
+    remote_base_url: String,
     studio_pid: Option<u32>,
 }
 
@@ -309,6 +334,9 @@ struct HelperInstanceStatus {
 struct HelperPlaceStatus {
     place_id: String,
     remote_base_url: String,
+    task_id: Option<String>,
+    generation: Option<u32>,
+    launch_id: Option<String>,
     registered_instance_count: usize,
     registered_instance_ids: Vec<String>,
     studio_pids: Vec<u32>,
@@ -352,11 +380,17 @@ struct ChildWindowSearch {
 struct PlaceQuery {
     #[serde(rename = "placeId")]
     place_id: String,
+    #[serde(rename = "taskId")]
+    task_id: Option<String>,
+    generation: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
 struct RojoConfigResponse {
     place_id: String,
+    task_id: Option<String>,
+    generation: Option<u32>,
+    launch_id: Option<String>,
     base_url: String,
     auth_header: String,
 }
@@ -365,6 +399,8 @@ struct RojoConfigResponse {
 struct ScreenshotQuery {
     #[serde(rename = "placeId")]
     place_id: Option<String>,
+    #[serde(rename = "taskId")]
+    task_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -376,6 +412,9 @@ struct ScreenshotResponse {
 struct RuntimeScreenshotRequest {
     #[serde(rename = "placeId", alias = "place_id")]
     place_id: Option<String>,
+    #[serde(rename = "taskId", alias = "task_id")]
+    task_id: Option<String>,
+    generation: Option<u32>,
     session_id: String,
     runtime_id: String,
     tag: Option<String>,
@@ -618,6 +657,72 @@ fn sanitize_identifier(label: &str, value: &str) -> Result<String> {
     Ok(trimmed)
 }
 
+fn maybe_sanitize_identifier(label: &str, value: Option<&str>) -> Result<Option<String>> {
+    match value {
+        Some(raw) => Ok(Some(sanitize_identifier(label, raw)?)),
+        None => Ok(None),
+    }
+}
+
+fn select_claimed_task(
+    state: &HelperState,
+    place_id: &str,
+    task_id: Option<&str>,
+    generation: Option<u32>,
+    launch_id: Option<&str>,
+) -> Result<ClaimedTask> {
+    if let Some(task_id) = task_id {
+        let task = state
+            .claimed_tasks
+            .get(task_id)
+            .ok_or_else(|| eyre!("helper has no claimed task for task_id {task_id}"))?;
+        if task.place_id != place_id {
+            return Err(eyre!(
+                "task_id {task_id} does not match place_id {place_id}"
+            ));
+        }
+        if let Some(expected_generation) = generation {
+            if task.generation != expected_generation {
+                return Err(eyre!(
+                    "task_id {task_id} generation mismatch: expected {expected_generation}, got {}",
+                    task.generation
+                ));
+            }
+        }
+        if let Some(expected_launch_id) = launch_id {
+            if task.launch_id != expected_launch_id {
+                return Err(eyre!(
+                    "task_id {task_id} launch_id mismatch: expected {expected_launch_id}, got {}",
+                    task.launch_id
+                ));
+            }
+        }
+        return Ok(task.clone());
+    }
+
+    let mut matches = state
+        .claimed_tasks
+        .values()
+        .filter(|task| task.place_id == place_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(expected_generation) = generation {
+        matches.retain(|task| task.generation == expected_generation);
+    }
+    if let Some(expected_launch_id) = launch_id {
+        matches.retain(|task| task.launch_id == expected_launch_id);
+    }
+    match matches.len() {
+        0 => Err(eyre!(
+            "helper has no claimed task for place_id {place_id}; wait for hub claim first"
+        )),
+        1 => Ok(matches.remove(0)),
+        _ => Err(eyre!(
+            "multiple claimed tasks found for place_id {place_id}; task_id is required"
+        )),
+    }
+}
+
 fn resolve_helper_id(args: &Args) -> Result<String> {
     if let Some(value) = args.helper_id.as_deref() {
         return sanitize_identifier("helper_id", value);
@@ -702,6 +807,9 @@ async fn hub_claim_task(helper: &HelperConfig) -> Result<ClaimTaskHubResponse> {
 fn validate_runtime_screenshot_upload_url(
     upload_url: &str,
     place_id: &str,
+    task_id: Option<&str>,
+    generation: Option<u32>,
+    state: &HelperState,
     helper: &HelperConfig,
 ) -> Result<String> {
     let trimmed = trim(upload_url);
@@ -709,7 +817,14 @@ fn validate_runtime_screenshot_upload_url(
         return Err(eyre!("upload_url must not be empty"));
     }
 
-    let expected = derive_runtime_screenshot_upload_url(place_id, helper);
+    let expected = match select_claimed_task(state, place_id, task_id, generation, None) {
+        Ok(task) => task
+            .runtime_log_base_url
+            .as_deref()
+            .map(runtime_screenshot_upload_url_for_base_url)
+            .ok_or_else(|| eyre!("claimed task has no runtime_log_base_url"))?,
+        Err(_) => derive_runtime_screenshot_upload_url(place_id, helper),
+    };
     if trimmed != expected {
         return Err(eyre!(
             "upload_url must match runtime screenshot sink for placeId {place_id}: {expected}"
@@ -1126,6 +1241,10 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
         .map(|(instance_id, instance)| HelperInstanceStatus {
             instance_id: instance_id.clone(),
             place_id: instance.place_id.clone(),
+            task_id: instance.task_id.clone(),
+            generation: instance.generation,
+            launch_id: instance.launch_id.clone(),
+            remote_base_url: instance.remote_base_url.clone(),
             studio_pid: instance.studio_pid,
         })
         .collect();
@@ -1180,6 +1299,17 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
     place_ids.sort();
     let mut place_statuses = Vec::with_capacity(place_ids.len());
     for place_id in place_ids {
+        let claimed_tasks_for_place = state
+            .claimed_tasks
+            .values()
+            .filter(|task| task.place_id == place_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let claimed_task = if claimed_tasks_for_place.len() == 1 {
+            claimed_tasks_for_place.into_iter().next()
+        } else {
+            None
+        };
         let mut registered_instance_ids = Vec::new();
         let mut studio_pids = Vec::new();
         for (instance_id, instance) in &state.instances {
@@ -1193,11 +1323,20 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
         registered_instance_ids.sort();
         studio_pids.sort();
         studio_pids.dedup();
-        let connection_key = place_connection_key(&place_id);
+        let connection_key = claimed_task
+            .as_ref()
+            .map(|task| task_connection_key(&task.task_id))
+            .unwrap_or_else(|| place_connection_key(&place_id));
         let remote_connection = state.remote_connections.get(&connection_key);
         place_statuses.push(HelperPlaceStatus {
-            remote_base_url: derive_public_base_url("mcp", &place_id, &app.helper),
+            remote_base_url: claimed_task
+                .as_ref()
+                .map(|task| task.mcp_base_url.clone())
+                .unwrap_or_else(|| derive_public_base_url("mcp", &place_id, &app.helper)),
             place_id: place_id.clone(),
+            task_id: claimed_task.as_ref().map(|task| task.task_id.clone()),
+            generation: claimed_task.as_ref().map(|task| task.generation),
+            launch_id: claimed_task.as_ref().map(|task| task.launch_id.clone()),
             registered_instance_count: registered_instance_ids.len(),
             registered_instance_ids,
             studio_pids,
@@ -1249,11 +1388,41 @@ async fn rojo_config_handler(
     Query(query): Query<PlaceQuery>,
 ) -> Result<Json<RojoConfigResponse>, HelperError> {
     let place_id = sanitize_place_id(&query.place_id)?;
-    let base_url = derive_public_base_url("rojo", &place_id, &app.helper);
+    let explicit_task_id = maybe_sanitize_identifier("task_id", query.task_id.as_deref())?;
     let bearer_token = app.helper.bearer_token.lock().await.clone();
-    tracing::info!(place_id, base_url, "resolved rojo config from helper");
+    if app.helper.hub_base_url.is_none() {
+        let base_url = derive_public_base_url("rojo", &place_id, &app.helper);
+        tracing::info!(place_id, base_url, "resolved legacy rojo config from helper");
+        return Ok(Json(RojoConfigResponse {
+            place_id,
+            task_id: None,
+            generation: None,
+            launch_id: None,
+            base_url,
+            auth_header: format!("Bearer {bearer_token}"),
+        }));
+    }
+    let claimed_task = {
+        let state = app.state.lock().await;
+        select_claimed_task(
+            &state,
+            &place_id,
+            explicit_task_id.as_deref(),
+            query.generation,
+            None,
+        )
+        .map_err(HelperError)?
+    };
+    let base_url = claimed_task
+        .rojo_base_url
+        .clone()
+        .ok_or_else(|| HelperError(eyre!("claimed task has no rojo_base_url")))?;
+    tracing::info!(place_id, task_id = claimed_task.task_id, generation = claimed_task.generation, launch_id = claimed_task.launch_id, base_url, "resolved rojo config from helper");
     Ok(Json(RojoConfigResponse {
         place_id,
+        task_id: Some(claimed_task.task_id),
+        generation: Some(claimed_task.generation),
+        launch_id: Some(claimed_task.launch_id),
         base_url,
         auth_header: format!("Bearer {bearer_token}"),
     }))
@@ -1266,14 +1435,37 @@ async fn mcp_register_handler(
 ) -> Result<Json<RegisterPluginResponse>, HelperError> {
     let place_id = sanitize_place_id(&payload.place_id)?;
     let instance_id = Uuid::new_v4().to_string();
-    let remote_base_url = derive_public_base_url("mcp", &place_id, &app.helper);
+    let explicit_task_id = maybe_sanitize_identifier("task_id", payload.task_id.as_deref())?;
     let studio_pid = resolve_peer_process_id_with_retry(peer_addr, app.helper.port).await?;
+    let claimed_task = if app.helper.hub_base_url.is_some() {
+        let state = app.state.lock().await;
+        Some(
+            select_claimed_task(
+                &state,
+                &place_id,
+                explicit_task_id.as_deref(),
+                payload.generation,
+                payload.launch_id.as_deref(),
+            )
+            .map_err(HelperError)?,
+        )
+    } else {
+        None
+    };
+    let remote_base_url = claimed_task
+        .as_ref()
+        .map(|task| task.mcp_base_url.clone())
+        .unwrap_or_else(|| derive_public_base_url("mcp", &place_id, &app.helper));
     {
         let mut state = app.state.lock().await;
         state.instances.insert(
             instance_id.clone(),
             PluginInstance {
                 place_id: place_id.clone(),
+                task_id: claimed_task.as_ref().map(|task| task.task_id.clone()),
+                generation: claimed_task.as_ref().map(|task| task.generation),
+                launch_id: claimed_task.as_ref().map(|task| task.launch_id.clone()),
+                remote_base_url: remote_base_url.clone(),
                 studio_pid,
                 last_seen_at: Instant::now(),
                 queue: VecDeque::new(),
@@ -1285,6 +1477,9 @@ async fn mcp_register_handler(
     tracing::info!(
         instance_id,
         place_id,
+        task_id = claimed_task.as_ref().map(|task| task.task_id.clone()),
+        generation = claimed_task.as_ref().map(|task| task.generation),
+        launch_id = claimed_task.as_ref().map(|task| task.launch_id.clone()),
         studio_pid,
         remote_base_url,
         "registered MCP plugin instance with helper"
@@ -1292,6 +1487,9 @@ async fn mcp_register_handler(
     Ok(Json(RegisterPluginResponse {
         instance_id,
         place_id,
+        task_id: claimed_task.as_ref().map(|task| task.task_id.clone()),
+        generation: claimed_task.as_ref().map(|task| task.generation),
+        launch_id: claimed_task.as_ref().map(|task| task.launch_id.clone()),
         remote_base_url,
     }))
 }
@@ -1392,7 +1590,8 @@ async fn screenshot_debug_handler(
         Some(value) => Some(sanitize_place_id(value)?),
         None => None,
     };
-    let path = take_screenshot(app, place_id.as_deref()).await?;
+    let task_id = maybe_sanitize_identifier("task_id", query.task_id.as_deref())?;
+    let path = take_screenshot(app, place_id.as_deref(), task_id.as_deref()).await?;
     Ok(Json(ScreenshotResponse { path }))
 }
 
@@ -1432,8 +1631,14 @@ fn build_active_remote_targets(app: &AppState, state: &HelperState) -> Vec<Remot
         targets.push(RemoteTarget {
             connection_key: task_connection_key(&claimed_task.task_id),
             place_id: claimed_task.place_id.clone(),
+            task_id: Some(claimed_task.task_id.clone()),
+            generation: Some(claimed_task.generation),
+            launch_id: Some(claimed_task.launch_id.clone()),
             remote_base_url: claimed_task.mcp_base_url.clone(),
         });
+    }
+    if app.helper.hub_base_url.is_some() {
+        return targets;
     }
     let mut seen_places = HashSet::new();
     for instance in state.instances.values() {
@@ -1443,6 +1648,9 @@ fn build_active_remote_targets(app: &AppState, state: &HelperState) -> Vec<Remot
         targets.push(RemoteTarget {
             connection_key: place_connection_key(&instance.place_id),
             place_id: instance.place_id.clone(),
+            task_id: instance.task_id.clone(),
+            generation: instance.generation,
+            launch_id: instance.launch_id.clone(),
             remote_base_url: derive_public_base_url("mcp", &instance.place_id, &app.helper),
         });
     }
@@ -1530,6 +1738,9 @@ fn sync_remote_connections(app: &AppState, state: &mut HelperState) {
                 sender,
                 remote_base_url: target.remote_base_url.clone(),
                 place_id: target.place_id.clone(),
+                task_id: target.task_id.clone(),
+                generation: target.generation,
+                launch_id: target.launch_id.clone(),
                 connection_state: RemoteConnectionState::Connecting,
                 connection_id: None,
                 last_ready_at: None,
@@ -1569,6 +1780,9 @@ async fn remote_ws_loop(app: AppState, target: RemoteTarget, mut stop_rx: watch:
             app.clone(),
             &target.connection_key,
             &target.place_id,
+            target.task_id.as_deref(),
+            target.generation,
+            target.launch_id.as_deref(),
             &ws_url,
             &mut stop_rx,
         )
@@ -1637,6 +1851,7 @@ async fn hub_maintenance_loop(app: AppState) {
                 .map(|task| HelperLaunchHubPayload {
                     launch_id: task.launch_id.clone(),
                     task_id: task.task_id.clone(),
+                    generation: task.generation,
                 })
                 .collect::<Vec<_>>()
         };
@@ -1646,9 +1861,18 @@ async fn hub_maintenance_loop(app: AppState) {
                 let mut state = app.state.lock().await;
                 state.hub_last_error = None;
                 state.hub_last_ready_at = Some(Instant::now());
-                for task_id in response.release_task_ids {
-                    state.claimed_tasks.remove(&task_id);
-                    state.last_remote_errors.remove(&task_connection_key(&task_id));
+                for release in response.release_launches {
+                    let should_remove = state
+                        .claimed_tasks
+                        .get(&release.task_id)
+                        .map(|task| task.generation == release.generation && task.launch_id == release.launch_id)
+                        .unwrap_or(false);
+                    if should_remove {
+                        state.claimed_tasks.remove(&release.task_id);
+                        state
+                            .last_remote_errors
+                            .remove(&task_connection_key(&release.task_id));
+                    }
                 }
                 sync_remote_connections(&app, &mut state);
             }
@@ -1790,6 +2014,9 @@ fn send_artifact_abort_message(
 async fn stream_runtime_screenshot(
     app: AppState,
     place_id: &str,
+    task_id: Option<&str>,
+    generation: Option<u32>,
+    launch_id: Option<&str>,
     args: TakeScreenshotToolArgs,
     sender: mpsc::UnboundedSender<RemoteOutgoingFrame>,
     upload_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<Result<ArtifactCommitted>>>>>,
@@ -1808,7 +2035,7 @@ async fn stream_runtime_screenshot(
         .as_deref()
         .map(|value| sanitize_identifier("tag", value))
         .transpose()?;
-    let captured = capture_screenshot_png(app, Some(place_id)).await?;
+    let captured = capture_screenshot_png(app, Some(place_id), task_id).await?;
     let upload_id = Uuid::new_v4();
     let (tx, rx) = oneshot::channel();
     upload_waiters
@@ -1824,6 +2051,9 @@ async fn stream_runtime_screenshot(
                 session_id: session_id.clone(),
                 runtime_id: runtime_id.clone(),
                 place_id: place_id.to_owned(),
+                task_id: task_id.map(ToOwned::to_owned),
+                generation,
+                launch_id: launch_id.map(ToOwned::to_owned),
                 tag: tag.clone(),
                 content_type: "image/png".to_owned(),
                 total_bytes: captured.png_bytes.len(),
@@ -1919,6 +2149,9 @@ async fn run_remote_ws_session(
     app: AppState,
     connection_key: &str,
     place_id: &str,
+    task_id: Option<&str>,
+    generation: Option<u32>,
+    launch_id: Option<&str>,
     ws_url: &str,
     stop_rx: &mut watch::Receiver<bool>,
 ) -> Result<()> {
@@ -1955,7 +2188,11 @@ async fn run_remote_ws_session(
     if out_tx
         .send(RemoteOutgoingFrame::Text(encode_remote_message(
             &HelperToServerMessage::Hello(HelperHello {
+                helper_id: app.helper.helper_id.clone(),
                 place_id: place_id.to_owned(),
+                task_id: task_id.map(ToOwned::to_owned),
+                generation,
+                launch_id: launch_id.map(ToOwned::to_owned),
                 helper_version: env!("CARGO_PKG_VERSION").to_owned(),
                 capabilities: vec![
                     "ws_tool_dispatch_v1".to_owned(),
@@ -1967,7 +2204,13 @@ async fn run_remote_ws_session(
                     state
                         .instances
                         .values()
-                        .filter(|instance| instance.place_id == place_id)
+                        .filter(|instance| {
+                            if let Some(expected_task_id) = task_id {
+                                instance.task_id.as_deref() == Some(expected_task_id)
+                            } else {
+                                instance.place_id == place_id
+                            }
+                        })
                         .count()
                 },
             }),
@@ -1992,7 +2235,13 @@ async fn run_remote_ws_session(
             _ = heartbeat.tick() => {
                 let plugin_instance_count = {
                     let state = app.state.lock().await;
-                    state.instances.values().filter(|instance| instance.place_id == place_id).count()
+                    state.instances.values().filter(|instance| {
+                        if let Some(expected_task_id) = task_id {
+                            instance.task_id.as_deref() == Some(expected_task_id)
+                        } else {
+                            instance.place_id == place_id
+                        }
+                    }).count()
                 };
                 heartbeat_count += 1;
                 last_heartbeat_sent_at = Instant::now();
@@ -2006,7 +2255,11 @@ async fn run_remote_ws_session(
                     );
                 }
                 if out_tx.send(RemoteOutgoingFrame::Text(encode_remote_message(&HelperToServerMessage::Heartbeat {
+                    helper_id: app.helper.helper_id.clone(),
                     place_id: place_id.to_owned(),
+                    task_id: task_id.map(ToOwned::to_owned),
+                    generation,
+                    launch_id: launch_id.map(ToOwned::to_owned),
                     plugin_instance_count,
                 })?)).is_err() {
                     tracing::warn!(place_id, heartbeat_count, "failed to queue helper remote websocket heartbeat");
@@ -2025,7 +2278,21 @@ async fn run_remote_ws_session(
                             note_remote_connection_activity(&mut state, connection_key);
                         }
                         match serde_json::from_str::<ServerToHelperMessage>(&text)? {
-                            ServerToHelperMessage::ReadyAck { connection_id, .. } => {
+                            ServerToHelperMessage::ReadyAck { connection_id, task_id: ack_task_id, generation: ack_generation, launch_id: ack_launch_id, .. } => {
+                                if ack_task_id != task_id.map(ToOwned::to_owned)
+                                    || ack_generation != generation
+                                    || ack_launch_id != launch_id.map(ToOwned::to_owned)
+                                {
+                                    return Err(eyre!(
+                                        "remote MCP ready ack identity mismatch: expected task={:?} generation={:?} launch={:?}, got task={:?} generation={:?} launch={:?}",
+                                        task_id,
+                                        generation,
+                                        launch_id,
+                                        ack_task_id,
+                                        ack_generation,
+                                        ack_launch_id,
+                                    ));
+                                }
                                 {
                                     let mut state = app.state.lock().await;
                                     set_remote_connection_connected(&mut state, connection_key, &connection_id);
@@ -2037,8 +2304,21 @@ async fn run_remote_ws_session(
                                 let tool_waiters = Arc::clone(&upload_waiters);
                                 let tool_app = app.clone();
                                 let tool_place = place_id.to_owned();
+                                let tool_task = task_id.map(ToOwned::to_owned);
+                                let tool_generation = generation;
+                                let tool_launch = launch_id.map(ToOwned::to_owned);
                                 tokio::spawn(async move {
-                                    let result = handle_remote_command(tool_app, &tool_place, command, tool_sender.clone(), tool_waiters, request_id.clone()).await;
+                                    let result = handle_remote_command(
+                                        tool_app,
+                                        &tool_place,
+                                        tool_task.as_deref(),
+                                        tool_generation,
+                                        tool_launch.as_deref(),
+                                        command,
+                                        tool_sender.clone(),
+                                        tool_waiters,
+                                        request_id.clone(),
+                                    ).await;
                                     let message = match result {
                                         Ok(body) => HelperToServerMessage::ToolResult { request_id, response: body },
                                         Err(error) => HelperToServerMessage::ToolError { request_id, error: error.to_string() },
@@ -2109,6 +2389,9 @@ async fn run_remote_ws_session(
 async fn handle_remote_command(
     app: AppState,
     place_id: &str,
+    task_id: Option<&str>,
+    generation: Option<u32>,
+    launch_id: Option<&str>,
     command: Value,
     sender: mpsc::UnboundedSender<RemoteOutgoingFrame>,
     upload_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<Result<ArtifactCommitted>>>>>,
@@ -2117,29 +2400,48 @@ async fn handle_remote_command(
     let (tool_name, payload) = extract_tool_name_and_args(&command)?;
     tracing::info!(
         place_id,
+        task_id,
+        generation,
+        launch_id,
         tool = tool_name,
         "helper received remote MCP command"
     );
     match tool_name.as_str() {
         "TakeScreenshot" | "take_screenshot" => {
             let args: TakeScreenshotToolArgs = serde_json::from_value(payload)?;
-            stream_runtime_screenshot(app, place_id, args, sender, upload_waiters, request_id).await
+            stream_runtime_screenshot(
+                app,
+                place_id,
+                task_id,
+                generation,
+                launch_id,
+                args,
+                sender,
+                upload_waiters,
+                request_id,
+            )
+            .await
         }
         "ReadStudioLog" | "read_studio_log" => {
             let args: ReadStudioLogArgs = serde_json::from_value(payload)?;
             Ok(serde_json::to_string(&read_studio_log(args)?)?)
         }
-        _ => forward_to_plugin(app, place_id, command).await,
+        _ => forward_to_plugin(app, place_id, task_id, command).await,
     }
 }
 
-async fn forward_to_plugin(app: AppState, place_id: &str, command: Value) -> Result<String> {
+async fn forward_to_plugin(
+    app: AppState,
+    place_id: &str,
+    task_id: Option<&str>,
+    command: Value,
+) -> Result<String> {
     let request_id = extract_command_id(&command)?;
     let (instance_id, notify) = {
         let mut state = app.state.lock().await;
         cleanup_stale_instances(&mut state.instances);
         sync_remote_connections(&app, &mut state);
-        let selected_instance_id = select_instance_for_place(place_id, &state.instances)
+        let selected_instance_id = select_instance_for_route(place_id, task_id, &state.instances)
             .ok_or_else(|| eyre!("no active Studio plugin registered for placeId {place_id}"))?;
         let instance = state
             .instances
@@ -2198,14 +2500,33 @@ fn select_instance_for_place(
         .map(|(instance_id, _)| instance_id.clone())
 }
 
+fn select_instance_for_route(
+    place_id: &str,
+    task_id: Option<&str>,
+    instances: &HashMap<String, PluginInstance>,
+) -> Option<String> {
+    if let Some(task_id) = task_id {
+        let exact = instances
+            .iter()
+            .filter(|(_, instance)| instance.task_id.as_deref() == Some(task_id))
+            .max_by_key(|(_, instance)| instance.last_seen_at)
+            .map(|(instance_id, _)| instance_id.clone());
+        if exact.is_some() {
+            return exact;
+        }
+    }
+    select_instance_for_place(place_id, instances)
+}
+
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 async fn resolve_capture_pid(
     app: &AppState,
     place_id: Option<&str>,
+    task_id: Option<&str>,
 ) -> Result<(Option<String>, u32)> {
     let state = app.state.lock().await;
     let selected = if let Some(place_id) = place_id {
-        let instance_id = select_instance_for_place(place_id, &state.instances)
+        let instance_id = select_instance_for_route(place_id, task_id, &state.instances)
             .ok_or_else(|| eyre!("no active Studio plugin registered for placeId {place_id}"))?;
         let instance = state
             .instances
@@ -2236,10 +2557,11 @@ async fn resolve_capture_pid(
 async fn capture_screenshot_png(
     app: AppState,
     place_id: Option<&str>,
+    task_id: Option<&str>,
 ) -> Result<CapturedScreenshot> {
     #[cfg(target_os = "windows")]
     {
-        let (resolved_place_id, studio_pid) = resolve_capture_pid(&app, place_id).await?;
+        let (resolved_place_id, studio_pid) = resolve_capture_pid(&app, place_id, task_id).await?;
         let (studio_hwnd, viewport_hwnd, window_title) =
             find_studio_capture_target_for_pid(studio_pid)?;
         let script_template = r#"
@@ -2360,16 +2682,17 @@ $memory.Dispose()
     {
         let _ = app;
         let _ = place_id;
+        let _ = task_id;
         Err(eyre!(
             "take_screenshot is only available on Windows helper builds"
         ))
     }
 }
 
-async fn take_screenshot(app: AppState, place_id: Option<&str>) -> Result<String> {
+async fn take_screenshot(app: AppState, place_id: Option<&str>, task_id: Option<&str>) -> Result<String> {
     #[cfg(target_os = "windows")]
     {
-        let captured = capture_screenshot_png(app, place_id).await?;
+        let captured = capture_screenshot_png(app, place_id, task_id).await?;
         let output_dir = helper_data_dir()?.join("screenshots");
         fs::create_dir_all(&output_dir)?;
         let file_name = if let Some(place_id) = captured.resolved_place_id.as_deref() {
@@ -2387,6 +2710,7 @@ async fn take_screenshot(app: AppState, place_id: Option<&str>) -> Result<String
     {
         let _ = app;
         let _ = place_id;
+        let _ = task_id;
         Err(eyre!(
             "take_screenshot is only available on Windows helper builds"
         ))
@@ -2403,15 +2727,25 @@ async fn upload_runtime_screenshot(
     };
     let session_id = sanitize_identifier("session_id", &payload.session_id)?;
     let runtime_id = sanitize_identifier("runtime_id", &payload.runtime_id)?;
+    let task_id = maybe_sanitize_identifier("task_id", payload.task_id.as_deref())?;
 
-    let captured = capture_screenshot_png(app.clone(), place_id.as_deref()).await?;
+    let captured = capture_screenshot_png(app.clone(), place_id.as_deref(), task_id.as_deref()).await?;
     let final_place_id = captured
         .resolved_place_id
         .clone()
         .or(place_id)
         .ok_or_else(|| eyre!("helper could not resolve placeId for runtime screenshot upload"))?;
-    let upload_url =
-        validate_runtime_screenshot_upload_url(&payload.upload_url, &final_place_id, &app.helper)?;
+    let upload_url = {
+        let state = app.state.lock().await;
+        validate_runtime_screenshot_upload_url(
+            &payload.upload_url,
+            &final_place_id,
+            task_id.as_deref(),
+            payload.generation,
+            &state,
+            &app.helper,
+        )?
+    };
     let sink_response = post_runtime_screenshot(
         &app.helper,
         &upload_url,
