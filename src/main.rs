@@ -63,6 +63,18 @@ struct Args {
     /// Write the bundled plugin file and exit.
     #[arg(long)]
     write_plugin: Option<PathBuf>,
+
+    /// Optional task_id metadata exposed via /status and artifact metadata.
+    #[arg(long)]
+    task_id: Option<String>,
+
+    /// Explicit workspace path metadata. Defaults to current directory.
+    #[arg(long)]
+    workspace_path: Option<PathBuf>,
+
+    /// Optional public base URL metadata exposed via /status.
+    #[arg(long)]
+    public_base_url: Option<String>,
 }
 
 #[derive(Clone)]
@@ -176,8 +188,15 @@ async fn main() -> Result<()> {
 
     tracing::info!("initialized server state");
 
-    let workspace = std::env::current_dir()?;
-    let server_state = Arc::new(Mutex::new(AppState::new(workspace)));
+    let workspace = match args.workspace_path.as_ref() {
+        Some(path) => path.clone(),
+        None => std::env::current_dir()?,
+    };
+    let server_state = Arc::new(Mutex::new(AppState::new(
+        workspace,
+        args.task_id.clone(),
+        args.public_base_url.clone(),
+    )));
     tokio::spawn(helper_health_loop(Arc::clone(&server_state)));
 
     let (close_tx, close_rx) = tokio::sync::oneshot::channel();

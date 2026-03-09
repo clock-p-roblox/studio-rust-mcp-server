@@ -63,6 +63,8 @@ pub struct RunCommandResponse {
 
 pub struct AppState {
     workspace: PathBuf,
+    task_id: Option<String>,
+    public_base_url: Option<String>,
     process_queue: VecDeque<ToolArguments>,
     output_map: HashMap<Uuid, mpsc::UnboundedSender<Result<String>>>,
     active_helper: Option<ActiveHelperConnection>,
@@ -75,6 +77,9 @@ pub type PackedState = Arc<Mutex<AppState>>;
 #[derive(Serialize)]
 pub struct StatusResponse {
     service: &'static str,
+    workspace: String,
+    task_id: Option<String>,
+    public_base_url: Option<String>,
     queued_requests: usize,
     pending_responses: usize,
     helper_connected: bool,
@@ -116,10 +121,12 @@ struct PreparedArtifactUpload {
 }
 
 impl AppState {
-    pub fn new(workspace: PathBuf) -> Self {
+    pub fn new(workspace: PathBuf, task_id: Option<String>, public_base_url: Option<String>) -> Self {
         let (trigger, waiter) = watch::channel(());
         Self {
             workspace,
+            task_id,
+            public_base_url,
             process_queue: VecDeque::new(),
             output_map: HashMap::new(),
             active_helper: None,
@@ -148,6 +155,9 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
         .map(|helper| helper.last_message_at.elapsed().as_millis());
     Json(StatusResponse {
         service: "rbx-studio-mcp",
+        workspace: state.workspace.to_string_lossy().into_owned(),
+        task_id: state.task_id.clone(),
+        public_base_url: state.public_base_url.clone(),
         queued_requests: state.process_queue.len(),
         pending_responses: state.output_map.len(),
         helper_connected,
@@ -570,6 +580,7 @@ fn ensure_session_metadata(
     workspace: &Path,
     session_id: &str,
     place_id: &str,
+    task_id: Option<&str>,
 ) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf)> {
     let artifact_dir = workspace
         .join(".clock-p")
@@ -584,6 +595,7 @@ fn ensure_session_metadata(
         let payload = serde_json::json!({
             "session_id": session_id,
             "place_id": place_id,
+            "task_id": task_id,
             "workspace": workspace.to_string_lossy(),
             "created_at_unix_ms": now_unix_ms(),
             "artifact_dir": artifact_dir.to_string_lossy(),
@@ -756,8 +768,12 @@ fn prepare_artifact_upload(
     if begin.content_type != "image/png" {
         return Err(eyre!("artifact upload only supports image/png").into());
     }
-    let (artifact_dir, _log_dir, screenshot_root, session_metadata_path) =
-        ensure_session_metadata(workspace, &session_id, &place_id)?;
+    let (artifact_dir, _log_dir, screenshot_root, session_metadata_path) = ensure_session_metadata(
+        workspace,
+        &session_id,
+        &place_id,
+        None,
+    )?;
     let screenshot_dir = screenshot_root.join(&runtime_id);
     fs::create_dir_all(&screenshot_dir)?;
     let temp_path = screenshot_dir.join(format!(".upload-{upload_id}.part"));

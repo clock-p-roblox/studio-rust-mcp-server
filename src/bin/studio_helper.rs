@@ -8,7 +8,7 @@ use clap::Parser;
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
@@ -72,16 +72,25 @@ struct Args {
     bearer_token_file: Option<PathBuf>,
     #[arg(long, default_value = DEFAULT_DOMAIN_SUFFIX)]
     domain_suffix: String,
+    #[arg(long)]
+    helper_id: Option<String>,
+    #[arg(long)]
+    hub_base_url: Option<String>,
+    #[arg(long, default_value_t = 4)]
+    capacity: usize,
 }
 
 #[derive(Clone)]
 struct HelperConfig {
     port: u16,
+    helper_id: String,
+    capacity: usize,
     user_name: String,
     bearer_token: Arc<Mutex<String>>,
     bearer_token_source: Arc<Mutex<String>>,
     bearer_token_candidates: Arc<Vec<ResolvedToken>>,
     domain_suffix: String,
+    hub_base_url: Option<String>,
     client: reqwest::Client,
 }
 
@@ -101,9 +110,31 @@ struct PluginInstance {
 
 struct HelperState {
     instances: HashMap<String, PluginInstance>,
+    claimed_tasks: HashMap<String, ClaimedTask>,
     waiting_for_plugin: HashMap<String, oneshot::Sender<PluginResponsePayload>>,
     remote_connections: HashMap<String, RemoteConnectionHandle>,
     last_remote_errors: HashMap<String, String>,
+    hub_last_error: Option<String>,
+    hub_last_ready_at: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct ClaimedTask {
+    task_id: String,
+    launch_id: String,
+    generation: u32,
+    place_id: String,
+    mcp_base_url: String,
+    rojo_base_url: Option<String>,
+    runtime_log_base_url: Option<String>,
+    claimed_at: Instant,
+}
+
+#[derive(Clone)]
+struct RemoteTarget {
+    connection_key: String,
+    place_id: String,
+    remote_base_url: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -117,6 +148,8 @@ enum RemoteConnectionState {
 struct RemoteConnectionHandle {
     stop_tx: watch::Sender<bool>,
     sender: mpsc::UnboundedSender<RemoteOutgoingFrame>,
+    remote_base_url: String,
+    place_id: String,
     connection_state: RemoteConnectionState,
     connection_id: Option<String>,
     last_ready_at: Option<Instant>,
@@ -170,12 +203,99 @@ struct PluginResponsePayload {
 #[derive(Debug, Serialize)]
 struct HelperStatusResponse {
     helper_port: u16,
+    helper_id: String,
     user_name: String,
+    capacity: usize,
+    hub_base_url: Option<String>,
+    hub_last_error: Option<String>,
+    hub_last_ready_age_ms: Option<u128>,
     active_instances: usize,
+    claimed_task_count: usize,
     active_places: Vec<String>,
+    claimed_tasks: Vec<ClaimedTaskStatus>,
     instances: Vec<HelperInstanceStatus>,
     place_statuses: Vec<HelperPlaceStatus>,
     last_remote_errors: HashMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ClaimedTaskStatus {
+    task_id: String,
+    launch_id: String,
+    generation: u32,
+    place_id: String,
+    mcp_base_url: String,
+    rojo_base_url: Option<String>,
+    runtime_log_base_url: Option<String>,
+    claimed_age_ms: u128,
+    remote_state: String,
+    remote_connection_id: Option<String>,
+    remote_last_error: Option<String>,
+    remote_last_ready_age_ms: Option<u128>,
+    remote_last_server_message_age_ms: Option<u128>,
+}
+
+#[derive(Debug, Serialize)]
+struct RegisterHelperHubRequest {
+    helper_id: String,
+    owner_user: String,
+    platform: String,
+    capacity: usize,
+    labels: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterHelperHubResponse {
+    helper_id: String,
+    heartbeat_interval_sec: u64,
+    heartbeat_timeout_sec: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct HelperHeartbeatHubRequest {
+    helper_id: String,
+    active_launches: Vec<HelperLaunchHubPayload>,
+}
+
+#[derive(Debug, Serialize)]
+struct HelperLaunchHubPayload {
+    launch_id: String,
+    task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HelperHeartbeatHubResponse {
+    ok: bool,
+    #[serde(default)]
+    release_task_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ClaimTaskHubRequest {
+    helper_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaimTaskHubResponse {
+    claimed: bool,
+    helper_id: String,
+    task: Option<ClaimedTaskHubPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaimedTaskHubPayload {
+    launch_id: String,
+    task_id: String,
+    generation: u32,
+    place_id: String,
+    routes: ClaimedTaskRoutes,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaimedTaskRoutes {
+    rojo_base_url: Option<String>,
+    mcp_base_url: Option<String>,
+    runtime_log_base_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -459,7 +579,6 @@ fn derive_runtime_screenshot_upload_url(place_id: &str, helper: &HelperConfig) -
     )
 }
 
-#[cfg(target_os = "windows")]
 fn helper_data_dir() -> Result<PathBuf> {
     if let Some(appdata) = windows_appdata_dir() {
         return Ok(appdata.join("dev.clock-p.com").join("studio-helper"));
@@ -497,6 +616,87 @@ fn sanitize_identifier(label: &str, value: &str) -> Result<String> {
         return Err(eyre!("{label} must use [A-Za-z0-9_-] only"));
     }
     Ok(trimmed)
+}
+
+fn resolve_helper_id(args: &Args) -> Result<String> {
+    if let Some(value) = args.helper_id.as_deref() {
+        return sanitize_identifier("helper_id", value);
+    }
+    let data_dir = helper_data_dir()?;
+    fs::create_dir_all(&data_dir)?;
+    let path = data_dir.join("helper-id");
+    if path.exists() {
+        let existing = trim(&fs::read_to_string(&path)?);
+        return sanitize_identifier("helper_id", &existing);
+    }
+    let generated = format!("h_{}", &Uuid::new_v4().simple().to_string()[..10]);
+    fs::write(&path, format!("{generated}\n"))?;
+    Ok(generated)
+}
+
+async fn hub_post_json<TRequest: Serialize, TResponse: DeserializeOwned>(
+    helper: &HelperConfig,
+    path: &str,
+    payload: &TRequest,
+) -> Result<TResponse> {
+    let Some(base_url) = helper.hub_base_url.as_ref() else {
+        return Err(eyre!("hub_base_url is not configured"));
+    };
+    let token = helper.bearer_token.lock().await.clone();
+    let response = helper
+        .client
+        .post(format!("{}{path}", base_url.trim_end_matches('/')))
+        .bearer_auth(token)
+        .json(payload)
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        return Err(eyre!("hub request {path} failed with {status}: {body}"));
+    }
+    Ok(serde_json::from_str(&body)?)
+}
+
+async fn hub_register_helper(helper: &HelperConfig) -> Result<RegisterHelperHubResponse> {
+    hub_post_json(
+        helper,
+        "/v1/helpers/register",
+        &RegisterHelperHubRequest {
+            helper_id: helper.helper_id.clone(),
+            owner_user: helper.user_name.clone(),
+            platform: std::env::consts::OS.to_owned(),
+            capacity: helper.capacity,
+            labels: vec![std::env::consts::ARCH.to_owned()],
+        },
+    )
+    .await
+}
+
+async fn hub_helper_heartbeat(
+    helper: &HelperConfig,
+    active_launches: Vec<HelperLaunchHubPayload>,
+) -> Result<HelperHeartbeatHubResponse> {
+    hub_post_json(
+        helper,
+        "/v1/helpers/heartbeat",
+        &HelperHeartbeatHubRequest {
+            helper_id: helper.helper_id.clone(),
+            active_launches,
+        },
+    )
+    .await
+}
+
+async fn hub_claim_task(helper: &HelperConfig) -> Result<ClaimTaskHubResponse> {
+    hub_post_json(
+        helper,
+        "/v1/helpers/claim",
+        &ClaimTaskHubRequest {
+            helper_id: helper.helper_id.clone(),
+        },
+    )
+    .await
 }
 
 fn validate_runtime_screenshot_upload_url(
@@ -912,7 +1112,13 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
     let mut state = app.state.lock().await;
     cleanup_stale_instances(&mut state.instances);
     sync_remote_connections(&app, &mut state);
-    let mut active_places: Vec<_> = state.remote_connections.keys().cloned().collect();
+    let mut active_places: Vec<_> = state
+        .instances
+        .values()
+        .map(|instance| instance.place_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     active_places.sort();
     let mut instances: Vec<_> = state
         .instances
@@ -924,6 +1130,46 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
         })
         .collect();
     instances.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
+    let mut claimed_tasks: Vec<_> = state
+        .claimed_tasks
+        .values()
+        .map(|task| {
+            let connection_key = task_connection_key(&task.task_id);
+            let remote_connection = state.remote_connections.get(&connection_key);
+            ClaimedTaskStatus {
+                task_id: task.task_id.clone(),
+                launch_id: task.launch_id.clone(),
+                generation: task.generation,
+                place_id: task.place_id.clone(),
+                mcp_base_url: task.mcp_base_url.clone(),
+                rojo_base_url: task.rojo_base_url.clone(),
+                runtime_log_base_url: task.runtime_log_base_url.clone(),
+                claimed_age_ms: task.claimed_at.elapsed().as_millis(),
+                remote_state: remote_connection
+                    .map(|connection| match connection.connection_state {
+                        RemoteConnectionState::Connecting => "connecting",
+                        RemoteConnectionState::Connected => "connected",
+                        RemoteConnectionState::Retrying => "retrying",
+                    })
+                    .unwrap_or("disconnected")
+                    .to_owned(),
+                remote_connection_id: remote_connection
+                    .and_then(|connection| connection.connection_id.clone()),
+                remote_last_error: state.last_remote_errors.get(&connection_key).cloned(),
+                remote_last_ready_age_ms: remote_connection.and_then(|connection| {
+                    connection
+                        .last_ready_at
+                        .map(|value| value.elapsed().as_millis())
+                }),
+                remote_last_server_message_age_ms: remote_connection.and_then(|connection| {
+                    connection
+                        .last_server_message_at
+                        .map(|value| value.elapsed().as_millis())
+                }),
+            }
+        })
+        .collect();
+    claimed_tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
     let mut place_ids: Vec<_> = state
         .instances
         .values()
@@ -947,7 +1193,8 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
         registered_instance_ids.sort();
         studio_pids.sort();
         studio_pids.dedup();
-        let remote_connection = state.remote_connections.get(&place_id);
+        let connection_key = place_connection_key(&place_id);
+        let remote_connection = state.remote_connections.get(&connection_key);
         place_statuses.push(HelperPlaceStatus {
             remote_base_url: derive_public_base_url("mcp", &place_id, &app.helper),
             place_id: place_id.clone(),
@@ -964,7 +1211,7 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
                 .to_owned(),
             remote_connection_id: remote_connection
                 .and_then(|connection| connection.connection_id.clone()),
-            remote_last_error: state.last_remote_errors.get(&place_id).cloned(),
+            remote_last_error: state.last_remote_errors.get(&connection_key).cloned(),
             remote_last_ready_age_ms: remote_connection.and_then(|connection| {
                 connection
                     .last_ready_at
@@ -979,9 +1226,18 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
     }
     Json(HelperStatusResponse {
         helper_port: app.helper.port,
+        helper_id: app.helper.helper_id.clone(),
         user_name: app.helper.user_name.clone(),
+        capacity: app.helper.capacity,
+        hub_base_url: app.helper.hub_base_url.clone(),
+        hub_last_error: state.hub_last_error.clone(),
+        hub_last_ready_age_ms: state
+            .hub_last_ready_at
+            .map(|value| value.elapsed().as_millis()),
         active_instances: state.instances.len(),
+        claimed_task_count: claimed_tasks.len(),
         active_places,
+        claimed_tasks,
         instances,
         place_statuses,
         last_remote_errors: state.last_remote_errors.clone(),
@@ -1154,89 +1410,126 @@ async fn read_studio_log_debug_handler(
     Ok(Json(read_studio_log(query)?))
 }
 
-fn derive_remote_helper_ws_url(place_id: &str, helper: &HelperConfig) -> String {
-    let base_url = derive_public_base_url("mcp", place_id, helper);
+fn place_connection_key(place_id: &str) -> String {
+    format!("place:{place_id}")
+}
+
+fn task_connection_key(task_id: &str) -> String {
+    format!("task:{task_id}")
+}
+
+fn derive_remote_helper_ws_url_from_base_url(remote_base_url: &str) -> String {
     format!(
         "{}{}",
-        base_url.replacen("https://", "wss://", 1),
+        remote_base_url.replacen("https://", "wss://", 1),
         HELPER_WS_PATH
     )
 }
 
-fn place_is_active(state: &HelperState, place_id: &str) -> bool {
-    state
-        .instances
-        .values()
-        .any(|instance| instance.place_id == place_id)
+fn build_active_remote_targets(app: &AppState, state: &HelperState) -> Vec<RemoteTarget> {
+    let mut targets = Vec::new();
+    for claimed_task in state.claimed_tasks.values() {
+        targets.push(RemoteTarget {
+            connection_key: task_connection_key(&claimed_task.task_id),
+            place_id: claimed_task.place_id.clone(),
+            remote_base_url: claimed_task.mcp_base_url.clone(),
+        });
+    }
+    let mut seen_places = HashSet::new();
+    for instance in state.instances.values() {
+        if !seen_places.insert(instance.place_id.clone()) {
+            continue;
+        }
+        targets.push(RemoteTarget {
+            connection_key: place_connection_key(&instance.place_id),
+            place_id: instance.place_id.clone(),
+            remote_base_url: derive_public_base_url("mcp", &instance.place_id, &app.helper),
+        });
+    }
+    targets
 }
 
-fn set_remote_connection_connecting(state: &mut HelperState, place_id: &str) {
-    if let Some(connection) = state.remote_connections.get_mut(place_id) {
+fn remote_connection_is_active(state: &HelperState, connection_key: &str) -> bool {
+    state
+        .claimed_tasks
+        .keys()
+        .any(|task_id| task_connection_key(task_id) == connection_key)
+        || state
+            .instances
+            .values()
+            .any(|instance| place_connection_key(&instance.place_id) == connection_key)
+}
+
+fn set_remote_connection_connecting(state: &mut HelperState, connection_key: &str) {
+    if let Some(connection) = state.remote_connections.get_mut(connection_key) {
         connection.connection_state = RemoteConnectionState::Connecting;
         connection.connection_id = None;
         connection.last_server_message_at = None;
     }
 }
 
-fn set_remote_connection_connected(state: &mut HelperState, place_id: &str, connection_id: &str) {
-    if let Some(connection) = state.remote_connections.get_mut(place_id) {
+fn set_remote_connection_connected(state: &mut HelperState, connection_key: &str, connection_id: &str) {
+    if let Some(connection) = state.remote_connections.get_mut(connection_key) {
         let now = Instant::now();
         connection.connection_state = RemoteConnectionState::Connected;
         connection.connection_id = Some(connection_id.to_owned());
         connection.last_ready_at = Some(now);
         connection.last_server_message_at = Some(now);
     }
-    state.last_remote_errors.remove(place_id);
+    state.last_remote_errors.remove(connection_key);
 }
 
-fn note_remote_connection_activity(state: &mut HelperState, place_id: &str) {
-    if let Some(connection) = state.remote_connections.get_mut(place_id) {
+fn note_remote_connection_activity(state: &mut HelperState, connection_key: &str) {
+    if let Some(connection) = state.remote_connections.get_mut(connection_key) {
         connection.last_server_message_at = Some(Instant::now());
     }
 }
 
-fn set_remote_connection_retrying(state: &mut HelperState, place_id: &str, error: &str) {
-    if let Some(connection) = state.remote_connections.get_mut(place_id) {
+fn set_remote_connection_retrying(state: &mut HelperState, connection_key: &str, error: &str) {
+    if let Some(connection) = state.remote_connections.get_mut(connection_key) {
         connection.connection_state = RemoteConnectionState::Retrying;
         connection.connection_id = None;
     }
     state
         .last_remote_errors
-        .insert(place_id.to_owned(), summarize_error(error));
+        .insert(connection_key.to_owned(), summarize_error(error));
 }
 
 fn sync_remote_connections(app: &AppState, state: &mut HelperState) {
-    let active_places: HashSet<String> = state
-        .instances
-        .values()
-        .map(|instance| instance.place_id.clone())
+    let active_targets = build_active_remote_targets(app, state);
+    let active_keys: HashSet<String> = active_targets
+        .iter()
+        .map(|target| target.connection_key.clone())
         .collect();
     let stale_places: Vec<String> = state
         .remote_connections
         .keys()
-        .filter(|place_id| !active_places.contains(*place_id))
+        .filter(|connection_key| !active_keys.contains(*connection_key))
         .cloned()
         .collect();
-    for place_id in stale_places {
-        if let Some(handle) = state.remote_connections.remove(&place_id) {
+    for connection_key in stale_places {
+        if let Some(handle) = state.remote_connections.remove(&connection_key) {
             let _ = handle.stop_tx.send(true);
             tracing::info!(
-                place_id,
+                connection_key,
                 "stopping helper remote websocket because plugin is gone"
             );
         }
+        state.last_remote_errors.remove(&connection_key);
     }
-    for place_id in active_places {
-        if state.remote_connections.contains_key(&place_id) {
+    for target in active_targets {
+        if state.remote_connections.contains_key(&target.connection_key) {
             continue;
         }
         let (stop_tx, stop_rx) = watch::channel(false);
         let (sender, _receiver) = mpsc::unbounded_channel::<RemoteOutgoingFrame>();
         state.remote_connections.insert(
-            place_id.clone(),
+            target.connection_key.clone(),
             RemoteConnectionHandle {
                 stop_tx,
                 sender,
+                remote_base_url: target.remote_base_url.clone(),
+                place_id: target.place_id.clone(),
                 connection_state: RemoteConnectionState::Connecting,
                 connection_id: None,
                 last_ready_at: None,
@@ -1244,16 +1537,16 @@ fn sync_remote_connections(app: &AppState, state: &mut HelperState) {
             },
         );
         let worker_app = app.clone();
-        let worker_place = place_id.clone();
+        let worker_target = target.clone();
         tokio::spawn(async move {
-            remote_ws_loop(worker_app, worker_place, stop_rx).await;
+            remote_ws_loop(worker_app, worker_target, stop_rx).await;
         });
     }
 }
 
-async fn remote_ws_loop(app: AppState, place_id: String, mut stop_rx: watch::Receiver<bool>) {
-    let ws_url = derive_remote_helper_ws_url(&place_id, &app.helper);
-    tracing::info!(place_id, ws_url, "starting helper remote websocket loop");
+async fn remote_ws_loop(app: AppState, target: RemoteTarget, mut stop_rx: watch::Receiver<bool>) {
+    let ws_url = derive_remote_helper_ws_url_from_base_url(&target.remote_base_url);
+    tracing::info!(connection_key = target.connection_key, place_id = target.place_id, ws_url, "starting helper remote websocket loop");
     loop {
         if *stop_rx.borrow() {
             break;
@@ -1261,29 +1554,37 @@ async fn remote_ws_loop(app: AppState, place_id: String, mut stop_rx: watch::Rec
         {
             let mut state = app.state.lock().await;
             cleanup_stale_instances(&mut state.instances);
-            if !place_is_active(&state, &place_id) {
-                state.remote_connections.remove(&place_id);
-                state.last_remote_errors.remove(&place_id);
+            if !remote_connection_is_active(&state, &target.connection_key) {
+                state.remote_connections.remove(&target.connection_key);
+                state.last_remote_errors.remove(&target.connection_key);
                 break;
             }
         }
 
         {
             let mut state = app.state.lock().await;
-            set_remote_connection_connecting(&mut state, &place_id);
+            set_remote_connection_connecting(&mut state, &target.connection_key);
         }
-        let result = run_remote_ws_session(app.clone(), &place_id, &ws_url, &mut stop_rx).await;
+        let result = run_remote_ws_session(
+            app.clone(),
+            &target.connection_key,
+            &target.place_id,
+            &ws_url,
+            &mut stop_rx,
+        )
+        .await;
         match result {
             Ok(()) => break,
             Err(error) => {
                 tracing::warn!(
-                    place_id,
+                    connection_key = target.connection_key,
+                    place_id = target.place_id,
                     error = summarize_error(&error.to_string()),
                     "helper remote websocket session failed"
                 );
                 let mut state = app.state.lock().await;
-                if place_is_active(&state, &place_id) {
-                    set_remote_connection_retrying(&mut state, &place_id, &error.to_string());
+                if remote_connection_is_active(&state, &target.connection_key) {
+                    set_remote_connection_retrying(&mut state, &target.connection_key, &error.to_string());
                 }
                 drop(state);
                 tokio::select! {
@@ -1299,9 +1600,109 @@ async fn remote_ws_loop(app: AppState, place_id: String, mut stop_rx: watch::Rec
         }
     }
     let mut state = app.state.lock().await;
-    state.remote_connections.remove(&place_id);
-    state.last_remote_errors.remove(&place_id);
-    tracing::info!(place_id, "stopped helper remote websocket loop");
+    state.remote_connections.remove(&target.connection_key);
+    state.last_remote_errors.remove(&target.connection_key);
+    tracing::info!(connection_key = target.connection_key, place_id = target.place_id, "stopped helper remote websocket loop");
+}
+
+async fn hub_maintenance_loop(app: AppState) {
+    if app.helper.hub_base_url.is_none() {
+        return;
+    }
+    let mut registered = false;
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        interval.tick().await;
+        if !registered {
+            match hub_register_helper(&app.helper).await {
+                Ok(_) => {
+                    registered = true;
+                    let mut state = app.state.lock().await;
+                    state.hub_last_error = None;
+                    state.hub_last_ready_at = Some(Instant::now());
+                }
+                Err(error) => {
+                    let mut state = app.state.lock().await;
+                    state.hub_last_error = Some(summarize_error(&error.to_string()));
+                    continue;
+                }
+            }
+        }
+
+        let active_launches = {
+            let state = app.state.lock().await;
+            state
+                .claimed_tasks
+                .values()
+                .map(|task| HelperLaunchHubPayload {
+                    launch_id: task.launch_id.clone(),
+                    task_id: task.task_id.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        match hub_helper_heartbeat(&app.helper, active_launches).await {
+            Ok(response) => {
+                let mut state = app.state.lock().await;
+                state.hub_last_error = None;
+                state.hub_last_ready_at = Some(Instant::now());
+                for task_id in response.release_task_ids {
+                    state.claimed_tasks.remove(&task_id);
+                    state.last_remote_errors.remove(&task_connection_key(&task_id));
+                }
+                sync_remote_connections(&app, &mut state);
+            }
+            Err(error) => {
+                let error_text = summarize_error(&error.to_string());
+                let mut state = app.state.lock().await;
+                state.hub_last_error = Some(error_text.clone());
+                if error.to_string().contains("helper not found") {
+                    registered = false;
+                }
+                continue;
+            }
+        }
+
+        let should_claim = {
+            let state = app.state.lock().await;
+            state.claimed_tasks.len() < app.helper.capacity
+        };
+        if !should_claim {
+            continue;
+        }
+        match hub_claim_task(&app.helper).await {
+            Ok(response) => {
+                if let Some(task) = response.task {
+                    let Some(mcp_base_url) = task.routes.mcp_base_url else {
+                        let mut state = app.state.lock().await;
+                        state.hub_last_error = Some("hub claimed task missing mcp_base_url".to_owned());
+                        continue;
+                    };
+                    let mut state = app.state.lock().await;
+                    state.claimed_tasks.insert(
+                        task.task_id.clone(),
+                        ClaimedTask {
+                            task_id: task.task_id.clone(),
+                            launch_id: task.launch_id,
+                            generation: task.generation,
+                            place_id: task.place_id,
+                            mcp_base_url,
+                            rojo_base_url: task.routes.rojo_base_url,
+                            runtime_log_base_url: task.routes.runtime_log_base_url,
+                            claimed_at: Instant::now(),
+                        },
+                    );
+                    state.hub_last_error = None;
+                    state.hub_last_ready_at = Some(Instant::now());
+                    sync_remote_connections(&app, &mut state);
+                }
+            }
+            Err(error) => {
+                let mut state = app.state.lock().await;
+                state.hub_last_error = Some(summarize_error(&error.to_string()));
+            }
+        }
+    }
 }
 
 async fn connect_remote_ws(
@@ -1516,6 +1917,7 @@ async fn stream_runtime_screenshot(
 
 async fn run_remote_ws_session(
     app: AppState,
+    connection_key: &str,
     place_id: &str,
     ws_url: &str,
     stop_rx: &mut watch::Receiver<bool>,
@@ -1529,11 +1931,11 @@ async fn run_remote_ws_session(
     let mut stopped_by_request = false;
     {
         let mut state = app.state.lock().await;
-        if let Some(connection) = state.remote_connections.get_mut(place_id) {
+        if let Some(connection) = state.remote_connections.get_mut(connection_key) {
             connection.sender = out_tx.clone();
         }
-        set_remote_connection_connecting(&mut state, place_id);
-        state.last_remote_errors.remove(place_id);
+        set_remote_connection_connecting(&mut state, connection_key);
+        state.last_remote_errors.remove(connection_key);
     }
     let writer_task = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
@@ -1620,15 +2022,15 @@ async fn run_remote_ws_session(
                         last_server_message_at = Instant::now();
                         {
                             let mut state = app.state.lock().await;
-                            note_remote_connection_activity(&mut state, place_id);
+                            note_remote_connection_activity(&mut state, connection_key);
                         }
                         match serde_json::from_str::<ServerToHelperMessage>(&text)? {
                             ServerToHelperMessage::ReadyAck { connection_id, .. } => {
                                 {
                                     let mut state = app.state.lock().await;
-                                    set_remote_connection_connected(&mut state, place_id, &connection_id);
+                                    set_remote_connection_connected(&mut state, connection_key, &connection_id);
                                 }
-                                tracing::info!(place_id, connection_id, "helper websocket acknowledged by MCP server");
+                                tracing::info!(connection_key, place_id, connection_id, "helper websocket acknowledged by MCP server");
                             }
                             ServerToHelperMessage::ToolCall { request_id, command } => {
                                 let tool_sender = out_tx.clone();
@@ -1665,7 +2067,7 @@ async fn run_remote_ws_session(
                         last_server_message_at = Instant::now();
                         {
                             let mut state = app.state.lock().await;
-                            note_remote_connection_activity(&mut state, place_id);
+                            note_remote_connection_activity(&mut state, connection_key);
                         }
                         let _ = out_tx.send(RemoteOutgoingFrame::Pong(payload));
                     }
@@ -1674,7 +2076,7 @@ async fn run_remote_ws_session(
                         last_server_message_at = Instant::now();
                         {
                             let mut state = app.state.lock().await;
-                            note_remote_connection_activity(&mut state, place_id);
+                            note_remote_connection_activity(&mut state, connection_key);
                         }
                     }
                 }
@@ -1689,6 +2091,7 @@ async fn run_remote_ws_session(
         )));
     }
     tracing::warn!(
+        connection_key,
         place_id,
         heartbeat_count,
         last_server_message_age_ms = last_server_message_at.elapsed().as_millis(),
@@ -2203,21 +2606,28 @@ async fn main() -> Result<()> {
         .find(|candidate| candidate.value == initial_bearer_token)
         .map(|candidate| candidate.source.clone())
         .unwrap_or_else(|| "unknown".to_owned());
+    let helper_id = resolve_helper_id(&args)?;
     let helper = HelperConfig {
         port: args.port,
+        helper_id: helper_id.clone(),
+        capacity: args.capacity,
         user_name: resolve_user_name(&args)?,
         bearer_token: Arc::new(Mutex::new(initial_bearer_token)),
         bearer_token_source: Arc::new(Mutex::new(initial_bearer_token_source)),
         bearer_token_candidates: Arc::new(bearer_token_candidates),
         domain_suffix: args.domain_suffix.clone(),
+        hub_base_url: args.hub_base_url.clone(),
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
             .build()?,
     };
     let token_source = helper.bearer_token_source.lock().await.clone();
     tracing::info!(
+        helper_id = helper.helper_id,
         user_name = helper.user_name,
         port = args.port,
+        capacity = helper.capacity,
+        hub_base_url = helper.hub_base_url,
         domain_suffix = helper.domain_suffix,
         token_source,
         "starting Studio helper"
@@ -2225,9 +2635,12 @@ async fn main() -> Result<()> {
 
     let state = Arc::new(Mutex::new(HelperState {
         instances: HashMap::new(),
+        claimed_tasks: HashMap::new(),
         waiting_for_plugin: HashMap::new(),
         remote_connections: HashMap::new(),
         last_remote_errors: HashMap::new(),
+        hub_last_error: None,
+        hub_last_ready_at: None,
     }));
 
     let app_state = AppState { helper, state };
@@ -2241,6 +2654,11 @@ async fn main() -> Result<()> {
             cleanup_stale_instances(&mut state.instances);
             sync_remote_connections(&maintenance_app, &mut state);
         }
+    });
+
+    let hub_app = app_state.clone();
+    tokio::spawn(async move {
+        hub_maintenance_loop(hub_app).await;
     });
 
     let app = Router::new()
