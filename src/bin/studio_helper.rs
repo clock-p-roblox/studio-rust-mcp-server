@@ -106,9 +106,21 @@ struct HelperState {
     last_remote_errors: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RemoteConnectionState {
+    Connecting,
+    Connected,
+    Retrying,
+}
+
 struct RemoteConnectionHandle {
     stop_tx: watch::Sender<bool>,
     sender: mpsc::UnboundedSender<RemoteOutgoingFrame>,
+    connection_state: RemoteConnectionState,
+    connection_id: Option<String>,
+    last_ready_at: Option<Instant>,
+    last_server_message_at: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -162,6 +174,7 @@ struct HelperStatusResponse {
     active_instances: usize,
     active_places: Vec<String>,
     instances: Vec<HelperInstanceStatus>,
+    place_statuses: Vec<HelperPlaceStatus>,
     last_remote_errors: HashMap<String, String>,
 }
 
@@ -170,6 +183,20 @@ struct HelperInstanceStatus {
     instance_id: String,
     place_id: String,
     studio_pid: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct HelperPlaceStatus {
+    place_id: String,
+    remote_base_url: String,
+    registered_instance_count: usize,
+    registered_instance_ids: Vec<String>,
+    studio_pids: Vec<u32>,
+    remote_state: String,
+    remote_connection_id: Option<String>,
+    remote_last_error: Option<String>,
+    remote_last_ready_age_ms: Option<u128>,
+    remote_last_server_message_age_ms: Option<u128>,
 }
 
 #[cfg(target_os = "windows")]
@@ -897,12 +924,66 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
         })
         .collect();
     instances.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
+    let mut place_ids: Vec<_> = state
+        .instances
+        .values()
+        .map(|instance| instance.place_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    place_ids.sort();
+    let mut place_statuses = Vec::with_capacity(place_ids.len());
+    for place_id in place_ids {
+        let mut registered_instance_ids = Vec::new();
+        let mut studio_pids = Vec::new();
+        for (instance_id, instance) in &state.instances {
+            if instance.place_id == place_id {
+                registered_instance_ids.push(instance_id.clone());
+                if let Some(studio_pid) = instance.studio_pid {
+                    studio_pids.push(studio_pid);
+                }
+            }
+        }
+        registered_instance_ids.sort();
+        studio_pids.sort();
+        studio_pids.dedup();
+        let remote_connection = state.remote_connections.get(&place_id);
+        place_statuses.push(HelperPlaceStatus {
+            remote_base_url: derive_public_base_url("mcp", &place_id, &app.helper),
+            place_id: place_id.clone(),
+            registered_instance_count: registered_instance_ids.len(),
+            registered_instance_ids,
+            studio_pids,
+            remote_state: remote_connection
+                .map(|connection| match connection.connection_state {
+                    RemoteConnectionState::Connecting => "connecting",
+                    RemoteConnectionState::Connected => "connected",
+                    RemoteConnectionState::Retrying => "retrying",
+                })
+                .unwrap_or("disconnected")
+                .to_owned(),
+            remote_connection_id: remote_connection
+                .and_then(|connection| connection.connection_id.clone()),
+            remote_last_error: state.last_remote_errors.get(&place_id).cloned(),
+            remote_last_ready_age_ms: remote_connection.and_then(|connection| {
+                connection
+                    .last_ready_at
+                    .map(|value| value.elapsed().as_millis())
+            }),
+            remote_last_server_message_age_ms: remote_connection.and_then(|connection| {
+                connection
+                    .last_server_message_at
+                    .map(|value| value.elapsed().as_millis())
+            }),
+        });
+    }
     Json(HelperStatusResponse {
         helper_port: app.helper.port,
         user_name: app.helper.user_name.clone(),
         active_instances: state.instances.len(),
         active_places,
         instances,
+        place_statuses,
         last_remote_errors: state.last_remote_errors.clone(),
     })
 }
@@ -1089,6 +1170,41 @@ fn place_is_active(state: &HelperState, place_id: &str) -> bool {
         .any(|instance| instance.place_id == place_id)
 }
 
+fn set_remote_connection_connecting(state: &mut HelperState, place_id: &str) {
+    if let Some(connection) = state.remote_connections.get_mut(place_id) {
+        connection.connection_state = RemoteConnectionState::Connecting;
+        connection.connection_id = None;
+        connection.last_server_message_at = None;
+    }
+}
+
+fn set_remote_connection_connected(state: &mut HelperState, place_id: &str, connection_id: &str) {
+    if let Some(connection) = state.remote_connections.get_mut(place_id) {
+        let now = Instant::now();
+        connection.connection_state = RemoteConnectionState::Connected;
+        connection.connection_id = Some(connection_id.to_owned());
+        connection.last_ready_at = Some(now);
+        connection.last_server_message_at = Some(now);
+    }
+    state.last_remote_errors.remove(place_id);
+}
+
+fn note_remote_connection_activity(state: &mut HelperState, place_id: &str) {
+    if let Some(connection) = state.remote_connections.get_mut(place_id) {
+        connection.last_server_message_at = Some(Instant::now());
+    }
+}
+
+fn set_remote_connection_retrying(state: &mut HelperState, place_id: &str, error: &str) {
+    if let Some(connection) = state.remote_connections.get_mut(place_id) {
+        connection.connection_state = RemoteConnectionState::Retrying;
+        connection.connection_id = None;
+    }
+    state
+        .last_remote_errors
+        .insert(place_id.to_owned(), summarize_error(error));
+}
+
 fn sync_remote_connections(app: &AppState, state: &mut HelperState) {
     let active_places: HashSet<String> = state
         .instances
@@ -1116,9 +1232,17 @@ fn sync_remote_connections(app: &AppState, state: &mut HelperState) {
         }
         let (stop_tx, stop_rx) = watch::channel(false);
         let (sender, _receiver) = mpsc::unbounded_channel::<RemoteOutgoingFrame>();
-        state
-            .remote_connections
-            .insert(place_id.clone(), RemoteConnectionHandle { stop_tx, sender });
+        state.remote_connections.insert(
+            place_id.clone(),
+            RemoteConnectionHandle {
+                stop_tx,
+                sender,
+                connection_state: RemoteConnectionState::Connecting,
+                connection_id: None,
+                last_ready_at: None,
+                last_server_message_at: None,
+            },
+        );
         let worker_app = app.clone();
         let worker_place = place_id.clone();
         tokio::spawn(async move {
@@ -1144,29 +1268,34 @@ async fn remote_ws_loop(app: AppState, place_id: String, mut stop_rx: watch::Rec
             }
         }
 
-        let result = run_remote_ws_session(app.clone(), &place_id, &ws_url, &mut stop_rx).await;
-        if let Err(error) = result {
-            tracing::warn!(
-                place_id,
-                error = summarize_error(&error.to_string()),
-                "helper remote websocket session failed"
-            );
+        {
             let mut state = app.state.lock().await;
-            if place_is_active(&state, &place_id) {
-                state
-                    .last_remote_errors
-                    .insert(place_id.clone(), summarize_error(&error.to_string()));
-            }
-            drop(state);
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(3)) => {}
-                changed = stop_rx.changed() => {
-                    if changed.is_ok() && *stop_rx.borrow() {
-                        break;
+            set_remote_connection_connecting(&mut state, &place_id);
+        }
+        let result = run_remote_ws_session(app.clone(), &place_id, &ws_url, &mut stop_rx).await;
+        match result {
+            Ok(()) => break,
+            Err(error) => {
+                tracing::warn!(
+                    place_id,
+                    error = summarize_error(&error.to_string()),
+                    "helper remote websocket session failed"
+                );
+                let mut state = app.state.lock().await;
+                if place_is_active(&state, &place_id) {
+                    set_remote_connection_retrying(&mut state, &place_id, &error.to_string());
+                }
+                drop(state);
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                    changed = stop_rx.changed() => {
+                        if changed.is_ok() && *stop_rx.borrow() {
+                            break;
+                        }
                     }
                 }
+                continue;
             }
-            continue;
         }
     }
     let mut state = app.state.lock().await;
@@ -1397,11 +1526,13 @@ async fn run_remote_ws_session(
     let mut last_server_message_at = Instant::now();
     let mut last_heartbeat_sent_at = Instant::now();
     let mut heartbeat_count: u64 = 0;
+    let mut stopped_by_request = false;
     {
         let mut state = app.state.lock().await;
         if let Some(connection) = state.remote_connections.get_mut(place_id) {
             connection.sender = out_tx.clone();
         }
+        set_remote_connection_connecting(&mut state, place_id);
         state.last_remote_errors.remove(place_id);
     }
     let writer_task = tokio::spawn(async move {
@@ -1452,6 +1583,7 @@ async fn run_remote_ws_session(
         tokio::select! {
             changed = stop_rx.changed() => {
                 if changed.is_ok() && *stop_rx.borrow() {
+                    stopped_by_request = true;
                     break;
                 }
             }
@@ -1486,8 +1618,16 @@ async fn run_remote_ws_session(
                 match message? {
                     WsMessage::Text(text) => {
                         last_server_message_at = Instant::now();
+                        {
+                            let mut state = app.state.lock().await;
+                            note_remote_connection_activity(&mut state, place_id);
+                        }
                         match serde_json::from_str::<ServerToHelperMessage>(&text)? {
                             ServerToHelperMessage::ReadyAck { connection_id, .. } => {
+                                {
+                                    let mut state = app.state.lock().await;
+                                    set_remote_connection_connected(&mut state, place_id, &connection_id);
+                                }
                                 tracing::info!(place_id, connection_id, "helper websocket acknowledged by MCP server");
                             }
                             ServerToHelperMessage::ToolCall { request_id, command } => {
@@ -1523,11 +1663,19 @@ async fn run_remote_ws_session(
                     }
                     WsMessage::Ping(payload) => {
                         last_server_message_at = Instant::now();
+                        {
+                            let mut state = app.state.lock().await;
+                            note_remote_connection_activity(&mut state, place_id);
+                        }
                         let _ = out_tx.send(RemoteOutgoingFrame::Pong(payload));
                     }
                     WsMessage::Close(_) => break,
                     WsMessage::Binary(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => {
                         last_server_message_at = Instant::now();
+                        {
+                            let mut state = app.state.lock().await;
+                            note_remote_connection_activity(&mut state, place_id);
+                        }
                     }
                 }
             }
@@ -1548,7 +1696,11 @@ async fn run_remote_ws_session(
         pending_upload_waiters = pending.len(),
         "helper remote websocket session ended"
     );
-    Ok(())
+    if stopped_by_request {
+        Ok(())
+    } else {
+        Err(eyre!("remote websocket session ended unexpectedly"))
+    }
 }
 
 async fn handle_remote_command(

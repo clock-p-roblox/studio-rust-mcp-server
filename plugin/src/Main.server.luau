@@ -16,6 +16,7 @@ local DEFAULT_HELPER_PORT = "44750"
 local HELPER_PORT_SETTING_KEY = "MCP-helper-port"
 local AUTO_CONNECT_SETTING_KEY = "MCP-auto-connect"
 local LOG_PREFIX = "[MCP Plugin]"
+local STATUS_POLL_INTERVAL_SECONDS = 3
 
 local STATUS_THEME = {
 	info = {
@@ -72,6 +73,40 @@ local function summarizeText(value: string?): string
 	return string.sub(value, 1, 180) .. "..."
 end
 
+local function formatAgeMs(value: number?): string?
+	if value == nil then
+		return nil
+	end
+
+	if value < 1000 then
+		return "just now"
+	end
+
+	local seconds = math.floor(value / 1000)
+	if seconds < 60 then
+		return tostring(seconds) .. "s ago"
+	end
+
+	local minutes = math.floor(seconds / 60)
+	if minutes < 60 then
+		return tostring(minutes) .. "m ago"
+	end
+
+	local hours = math.floor(minutes / 60)
+	return tostring(hours) .. "h ago"
+end
+
+local function joinSentences(parts: { string }): string
+	local filtered = {}
+	for _, part in parts do
+		if part ~= "" then
+			table.insert(filtered, part)
+		end
+	end
+
+	return table.concat(filtered, " ")
+end
+
 local function logInfo(message: string)
 	print(LOG_PREFIX, message)
 end
@@ -106,6 +141,57 @@ local function saveConnectionConfig(helperPort: string, autoConnect: boolean)
 	PluginUtils.setSettings(AUTO_CONNECT_SETTING_KEY, autoConnect)
 	logInfo("Saved helper settings for port " .. normalizedPort)
 	return normalizedPort
+end
+
+local function createDefaultStatusSections()
+	return {
+		helper = {
+			title = "Local Helper",
+			kind = "warning",
+			message = "Disconnected",
+			detail = "Connect to the local helper to start MCP routing.",
+		},
+		registration = {
+			title = "Plugin Registration",
+			kind = "warning",
+			message = "Inactive",
+			detail = "The plugin is not registered with the helper yet.",
+		},
+		remote = {
+			title = "Remote MCP",
+			kind = "warning",
+			message = "Inactive",
+			detail = "The helper has not opened a remote MCP bridge for this place.",
+		},
+	}
+end
+
+local function findRegisteredInstance(statusPayload: any, instanceId: string)
+	if type(statusPayload) ~= "table" or type(statusPayload.instances) ~= "table" then
+		return nil
+	end
+
+	for _, instance in statusPayload.instances do
+		if type(instance) == "table" and tostring(instance.instance_id) == instanceId then
+			return instance
+		end
+	end
+
+	return nil
+end
+
+local function findPlaceStatus(statusPayload: any, placeId: string)
+	if type(statusPayload) ~= "table" or type(statusPayload.place_statuses) ~= "table" then
+		return nil
+	end
+
+	for _, placeStatus in statusPayload.place_statuses do
+		if type(placeStatus) == "table" and tostring(placeStatus.place_id) == placeId then
+			return placeStatus
+		end
+	end
+
+	return nil
 end
 
 local function requestJson(baseUrl: string, method: string, path: string, body: any?)
@@ -184,7 +270,7 @@ local toolbar = plugin:CreateToolbar("MCP")
 local toggleButton = toolbar:CreateButton("MCP", "Show MCP helper connection panel", getButtonImage())
 toggleButton.ClickableWhenViewportHidden = true
 
-local widgetInfo = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 420, 300, 360, 240)
+local widgetInfo = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 420, 420, 360, 300)
 local widget = plugin:CreateDockWidgetPluginGui("MCPConnectionPanel", widgetInfo)
 widget.Title = "Studio MCP"
 
@@ -192,17 +278,25 @@ local currentHelperPort, currentAutoConnect = loadConnectionConfig()
 local currentClient: MockWebSocketService.MockWebSocketClient?
 local currentInstanceId: string? = nil
 local currentHelperBaseUrl: string? = nil
+local currentRemoteBaseUrl: string? = nil
 local readyAnnounced = false
 local staleReconnectInFlight = false
 local currentStatusKind = "warning"
 local currentStatusMessage = "Not connected"
 local currentStatusDetail = "Connect to the local helper. The helper derives place URLs automatically from the current PlaceId."
+local statusSections = createDefaultStatusSections()
+local statusPollToken = 0
 local connectCurrentClient = nil
 
-local panel = Instance.new("Frame")
+local panel = Instance.new("ScrollingFrame")
 panel.Size = UDim2.fromScale(1, 1)
 panel.BackgroundColor3 = Color3.fromRGB(15, 20, 26)
 panel.BorderSizePixel = 0
+panel.AutomaticCanvasSize = Enum.AutomaticSize.Y
+panel.CanvasSize = UDim2.fromOffset(0, 0)
+panel.ScrollBarThickness = 6
+panel.ScrollingDirection = Enum.ScrollingDirection.Y
+panel.ScrollBarImageColor3 = Color3.fromRGB(55, 68, 84)
 panel.Parent = widget
 
 local panelCorner = Instance.new("UICorner")
@@ -351,7 +445,7 @@ local autoConnectButtonCorner = Instance.new("UICorner")
 autoConnectButtonCorner.CornerRadius = UDim.new(0, 999)
 autoConnectButtonCorner.Parent = autoConnectButton
 
-local statusCard = createCard(94)
+local statusCard = createCard(244)
 
 local statusPill = Instance.new("TextLabel")
 statusPill.Position = UDim2.new(0, 14, 0, 12)
@@ -377,7 +471,7 @@ statusTitle.Parent = statusCard
 
 local statusDetail = Instance.new("TextLabel")
 statusDetail.Position = UDim2.new(0, 14, 0, 64)
-statusDetail.Size = UDim2.new(1, -28, 0, 22)
+statusDetail.Size = UDim2.new(1, -28, 0, 30)
 statusDetail.BackgroundTransparency = 1
 statusDetail.TextXAlignment = Enum.TextXAlignment.Left
 statusDetail.TextYAlignment = Enum.TextYAlignment.Top
@@ -386,6 +480,58 @@ statusDetail.TextSize = 12
 statusDetail.TextColor3 = Color3.fromRGB(156, 169, 181)
 statusDetail.TextWrapped = true
 statusDetail.Parent = statusCard
+
+local function createStatusRow(parent: Instance, top: number, title: string)
+	local row = Instance.new("Frame")
+	row.Position = UDim2.new(0, 14, 0, top)
+	row.Size = UDim2.new(1, -28, 0, 42)
+	row.BackgroundTransparency = 1
+	row.Parent = parent
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(0.44, 0, 0, 18)
+	label.BackgroundTransparency = 1
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.Font = Enum.Font.GothamSemibold
+	label.TextSize = 12
+	label.TextColor3 = Color3.fromRGB(220, 228, 235)
+	label.Text = title
+	label.Parent = row
+
+	local pill = Instance.new("TextLabel")
+	pill.AnchorPoint = Vector2.new(1, 0)
+	pill.Position = UDim2.new(1, 0, 0, 0)
+	pill.Size = UDim2.new(0, 100, 0, 20)
+	pill.BorderSizePixel = 0
+	pill.Font = Enum.Font.GothamSemibold
+	pill.TextSize = 11
+	pill.Parent = row
+
+	local pillCorner = Instance.new("UICorner")
+	pillCorner.CornerRadius = UDim.new(0, 999)
+	pillCorner.Parent = pill
+
+	local detail = Instance.new("TextLabel")
+	detail.Position = UDim2.new(0, 0, 0, 18)
+	detail.Size = UDim2.new(1, 0, 0, 24)
+	detail.BackgroundTransparency = 1
+	detail.TextXAlignment = Enum.TextXAlignment.Left
+	detail.TextYAlignment = Enum.TextYAlignment.Top
+	detail.Font = Enum.Font.Gotham
+	detail.TextSize = 11
+	detail.TextColor3 = Color3.fromRGB(156, 169, 181)
+	detail.TextWrapped = true
+	detail.Parent = row
+
+	return {
+		pill = pill,
+		detail = detail,
+	}
+end
+
+local helperStatusRow = createStatusRow(statusCard, 110, statusSections.helper.title)
+local registrationStatusRow = createStatusRow(statusCard, 152, statusSections.registration.title)
+local remoteStatusRow = createStatusRow(statusCard, 194, statusSections.remote.title)
 
 local buttonRow = Instance.new("Frame")
 buttonRow.Size = UDim2.new(1, 0, 0, 38)
@@ -428,6 +574,78 @@ local function updateAutoConnectViews()
 	autoConnectButton.TextColor3 = if currentAutoConnect then Color3.fromRGB(18, 24, 31) else Color3.fromRGB(230, 236, 241)
 end
 
+local statusRows = {
+	helper = helperStatusRow,
+	registration = registrationStatusRow,
+	remote = remoteStatusRow,
+}
+
+local function recomputeSummaryStatus()
+	local helper = statusSections.helper
+	local registration = statusSections.registration
+	local remote = statusSections.remote
+
+	if helper.kind == "error" then
+		currentStatusKind = "error"
+		currentStatusMessage = "Local helper unavailable"
+		currentStatusDetail = helper.detail
+		return
+	end
+
+	if registration.kind == "error" then
+		currentStatusKind = "error"
+		currentStatusMessage = "Plugin registration failed"
+		currentStatusDetail = registration.detail
+		return
+	end
+
+	if registration.kind == "warning" and currentClient ~= nil then
+		currentStatusKind = "warning"
+		currentStatusMessage = "Plugin registration lost"
+		currentStatusDetail = registration.detail
+		return
+	end
+
+	if remote.kind == "error" then
+		currentStatusKind = "error"
+		currentStatusMessage = "Remote MCP unavailable"
+		currentStatusDetail = remote.detail
+		return
+	end
+
+	if remote.kind == "warning" and currentClient ~= nil then
+		currentStatusKind = "warning"
+		currentStatusMessage = "Remote MCP degraded"
+		currentStatusDetail = remote.detail
+		return
+	end
+
+	if helper.kind == "connected" and registration.kind == "connected" and remote.kind == "connected" then
+		currentStatusKind = "connected"
+		currentStatusMessage = "MCP ready"
+		currentStatusDetail = remote.detail
+		return
+	end
+
+	if helper.kind == "connected" and registration.kind == "connected" then
+		currentStatusKind = "info"
+		currentStatusMessage = "Waiting for remote MCP"
+		currentStatusDetail = remote.detail
+		return
+	end
+
+	if helper.kind == "connected" then
+		currentStatusKind = "info"
+		currentStatusMessage = "Helper connected"
+		currentStatusDetail = registration.detail
+		return
+	end
+
+	currentStatusKind = helper.kind
+	currentStatusMessage = helper.message
+	currentStatusDetail = helper.detail
+end
+
 local function updateStatusViews()
 	local theme = STATUS_THEME[currentStatusKind] or STATUS_THEME.warning
 	statusPill.BackgroundColor3 = theme.background
@@ -435,6 +653,14 @@ local function updateStatusViews()
 	statusPill.Text = theme.label
 	statusTitle.Text = currentStatusMessage
 	statusDetail.Text = currentStatusDetail
+	for name, row in statusRows do
+		local section = statusSections[name]
+		local rowTheme = STATUS_THEME[section.kind] or STATUS_THEME.warning
+		row.pill.BackgroundColor3 = rowTheme.background
+		row.pill.TextColor3 = rowTheme.accent
+		row.pill.Text = section.message
+		row.detail.Text = section.detail
+	end
 	helperPortInput.Text = currentHelperPort
 	updateAutoConnectViews()
 	if currentClient ~= nil then
@@ -450,19 +676,33 @@ local function updateStatusViews()
 	end
 end
 
-local function setStatus(kind: string, message: string, detail: string?)
-	currentStatusKind = kind
-	currentStatusMessage = message
-	if detail ~= nil then
-		currentStatusDetail = detail
+local function setStatusSection(name: string, kind: string, message: string, detail: string)
+	local section = statusSections[name]
+	if section == nil then
+		return
 	end
+
+	section.kind = kind
+	section.message = message
+	section.detail = detail
+	recomputeSummaryStatus()
 	updateStatusViews()
+end
+
+local function resetStatusSections(detail: string?)
+	statusSections = createDefaultStatusSections()
+	if detail ~= nil then
+		statusSections.helper.detail = detail
+	end
+	recomputeSummaryStatus()
+	updateStatusViews()
+	return statusSections
 end
 
 local function persistCurrentInputs()
 	currentHelperPort = saveConnectionConfig(helperPortInput.Text, currentAutoConnect)
 	helperPortInput.Text = currentHelperPort
-	setStatus(currentStatusKind, currentStatusMessage, "Saved helper settings for port " .. currentHelperPort)
+	updateStatusViews()
 end
 
 local function isCurrentClient(client: MockWebSocketService.MockWebSocketClient): boolean
@@ -479,6 +719,149 @@ local function unregisterCurrentInstance()
 	end
 	currentInstanceId = nil
 	currentHelperBaseUrl = nil
+	currentRemoteBaseUrl = nil
+end
+
+local function stopStatusPolling()
+	statusPollToken = statusPollToken + 1
+end
+
+local function refreshStatusFromHelper()
+	if currentClient == nil or currentHelperBaseUrl == nil then
+		return
+	end
+
+	local ok, statusPayload = pcall(function()
+		return requestJson(currentHelperBaseUrl, "GET", "/status")
+	end)
+	if not ok then
+		local errorMessage = tostring(statusPayload)
+		setStatusSection("helper", "error", "Unavailable", summarizeText(errorMessage))
+		setStatusSection(
+			"registration",
+			"warning",
+			"Unknown",
+			"Could not confirm plugin registration while the helper status endpoint is unavailable."
+		)
+		setStatusSection(
+			"remote",
+			"warning",
+			"Unknown",
+			currentRemoteBaseUrl ~= nil
+				and ("Remote MCP status is unknown for " .. currentRemoteBaseUrl .. ".")
+				or "Remote MCP status is unknown while the helper status endpoint is unavailable."
+		)
+		return
+	end
+
+	local helperPort = tostring(statusPayload.helper_port or currentHelperPort)
+	setStatusSection("helper", "connected", "Connected", "Local helper reachable on port " .. helperPort .. ".")
+
+	if currentInstanceId ~= nil and findRegisteredInstance(statusPayload, currentInstanceId) ~= nil then
+		setStatusSection(
+			"registration",
+			"connected",
+			"Registered",
+			"Helper tracks plugin instance " .. currentInstanceId .. " for PlaceId " .. tostring(game.PlaceId) .. "."
+		)
+	else
+		local registrationDetail = if currentInstanceId ~= nil
+			then "Helper does not report plugin instance " .. currentInstanceId .. " for PlaceId " .. tostring(game.PlaceId) .. "."
+			else "The plugin has not registered an instance_id with the helper yet."
+		setStatusSection("registration", "warning", "Missing", registrationDetail)
+	end
+
+	local placeStatus = findPlaceStatus(statusPayload, tostring(game.PlaceId))
+	if type(placeStatus) ~= "table" then
+		local remoteDetail = if currentRemoteBaseUrl ~= nil
+			then "Helper has not opened the remote MCP bridge at " .. currentRemoteBaseUrl .. "."
+			else "Helper has not opened the remote MCP bridge for this place yet."
+		setStatusSection("remote", "warning", "Missing", remoteDetail)
+		return
+	end
+
+	local remoteBaseUrl = if type(placeStatus.remote_base_url) == "string" and placeStatus.remote_base_url ~= ""
+		then placeStatus.remote_base_url
+		else currentRemoteBaseUrl
+	if remoteBaseUrl ~= nil then
+		currentRemoteBaseUrl = remoteBaseUrl
+	end
+
+	local remoteState = tostring(placeStatus.remote_state or "disconnected")
+	local remoteConnectionId = if type(placeStatus.remote_connection_id) == "string" and placeStatus.remote_connection_id ~= ""
+		then placeStatus.remote_connection_id
+		else nil
+	local remoteLastError = if type(placeStatus.remote_last_error) == "string" and placeStatus.remote_last_error ~= ""
+		then placeStatus.remote_last_error
+		else nil
+	local lastReadyAge = formatAgeMs(tonumber(placeStatus.remote_last_ready_age_ms))
+	local lastServerAge = formatAgeMs(tonumber(placeStatus.remote_last_server_message_age_ms))
+
+	if remoteState == "connected" then
+		setStatusSection(
+			"remote",
+			"connected",
+			"Connected",
+			joinSentences({
+				remoteBaseUrl ~= nil and ("Remote bridge healthy at " .. remoteBaseUrl .. ".") or "",
+				remoteConnectionId ~= nil and ("Connection " .. remoteConnectionId .. ".") or "",
+				lastServerAge ~= nil and ("Last server traffic " .. lastServerAge .. ".") or "",
+			})
+		)
+		return
+	end
+
+	if remoteState == "connecting" then
+		setStatusSection(
+			"remote",
+			"info",
+			"Connecting",
+			joinSentences({
+				remoteBaseUrl ~= nil and ("Opening remote bridge at " .. remoteBaseUrl .. ".") or "",
+				lastReadyAge ~= nil and ("Last ready acknowledgement " .. lastReadyAge .. ".") or "",
+			})
+		)
+		return
+	end
+
+	if remoteState == "retrying" then
+		setStatusSection(
+			"remote",
+			"error",
+			"Retrying",
+			joinSentences({
+				remoteBaseUrl ~= nil and ("Remote bridge retrying at " .. remoteBaseUrl .. ".") or "",
+				remoteLastError ~= nil and ("Last error: " .. remoteLastError .. ".") or "",
+				lastReadyAge ~= nil and ("Last healthy acknowledgement " .. lastReadyAge .. ".") or "",
+			})
+		)
+		return
+	end
+
+	setStatusSection(
+		"remote",
+		"warning",
+		"Disconnected",
+		joinSentences({
+			remoteBaseUrl ~= nil and ("No active remote bridge at " .. remoteBaseUrl .. ".") or "",
+			remoteLastError ~= nil and ("Last error: " .. remoteLastError .. ".") or "",
+		})
+	)
+end
+
+local function startStatusPolling()
+	stopStatusPolling()
+	local token = statusPollToken
+	task.spawn(function()
+		while token == statusPollToken do
+			if currentClient == nil or currentHelperBaseUrl == nil then
+				return
+			end
+
+			refreshStatusFromHelper()
+			task.wait(STATUS_POLL_INTERVAL_SECONDS)
+		end
+	end)
 end
 
 local function handleClientStatus(kind: string, message: string)
@@ -489,18 +872,26 @@ local function handleClientStatus(kind: string, message: string)
 
 		staleReconnectInFlight = true
 		task.defer(function()
-			setStatus("info", "Reconnecting", "The helper forgot this plugin instance. Re-registering with the local helper.")
+			setStatusSection("registration", "warning", "Expired", "The helper forgot this plugin instance. Re-registering now.")
 			local connected = if connectCurrentClient ~= nil then connectCurrentClient() else false
 			staleReconnectInFlight = false
 			if not connected then
-				setStatus("error", "Failed to reconnect to helper", "The helper instance expired and the automatic re-register attempt failed.")
+				setStatusSection(
+					"registration",
+					"error",
+					"Reconnect failed",
+					"The helper instance expired and the automatic re-register attempt failed."
+				)
 			end
 		end)
 	end
 
+	local lowerMessage = string.lower(message)
+
 	if kind == "error" then
 		logWarn(message)
-		setStatus("error", "Helper request failed", message)
+		setStatusSection("helper", "error", "Error", message)
+		setStatusSection("remote", "warning", "Unknown", "Remote MCP status is unavailable while helper requests are failing.")
 		readyAnnounced = false
 		return
 	end
@@ -511,19 +902,26 @@ local function handleClientStatus(kind: string, message: string)
 			readyAnnounced = true
 		end
 		logInfo(message)
-		setStatus("connected", "Connected to helper", message)
+		setStatusSection("helper", "connected", "Connected", message)
+		refreshStatusFromHelper()
 		return
 	end
 
 	logInfo(message)
-	setStatus("info", "Waiting on helper", message)
 	if kind == "warning" then
-		if string.find(string.lower(message), "expired") then
+		if string.find(lowerMessage, "expired") then
+			setStatusSection("helper", "connected", "Connected", "Local helper responded, but the plugin registration expired.")
+			setStatusSection("registration", "warning", "Expired", message)
+			setStatusSection("remote", "warning", "Unknown", "Waiting for the plugin to re-register before remote MCP can recover.")
 			tryRecoverExpiredRegistration()
 			return
 		end
+		setStatusSection("helper", "warning", "Disconnected", message)
 		readyAnnounced = false
+		return
 	end
+
+	setStatusSection("helper", "info", "Polling", message)
 end
 
 local function connectToHelper(helperPort: string)
@@ -535,6 +933,9 @@ local function connectToHelper(helperPort: string)
 	if type(instanceId) ~= "string" or instanceId == "" then
 		error("Helper register did not return an instance_id")
 	end
+	local remoteBaseUrl = if type(registration.remote_base_url) == "string" and registration.remote_base_url ~= ""
+		then registration.remote_base_url
+		else nil
 
 	local client = MockWebSocketService:CreateClient(baseUrl)
 	client:SetReceiveEndpoint("/v1/mcp/plugin/request?instance_id=" .. instanceId)
@@ -543,18 +944,38 @@ local function connectToHelper(helperPort: string)
 	client.Opened:Connect(function()
 		if isCurrentClient(client) then
 			logInfo("Started local long polling against helper on port " .. helperPort)
-			setStatus("connected", "Connected to helper", "Registered place " .. tostring(game.PlaceId) .. " as instance " .. instanceId .. ". Waiting for tool requests.")
+			setStatusSection("helper", "info", "Polling", "Started local long polling against helper on port " .. helperPort .. ".")
+			setStatusSection(
+				"registration",
+				"info",
+				"Registering",
+				"Registered place " .. tostring(game.PlaceId) .. " as helper instance " .. instanceId .. "."
+			)
+			setStatusSection(
+				"remote",
+				"info",
+				"Checking",
+				remoteBaseUrl ~= nil
+					and ("Waiting for helper to establish the remote MCP bridge at " .. remoteBaseUrl .. ".")
+					or "Waiting for helper to establish the remote MCP bridge."
+			)
 			if not readyAnnounced then
 				logInfo("The MCP Studio plugin is ready for prompts.")
 				readyAnnounced = true
 			end
+			refreshStatusFromHelper()
 		end
 	end)
 
 	client.Closed:Connect(function()
 		if isCurrentClient(client) then
 			logWarn("Helper connection closed for port " .. helperPort)
-			setStatus("warning", "Disconnected", "Stopped polling the local helper on port " .. helperPort)
+			stopStatusPolling()
+			currentClient = nil
+			currentInstanceId = nil
+			currentHelperBaseUrl = nil
+			currentRemoteBaseUrl = nil
+			resetStatusSections("Stopped polling the local helper on port " .. helperPort .. ".")
 			readyAnnounced = false
 		end
 	end)
@@ -576,14 +997,14 @@ local function connectToHelper(helperPort: string)
 		if not decodeOk then
 			local decodeError = "Failed to decode helper request payload: " .. tostring(body)
 			logWarn(decodeError)
-			setStatus("error", "Invalid request payload", decodeError)
+			setStatusSection("registration", "error", "Invalid payload", decodeError)
 			return
 		end
 
 		if type(body) ~= "table" or body.id == nil or body.args == nil then
 			local invalidError = "Received malformed helper request payload"
 			logWarn(invalidError)
-			setStatus("error", "Malformed request payload", invalidError)
+			setStatusSection("registration", "error", "Malformed payload", invalidError)
 			return
 		end
 
@@ -610,28 +1031,31 @@ local function connectToHelper(helperPort: string)
 		local success, response = pcall(toolCallHandler, args)
 		if success then
 			sendResponseOnce(true, response)
-			setStatus("connected", "Connected to helper", "Handled tool " .. tostring(toolName))
+			setStatusSection("registration", "connected", "Registered", "Handled tool " .. tostring(toolName) .. ".")
 		else
 			local errorMessage = tostring(response)
 			sendResponseOnce(false, errorMessage)
-			setStatus("error", "Tool failed", errorMessage)
+			setStatusSection("registration", "error", "Tool failed", errorMessage)
 		end
 	end)
 
 	currentInstanceId = instanceId
 	currentHelperBaseUrl = baseUrl
+	currentRemoteBaseUrl = remoteBaseUrl
 	return client, instanceId
 end
 
 local function disconnectCurrentClient()
 	if currentClient ~= nil then
-		currentClient:Close()
+		local client = currentClient
 		currentClient = nil
+		stopStatusPolling()
+		client:Close()
 	end
 	unregisterCurrentInstance()
 	readyAnnounced = false
 	logInfo("The MCP Studio plugin is stopped.")
-	setStatus("warning", "Disconnected", "Stopped polling the local helper")
+	resetStatusSections("Stopped polling the local helper.")
 end
 
 connectCurrentClient = function()
@@ -643,7 +1067,14 @@ connectCurrentClient = function()
 	readyAnnounced = false
 	staleReconnectInFlight = false
 	logInfo("Connecting to local helper on port " .. currentHelperPort)
-	setStatus("info", "Connecting", "Registering PlaceId " .. tostring(game.PlaceId) .. " with the local helper on port " .. currentHelperPort)
+	setStatusSection(
+		"helper",
+		"info",
+		"Connecting",
+		"Registering PlaceId " .. tostring(game.PlaceId) .. " with the local helper on port " .. currentHelperPort .. "."
+	)
+	setStatusSection("registration", "info", "Waiting", "The plugin is waiting for the helper registration response.")
+	setStatusSection("remote", "warning", "Inactive", "Remote MCP will be checked after local helper registration succeeds.")
 
 	local ok, clientOrError, instanceId = pcall(function()
 		return connectToHelper(currentHelperPort)
@@ -651,13 +1082,17 @@ connectCurrentClient = function()
 	if not ok then
 		local errorMessage = tostring(clientOrError)
 		logWarn(errorMessage)
-		setStatus("error", "Failed to connect to helper", errorMessage)
+		stopStatusPolling()
+		setStatusSection("helper", "error", "Error", errorMessage)
+		setStatusSection("registration", "warning", "Inactive", "The plugin could not register because the helper connection failed.")
+		setStatusSection("remote", "warning", "Inactive", "Remote MCP is unavailable until the helper connection succeeds.")
 		return false
 	end
 
 	currentClient = clientOrError
-	setStatus("connected", "Connected to helper", "Registered helper instance " .. tostring(instanceId) .. " for PlaceId " .. tostring(game.PlaceId) .. ". Waiting for tool requests.")
-	readyAnnounced = true
+	setStatusSection("registration", "info", "Registering", "Registered helper instance " .. tostring(instanceId) .. " for PlaceId " .. tostring(game.PlaceId) .. ".")
+	startStatusPolling()
+	refreshStatusFromHelper()
 	return true
 end
 
@@ -688,7 +1123,16 @@ resetButton.MouseButton1Click:Connect(function()
 	currentAutoConnect = false
 	helperPortInput.Text = currentHelperPort
 	saveConnectionConfig(currentHelperPort, currentAutoConnect)
-	setStatus("warning", "Reset settings", "Reset helper settings to the default local port and disabled auto connect.")
+	if currentClient == nil then
+		resetStatusSections("Reset helper settings to the default local port and disabled auto connect.")
+	else
+		setStatusSection(
+			"helper",
+			statusSections.helper.kind,
+			statusSections.helper.message,
+			"Saved default helper settings. Reconnect if you want to switch the live connection to port " .. currentHelperPort .. "."
+		)
+	end
 end)
 
 connectButton.MouseButton1Click:Connect(function()
@@ -699,6 +1143,8 @@ connectButton.MouseButton1Click:Connect(function()
 	end
 end)
 
+resetStatusSections(currentStatusDetail)
+
 if currentAutoConnect then
 	task.defer(function()
 		local connected = connectCurrentClient()
@@ -707,8 +1153,6 @@ if currentAutoConnect then
 		end
 	end)
 end
-
-updateStatusViews()
 
 toggleButton.Click:Connect(function()
 	widget.Enabled = not widget.Enabled

@@ -2390,7 +2390,7 @@ dependencies = [
 
 [[package]]
 name = "rbx-studio-mcp"
-version = "0.1.0"
+version = "0.2.23"
 dependencies = [
  "axum",
  "base64 0.22.1",
