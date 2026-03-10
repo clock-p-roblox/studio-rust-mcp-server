@@ -166,14 +166,35 @@ local function createDefaultStatusSections()
 	}
 end
 
-local function findRegisteredInstance(statusPayload: any, instanceId: string)
+local function matchesTaskIdentity(payload: any, taskId: string?, generation: number?, launchId: string?)
+	if type(payload) ~= "table" then
+		return false
+	end
+	if taskId ~= nil and tostring(payload.task_id) ~= taskId then
+		return false
+	end
+	if generation ~= nil and payload.generation ~= generation then
+		return false
+	end
+	if launchId ~= nil and tostring(payload.launch_id) ~= launchId then
+		return false
+	end
+	return true
+end
+
+local function findRegisteredInstance(statusPayload: any, instanceId: string, taskId: string?, generation: number?, launchId: string?)
 	if type(statusPayload) ~= "table" or type(statusPayload.instances) ~= "table" then
 		return nil
 	end
 
 	for _, instance in statusPayload.instances do
 		if type(instance) == "table" and tostring(instance.instance_id) == instanceId then
-			return instance
+			if taskId == nil and generation == nil and launchId == nil then
+				return instance
+			end
+			if matchesTaskIdentity(instance, taskId, generation, launchId) then
+				return instance
+			end
 		end
 	end
 
@@ -194,13 +215,13 @@ local function findPlaceStatus(statusPayload: any, placeId: string)
 	return nil
 end
 
-local function findClaimedTask(statusPayload: any, taskId: string)
+local function findClaimedTask(statusPayload: any, taskId: string, generation: number?, launchId: string?)
 	if type(statusPayload) ~= "table" or type(statusPayload.claimed_tasks) ~= "table" then
 		return nil
 	end
 
 	for _, taskInfo in statusPayload.claimed_tasks do
-		if type(taskInfo) == "table" and tostring(taskInfo.task_id) == taskId then
+		if type(taskInfo) == "table" and matchesTaskIdentity(taskInfo, taskId, generation, launchId) then
 			return taskInfo
 		end
 	end
@@ -777,7 +798,10 @@ local function refreshStatusFromHelper()
 	local helperPort = tostring(statusPayload.helper_port or currentHelperPort)
 	setStatusSection("helper", "connected", "Connected", "Local helper reachable on port " .. helperPort .. ".")
 
-	if currentInstanceId ~= nil and findRegisteredInstance(statusPayload, currentInstanceId) ~= nil then
+	if
+		currentInstanceId ~= nil
+		and findRegisteredInstance(statusPayload, currentInstanceId, currentTaskId, currentTaskGeneration, currentLaunchId) ~= nil
+	then
 		local taskSuffix = if currentTaskId ~= nil
 			then " for task " .. currentTaskId .. (currentTaskGeneration ~= nil and (" gen " .. tostring(currentTaskGeneration)) or "") .. "."
 			else "."
@@ -794,8 +818,13 @@ local function refreshStatusFromHelper()
 		setStatusSection("registration", "warning", "Missing", registrationDetail)
 	end
 
-	local claimedTask = if currentTaskId ~= nil then findClaimedTask(statusPayload, currentTaskId) else nil
-	local placeStatus = if claimedTask == nil then findPlaceStatus(statusPayload, tostring(game.PlaceId)) else nil
+	local claimedTask = if currentTaskId ~= nil
+		then findClaimedTask(statusPayload, currentTaskId, currentTaskGeneration, currentLaunchId)
+		else nil
+	local allowPlaceFallback = currentTaskId == nil and currentTaskGeneration == nil and currentLaunchId == nil
+	local placeStatus = if claimedTask == nil and allowPlaceFallback
+		then findPlaceStatus(statusPayload, tostring(game.PlaceId))
+		else nil
 	if type(claimedTask) ~= "table" and type(placeStatus) ~= "table" then
 		local remoteDetail = if currentRemoteBaseUrl ~= nil
 			then "Helper has not opened the remote MCP bridge at " .. currentRemoteBaseUrl .. "."

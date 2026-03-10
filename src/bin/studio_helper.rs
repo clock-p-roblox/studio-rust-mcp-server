@@ -15,6 +15,7 @@ use std::env;
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::process::Child;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify};
@@ -76,6 +77,8 @@ struct Args {
     helper_id: Option<String>,
     #[arg(long)]
     hub_base_url: Option<String>,
+    #[arg(long)]
+    studio_path: Option<PathBuf>,
     #[arg(long, default_value_t = 4)]
     capacity: usize,
 }
@@ -91,6 +94,7 @@ struct HelperConfig {
     bearer_token_candidates: Arc<Vec<ResolvedToken>>,
     domain_suffix: String,
     hub_base_url: Option<String>,
+    studio_path: Option<PathBuf>,
     client: reqwest::Client,
 }
 
@@ -115,6 +119,7 @@ struct PluginInstance {
 struct HelperState {
     instances: HashMap<String, PluginInstance>,
     claimed_tasks: HashMap<String, ClaimedTask>,
+    launch_processes: HashMap<String, LaunchProcessRecord>,
     waiting_for_plugin: HashMap<String, oneshot::Sender<PluginResponsePayload>>,
     remote_connections: HashMap<String, RemoteConnectionHandle>,
     last_remote_errors: HashMap<String, String>,
@@ -128,10 +133,30 @@ struct ClaimedTask {
     launch_id: String,
     generation: u32,
     place_id: String,
+    game_id: Option<String>,
     mcp_base_url: String,
     rojo_base_url: Option<String>,
     runtime_log_base_url: Option<String>,
     claimed_at: Instant,
+}
+
+struct LaunchProcessRecord {
+    task_id: String,
+    launch_id: String,
+    generation: u32,
+    place_id: String,
+    game_id: Option<String>,
+    studio_pid: u32,
+    launched_by_helper: bool,
+    child: Option<Child>,
+}
+
+struct PendingLaunchTermination {
+    task_id: String,
+    launch_id: String,
+    generation: u32,
+    studio_pid: u32,
+    child: Child,
 }
 
 fn runtime_screenshot_upload_url_for_base_url(base_url: &str) -> String {
@@ -233,6 +258,7 @@ struct HelperStatusResponse {
     claimed_task_count: usize,
     active_places: Vec<String>,
     claimed_tasks: Vec<ClaimedTaskStatus>,
+    launched_studios: Vec<LaunchProcessStatus>,
     instances: Vec<HelperInstanceStatus>,
     place_statuses: Vec<HelperPlaceStatus>,
     last_remote_errors: HashMap<String, String>,
@@ -244,15 +270,29 @@ struct ClaimedTaskStatus {
     launch_id: String,
     generation: u32,
     place_id: String,
+    game_id: Option<String>,
     mcp_base_url: String,
     rojo_base_url: Option<String>,
     runtime_log_base_url: Option<String>,
+    studio_pid: Option<u32>,
+    launched_by_helper: bool,
     claimed_age_ms: u128,
     remote_state: String,
     remote_connection_id: Option<String>,
     remote_last_error: Option<String>,
     remote_last_ready_age_ms: Option<u128>,
     remote_last_server_message_age_ms: Option<u128>,
+}
+
+#[derive(Debug, Serialize)]
+struct LaunchProcessStatus {
+    task_id: String,
+    launch_id: String,
+    generation: u32,
+    place_id: String,
+    game_id: Option<String>,
+    studio_pid: u32,
+    launched_by_helper: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -309,6 +349,7 @@ struct ClaimedTaskHubPayload {
     task_id: String,
     generation: u32,
     place_id: String,
+    game_id: Option<String>,
     routes: ClaimedTaskRoutes,
 }
 
@@ -383,6 +424,8 @@ struct PlaceQuery {
     #[serde(rename = "taskId")]
     task_id: Option<String>,
     generation: Option<u32>,
+    #[serde(rename = "launchId")]
+    launch_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -401,6 +444,9 @@ struct ScreenshotQuery {
     place_id: Option<String>,
     #[serde(rename = "taskId")]
     task_id: Option<String>,
+    generation: Option<u32>,
+    #[serde(rename = "launchId")]
+    launch_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -415,6 +461,8 @@ struct RuntimeScreenshotRequest {
     #[serde(rename = "taskId", alias = "task_id")]
     task_id: Option<String>,
     generation: Option<u32>,
+    #[serde(rename = "launchId", alias = "launch_id")]
+    launch_id: Option<String>,
     session_id: String,
     runtime_id: String,
     tag: Option<String>,
@@ -637,6 +685,99 @@ fn now_stamp() -> String {
     millis.to_string()
 }
 
+#[cfg(target_os = "windows")]
+fn resolve_studio_path(helper: &HelperConfig) -> Result<PathBuf> {
+    if let Some(path) = helper.studio_path.as_ref() {
+        if path.is_file() {
+            return Ok(path.clone());
+        }
+        return Err(eyre!(
+            "configured studio_path does not exist: {}",
+            path.display()
+        ));
+    }
+    if let Some(path) = env::var_os("CLOCK_P_STUDIO_PATH").map(PathBuf::from) {
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(eyre!(
+            "CLOCK_P_STUDIO_PATH does not exist: {}",
+            path.display()
+        ));
+    }
+    let versions_root = env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|path| path.join("Roblox").join("Versions"))
+        .ok_or_else(|| eyre!("cannot resolve LOCALAPPDATA for Studio discovery"))?;
+    let entries = fs::read_dir(&versions_root).wrap_err_with(|| {
+        format!(
+            "cannot read Roblox Studio versions directory: {}",
+            versions_root.display()
+        )
+    })?;
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let candidate = entry.path().join("RobloxStudioBeta.exe");
+        if !candidate.is_file() {
+            continue;
+        }
+        let modified = candidate
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH);
+        candidates.push((modified, candidate));
+    }
+    candidates.sort_by_key(|(modified, _)| *modified);
+    candidates.pop().map(|(_, path)| path).ok_or_else(|| {
+        eyre!(
+            "could not locate RobloxStudioBeta.exe under {}",
+            versions_root.display()
+        )
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn launch_studio_for_claim(
+    helper: &HelperConfig,
+    task: &ClaimedTask,
+) -> Result<LaunchProcessRecord> {
+    let studio_path = resolve_studio_path(helper)?;
+    let mut command = std::process::Command::new(&studio_path);
+    command.arg("-task").arg("EditPlace");
+    command.arg("-placeId").arg(&task.place_id);
+    if let Some(game_id) = task.game_id.as_deref() {
+        command.arg("-universeId").arg(game_id);
+    }
+    if let Some(parent) = studio_path.parent() {
+        command.current_dir(parent);
+    }
+    let child = command
+        .spawn()
+        .wrap_err_with(|| format!("failed to launch Studio at {}", studio_path.display()))?;
+    let studio_pid = child.id();
+    tracing::info!(
+        task_id = task.task_id.as_str(),
+        generation = task.generation,
+        launch_id = task.launch_id.as_str(),
+        place_id = task.place_id.as_str(),
+        game_id = task.game_id.as_deref(),
+        studio_pid,
+        studio_path = %studio_path.display(),
+        "launched Roblox Studio for claimed task"
+    );
+    Ok(LaunchProcessRecord {
+        task_id: task.task_id.clone(),
+        launch_id: task.launch_id.clone(),
+        generation: task.generation,
+        place_id: task.place_id.clone(),
+        game_id: task.game_id.clone(),
+        studio_pid,
+        launched_by_helper: true,
+        child: Some(child),
+    })
+}
+
 fn sanitize_place_id(value: &str) -> Result<String> {
     let trimmed = trim(value);
     if trimmed.is_empty() || !trimmed.chars().all(|ch| ch.is_ascii_digit()) {
@@ -720,6 +861,297 @@ fn select_claimed_task(
         _ => Err(eyre!(
             "multiple claimed tasks found for place_id {place_id}; task_id is required"
         )),
+    }
+}
+
+fn route_identity_matches(
+    instance: &PluginInstance,
+    task_id: Option<&str>,
+    generation: Option<u32>,
+    launch_id: Option<&str>,
+) -> bool {
+    if let Some(expected_task_id) = task_id {
+        if instance.task_id.as_deref() != Some(expected_task_id) {
+            return false;
+        }
+    }
+    if let Some(expected_generation) = generation {
+        if instance.generation != Some(expected_generation) {
+            return false;
+        }
+    }
+    if let Some(expected_launch_id) = launch_id {
+        if instance.launch_id.as_deref() != Some(expected_launch_id) {
+            return false;
+        }
+    }
+    true
+}
+
+fn select_claimed_task_for_pid(
+    state: &HelperState,
+    studio_pid: u32,
+    place_id: &str,
+) -> Option<ClaimedTask> {
+    let task_id = state
+        .launch_processes
+        .values()
+        .find(|launch| launch.studio_pid == studio_pid)
+        .map(|launch| launch.task_id.clone())?;
+    let task = state.claimed_tasks.get(&task_id)?;
+    if task.place_id != place_id {
+        return None;
+    }
+    Some(task.clone())
+}
+
+fn resolve_claimed_task_for_request(
+    state: &HelperState,
+    place_id: &str,
+    task_id: Option<&str>,
+    generation: Option<u32>,
+    launch_id: Option<&str>,
+    studio_pid: Option<u32>,
+) -> Result<ClaimedTask> {
+    if let Some(studio_pid) = studio_pid {
+        if let Some(task) = select_claimed_task_for_pid(state, studio_pid, place_id) {
+            return Ok(task);
+        }
+    }
+    if task_id.is_none() && generation.is_none() && launch_id.is_none() {
+        return Err(eyre!(
+            "helper could not map Studio for place_id {place_id} to a claimed launch; task_id, generation, and launch_id are required unless the Studio pid was launched by helper"
+        ));
+    }
+    select_claimed_task(state, place_id, task_id, generation, launch_id)
+}
+
+fn bind_launch_process_to_pid(
+    state: &mut HelperState,
+    task: &ClaimedTask,
+    studio_pid: u32,
+) -> Result<()> {
+    if let Some(existing) = state.launch_processes.get_mut(&task.task_id) {
+        if existing.generation != task.generation || existing.launch_id != task.launch_id {
+            return Err(eyre!(
+                "launch process identity mismatch for task {}: expected gen {} launch {}, got gen {} launch {}",
+                task.task_id,
+                task.generation,
+                task.launch_id,
+                existing.generation,
+                existing.launch_id
+            ));
+        }
+        if existing.studio_pid != studio_pid {
+            if existing.launched_by_helper {
+                return Err(eyre!(
+                    "helper-launched Studio pid mismatch for task {}: expected {}, got {}",
+                    task.task_id,
+                    existing.studio_pid,
+                    studio_pid
+                ));
+            }
+            existing.studio_pid = studio_pid;
+        }
+        return Ok(());
+    }
+    state.launch_processes.insert(
+        task.task_id.clone(),
+        LaunchProcessRecord {
+            task_id: task.task_id.clone(),
+            launch_id: task.launch_id.clone(),
+            generation: task.generation,
+            place_id: task.place_id.clone(),
+            game_id: task.game_id.clone(),
+            studio_pid,
+            launched_by_helper: false,
+            child: None,
+        },
+    );
+    Ok(())
+}
+
+fn remove_instances_for_claimed_task(
+    state: &mut HelperState,
+    task_id: &str,
+    generation: u32,
+    launch_id: &str,
+) {
+    state.instances.retain(|instance_id, instance| {
+        let keep =
+            !route_identity_matches(instance, Some(task_id), Some(generation), Some(launch_id));
+        if !keep {
+            tracing::info!(
+                instance_id,
+                task_id,
+                generation,
+                launch_id,
+                "dropping plugin instance for released claimed task"
+            );
+        }
+        keep
+    });
+}
+
+fn release_claimed_task(
+    state: &mut HelperState,
+    task_id: &str,
+    generation: u32,
+    launch_id: &str,
+    terminate_helper_spawned: bool,
+    reason: &str,
+) -> Option<PendingLaunchTermination> {
+    let should_remove = state
+        .claimed_tasks
+        .get(task_id)
+        .map(|task| task.generation == generation && task.launch_id == launch_id)
+        .unwrap_or(false);
+    if !should_remove {
+        return None;
+    }
+
+    let remove_launch_process = state
+        .launch_processes
+        .get(task_id)
+        .map(|launch| launch.generation == generation && launch.launch_id == launch_id)
+        .unwrap_or(false);
+    let pending_termination = if remove_launch_process {
+        state
+            .launch_processes
+            .remove(task_id)
+            .and_then(|mut launch| {
+                if terminate_helper_spawned && launch.launched_by_helper {
+                    launch.child.take().map(|child| PendingLaunchTermination {
+                        task_id: launch.task_id,
+                        launch_id: launch.launch_id,
+                        generation: launch.generation,
+                        studio_pid: launch.studio_pid,
+                        child,
+                    })
+                } else {
+                    None
+                }
+            })
+    } else {
+        None
+    };
+
+    remove_instances_for_claimed_task(state, task_id, generation, launch_id);
+    state.claimed_tasks.remove(task_id);
+    state
+        .last_remote_errors
+        .remove(&task_connection_key(task_id, generation, launch_id));
+    tracing::info!(
+        task_id,
+        generation,
+        launch_id,
+        reason,
+        "released claimed task from helper state"
+    );
+    pending_termination
+}
+
+async fn terminate_pending_launch_termination(pending: PendingLaunchTermination) {
+    let PendingLaunchTermination {
+        task_id,
+        launch_id,
+        generation,
+        studio_pid,
+        mut child,
+    } = pending;
+    let task_id_for_join = task_id.clone();
+    let launch_id_for_join = launch_id.clone();
+    match tokio::task::spawn_blocking(move || {
+        if let Err(error) = child.kill() {
+            tracing::warn!(
+                task_id,
+                generation,
+                launch_id,
+                studio_pid,
+                error = summarize_error(&error.to_string()),
+                "failed to terminate helper-launched Studio during claim release"
+            );
+            return;
+        }
+        tracing::info!(
+            task_id,
+            generation,
+            launch_id,
+            studio_pid,
+            "terminated helper-launched Studio during claim release"
+        );
+        if let Err(error) = child.wait() {
+            tracing::warn!(
+                task_id,
+                generation,
+                launch_id,
+                studio_pid,
+                error = summarize_error(&error.to_string()),
+                "failed to reap helper-launched Studio after claim release"
+            );
+        }
+    })
+    .await
+    {
+        Ok(()) => {}
+        Err(error) => {
+            tracing::warn!(
+                task_id = task_id_for_join,
+                generation,
+                launch_id = launch_id_for_join,
+                studio_pid,
+                error = summarize_error(&error.to_string()),
+                "helper-launched Studio termination task panicked"
+            );
+        }
+    }
+}
+
+fn reconcile_launch_processes(state: &mut HelperState) {
+    let mut exited = Vec::new();
+    for (task_id, launch) in state.launch_processes.iter_mut() {
+        let Some(child) = launch.child.as_mut() else {
+            continue;
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => exited.push((
+                task_id.clone(),
+                launch.generation,
+                launch.launch_id.clone(),
+                launch.studio_pid,
+                status.to_string(),
+            )),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    task_id,
+                    generation = launch.generation,
+                    launch_id = launch.launch_id,
+                    studio_pid = launch.studio_pid,
+                    error = summarize_error(&error.to_string()),
+                    "failed to poll helper-launched Studio process"
+                );
+            }
+        }
+    }
+
+    for (task_id, generation, launch_id, studio_pid, status) in exited {
+        tracing::warn!(
+            task_id,
+            generation,
+            launch_id,
+            studio_pid,
+            exit_status = status,
+            "helper-launched Studio exited"
+        );
+        let _ = release_claimed_task(
+            state,
+            &task_id,
+            generation,
+            &launch_id,
+            false,
+            "helper-launched Studio exited",
+        );
     }
 }
 
@@ -1097,7 +1529,13 @@ async fn resolve_peer_process_id_with_retry(
     helper_port: u16,
 ) -> Result<Option<u32>> {
     for attempt in 0..10 {
-        if let Some(pid) = resolve_peer_process_id(peer_addr, helper_port)? {
+        let peer_addr_for_attempt = peer_addr;
+        let pid = tokio::task::spawn_blocking(move || {
+            resolve_peer_process_id(peer_addr_for_attempt, helper_port)
+        })
+        .await
+        .map_err(|error| eyre!("peer pid lookup task failed: {error}"))??;
+        if let Some(pid) = pid {
             return Ok(Some(pid));
         }
         if attempt < 9 {
@@ -1226,11 +1664,18 @@ fn find_studio_capture_target_for_pid(studio_pid: u32) -> Result<(HWND, HWND, St
 async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse> {
     let mut state = app.state.lock().await;
     cleanup_stale_instances(&mut state.instances);
+    reconcile_launch_processes(&mut state);
     sync_remote_connections(&app, &mut state);
     let mut active_places: Vec<_> = state
         .instances
         .values()
         .map(|instance| instance.place_id.clone())
+        .chain(
+            state
+                .claimed_tasks
+                .values()
+                .map(|task| task.place_id.clone()),
+        )
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
@@ -1253,16 +1698,39 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
         .claimed_tasks
         .values()
         .map(|task| {
-            let connection_key = task_connection_key(&task.task_id);
+            let connection_key =
+                task_connection_key(&task.task_id, task.generation, &task.launch_id);
             let remote_connection = state.remote_connections.get(&connection_key);
+            let launch_process = state.launch_processes.get(&task.task_id).filter(|launch| {
+                launch.generation == task.generation && launch.launch_id == task.launch_id
+            });
+            let studio_pid = launch_process.map(|launch| launch.studio_pid).or_else(|| {
+                state
+                    .instances
+                    .values()
+                    .find(|instance| {
+                        route_identity_matches(
+                            instance,
+                            Some(task.task_id.as_str()),
+                            Some(task.generation),
+                            Some(task.launch_id.as_str()),
+                        )
+                    })
+                    .and_then(|instance| instance.studio_pid)
+            });
             ClaimedTaskStatus {
                 task_id: task.task_id.clone(),
                 launch_id: task.launch_id.clone(),
                 generation: task.generation,
                 place_id: task.place_id.clone(),
+                game_id: task.game_id.clone(),
                 mcp_base_url: task.mcp_base_url.clone(),
                 rojo_base_url: task.rojo_base_url.clone(),
                 runtime_log_base_url: task.runtime_log_base_url.clone(),
+                studio_pid,
+                launched_by_helper: launch_process
+                    .map(|launch| launch.launched_by_helper)
+                    .unwrap_or(false),
                 claimed_age_ms: task.claimed_at.elapsed().as_millis(),
                 remote_state: remote_connection
                     .map(|connection| match connection.connection_state {
@@ -1289,10 +1757,30 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
         })
         .collect();
     claimed_tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+    let mut launched_studios: Vec<_> = state
+        .launch_processes
+        .values()
+        .map(|launch| LaunchProcessStatus {
+            task_id: launch.task_id.clone(),
+            launch_id: launch.launch_id.clone(),
+            generation: launch.generation,
+            place_id: launch.place_id.clone(),
+            game_id: launch.game_id.clone(),
+            studio_pid: launch.studio_pid,
+            launched_by_helper: launch.launched_by_helper,
+        })
+        .collect();
+    launched_studios.sort_by(|left, right| left.task_id.cmp(&right.task_id));
     let mut place_ids: Vec<_> = state
         .instances
         .values()
         .map(|instance| instance.place_id.clone())
+        .chain(
+            state
+                .claimed_tasks
+                .values()
+                .map(|task| task.place_id.clone()),
+        )
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
@@ -1320,12 +1808,25 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
                 }
             }
         }
+        if let Some(claimed_task) = claimed_task.as_ref() {
+            if let Some(launch) =
+                state
+                    .launch_processes
+                    .get(&claimed_task.task_id)
+                    .filter(|launch| {
+                        launch.generation == claimed_task.generation
+                            && launch.launch_id == claimed_task.launch_id
+                    })
+            {
+                studio_pids.push(launch.studio_pid);
+            }
+        }
         registered_instance_ids.sort();
         studio_pids.sort();
         studio_pids.dedup();
         let connection_key = claimed_task
             .as_ref()
-            .map(|task| task_connection_key(&task.task_id))
+            .map(|task| task_connection_key(&task.task_id, task.generation, &task.launch_id))
             .unwrap_or_else(|| place_connection_key(&place_id));
         let remote_connection = state.remote_connections.get(&connection_key);
         place_statuses.push(HelperPlaceStatus {
@@ -1377,6 +1878,7 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
         claimed_task_count: claimed_tasks.len(),
         active_places,
         claimed_tasks,
+        launched_studios,
         instances,
         place_statuses,
         last_remote_errors: state.last_remote_errors.clone(),
@@ -1385,14 +1887,20 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
 
 async fn rojo_config_handler(
     State(app): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     Query(query): Query<PlaceQuery>,
 ) -> Result<Json<RojoConfigResponse>, HelperError> {
     let place_id = sanitize_place_id(&query.place_id)?;
     let explicit_task_id = maybe_sanitize_identifier("task_id", query.task_id.as_deref())?;
+    let explicit_launch_id = maybe_sanitize_identifier("launch_id", query.launch_id.as_deref())?;
     let bearer_token = app.helper.bearer_token.lock().await.clone();
     if app.helper.hub_base_url.is_none() {
         let base_url = derive_public_base_url("rojo", &place_id, &app.helper);
-        tracing::info!(place_id, base_url, "resolved legacy rojo config from helper");
+        tracing::info!(
+            place_id,
+            base_url,
+            "resolved legacy rojo config from helper"
+        );
         return Ok(Json(RojoConfigResponse {
             place_id,
             task_id: None,
@@ -1402,22 +1910,35 @@ async fn rojo_config_handler(
             auth_header: format!("Bearer {bearer_token}"),
         }));
     }
+    let studio_pid = resolve_peer_process_id_with_retry(peer_addr, app.helper.port).await?;
     let claimed_task = {
         let state = app.state.lock().await;
-        select_claimed_task(
+        resolve_claimed_task_for_request(
             &state,
             &place_id,
             explicit_task_id.as_deref(),
             query.generation,
-            None,
+            explicit_launch_id.as_deref(),
+            studio_pid,
         )
         .map_err(HelperError)?
     };
+    if let Some(studio_pid) = studio_pid {
+        let mut state = app.state.lock().await;
+        bind_launch_process_to_pid(&mut state, &claimed_task, studio_pid).map_err(HelperError)?;
+    }
     let base_url = claimed_task
         .rojo_base_url
         .clone()
         .ok_or_else(|| HelperError(eyre!("claimed task has no rojo_base_url")))?;
-    tracing::info!(place_id, task_id = claimed_task.task_id, generation = claimed_task.generation, launch_id = claimed_task.launch_id, base_url, "resolved rojo config from helper");
+    tracing::info!(
+        place_id,
+        task_id = claimed_task.task_id,
+        generation = claimed_task.generation,
+        launch_id = claimed_task.launch_id,
+        base_url,
+        "resolved rojo config from helper"
+    );
     Ok(Json(RojoConfigResponse {
         place_id,
         task_id: Some(claimed_task.task_id),
@@ -1436,16 +1957,18 @@ async fn mcp_register_handler(
     let place_id = sanitize_place_id(&payload.place_id)?;
     let instance_id = Uuid::new_v4().to_string();
     let explicit_task_id = maybe_sanitize_identifier("task_id", payload.task_id.as_deref())?;
+    let explicit_launch_id = maybe_sanitize_identifier("launch_id", payload.launch_id.as_deref())?;
     let studio_pid = resolve_peer_process_id_with_retry(peer_addr, app.helper.port).await?;
     let claimed_task = if app.helper.hub_base_url.is_some() {
         let state = app.state.lock().await;
         Some(
-            select_claimed_task(
+            resolve_claimed_task_for_request(
                 &state,
                 &place_id,
                 explicit_task_id.as_deref(),
                 payload.generation,
-                payload.launch_id.as_deref(),
+                explicit_launch_id.as_deref(),
+                studio_pid,
             )
             .map_err(HelperError)?,
         )
@@ -1472,6 +1995,10 @@ async fn mcp_register_handler(
                 notify: Arc::new(Notify::new()),
             },
         );
+        if let (Some(claimed_task), Some(studio_pid)) = (claimed_task.as_ref(), studio_pid) {
+            bind_launch_process_to_pid(&mut state, claimed_task, studio_pid)
+                .map_err(HelperError)?;
+        }
         sync_remote_connections(&app, &mut state);
     }
     tracing::info!(
@@ -1591,7 +2118,15 @@ async fn screenshot_debug_handler(
         None => None,
     };
     let task_id = maybe_sanitize_identifier("task_id", query.task_id.as_deref())?;
-    let path = take_screenshot(app, place_id.as_deref(), task_id.as_deref()).await?;
+    let launch_id = maybe_sanitize_identifier("launch_id", query.launch_id.as_deref())?;
+    let path = take_screenshot(
+        app,
+        place_id.as_deref(),
+        task_id.as_deref(),
+        query.generation,
+        launch_id.as_deref(),
+    )
+    .await?;
     Ok(Json(ScreenshotResponse { path }))
 }
 
@@ -1613,23 +2148,30 @@ fn place_connection_key(place_id: &str) -> String {
     format!("place:{place_id}")
 }
 
-fn task_connection_key(task_id: &str) -> String {
-    format!("task:{task_id}")
+fn task_connection_key(task_id: &str, generation: u32, launch_id: &str) -> String {
+    format!("task:{task_id}:{generation}:{launch_id}")
 }
 
 fn derive_remote_helper_ws_url_from_base_url(remote_base_url: &str) -> String {
-    format!(
-        "{}{}",
-        remote_base_url.replacen("https://", "wss://", 1),
-        HELPER_WS_PATH
-    )
+    let base = if remote_base_url.starts_with("https://") {
+        remote_base_url.replacen("https://", "wss://", 1)
+    } else if remote_base_url.starts_with("http://") {
+        remote_base_url.replacen("http://", "ws://", 1)
+    } else {
+        remote_base_url.to_owned()
+    };
+    format!("{}{}", base.trim_end_matches('/'), HELPER_WS_PATH)
 }
 
 fn build_active_remote_targets(app: &AppState, state: &HelperState) -> Vec<RemoteTarget> {
     let mut targets = Vec::new();
     for claimed_task in state.claimed_tasks.values() {
         targets.push(RemoteTarget {
-            connection_key: task_connection_key(&claimed_task.task_id),
+            connection_key: task_connection_key(
+                &claimed_task.task_id,
+                claimed_task.generation,
+                &claimed_task.launch_id,
+            ),
             place_id: claimed_task.place_id.clone(),
             task_id: Some(claimed_task.task_id.clone()),
             generation: Some(claimed_task.generation),
@@ -1658,14 +2200,12 @@ fn build_active_remote_targets(app: &AppState, state: &HelperState) -> Vec<Remot
 }
 
 fn remote_connection_is_active(state: &HelperState, connection_key: &str) -> bool {
-    state
-        .claimed_tasks
-        .keys()
-        .any(|task_id| task_connection_key(task_id) == connection_key)
-        || state
-            .instances
-            .values()
-            .any(|instance| place_connection_key(&instance.place_id) == connection_key)
+    state.claimed_tasks.values().any(|task| {
+        task_connection_key(&task.task_id, task.generation, &task.launch_id) == connection_key
+    }) || state
+        .instances
+        .values()
+        .any(|instance| place_connection_key(&instance.place_id) == connection_key)
 }
 
 fn set_remote_connection_connecting(state: &mut HelperState, connection_key: &str) {
@@ -1676,7 +2216,11 @@ fn set_remote_connection_connecting(state: &mut HelperState, connection_key: &st
     }
 }
 
-fn set_remote_connection_connected(state: &mut HelperState, connection_key: &str, connection_id: &str) {
+fn set_remote_connection_connected(
+    state: &mut HelperState,
+    connection_key: &str,
+    connection_id: &str,
+) {
     if let Some(connection) = state.remote_connections.get_mut(connection_key) {
         let now = Instant::now();
         connection.connection_state = RemoteConnectionState::Connected;
@@ -1726,7 +2270,10 @@ fn sync_remote_connections(app: &AppState, state: &mut HelperState) {
         state.last_remote_errors.remove(&connection_key);
     }
     for target in active_targets {
-        if state.remote_connections.contains_key(&target.connection_key) {
+        if state
+            .remote_connections
+            .contains_key(&target.connection_key)
+        {
             continue;
         }
         let (stop_tx, stop_rx) = watch::channel(false);
@@ -1757,7 +2304,12 @@ fn sync_remote_connections(app: &AppState, state: &mut HelperState) {
 
 async fn remote_ws_loop(app: AppState, target: RemoteTarget, mut stop_rx: watch::Receiver<bool>) {
     let ws_url = derive_remote_helper_ws_url_from_base_url(&target.remote_base_url);
-    tracing::info!(connection_key = target.connection_key, place_id = target.place_id, ws_url, "starting helper remote websocket loop");
+    tracing::info!(
+        connection_key = target.connection_key,
+        place_id = target.place_id,
+        ws_url,
+        "starting helper remote websocket loop"
+    );
     loop {
         if *stop_rx.borrow() {
             break;
@@ -1798,7 +2350,11 @@ async fn remote_ws_loop(app: AppState, target: RemoteTarget, mut stop_rx: watch:
                 );
                 let mut state = app.state.lock().await;
                 if remote_connection_is_active(&state, &target.connection_key) {
-                    set_remote_connection_retrying(&mut state, &target.connection_key, &error.to_string());
+                    set_remote_connection_retrying(
+                        &mut state,
+                        &target.connection_key,
+                        &error.to_string(),
+                    );
                 }
                 drop(state);
                 tokio::select! {
@@ -1816,7 +2372,11 @@ async fn remote_ws_loop(app: AppState, target: RemoteTarget, mut stop_rx: watch:
     let mut state = app.state.lock().await;
     state.remote_connections.remove(&target.connection_key);
     state.last_remote_errors.remove(&target.connection_key);
-    tracing::info!(connection_key = target.connection_key, place_id = target.place_id, "stopped helper remote websocket loop");
+    tracing::info!(
+        connection_key = target.connection_key,
+        place_id = target.place_id,
+        "stopped helper remote websocket loop"
+    );
 }
 
 async fn hub_maintenance_loop(app: AppState) {
@@ -1858,23 +2418,29 @@ async fn hub_maintenance_loop(app: AppState) {
 
         match hub_helper_heartbeat(&app.helper, active_launches).await {
             Ok(response) => {
-                let mut state = app.state.lock().await;
-                state.hub_last_error = None;
-                state.hub_last_ready_at = Some(Instant::now());
-                for release in response.release_launches {
-                    let should_remove = state
-                        .claimed_tasks
-                        .get(&release.task_id)
-                        .map(|task| task.generation == release.generation && task.launch_id == release.launch_id)
-                        .unwrap_or(false);
-                    if should_remove {
-                        state.claimed_tasks.remove(&release.task_id);
-                        state
-                            .last_remote_errors
-                            .remove(&task_connection_key(&release.task_id));
+                let pending_terminations = {
+                    let mut state = app.state.lock().await;
+                    state.hub_last_error = None;
+                    state.hub_last_ready_at = Some(Instant::now());
+                    let mut pending_terminations = Vec::new();
+                    for release in response.release_launches {
+                        if let Some(pending_termination) = release_claimed_task(
+                            &mut state,
+                            &release.task_id,
+                            release.generation,
+                            &release.launch_id,
+                            true,
+                            "hub requested launch release",
+                        ) {
+                            pending_terminations.push(pending_termination);
+                        }
                     }
+                    sync_remote_connections(&app, &mut state);
+                    pending_terminations
+                };
+                for pending_termination in pending_terminations {
+                    terminate_pending_launch_termination(pending_termination).await;
                 }
-                sync_remote_connections(&app, &mut state);
             }
             Err(error) => {
                 let error_text = summarize_error(&error.to_string());
@@ -1899,23 +2465,41 @@ async fn hub_maintenance_loop(app: AppState) {
                 if let Some(task) = response.task {
                     let Some(mcp_base_url) = task.routes.mcp_base_url else {
                         let mut state = app.state.lock().await;
-                        state.hub_last_error = Some("hub claimed task missing mcp_base_url".to_owned());
+                        state.hub_last_error =
+                            Some("hub claimed task missing mcp_base_url".to_owned());
                         continue;
                     };
+                    let claimed_task = ClaimedTask {
+                        task_id: task.task_id.clone(),
+                        launch_id: task.launch_id,
+                        generation: task.generation,
+                        place_id: task.place_id,
+                        game_id: task.game_id,
+                        mcp_base_url,
+                        rojo_base_url: task.routes.rojo_base_url,
+                        runtime_log_base_url: task.routes.runtime_log_base_url,
+                        claimed_at: Instant::now(),
+                    };
+                    #[cfg(target_os = "windows")]
+                    let launch_record = match launch_studio_for_claim(&app.helper, &claimed_task) {
+                        Ok(record) => Some(record),
+                        Err(error) => {
+                            let mut state = app.state.lock().await;
+                            state.hub_last_error = Some(summarize_error(&error.to_string()));
+                            continue;
+                        }
+                    };
+                    #[cfg(not(target_os = "windows"))]
+                    let launch_record: Option<LaunchProcessRecord> = None;
                     let mut state = app.state.lock().await;
-                    state.claimed_tasks.insert(
-                        task.task_id.clone(),
-                        ClaimedTask {
-                            task_id: task.task_id.clone(),
-                            launch_id: task.launch_id,
-                            generation: task.generation,
-                            place_id: task.place_id,
-                            mcp_base_url,
-                            rojo_base_url: task.routes.rojo_base_url,
-                            runtime_log_base_url: task.routes.runtime_log_base_url,
-                            claimed_at: Instant::now(),
-                        },
-                    );
+                    state
+                        .claimed_tasks
+                        .insert(claimed_task.task_id.clone(), claimed_task);
+                    if let Some(launch_record) = launch_record {
+                        state
+                            .launch_processes
+                            .insert(launch_record.task_id.clone(), launch_record);
+                    }
                     state.hub_last_error = None;
                     state.hub_last_ready_at = Some(Instant::now());
                     sync_remote_connections(&app, &mut state);
@@ -2035,7 +2619,8 @@ async fn stream_runtime_screenshot(
         .as_deref()
         .map(|value| sanitize_identifier("tag", value))
         .transpose()?;
-    let captured = capture_screenshot_png(app, Some(place_id), task_id).await?;
+    let captured =
+        capture_screenshot_png(app, Some(place_id), task_id, generation, launch_id).await?;
     let upload_id = Uuid::new_v4();
     let (tx, rx) = oneshot::channel();
     upload_waiters
@@ -2426,7 +3011,7 @@ async fn handle_remote_command(
             let args: ReadStudioLogArgs = serde_json::from_value(payload)?;
             Ok(serde_json::to_string(&read_studio_log(args)?)?)
         }
-        _ => forward_to_plugin(app, place_id, task_id, command).await,
+        _ => forward_to_plugin(app, place_id, task_id, generation, launch_id, command).await,
     }
 }
 
@@ -2434,6 +3019,8 @@ async fn forward_to_plugin(
     app: AppState,
     place_id: &str,
     task_id: Option<&str>,
+    generation: Option<u32>,
+    launch_id: Option<&str>,
     command: Value,
 ) -> Result<String> {
     let request_id = extract_command_id(&command)?;
@@ -2441,8 +3028,9 @@ async fn forward_to_plugin(
         let mut state = app.state.lock().await;
         cleanup_stale_instances(&mut state.instances);
         sync_remote_connections(&app, &mut state);
-        let selected_instance_id = select_instance_for_route(place_id, task_id, &state.instances)
-            .ok_or_else(|| eyre!("no active Studio plugin registered for placeId {place_id}"))?;
+        let selected_instance_id =
+            select_instance_for_route(place_id, task_id, generation, launch_id, &state.instances)
+                .ok_or_else(|| eyre!("no active Studio plugin registered for placeId {place_id}"))?;
         let instance = state
             .instances
             .get_mut(&selected_instance_id)
@@ -2457,6 +3045,9 @@ async fn forward_to_plugin(
     tracing::info!(
         instance_id,
         place_id,
+        task_id,
+        generation,
+        launch_id,
         id = request_id,
         "forwarded MCP command from helper to local plugin"
     );
@@ -2503,17 +3094,23 @@ fn select_instance_for_place(
 fn select_instance_for_route(
     place_id: &str,
     task_id: Option<&str>,
+    generation: Option<u32>,
+    launch_id: Option<&str>,
     instances: &HashMap<String, PluginInstance>,
 ) -> Option<String> {
-    if let Some(task_id) = task_id {
-        let exact = instances
-            .iter()
-            .filter(|(_, instance)| instance.task_id.as_deref() == Some(task_id))
-            .max_by_key(|(_, instance)| instance.last_seen_at)
-            .map(|(instance_id, _)| instance_id.clone());
-        if exact.is_some() {
-            return exact;
-        }
+    let exact = instances
+        .iter()
+        .filter(|(_, instance)| {
+            instance.place_id == place_id
+                && route_identity_matches(instance, task_id, generation, launch_id)
+        })
+        .max_by_key(|(_, instance)| instance.last_seen_at)
+        .map(|(instance_id, _)| instance_id.clone());
+    if exact.is_some() {
+        return exact;
+    }
+    if task_id.is_some() || generation.is_some() || launch_id.is_some() {
+        return None;
     }
     select_instance_for_place(place_id, instances)
 }
@@ -2523,11 +3120,14 @@ async fn resolve_capture_pid(
     app: &AppState,
     place_id: Option<&str>,
     task_id: Option<&str>,
+    generation: Option<u32>,
+    launch_id: Option<&str>,
 ) -> Result<(Option<String>, u32)> {
     let state = app.state.lock().await;
     let selected = if let Some(place_id) = place_id {
-        let instance_id = select_instance_for_route(place_id, task_id, &state.instances)
-            .ok_or_else(|| eyre!("no active Studio plugin registered for placeId {place_id}"))?;
+        let instance_id =
+            select_instance_for_route(place_id, task_id, generation, launch_id, &state.instances)
+                .ok_or_else(|| eyre!("no active Studio plugin registered for placeId {place_id}"))?;
         let instance = state
             .instances
             .get(&instance_id)
@@ -2558,10 +3158,13 @@ async fn capture_screenshot_png(
     app: AppState,
     place_id: Option<&str>,
     task_id: Option<&str>,
+    generation: Option<u32>,
+    launch_id: Option<&str>,
 ) -> Result<CapturedScreenshot> {
     #[cfg(target_os = "windows")]
     {
-        let (resolved_place_id, studio_pid) = resolve_capture_pid(&app, place_id, task_id).await?;
+        let (resolved_place_id, studio_pid) =
+            resolve_capture_pid(&app, place_id, task_id, generation, launch_id).await?;
         let (studio_hwnd, viewport_hwnd, window_title) =
             find_studio_capture_target_for_pid(studio_pid)?;
         let script_template = r#"
@@ -2683,16 +3286,25 @@ $memory.Dispose()
         let _ = app;
         let _ = place_id;
         let _ = task_id;
+        let _ = generation;
+        let _ = launch_id;
         Err(eyre!(
             "take_screenshot is only available on Windows helper builds"
         ))
     }
 }
 
-async fn take_screenshot(app: AppState, place_id: Option<&str>, task_id: Option<&str>) -> Result<String> {
+async fn take_screenshot(
+    app: AppState,
+    place_id: Option<&str>,
+    task_id: Option<&str>,
+    generation: Option<u32>,
+    launch_id: Option<&str>,
+) -> Result<String> {
     #[cfg(target_os = "windows")]
     {
-        let captured = capture_screenshot_png(app, place_id, task_id).await?;
+        let captured =
+            capture_screenshot_png(app, place_id, task_id, generation, launch_id).await?;
         let output_dir = helper_data_dir()?.join("screenshots");
         fs::create_dir_all(&output_dir)?;
         let file_name = if let Some(place_id) = captured.resolved_place_id.as_deref() {
@@ -2711,6 +3323,8 @@ async fn take_screenshot(app: AppState, place_id: Option<&str>, task_id: Option<
         let _ = app;
         let _ = place_id;
         let _ = task_id;
+        let _ = generation;
+        let _ = launch_id;
         Err(eyre!(
             "take_screenshot is only available on Windows helper builds"
         ))
@@ -2729,7 +3343,15 @@ async fn upload_runtime_screenshot(
     let runtime_id = sanitize_identifier("runtime_id", &payload.runtime_id)?;
     let task_id = maybe_sanitize_identifier("task_id", payload.task_id.as_deref())?;
 
-    let captured = capture_screenshot_png(app.clone(), place_id.as_deref(), task_id.as_deref()).await?;
+    let launch_id = maybe_sanitize_identifier("launch_id", payload.launch_id.as_deref())?;
+    let captured = capture_screenshot_png(
+        app.clone(),
+        place_id.as_deref(),
+        task_id.as_deref(),
+        payload.generation,
+        launch_id.as_deref(),
+    )
+    .await?;
     let final_place_id = captured
         .resolved_place_id
         .clone()
@@ -2951,6 +3573,7 @@ async fn main() -> Result<()> {
         bearer_token_candidates: Arc::new(bearer_token_candidates),
         domain_suffix: args.domain_suffix.clone(),
         hub_base_url: args.hub_base_url.clone(),
+        studio_path: args.studio_path.clone(),
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
             .build()?,
@@ -2970,6 +3593,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(Mutex::new(HelperState {
         instances: HashMap::new(),
         claimed_tasks: HashMap::new(),
+        launch_processes: HashMap::new(),
         waiting_for_plugin: HashMap::new(),
         remote_connections: HashMap::new(),
         last_remote_errors: HashMap::new(),
@@ -2986,6 +3610,7 @@ async fn main() -> Result<()> {
             interval.tick().await;
             let mut state = maintenance_app.state.lock().await;
             cleanup_stale_instances(&mut state.instances);
+            reconcile_launch_processes(&mut state);
             sync_remote_connections(&maintenance_app, &mut state);
         }
     });
@@ -3018,4 +3643,216 @@ async fn main() -> Result<()> {
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_instance(
+        place_id: &str,
+        task_id: Option<&str>,
+        generation: Option<u32>,
+        launch_id: Option<&str>,
+        age_ms: u64,
+    ) -> PluginInstance {
+        PluginInstance {
+            place_id: place_id.to_owned(),
+            task_id: task_id.map(ToOwned::to_owned),
+            generation,
+            launch_id: launch_id.map(ToOwned::to_owned),
+            remote_base_url: "https://example.com".to_owned(),
+            studio_pid: Some(123),
+            last_seen_at: Instant::now() - Duration::from_millis(age_ms),
+            queue: VecDeque::new(),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    fn test_claimed_task(
+        task_id: &str,
+        generation: u32,
+        launch_id: &str,
+        place_id: &str,
+    ) -> ClaimedTask {
+        ClaimedTask {
+            task_id: task_id.to_owned(),
+            launch_id: launch_id.to_owned(),
+            generation,
+            place_id: place_id.to_owned(),
+            game_id: Some("999".to_owned()),
+            mcp_base_url: "https://example.com".to_owned(),
+            rojo_base_url: Some("https://example.com".to_owned()),
+            runtime_log_base_url: Some("https://example.com".to_owned()),
+            claimed_at: Instant::now(),
+        }
+    }
+
+    fn empty_helper_state() -> HelperState {
+        HelperState {
+            instances: HashMap::new(),
+            claimed_tasks: HashMap::new(),
+            launch_processes: HashMap::new(),
+            waiting_for_plugin: HashMap::new(),
+            remote_connections: HashMap::new(),
+            last_remote_errors: HashMap::new(),
+            hub_last_error: None,
+            hub_last_ready_at: None,
+        }
+    }
+
+    #[test]
+    fn select_instance_for_route_uses_full_identity() {
+        let mut instances = HashMap::new();
+        instances.insert(
+            "older".to_owned(),
+            test_instance("93795519121520", Some("t1"), Some(1), Some("l_old"), 50),
+        );
+        instances.insert(
+            "newer".to_owned(),
+            test_instance("93795519121520", Some("t1"), Some(2), Some("l_new"), 5),
+        );
+
+        let selected = select_instance_for_route(
+            "93795519121520",
+            Some("t1"),
+            Some(2),
+            Some("l_new"),
+            &instances,
+        );
+        assert_eq!(selected.as_deref(), Some("newer"));
+
+        let missing = select_instance_for_route(
+            "93795519121520",
+            Some("t1"),
+            Some(3),
+            Some("l_missing"),
+            &instances,
+        );
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn derive_remote_helper_ws_url_supports_http_and_https() {
+        assert_eq!(
+            derive_remote_helper_ws_url_from_base_url("https://example.com"),
+            "wss://example.com/ws/helper"
+        );
+        assert_eq!(
+            derive_remote_helper_ws_url_from_base_url("http://127.0.0.1:44756"),
+            "ws://127.0.0.1:44756/ws/helper"
+        );
+        assert_eq!(
+            derive_remote_helper_ws_url_from_base_url("ws://127.0.0.1:44756/"),
+            "ws://127.0.0.1:44756/ws/helper"
+        );
+    }
+
+    #[test]
+    fn resolve_claimed_task_for_request_prefers_pid_binding() {
+        let mut state = empty_helper_state();
+        state.claimed_tasks.insert(
+            "task_a".to_owned(),
+            test_claimed_task("task_a", 1, "l_a", "93795519121520"),
+        );
+        state.claimed_tasks.insert(
+            "task_b".to_owned(),
+            test_claimed_task("task_b", 1, "l_b", "93795519121520"),
+        );
+        state.launch_processes.insert(
+            "task_a".to_owned(),
+            LaunchProcessRecord {
+                task_id: "task_a".to_owned(),
+                launch_id: "l_a".to_owned(),
+                generation: 1,
+                place_id: "93795519121520".to_owned(),
+                game_id: Some("999".to_owned()),
+                studio_pid: 111,
+                launched_by_helper: true,
+                child: None,
+            },
+        );
+        state.launch_processes.insert(
+            "task_b".to_owned(),
+            LaunchProcessRecord {
+                task_id: "task_b".to_owned(),
+                launch_id: "l_b".to_owned(),
+                generation: 1,
+                place_id: "93795519121520".to_owned(),
+                game_id: Some("999".to_owned()),
+                studio_pid: 222,
+                launched_by_helper: true,
+                child: None,
+            },
+        );
+
+        let selected =
+            resolve_claimed_task_for_request(&state, "93795519121520", None, None, None, Some(222))
+                .expect("pid-bound task should resolve");
+        assert_eq!(selected.task_id, "task_b");
+        assert_eq!(selected.launch_id, "l_b");
+    }
+
+    #[test]
+    fn resolve_claimed_task_for_request_requires_identity_without_pid_binding() {
+        let mut state = empty_helper_state();
+        state.claimed_tasks.insert(
+            "task_a".to_owned(),
+            test_claimed_task("task_a", 1, "l_a", "93795519121520"),
+        );
+
+        let error = match resolve_claimed_task_for_request(
+            &state,
+            "93795519121520",
+            None,
+            None,
+            None,
+            Some(999),
+        ) {
+            Ok(_) => panic!("expected unbound Studio pid without explicit identity to fail"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("task_id, generation, and launch_id are required"));
+    }
+
+    #[test]
+    fn release_claimed_task_cleans_exact_route_state() {
+        let mut state = empty_helper_state();
+        state.claimed_tasks.insert(
+            "task_a".to_owned(),
+            test_claimed_task("task_a", 1, "l_a", "93795519121520"),
+        );
+        state.instances.insert(
+            "instance_a".to_owned(),
+            test_instance("93795519121520", Some("task_a"), Some(1), Some("l_a"), 5),
+        );
+        state.launch_processes.insert(
+            "task_a".to_owned(),
+            LaunchProcessRecord {
+                task_id: "task_a".to_owned(),
+                launch_id: "l_a".to_owned(),
+                generation: 1,
+                place_id: "93795519121520".to_owned(),
+                game_id: Some("999".to_owned()),
+                studio_pid: 111,
+                launched_by_helper: false,
+                child: None,
+            },
+        );
+        state
+            .last_remote_errors
+            .insert(task_connection_key("task_a", 1, "l_a"), "boom".to_owned());
+
+        let pending_termination =
+            release_claimed_task(&mut state, "task_a", 1, "l_a", false, "test release");
+
+        assert!(state.claimed_tasks.is_empty());
+        assert!(state.instances.is_empty());
+        assert!(state.launch_processes.is_empty());
+        assert!(state.last_remote_errors.is_empty());
+        assert!(pending_termination.is_none());
+    }
 }
