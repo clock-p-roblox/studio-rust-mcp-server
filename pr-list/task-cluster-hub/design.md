@@ -17,6 +17,15 @@
 - `recover` 才接管旧 `task_id`
 - `cluster_key = user + repo + worktree_name + place_id`
 
+## 最新收口共识
+
+- 一个机器只允许一个 helper；helper 是机器级单例。
+- 当前控制域只允许一个 hub；同一 `task_id` 同时只允许一个有效 `generation`。
+- hub 只会把一个 `task_id` 的当前有效任期交给一个 helper；当前强设定下一条 task 永远只对应一个 Studio/launch。
+- `generation` 保留为 control plane fencing 字段，只用于 hub/helper/server 判定当前任期是否合法。
+- plugin 不应持久化 `generation` 或自行决定 task 任期；plugin 只应该向 helper 注册并接受 helper 下发的当前绑定信息。
+- server 数据面不把 `generation` 当业务字段扩散；只在 helper 接入时使用它做 launch fencing。
+
 ## 当前问题
 
 - helper 侧本地实例虽然按 `instance_id` 存，但远端连接按 `place_id` 聚合。
@@ -80,6 +89,13 @@
 - helper 与 server WebSocket：`Hello/Heartbeat/Artifact` 等消息补 `task_id`，必要时补 `launch_id`。
 - plugin 与 helper：注册结果除 `instance_id` 外，还要能关联当前 task 身份；三期再把 Windows pid / launch 绑定补全。
 
+### 4.1 简化方向
+
+- 不再继续引入新的 token/lease 概念扩张协议面；先把复杂度收进 helper/hub 内部。
+- hub/helper 之间继续使用 `task_id + generation + launch_id` 作为当前最小充分身份。
+- helper 对 plugin 暴露的应是“当前有效绑定”，而不是完整控制面真相。
+- 三期若继续简化，应优先减少 plugin 可见字段，而不是增加新的协议对象。
+
 ### 5. Linux helper 裁剪策略
 
 - 保留：
@@ -111,6 +127,18 @@
 - Windows helper 启动 Studio
 - pid 跟踪与清理
 - 插件绑定 helper，并拿 task_id 完成 MCP/Rojo 最终接线
+
+### Windows 接力指引
+
+- Windows 侧应重点查看：
+  - 本文档的“关键约束”“最新收口共识”“4.1 简化方向”
+  - `src/bin/studio_helper.rs`
+  - `src/rbx_studio_server.rs`
+  - `src/helper_ws.rs`
+- Windows 侧后续修改优先级：
+  - 巩固 helper 对本机 Studio/plugin 的单点权威
+  - 避免 plugin 再缓存或传播 `generation`
+  - 不增加新的临时 token/fallback/启发式补丁
 
 ## 非目标
 
