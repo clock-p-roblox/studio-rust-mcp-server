@@ -128,7 +128,6 @@ struct ActiveHelperConnection {
     task_id: Option<String>,
     generation: Option<u32>,
     launch_id: Option<String>,
-    helper_id: Option<String>,
     sender: mpsc::UnboundedSender<OutgoingHelperFrame>,
     last_message_at: Instant,
 }
@@ -1177,7 +1176,6 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
             task_id: hello.task_id.clone(),
             generation: hello.generation,
             launch_id: hello.launch_id.clone(),
-            helper_id: Some(hello.helper_id.clone()),
             sender: out_tx.clone(),
             last_message_at: Instant::now(),
         }) {

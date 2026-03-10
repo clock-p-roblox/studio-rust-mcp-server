@@ -9,7 +9,7 @@ use axum::{
 use clap::Parser;
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::net::Ipv4Addr;
@@ -21,8 +21,6 @@ use tracing_subscriber::{self, EnvFilter};
 use uuid::Uuid;
 
 const DEFAULT_HUB_PORT: u16 = 44758;
-const TASK_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
-const HELPER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 
 #[derive(Debug, Clone)]
@@ -301,6 +299,31 @@ struct TaskStatusPayload {
     last_seen_age_ms: u128,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LaunchIdentity {
+    task_id: String,
+    generation: u32,
+    launch_id: String,
+}
+
+impl LaunchIdentity {
+    fn from_helper_launch(launch: &HelperLaunchState) -> Self {
+        Self {
+            task_id: launch.task_id.clone(),
+            generation: launch.generation,
+            launch_id: launch.launch_id.clone(),
+        }
+    }
+
+    fn into_helper_launch_state(self) -> HelperLaunchState {
+        HelperLaunchState {
+            launch_id: self.launch_id,
+            task_id: self.task_id,
+            generation: self.generation,
+        }
+    }
+}
+
 fn normalize_bearer_token(token: &str) -> Option<String> {
     let trimmed = token.trim();
     if trimmed.is_empty() {
@@ -533,6 +556,47 @@ fn expire_task(task: &mut TaskRecord, now: u64) -> bool {
     true
 }
 
+fn task_status_payload(task: &TaskRecord) -> TaskStatusPayload {
+    TaskStatusPayload {
+        task_id: task.task_id.clone(),
+        cluster_key: task.cluster_key.clone(),
+        generation: task.generation,
+        place_id: task.place_id.clone(),
+        game_id: task.game_id.clone(),
+        owner_user: task.owner_user.clone(),
+        repo: task.repo.clone(),
+        worktree_name: task.worktree_name.clone(),
+        service_state: task.service_state.clone(),
+        accepting_launches: task.accepting_launches,
+        claimed_by_helper_id: task.claimed_by_helper_id.clone(),
+        active_launch_id: task.active_launch_id.clone(),
+        released: task.released,
+        routes: task.routes.clone(),
+        services: task.services.clone(),
+        created_at_unix_ms: task.created_at_unix_ms,
+        updated_at_unix_ms: task.updated_at_unix_ms,
+        last_task_heartbeat_at_unix_ms: task.last_task_heartbeat_at_unix_ms,
+        last_seen_age_ms: task.last_seen_at.elapsed().as_millis(),
+    }
+}
+
+fn task_active_launch_identity(task: &TaskRecord) -> Option<LaunchIdentity> {
+    task.active_launch_id.as_ref().map(|launch_id| LaunchIdentity {
+        task_id: task.task_id.clone(),
+        generation: task.generation,
+        launch_id: launch_id.clone(),
+    })
+}
+
+fn task_matches_claimed_launch(task: &TaskRecord, helper_id: &str, launch: &LaunchIdentity) -> bool {
+    !task.released
+        && task.service_state != "expired"
+        && task.task_id == launch.task_id
+        && task.generation == launch.generation
+        && task.claimed_by_helper_id.as_deref() == Some(helper_id)
+        && task.active_launch_id.as_deref() == Some(launch.launch_id.as_str())
+}
+
 fn cleanup_stale_state(state: &mut HubState) -> bool {
     let mut changed = false;
     let now = now_unix_ms();
@@ -587,27 +651,7 @@ async fn status_handler(State(state): State<SharedHubState>) -> Json<HubStatusRe
     let mut tasks = state
         .tasks
         .values()
-        .map(|task| TaskStatusPayload {
-            task_id: task.task_id.clone(),
-            cluster_key: task.cluster_key.clone(),
-            generation: task.generation,
-            place_id: task.place_id.clone(),
-            game_id: task.game_id.clone(),
-            owner_user: task.owner_user.clone(),
-            repo: task.repo.clone(),
-            worktree_name: task.worktree_name.clone(),
-            service_state: task.service_state.clone(),
-            accepting_launches: task.accepting_launches,
-            claimed_by_helper_id: task.claimed_by_helper_id.clone(),
-            active_launch_id: task.active_launch_id.clone(),
-            released: task.released,
-            routes: task.routes.clone(),
-            services: task.services.clone(),
-            created_at_unix_ms: task.created_at_unix_ms,
-            updated_at_unix_ms: task.updated_at_unix_ms,
-            last_task_heartbeat_at_unix_ms: task.last_task_heartbeat_at_unix_ms,
-            last_seen_age_ms: task.last_seen_at.elapsed().as_millis(),
-        })
+        .map(task_status_payload)
         .collect::<Vec<_>>();
     tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
     Json(HubStatusResponse {
@@ -631,27 +675,7 @@ async fn task_status_handler(
         .tasks
         .get(&task_id)
         .ok_or_else(|| HubError(eyre!("task not found: {task_id}")))?;
-    Ok(Json(TaskStatusPayload {
-        task_id: task.task_id.clone(),
-        cluster_key: task.cluster_key.clone(),
-        generation: task.generation,
-        place_id: task.place_id.clone(),
-        game_id: task.game_id.clone(),
-        owner_user: task.owner_user.clone(),
-        repo: task.repo.clone(),
-        worktree_name: task.worktree_name.clone(),
-        service_state: task.service_state.clone(),
-        accepting_launches: task.accepting_launches,
-        claimed_by_helper_id: task.claimed_by_helper_id.clone(),
-        active_launch_id: task.active_launch_id.clone(),
-        released: task.released,
-        routes: task.routes.clone(),
-        services: task.services.clone(),
-        created_at_unix_ms: task.created_at_unix_ms,
-        updated_at_unix_ms: task.updated_at_unix_ms,
-        last_task_heartbeat_at_unix_ms: task.last_task_heartbeat_at_unix_ms,
-        last_seen_age_ms: task.last_seen_at.elapsed().as_millis(),
-    }))
+    Ok(Json(task_status_payload(task)))
 }
 
 async fn create_task_handler(
@@ -868,43 +892,33 @@ async fn helper_heartbeat_handler(
         persist_state(&state)?;
     }
     let now = now_unix_ms();
-    let mut release_launches = Vec::new();
-    let active_launches_by_task: HashMap<String, (String, u32)> = payload
+    let helper_id = payload.helper_id.clone();
+    let active_launches_by_task: HashMap<String, LaunchIdentity> = payload
         .active_launches
         .iter()
-        .map(|launch| {
-            (
-                launch.task_id.clone(),
-                (launch.launch_id.clone(), launch.generation),
-            )
-        })
+        .map(|launch| (launch.task_id.clone(), LaunchIdentity::from_helper_launch(launch)))
         .collect();
+    let mut release_launches = HashSet::new();
     let mut changed = false;
 
     for task in state.tasks.values_mut() {
-        if task.claimed_by_helper_id.as_deref() != Some(payload.helper_id.as_str()) {
+        if task.claimed_by_helper_id.as_deref() != Some(helper_id.as_str()) {
             continue;
         }
         match active_launches_by_task.get(&task.task_id) {
-            Some((launch_id, generation)) => {
-                if task.released
-                    || task.service_state == "expired"
-                    || task.generation != *generation
-                    || task.active_launch_id.as_deref() != Some(launch_id.as_str())
-                {
-                    release_launches.push(HelperLaunchState {
-                        launch_id: launch_id.clone(),
-                        task_id: task.task_id.clone(),
-                        generation: *generation,
-                    });
+            Some(launch) => {
+                if !task_matches_claimed_launch(task, &helper_id, launch) {
+                    release_launches.insert(launch.clone());
                     task.claimed_by_helper_id = None;
                     task.active_launch_id = None;
                     task.updated_at_unix_ms = now;
                     changed = true;
-                    continue;
                 }
             }
             None => {
+                if let Some(identity) = task_active_launch_identity(task) {
+                    release_launches.insert(identity);
+                }
                 task.claimed_by_helper_id = None;
                 task.active_launch_id = None;
                 task.updated_at_unix_ms = now;
@@ -914,42 +928,24 @@ async fn helper_heartbeat_handler(
     }
 
     for launch in &payload.active_launches {
-        let should_release = match state.tasks.get_mut(&launch.task_id) {
-            Some(task) => {
-                if task.released
-                    || task.service_state == "expired"
-                    || task.generation != launch.generation
-                    || task.claimed_by_helper_id.as_deref() != Some(payload.helper_id.as_str())
-                    || task.active_launch_id.as_deref() != Some(launch.launch_id.as_str())
-                {
-                    true
-                } else {
-                    false
-                }
-            }
+        let identity = LaunchIdentity::from_helper_launch(launch);
+        let should_release = match state.tasks.get(&launch.task_id) {
+            Some(task) => !task_matches_claimed_launch(task, &helper_id, &identity),
             None => true,
         };
         if should_release {
-            if !release_launches.iter().any(|item| item.task_id == launch.task_id && item.generation == launch.generation) {
-                release_launches.push(HelperLaunchState {
-                    launch_id: launch.launch_id.clone(),
-                    task_id: launch.task_id.clone(),
-                    generation: launch.generation,
-                });
-            }
+            release_launches.insert(identity);
         }
     }
     let helper = state
         .helpers
-        .get_mut(&payload.helper_id)
-        .ok_or_else(|| HubError(eyre!("helper not found: {}", payload.helper_id)))?;
+        .get_mut(&helper_id)
+        .ok_or_else(|| HubError(eyre!("helper not found: {}", helper_id)))?;
     helper.last_seen_at = Instant::now();
     helper.active_launches.clear();
     for launch in payload.active_launches {
-        if release_launches
-            .iter()
-            .any(|item| item.task_id == launch.task_id && item.generation == launch.generation)
-        {
+        let identity = LaunchIdentity::from_helper_launch(&launch);
+        if release_launches.contains(&identity) {
             continue;
         }
         helper.active_launches.insert(launch.launch_id, launch.task_id);
@@ -959,7 +955,10 @@ async fn helper_heartbeat_handler(
     }
     Ok(Json(HelperHeartbeatHubResponse {
         ok: true,
-        release_launches,
+        release_launches: release_launches
+            .into_iter()
+            .map(LaunchIdentity::into_helper_launch_state)
+            .collect(),
     }))
 }
 
