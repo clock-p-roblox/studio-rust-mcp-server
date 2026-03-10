@@ -20,11 +20,13 @@
 ## 最新收口共识
 
 - 一个机器只允许一个 helper；helper 是机器级单例。
+- helper 的机器稳定身份使用 `helper_id`；在 Windows 侧建议用 `MachineGuid` 派生，避免继续依赖随机落盘 id 或网卡 MAC 直接暴露。
 - 当前控制域只允许一个 hub；同一 `task_id` 同时只允许一个有效 `generation`。
 - hub 只会把一个 `task_id` 的当前有效任期交给一个 helper；当前强设定下一条 task 永远只对应一个 Studio/launch。
 - `generation` 保留为 control plane fencing 字段，只用于 hub/helper/server 判定当前任期是否合法。
 - plugin 不应持久化 `generation` 或自行决定 task 任期；plugin 只应该向 helper 注册并接受 helper 下发的当前绑定信息。
 - server 数据面不把 `generation` 当业务字段扩散；只在 helper 接入时使用它做 launch fencing。
+- 后启动的同 `helper_id` helper 必须失败退出，不能顶掉前一个活跃 helper；只有前一个退出或 heartbeat 超时后，后一个 helper 才能成功注册。
 
 ## 当前问题
 
@@ -136,6 +138,8 @@
   - `src/rbx_studio_server.rs`
   - `src/helper_ws.rs`
 - Windows 侧后续修改优先级：
+  - 启动 helper 前先从 `MachineGuid` 派生稳定 `helper_id`
+  - helper 启动流程里把 hub register 前置；若 hub 返回 `helper_id_conflict`，直接打印原因并退出，不进入 claim/启动 Studio 流程
   - 巩固 helper 对本机 Studio/plugin 的单点权威
   - 避免 plugin 再缓存或传播 `generation`
   - 不增加新的临时 token/fallback/启发式补丁

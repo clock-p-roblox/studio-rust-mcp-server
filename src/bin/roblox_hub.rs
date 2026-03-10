@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -860,19 +860,32 @@ async fn release_task_handler(
 async fn register_helper_handler(
     State(state): State<SharedHubState>,
     Json(payload): Json<RegisterHelperRequest>,
-) -> Result<Json<RegisterHelperResponse>, HubError> {
+) -> Result<Json<RegisterHelperResponse>, Response> {
     let mut state = state.lock().await;
     if cleanup_stale_state(&mut state) {
-        persist_state(&state)?;
+        persist_state(&state).map_err(HubError::from).map_err(IntoResponse::into_response)?;
     }
-    let helper_id = require_non_empty(&payload.helper_id, "helper_id")?;
+    let helper_id = require_non_empty(&payload.helper_id, "helper_id")
+        .map_err(HubError::from)
+        .map_err(IntoResponse::into_response)?;
+    if let Some(existing) = state.helpers.get(&helper_id) {
+        let age_ms = existing.last_seen_at.elapsed().as_millis();
+        let message = format!(
+            "helper_id already active: {helper_id}; existing helper is still alive (last_seen_age_ms={age_ms})"
+        );
+        return Err(HttpHubError::conflict("helper_id_conflict", message).into_response());
+    }
     let now = now_unix_ms();
     state.helpers.insert(
         helper_id.clone(),
         HelperRecord {
             helper_id: helper_id.clone(),
-            owner_user: require_non_empty(&payload.owner_user, "owner_user")?,
-            platform: require_non_empty(&payload.platform, "platform")?,
+            owner_user: require_non_empty(&payload.owner_user, "owner_user")
+                .map_err(HubError::from)
+                .map_err(IntoResponse::into_response)?,
+            platform: require_non_empty(&payload.platform, "platform")
+                .map_err(HubError::from)
+                .map_err(IntoResponse::into_response)?,
             capacity: payload.capacity,
             labels: payload.labels,
             active_launches: HashMap::new(),
@@ -1042,6 +1055,12 @@ async fn claim_task_handler(
 #[derive(Debug)]
 struct HubError(color_eyre::Report);
 
+struct HttpHubError {
+    status: StatusCode,
+    message: String,
+    code: &'static str,
+}
+
 impl From<color_eyre::Report> for HubError {
     fn from(value: color_eyre::Report) -> Self {
         Self(value)
@@ -1051,6 +1070,26 @@ impl From<color_eyre::Report> for HubError {
 impl IntoResponse for HubError {
     fn into_response(self) -> Response {
         (StatusCode::BAD_REQUEST, self.0.to_string()).into_response()
+    }
+}
+
+impl HttpHubError {
+    fn conflict(code: &'static str, message: String) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message,
+            code,
+        }
+    }
+}
+
+impl IntoResponse for HttpHubError {
+    fn into_response(self) -> Response {
+        let mut response = (self.status, self.message).into_response();
+        if let Ok(value) = HeaderValue::from_str(self.code) {
+            response.headers_mut().insert("x-clock-p-hub-error", value);
+        }
+        response
     }
 }
 
