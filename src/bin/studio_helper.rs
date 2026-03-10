@@ -213,7 +213,6 @@ struct AppState {
 struct RegisterPluginRequest {
     place_id: String,
     task_id: Option<String>,
-    generation: Option<u32>,
     launch_id: Option<String>,
 }
 
@@ -222,7 +221,6 @@ struct RegisterPluginResponse {
     instance_id: String,
     place_id: String,
     task_id: Option<String>,
-    generation: Option<u32>,
     launch_id: Option<String>,
     remote_base_url: String,
 }
@@ -423,7 +421,6 @@ struct PlaceQuery {
     place_id: String,
     #[serde(rename = "taskId")]
     task_id: Option<String>,
-    generation: Option<u32>,
     #[serde(rename = "launchId")]
     launch_id: Option<String>,
 }
@@ -432,7 +429,6 @@ struct PlaceQuery {
 struct RojoConfigResponse {
     place_id: String,
     task_id: Option<String>,
-    generation: Option<u32>,
     launch_id: Option<String>,
     base_url: String,
     auth_header: String,
@@ -905,6 +901,7 @@ fn select_claimed_task_for_pid(
     Some(task.clone())
 }
 
+#[cfg(test)]
 fn resolve_claimed_task_for_request(
     state: &HelperState,
     place_id: &str,
@@ -924,6 +921,26 @@ fn resolve_claimed_task_for_request(
         ));
     }
     select_claimed_task(state, place_id, task_id, generation, launch_id)
+}
+
+fn resolve_claimed_task_for_plugin_request(
+    state: &HelperState,
+    place_id: &str,
+    task_id: Option<&str>,
+    launch_id: Option<&str>,
+    studio_pid: Option<u32>,
+) -> Result<ClaimedTask> {
+    if let Some(studio_pid) = studio_pid {
+        if let Some(task) = select_claimed_task_for_pid(state, studio_pid, place_id) {
+            return Ok(task);
+        }
+    }
+    if task_id.is_none() && launch_id.is_none() {
+        return Err(eyre!(
+            "helper could not map Studio for place_id {place_id} to a claimed launch; task_id or launch_id is required unless the Studio pid was launched by helper"
+        ));
+    }
+    select_claimed_task(state, place_id, task_id, None, launch_id)
 }
 
 fn bind_launch_process_to_pid(
@@ -1904,7 +1921,6 @@ async fn rojo_config_handler(
         return Ok(Json(RojoConfigResponse {
             place_id,
             task_id: None,
-            generation: None,
             launch_id: None,
             base_url,
             auth_header: format!("Bearer {bearer_token}"),
@@ -1913,11 +1929,10 @@ async fn rojo_config_handler(
     let studio_pid = resolve_peer_process_id_with_retry(peer_addr, app.helper.port).await?;
     let claimed_task = {
         let state = app.state.lock().await;
-        resolve_claimed_task_for_request(
+        resolve_claimed_task_for_plugin_request(
             &state,
             &place_id,
             explicit_task_id.as_deref(),
-            query.generation,
             explicit_launch_id.as_deref(),
             studio_pid,
         )
@@ -1934,7 +1949,6 @@ async fn rojo_config_handler(
     tracing::info!(
         place_id,
         task_id = claimed_task.task_id,
-        generation = claimed_task.generation,
         launch_id = claimed_task.launch_id,
         base_url,
         "resolved rojo config from helper"
@@ -1942,7 +1956,6 @@ async fn rojo_config_handler(
     Ok(Json(RojoConfigResponse {
         place_id,
         task_id: Some(claimed_task.task_id),
-        generation: Some(claimed_task.generation),
         launch_id: Some(claimed_task.launch_id),
         base_url,
         auth_header: format!("Bearer {bearer_token}"),
@@ -1962,11 +1975,10 @@ async fn mcp_register_handler(
     let claimed_task = if app.helper.hub_base_url.is_some() {
         let state = app.state.lock().await;
         Some(
-            resolve_claimed_task_for_request(
+            resolve_claimed_task_for_plugin_request(
                 &state,
                 &place_id,
                 explicit_task_id.as_deref(),
-                payload.generation,
                 explicit_launch_id.as_deref(),
                 studio_pid,
             )
@@ -2005,7 +2017,6 @@ async fn mcp_register_handler(
         instance_id,
         place_id,
         task_id = claimed_task.as_ref().map(|task| task.task_id.clone()),
-        generation = claimed_task.as_ref().map(|task| task.generation),
         launch_id = claimed_task.as_ref().map(|task| task.launch_id.clone()),
         studio_pid,
         remote_base_url,
@@ -2015,7 +2026,6 @@ async fn mcp_register_handler(
         instance_id,
         place_id,
         task_id: claimed_task.as_ref().map(|task| task.task_id.clone()),
-        generation: claimed_task.as_ref().map(|task| task.generation),
         launch_id: claimed_task.as_ref().map(|task| task.launch_id.clone()),
         remote_base_url,
     }))
@@ -3816,6 +3826,52 @@ mod tests {
         assert!(error
             .to_string()
             .contains("task_id, generation, and launch_id are required"));
+    }
+
+    #[test]
+    fn resolve_claimed_task_for_plugin_request_bans_place_only_fallback() {
+        let mut state = empty_helper_state();
+        state.claimed_tasks.insert(
+            "task_a".to_owned(),
+            test_claimed_task("task_a", 1, "l_a", "93795519121520"),
+        );
+
+        let error = match resolve_claimed_task_for_plugin_request(
+            &state,
+            "93795519121520",
+            None,
+            None,
+            Some(999),
+        ) {
+            Ok(_) => panic!("expected place-only plugin request without pid binding to fail"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("task_id or launch_id is required"));
+    }
+
+    #[test]
+    fn resolve_claimed_task_for_plugin_request_accepts_task_hint_without_generation() {
+        let mut state = empty_helper_state();
+        state.claimed_tasks.insert(
+            "task_a".to_owned(),
+            test_claimed_task("task_a", 7, "l_a", "93795519121520"),
+        );
+
+        let selected = resolve_claimed_task_for_plugin_request(
+            &state,
+            "93795519121520",
+            Some("task_a"),
+            Some("l_a"),
+            Some(999),
+        )
+        .expect("task hint should resolve without plugin-supplied generation");
+
+        assert_eq!(selected.task_id, "task_a");
+        assert_eq!(selected.generation, 7);
+        assert_eq!(selected.launch_id, "l_a");
     }
 
     #[test]

@@ -166,14 +166,11 @@ local function createDefaultStatusSections()
 	}
 end
 
-local function matchesTaskIdentity(payload: any, taskId: string?, generation: number?, launchId: string?)
+local function matchesTaskIdentity(payload: any, taskId: string?, launchId: string?)
 	if type(payload) ~= "table" then
 		return false
 	end
 	if taskId ~= nil and tostring(payload.task_id) ~= taskId then
-		return false
-	end
-	if generation ~= nil and payload.generation ~= generation then
 		return false
 	end
 	if launchId ~= nil and tostring(payload.launch_id) ~= launchId then
@@ -182,17 +179,17 @@ local function matchesTaskIdentity(payload: any, taskId: string?, generation: nu
 	return true
 end
 
-local function findRegisteredInstance(statusPayload: any, instanceId: string, taskId: string?, generation: number?, launchId: string?)
+local function findRegisteredInstance(statusPayload: any, instanceId: string, taskId: string?, launchId: string?)
 	if type(statusPayload) ~= "table" or type(statusPayload.instances) ~= "table" then
 		return nil
 	end
 
 	for _, instance in statusPayload.instances do
 		if type(instance) == "table" and tostring(instance.instance_id) == instanceId then
-			if taskId == nil and generation == nil and launchId == nil then
+			if taskId == nil and launchId == nil then
 				return instance
 			end
-			if matchesTaskIdentity(instance, taskId, generation, launchId) then
+			if matchesTaskIdentity(instance, taskId, launchId) then
 				return instance
 			end
 		end
@@ -215,13 +212,13 @@ local function findPlaceStatus(statusPayload: any, placeId: string)
 	return nil
 end
 
-local function findClaimedTask(statusPayload: any, taskId: string, generation: number?, launchId: string?)
+local function findClaimedTask(statusPayload: any, taskId: string, launchId: string?)
 	if type(statusPayload) ~= "table" or type(statusPayload.claimed_tasks) ~= "table" then
 		return nil
 	end
 
 	for _, taskInfo in statusPayload.claimed_tasks do
-		if type(taskInfo) == "table" and matchesTaskIdentity(taskInfo, taskId, generation, launchId) then
+		if type(taskInfo) == "table" and matchesTaskIdentity(taskInfo, taskId, launchId) then
 			return taskInfo
 		end
 	end
@@ -315,7 +312,6 @@ local currentInstanceId: string? = nil
 local currentHelperBaseUrl: string? = nil
 local currentRemoteBaseUrl: string? = nil
 local currentTaskId: string? = nil
-local currentTaskGeneration: number? = nil
 local currentLaunchId: string? = nil
 local readyAnnounced = false
 local staleReconnectInFlight = false
@@ -759,7 +755,6 @@ local function unregisterCurrentInstance()
 	currentHelperBaseUrl = nil
 	currentRemoteBaseUrl = nil
 	currentTaskId = nil
-	currentTaskGeneration = nil
 	currentLaunchId = nil
 end
 
@@ -800,10 +795,10 @@ local function refreshStatusFromHelper()
 
 	if
 		currentInstanceId ~= nil
-		and findRegisteredInstance(statusPayload, currentInstanceId, currentTaskId, currentTaskGeneration, currentLaunchId) ~= nil
+		and findRegisteredInstance(statusPayload, currentInstanceId, currentTaskId, currentLaunchId) ~= nil
 	then
 		local taskSuffix = if currentTaskId ~= nil
-			then " for task " .. currentTaskId .. (currentTaskGeneration ~= nil and (" gen " .. tostring(currentTaskGeneration)) or "") .. "."
+			then " for task " .. currentTaskId .. "."
 			else "."
 		setStatusSection(
 			"registration",
@@ -819,9 +814,11 @@ local function refreshStatusFromHelper()
 	end
 
 	local claimedTask = if currentTaskId ~= nil
-		then findClaimedTask(statusPayload, currentTaskId, currentTaskGeneration, currentLaunchId)
+		then findClaimedTask(statusPayload, currentTaskId, currentLaunchId)
 		else nil
-	local allowPlaceFallback = currentTaskId == nil and currentTaskGeneration == nil and currentLaunchId == nil
+	local allowPlaceFallback = currentTaskId == nil
+		and currentLaunchId == nil
+		and statusPayload.hub_base_url == nil
 	local placeStatus = if claimedTask == nil and allowPlaceFallback
 		then findPlaceStatus(statusPayload, tostring(game.PlaceId))
 		else nil
@@ -836,9 +833,6 @@ local function refreshStatusFromHelper()
 	local remoteSource = if type(claimedTask) == "table" then claimedTask else placeStatus
 	if type(remoteSource.task_id) == "string" and remoteSource.task_id ~= "" then
 		currentTaskId = remoteSource.task_id
-	end
-	if type(remoteSource.generation) == "number" then
-		currentTaskGeneration = remoteSource.generation
 	end
 	if type(remoteSource.launch_id) == "string" and remoteSource.launch_id ~= "" then
 		currentLaunchId = remoteSource.launch_id
@@ -997,9 +991,6 @@ local function connectToHelper(helperPort: string)
 	if currentTaskId ~= nil then
 		registrationPayload.task_id = currentTaskId
 	end
-	if currentTaskGeneration ~= nil then
-		registrationPayload.generation = currentTaskGeneration
-	end
 	if currentLaunchId ~= nil then
 		registrationPayload.launch_id = currentLaunchId
 	end
@@ -1014,7 +1005,6 @@ local function connectToHelper(helperPort: string)
 	local taskId = if type(registration.task_id) == "string" and registration.task_id ~= ""
 		then registration.task_id
 		else nil
-	local generation = if type(registration.generation) == "number" then registration.generation else nil
 	local launchId = if type(registration.launch_id) == "string" and registration.launch_id ~= ""
 		then registration.launch_id
 		else nil
@@ -1058,7 +1048,6 @@ local function connectToHelper(helperPort: string)
 			currentHelperBaseUrl = nil
 			currentRemoteBaseUrl = nil
 			currentTaskId = nil
-			currentTaskGeneration = nil
 			currentLaunchId = nil
 			resetStatusSections("Stopped polling the local helper on port " .. helperPort .. ".")
 			readyAnnounced = false
@@ -1128,7 +1117,6 @@ local function connectToHelper(helperPort: string)
 	currentHelperBaseUrl = baseUrl
 	currentRemoteBaseUrl = remoteBaseUrl
 	currentTaskId = taskId
-	currentTaskGeneration = generation
 	currentLaunchId = launchId
 	return client, instanceId
 end
