@@ -87,7 +87,7 @@ struct HelperRecord {
     last_seen_at: Instant,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 struct TaskRoutes {
     rojo_base_url: Option<String>,
     mcp_base_url: Option<String>,
@@ -505,8 +505,37 @@ fn new_token() -> String {
     Uuid::new_v4().to_string()
 }
 
+fn clear_task_claim_state(task: &mut TaskRecord) {
+    task.accepting_launches = false;
+    task.claimed_by_helper_id = None;
+    task.active_launch_id = None;
+}
+
+fn clear_task_route_state(task: &mut TaskRecord) {
+    task.routes = TaskRoutes::default();
+    task.services.clear();
+}
+
+fn expire_task(task: &mut TaskRecord, now: u64) -> bool {
+    if task.service_state == "expired"
+        && !task.accepting_launches
+        && task.claimed_by_helper_id.is_none()
+        && task.active_launch_id.is_none()
+        && task.routes == TaskRoutes::default()
+        && task.services.is_empty()
+    {
+        return false;
+    }
+    task.service_state = "expired".to_owned();
+    clear_task_claim_state(task);
+    clear_task_route_state(task);
+    task.updated_at_unix_ms = now;
+    true
+}
+
 fn cleanup_stale_state(state: &mut HubState) -> bool {
     let mut changed = false;
+    let now = now_unix_ms();
     let stale_helpers: Vec<String> = state
         .helpers
         .iter()
@@ -518,9 +547,8 @@ fn cleanup_stale_state(state: &mut HubState) -> bool {
         changed = true;
         for task in state.tasks.values_mut() {
             if task.claimed_by_helper_id.as_deref() == Some(helper_id.as_str()) {
-                task.claimed_by_helper_id = None;
-                task.active_launch_id = None;
-                task.updated_at_unix_ms = now_unix_ms();
+                clear_task_claim_state(task);
+                task.updated_at_unix_ms = now;
                 changed = true;
             }
         }
@@ -530,12 +558,7 @@ fn cleanup_stale_state(state: &mut HubState) -> bool {
             continue;
         }
         if task.last_seen_at.elapsed() > state.config.task_heartbeat_timeout {
-            task.service_state = "expired".to_owned();
-            task.accepting_launches = false;
-            task.claimed_by_helper_id = None;
-            task.active_launch_id = None;
-            task.updated_at_unix_ms = now_unix_ms();
-            changed = true;
+            changed |= expire_task(task, now);
         }
     }
     changed
@@ -704,12 +727,17 @@ async fn recover_task_handler(
     if task.recover_token != payload.recover_token {
         return Err(HubError(eyre!("recover_token mismatch")));
     }
+    if task.released {
+        return Err(HubError(eyre!(
+            "released task cannot be recovered: {}",
+            payload.task_id
+        )));
+    }
     task.generation += 1;
     task.task_token = new_token();
     task.service_state = "recovering".to_owned();
-    task.accepting_launches = false;
-    task.claimed_by_helper_id = None;
-    task.active_launch_id = None;
+    clear_task_claim_state(task);
+    clear_task_route_state(task);
     let now = now_unix_ms();
     task.updated_at_unix_ms = now;
     task.last_task_heartbeat_at_unix_ms = now;
@@ -747,6 +775,12 @@ async fn task_heartbeat_handler(
     if task.task_token != payload.task_token {
         return Err(HubError(eyre!("task token mismatch")));
     }
+    if task.released {
+        return Err(HubError(eyre!("released task cannot accept heartbeat")));
+    }
+    if task.service_state == "expired" {
+        return Err(HubError(eyre!("expired task requires recover before heartbeat")));
+    }
     task.service_state = require_non_empty(&payload.service_state, "service_state")?;
     task.accepting_launches = payload.accepting_launches;
     task.routes = payload.routes;
@@ -780,9 +814,8 @@ async fn release_task_handler(
         }
         let helper_id = task.claimed_by_helper_id.clone();
         task.service_state = "released".to_owned();
-        task.accepting_launches = false;
-        task.claimed_by_helper_id = None;
-        task.active_launch_id = None;
+        clear_task_claim_state(task);
+        clear_task_route_state(task);
         task.released = true;
         task.updated_at_unix_ms = now_unix_ms();
         helper_id
