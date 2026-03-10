@@ -172,6 +172,7 @@ struct RecoverTaskRequest {
     cluster_key: String,
     task_id: String,
     recover_token: String,
+    game_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -759,6 +760,9 @@ async fn recover_task_handler(
     }
     task.generation += 1;
     task.task_token = new_token();
+    if let Some(game_id) = payload.game_id.filter(|value| !value.trim().is_empty()) {
+        task.game_id = Some(game_id);
+    }
     task.service_state = "recovering".to_owned();
     clear_task_claim_state(task);
     clear_task_route_state(task);
