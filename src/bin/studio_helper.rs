@@ -38,17 +38,25 @@ use regex::Regex;
 #[cfg(target_os = "windows")]
 use std::mem::size_of;
 #[cfg(target_os = "windows")]
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+#[cfg(target_os = "windows")]
 use std::ptr::null_mut;
 #[cfg(target_os = "windows")]
 use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
+use windows_sys::Win32::Foundation::{HANDLE, HWND, LPARAM, RECT};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Networking::WinSock::AF_INET;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+    JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, EnumWindows, GetClientRect, GetWindowRect, GetWindowTextLengthW,
@@ -111,6 +119,8 @@ struct PluginInstance {
     launch_id: Option<String>,
     remote_base_url: String,
     studio_pid: Option<u32>,
+    helper_managed: bool,
+    exception_reason: Option<String>,
     last_seen_at: Instant,
     queue: VecDeque<Value>,
     notify: Arc<Notify>,
@@ -148,6 +158,8 @@ struct LaunchProcessRecord {
     game_id: Option<String>,
     studio_pid: u32,
     launched_by_helper: bool,
+    #[cfg(target_os = "windows")]
+    kill_on_close_job: Option<OwnedHandle>,
     child: Option<Child>,
 }
 
@@ -156,7 +168,14 @@ struct PendingLaunchTermination {
     launch_id: String,
     generation: u32,
     studio_pid: u32,
+    #[cfg(target_os = "windows")]
+    _kill_on_close_job: Option<OwnedHandle>,
     child: Child,
+}
+
+enum PluginRoutingDecision {
+    Managed(ClaimedTask),
+    Exception(String),
 }
 
 fn runtime_screenshot_upload_url_for_base_url(base_url: &str) -> String {
@@ -223,6 +242,8 @@ struct RegisterPluginResponse {
     task_id: Option<String>,
     launch_id: Option<String>,
     remote_base_url: String,
+    helper_managed: bool,
+    exception_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -309,6 +330,31 @@ struct RegisterHelperHubResponse {
     heartbeat_timeout_sec: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct HubErrorResponse {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Debug)]
+enum RegisterHelperError {
+    HelperIdConflict(String),
+    Other(color_eyre::Report),
+}
+
+impl std::fmt::Display for RegisterHelperError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HelperIdConflict(message) => write!(f, "helper_id_conflict: {message}"),
+            Self::Other(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for RegisterHelperError {}
+
 #[derive(Debug, Serialize)]
 struct HelperHeartbeatHubRequest {
     helper_id: String,
@@ -367,6 +413,8 @@ struct HelperInstanceStatus {
     launch_id: Option<String>,
     remote_base_url: String,
     studio_pid: Option<u32>,
+    helper_managed: bool,
+    exception_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -672,6 +720,119 @@ fn helper_data_dir() -> Result<PathBuf> {
     Err(eyre!("cannot resolve helper data directory"))
 }
 
+fn helper_id_from_machine_guid(machine_guid: &str) -> Result<String> {
+    let normalized = trim(machine_guid).to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Err(eyre!("MachineGuid must not be empty"));
+    }
+    let source = format!("windows-machine-guid:{normalized}");
+    let derived = Uuid::new_v5(&Uuid::NAMESPACE_OID, source.as_bytes())
+        .simple()
+        .to_string();
+    sanitize_identifier("helper_id", &format!("h_{}", &derived[..12]))
+}
+
+fn parse_machine_guid_reg_query_output(output: &str) -> Result<String> {
+    for line in output.lines() {
+        let trimmed = trim(line);
+        if !trimmed.starts_with("MachineGuid") {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let name = parts.next();
+        let value_type = parts.next();
+        let value = parts.collect::<Vec<_>>().join(" ");
+        if name == Some("MachineGuid") && value_type == Some("REG_SZ") && !value.is_empty() {
+            return Ok(trim(&value).to_owned());
+        }
+    }
+    Err(eyre!("reg query did not return MachineGuid"))
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_default_helper_id() -> Result<String> {
+    let output = std::process::Command::new("reg")
+        .args([
+            "query",
+            r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Cryptography",
+            "/v",
+            "MachineGuid",
+        ])
+        .output()
+        .wrap_err("failed to query Windows MachineGuid with reg.exe")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(eyre!(
+            "failed to query MachineGuid: status={}, stderr={}",
+            output.status,
+            trim(&stderr)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let machine_guid = parse_machine_guid_reg_query_output(&stdout)?;
+    helper_id_from_machine_guid(&machine_guid)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn resolve_default_helper_id() -> Result<String> {
+    let data_dir = helper_data_dir()?;
+    fs::create_dir_all(&data_dir)?;
+    let path = data_dir.join("helper-id");
+    if path.exists() {
+        let existing = trim(&fs::read_to_string(&path)?);
+        return sanitize_identifier("helper_id", &existing);
+    }
+    let generated = format!("h_{}", &Uuid::new_v4().simple().to_string()[..10]);
+    fs::write(&path, format!("{generated}\n"))?;
+    Ok(generated)
+}
+
+#[cfg(target_os = "windows")]
+fn create_kill_on_close_job() -> Result<OwnedHandle> {
+    let job = unsafe { CreateJobObjectW(null_mut(), null_mut()) };
+    if job.is_null() {
+        return Err(eyre!(
+            "failed to create Studio kill-on-close job object: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let ok = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &limits as *const _ as *const _,
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if ok == 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            let _ = OwnedHandle::from_raw_handle(job as _);
+        }
+        return Err(eyre!(
+            "failed to configure Studio kill-on-close job object: {error}"
+        ));
+    }
+
+    Ok(unsafe { OwnedHandle::from_raw_handle(job as _) })
+}
+
+#[cfg(target_os = "windows")]
+fn assign_child_to_kill_on_close_job(job: &OwnedHandle, child: &Child) -> Result<()> {
+    let process_handle = child.as_raw_handle() as HANDLE;
+    let ok = unsafe { AssignProcessToJobObject(job.as_raw_handle() as HANDLE, process_handle) };
+    if ok == 0 {
+        return Err(eyre!(
+            "failed to assign helper-launched Studio to kill-on-close job object: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "windows")]
 fn now_stamp() -> String {
     let millis = SystemTime::now()
@@ -748,9 +909,32 @@ fn launch_studio_for_claim(
     if let Some(parent) = studio_path.parent() {
         command.current_dir(parent);
     }
-    let child = command
+    let mut child = command
         .spawn()
         .wrap_err_with(|| format!("failed to launch Studio at {}", studio_path.display()))?;
+    let kill_on_close_job = match create_kill_on_close_job() {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error).wrap_err_with(|| {
+                format!(
+                    "failed to arm helper-launched Studio for helper-exit cleanup at {}",
+                    studio_path.display()
+                )
+            });
+        }
+    };
+    if let Err(error) = assign_child_to_kill_on_close_job(&kill_on_close_job, &child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error).wrap_err_with(|| {
+            format!(
+                "failed to tie helper-launched Studio to helper lifetime at {}",
+                studio_path.display()
+            )
+        });
+    }
     let studio_pid = child.id();
     tracing::info!(
         task_id = task.task_id.as_str(),
@@ -770,6 +954,7 @@ fn launch_studio_for_claim(
         game_id: task.game_id.clone(),
         studio_pid,
         launched_by_helper: true,
+        kill_on_close_job: Some(kill_on_close_job),
         child: Some(child),
     })
 }
@@ -943,6 +1128,46 @@ fn resolve_claimed_task_for_plugin_request(
     select_claimed_task(state, place_id, task_id, None, launch_id)
 }
 
+#[cfg(target_os = "windows")]
+fn manual_studio_exception_reason(place_id: &str, studio_pid: Option<u32>) -> String {
+    match studio_pid {
+        Some(studio_pid) => format!(
+            "Studio pid {studio_pid} for place_id {place_id} was not launched by helper; treating it as a manual Studio exception"
+        ),
+        None => format!(
+            "helper could not resolve Studio pid for place_id {place_id}; treating it as a manual Studio exception"
+        ),
+    }
+}
+
+fn resolve_plugin_routing_decision(
+    state: &HelperState,
+    place_id: &str,
+    task_id: Option<&str>,
+    launch_id: Option<&str>,
+    studio_pid: Option<u32>,
+) -> Result<PluginRoutingDecision> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (task_id, launch_id);
+        if let Some(studio_pid) = studio_pid {
+            if let Some(task) = select_claimed_task_for_pid(state, studio_pid, place_id) {
+                return Ok(PluginRoutingDecision::Managed(task));
+            }
+        }
+        return Ok(PluginRoutingDecision::Exception(
+            manual_studio_exception_reason(place_id, studio_pid),
+        ));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(PluginRoutingDecision::Managed(
+            resolve_claimed_task_for_plugin_request(state, place_id, task_id, launch_id, studio_pid)?,
+        ))
+    }
+}
+
 fn bind_launch_process_to_pid(
     state: &mut HelperState,
     task: &ClaimedTask,
@@ -982,6 +1207,8 @@ fn bind_launch_process_to_pid(
             game_id: task.game_id.clone(),
             studio_pid,
             launched_by_helper: false,
+            #[cfg(target_os = "windows")]
+            kill_on_close_job: None,
             child: None,
         },
     );
@@ -1043,6 +1270,8 @@ fn release_claimed_task(
                         launch_id: launch.launch_id,
                         generation: launch.generation,
                         studio_pid: launch.studio_pid,
+                        #[cfg(target_os = "windows")]
+                        _kill_on_close_job: launch.kill_on_close_job.take(),
                         child,
                     })
                 } else {
@@ -1074,6 +1303,8 @@ async fn terminate_pending_launch_termination(pending: PendingLaunchTermination)
         launch_id,
         generation,
         studio_pid,
+        #[cfg(target_os = "windows")]
+        _kill_on_close_job,
         mut child,
     } = pending;
     let task_id_for_join = task_id.clone();
@@ -1176,16 +1407,7 @@ fn resolve_helper_id(args: &Args) -> Result<String> {
     if let Some(value) = args.helper_id.as_deref() {
         return sanitize_identifier("helper_id", value);
     }
-    let data_dir = helper_data_dir()?;
-    fs::create_dir_all(&data_dir)?;
-    let path = data_dir.join("helper-id");
-    if path.exists() {
-        let existing = trim(&fs::read_to_string(&path)?);
-        return sanitize_identifier("helper_id", &existing);
-    }
-    let generated = format!("h_{}", &Uuid::new_v4().simple().to_string()[..10]);
-    fs::write(&path, format!("{generated}\n"))?;
-    Ok(generated)
+    resolve_default_helper_id()
 }
 
 async fn hub_post_json<TRequest: Serialize, TResponse: DeserializeOwned>(
@@ -1212,19 +1434,73 @@ async fn hub_post_json<TRequest: Serialize, TResponse: DeserializeOwned>(
     Ok(serde_json::from_str(&body)?)
 }
 
-async fn hub_register_helper(helper: &HelperConfig) -> Result<RegisterHelperHubResponse> {
-    hub_post_json(
-        helper,
-        "/v1/helpers/register",
-        &RegisterHelperHubRequest {
+fn parse_helper_id_conflict(
+    status: StatusCode,
+    error_code: Option<&str>,
+    body: &str,
+) -> Option<String> {
+    if status != StatusCode::CONFLICT {
+        return None;
+    }
+    if error_code == Some("helper_id_conflict") {
+        return Some(trim(body).to_owned());
+    }
+    let parsed: HubErrorResponse = serde_json::from_str(body).ok()?;
+    if parsed.code.as_deref() != Some("helper_id_conflict") {
+        return None;
+    }
+    Some(
+        parsed
+            .message
+            .unwrap_or_else(|| "helper_id already active".to_owned()),
+    )
+}
+
+async fn hub_register_helper(
+    helper: &HelperConfig,
+) -> std::result::Result<RegisterHelperHubResponse, RegisterHelperError> {
+    let Some(base_url) = helper.hub_base_url.as_ref() else {
+        return Err(RegisterHelperError::Other(eyre!(
+            "hub_base_url is not configured"
+        )));
+    };
+    let token = helper.bearer_token.lock().await.clone();
+    let response = helper
+        .client
+        .post(format!(
+            "{}/v1/helpers/register",
+            base_url.trim_end_matches('/')
+        ))
+        .bearer_auth(token)
+        .json(&RegisterHelperHubRequest {
             helper_id: helper.helper_id.clone(),
             owner_user: helper.user_name.clone(),
             platform: std::env::consts::OS.to_owned(),
             capacity: helper.capacity,
             labels: vec![std::env::consts::ARCH.to_owned()],
-        },
-    )
-    .await
+        })
+        .send()
+        .await
+        .map_err(|error| RegisterHelperError::Other(error.into()))?;
+    let status = response.status();
+    let error_code = response
+        .headers()
+        .get("x-clock-p-hub-error")
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let body = response
+        .text()
+        .await
+        .map_err(|error| RegisterHelperError::Other(error.into()))?;
+    if let Some(message) = parse_helper_id_conflict(status, error_code.as_deref(), &body) {
+        return Err(RegisterHelperError::HelperIdConflict(message));
+    }
+    if !status.is_success() {
+        return Err(RegisterHelperError::Other(eyre!(
+            "hub request /v1/helpers/register failed with {status}: {body}"
+        )));
+    }
+    serde_json::from_str(&body).map_err(|error| RegisterHelperError::Other(error.into()))
 }
 
 async fn hub_helper_heartbeat(
@@ -1708,6 +1984,8 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
             launch_id: instance.launch_id.clone(),
             remote_base_url: instance.remote_base_url.clone(),
             studio_pid: instance.studio_pid,
+            helper_managed: instance.helper_managed,
+            exception_reason: instance.exception_reason.clone(),
         })
         .collect();
     instances.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
@@ -1929,7 +2207,7 @@ async fn rojo_config_handler(
     let studio_pid = resolve_peer_process_id_with_retry(peer_addr, app.helper.port).await?;
     let claimed_task = {
         let state = app.state.lock().await;
-        resolve_claimed_task_for_plugin_request(
+        match resolve_plugin_routing_decision(
             &state,
             &place_id,
             explicit_task_id.as_deref(),
@@ -1937,6 +2215,12 @@ async fn rojo_config_handler(
             studio_pid,
         )
         .map_err(HelperError)?
+        {
+            PluginRoutingDecision::Managed(task) => task,
+            PluginRoutingDecision::Exception(reason) => {
+                return Err(HelperError(eyre!(reason)));
+            }
+        }
     };
     if let Some(studio_pid) = studio_pid {
         let mut state = app.state.lock().await;
@@ -1972,25 +2256,33 @@ async fn mcp_register_handler(
     let explicit_task_id = maybe_sanitize_identifier("task_id", payload.task_id.as_deref())?;
     let explicit_launch_id = maybe_sanitize_identifier("launch_id", payload.launch_id.as_deref())?;
     let studio_pid = resolve_peer_process_id_with_retry(peer_addr, app.helper.port).await?;
-    let claimed_task = if app.helper.hub_base_url.is_some() {
+    let (claimed_task, helper_managed, exception_reason) = if app.helper.hub_base_url.is_some() {
         let state = app.state.lock().await;
-        Some(
-            resolve_claimed_task_for_plugin_request(
-                &state,
-                &place_id,
-                explicit_task_id.as_deref(),
-                explicit_launch_id.as_deref(),
-                studio_pid,
-            )
-            .map_err(HelperError)?,
+        match resolve_plugin_routing_decision(
+            &state,
+            &place_id,
+            explicit_task_id.as_deref(),
+            explicit_launch_id.as_deref(),
+            studio_pid,
         )
+        .map_err(HelperError)?
+        {
+            PluginRoutingDecision::Managed(task) => (Some(task), true, None),
+            PluginRoutingDecision::Exception(reason) => (None, false, Some(reason)),
+        }
     } else {
-        None
+        (None, true, None)
     };
     let remote_base_url = claimed_task
         .as_ref()
         .map(|task| task.mcp_base_url.clone())
-        .unwrap_or_else(|| derive_public_base_url("mcp", &place_id, &app.helper));
+        .unwrap_or_else(|| {
+            if helper_managed {
+                derive_public_base_url("mcp", &place_id, &app.helper)
+            } else {
+                String::new()
+            }
+        });
     {
         let mut state = app.state.lock().await;
         state.instances.insert(
@@ -2002,6 +2294,8 @@ async fn mcp_register_handler(
                 launch_id: claimed_task.as_ref().map(|task| task.launch_id.clone()),
                 remote_base_url: remote_base_url.clone(),
                 studio_pid,
+                helper_managed,
+                exception_reason: exception_reason.clone(),
                 last_seen_at: Instant::now(),
                 queue: VecDeque::new(),
                 notify: Arc::new(Notify::new()),
@@ -2019,6 +2313,8 @@ async fn mcp_register_handler(
         task_id = claimed_task.as_ref().map(|task| task.task_id.clone()),
         launch_id = claimed_task.as_ref().map(|task| task.launch_id.clone()),
         studio_pid,
+        helper_managed,
+        exception_reason,
         remote_base_url,
         "registered MCP plugin instance with helper"
     );
@@ -2028,6 +2324,8 @@ async fn mcp_register_handler(
         task_id: claimed_task.as_ref().map(|task| task.task_id.clone()),
         launch_id: claimed_task.as_ref().map(|task| task.launch_id.clone()),
         remote_base_url,
+        helper_managed,
+        exception_reason,
     }))
 }
 
@@ -2389,11 +2687,10 @@ async fn remote_ws_loop(app: AppState, target: RemoteTarget, mut stop_rx: watch:
     );
 }
 
-async fn hub_maintenance_loop(app: AppState) {
+async fn hub_maintenance_loop(app: AppState, mut registered: bool) {
     if app.helper.hub_base_url.is_none() {
         return;
     }
-    let mut registered = false;
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     loop {
         interval.tick().await;
@@ -2405,7 +2702,12 @@ async fn hub_maintenance_loop(app: AppState) {
                     state.hub_last_error = None;
                     state.hub_last_ready_at = Some(Instant::now());
                 }
-                Err(error) => {
+                Err(RegisterHelperError::HelperIdConflict(message)) => {
+                    let mut state = app.state.lock().await;
+                    state.hub_last_error = Some(format!("helper_id_conflict: {message}"));
+                    continue;
+                }
+                Err(RegisterHelperError::Other(error)) => {
                     let mut state = app.state.lock().await;
                     state.hub_last_error = Some(summarize_error(&error.to_string()));
                     continue;
@@ -3600,6 +3902,29 @@ async fn main() -> Result<()> {
         "starting Studio helper"
     );
 
+    let initial_hub_registration = if helper.hub_base_url.is_some() {
+        match hub_register_helper(&helper).await {
+            Ok(response) => {
+                tracing::info!(
+                    helper_id = helper.helper_id,
+                    heartbeat_interval_sec = response.heartbeat_interval_sec,
+                    heartbeat_timeout_sec = response.heartbeat_timeout_sec,
+                    "registered helper with hub"
+                );
+                Some(response)
+            }
+            Err(RegisterHelperError::HelperIdConflict(message)) => {
+                eprintln!("helper_id_conflict: {message}");
+                return Err(eyre!("helper_id_conflict: {message}"));
+            }
+            Err(RegisterHelperError::Other(error)) => {
+                return Err(error).wrap_err("failed to register helper with hub during startup");
+            }
+        }
+    } else {
+        None
+    };
+
     let state = Arc::new(Mutex::new(HelperState {
         instances: HashMap::new(),
         claimed_tasks: HashMap::new(),
@@ -3608,7 +3933,7 @@ async fn main() -> Result<()> {
         remote_connections: HashMap::new(),
         last_remote_errors: HashMap::new(),
         hub_last_error: None,
-        hub_last_ready_at: None,
+        hub_last_ready_at: initial_hub_registration.as_ref().map(|_| Instant::now()),
     }));
 
     let app_state = AppState { helper, state };
@@ -3626,8 +3951,9 @@ async fn main() -> Result<()> {
     });
 
     let hub_app = app_state.clone();
+    let hub_registered = initial_hub_registration.is_some();
     tokio::spawn(async move {
-        hub_maintenance_loop(hub_app).await;
+        hub_maintenance_loop(hub_app, hub_registered).await;
     });
 
     let app = Router::new()
@@ -3673,6 +3999,8 @@ mod tests {
             launch_id: launch_id.map(ToOwned::to_owned),
             remote_base_url: "https://example.com".to_owned(),
             studio_pid: Some(123),
+            helper_managed: true,
+            exception_reason: None,
             last_seen_at: Instant::now() - Duration::from_millis(age_ms),
             queue: VecDeque::new(),
             notify: Arc::new(Notify::new()),
@@ -3759,6 +4087,115 @@ mod tests {
     }
 
     #[test]
+    fn helper_id_from_machine_guid_is_stable() {
+        let machine_guid = "12345678-90AB-CDEF-1234-567890ABCDEF";
+        let derived_a = helper_id_from_machine_guid(machine_guid).expect("helper id should derive");
+        let derived_b = helper_id_from_machine_guid(machine_guid).expect("helper id should derive");
+        assert_eq!(derived_a, derived_b);
+        assert!(derived_a.starts_with("h_"));
+        assert!(derived_a.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'));
+    }
+
+    #[test]
+    fn parse_machine_guid_reg_query_output_extracts_guid() {
+        let guid = parse_machine_guid_reg_query_output(
+            "\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography\n    MachineGuid    REG_SZ    abcdef12-3456-7890-abcd-ef1234567890\n",
+        )
+        .expect("MachineGuid should parse");
+        assert_eq!(guid, "abcdef12-3456-7890-abcd-ef1234567890");
+    }
+
+    #[test]
+    fn parse_helper_id_conflict_extracts_message() {
+        let message = parse_helper_id_conflict(
+            StatusCode::CONFLICT,
+            None,
+            r#"{"code":"helper_id_conflict","message":"helper_id already active"}"#,
+        )
+        .expect("helper_id_conflict should parse");
+        assert_eq!(message, "helper_id already active");
+        let header_message = parse_helper_id_conflict(
+            StatusCode::CONFLICT,
+            Some("helper_id_conflict"),
+            "helper_id already active",
+        )
+        .expect("helper_id_conflict header should parse");
+        assert_eq!(header_message, "helper_id already active");
+        assert!(parse_helper_id_conflict(StatusCode::BAD_REQUEST, None, "{}").is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn resolve_plugin_routing_decision_marks_manual_studio_as_exception() {
+        let mut state = empty_helper_state();
+        state.claimed_tasks.insert(
+            "task_a".to_owned(),
+            test_claimed_task("task_a", 1, "l_a", "93795519121520"),
+        );
+
+        let decision = resolve_plugin_routing_decision(
+            &state,
+            "93795519121520",
+            Some("task_a"),
+            Some("l_a"),
+            Some(999),
+        )
+        .expect("manual Studio should become exception");
+
+        match decision {
+            PluginRoutingDecision::Managed(_) => {
+                panic!("manual Studio should not be assigned a claimed task")
+            }
+            PluginRoutingDecision::Exception(reason) => {
+                assert!(reason.contains("manual Studio exception"));
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn resolve_plugin_routing_decision_accepts_helper_launched_pid() {
+        let mut state = empty_helper_state();
+        state.claimed_tasks.insert(
+            "task_a".to_owned(),
+            test_claimed_task("task_a", 1, "l_a", "93795519121520"),
+        );
+        state.launch_processes.insert(
+            "task_a".to_owned(),
+            LaunchProcessRecord {
+                task_id: "task_a".to_owned(),
+                launch_id: "l_a".to_owned(),
+                generation: 1,
+                place_id: "93795519121520".to_owned(),
+                game_id: Some("999".to_owned()),
+                studio_pid: 222,
+                launched_by_helper: true,
+                kill_on_close_job: None,
+                child: None,
+            },
+        );
+
+        let decision = resolve_plugin_routing_decision(
+            &state,
+            "93795519121520",
+            None,
+            None,
+            Some(222),
+        )
+        .expect("helper-launched Studio should stay managed");
+
+        match decision {
+            PluginRoutingDecision::Managed(task) => {
+                assert_eq!(task.task_id, "task_a");
+                assert_eq!(task.launch_id, "l_a");
+            }
+            PluginRoutingDecision::Exception(reason) => {
+                panic!("expected managed helper launch, got exception: {reason}")
+            }
+        }
+    }
+
+    #[test]
     fn resolve_claimed_task_for_request_prefers_pid_binding() {
         let mut state = empty_helper_state();
         state.claimed_tasks.insert(
@@ -3779,6 +4216,8 @@ mod tests {
                 game_id: Some("999".to_owned()),
                 studio_pid: 111,
                 launched_by_helper: true,
+                #[cfg(target_os = "windows")]
+                kill_on_close_job: None,
                 child: None,
             },
         );
@@ -3792,6 +4231,8 @@ mod tests {
                 game_id: Some("999".to_owned()),
                 studio_pid: 222,
                 launched_by_helper: true,
+                #[cfg(target_os = "windows")]
+                kill_on_close_job: None,
                 child: None,
             },
         );
@@ -3895,6 +4336,8 @@ mod tests {
                 game_id: Some("999".to_owned()),
                 studio_pid: 111,
                 launched_by_helper: false,
+                #[cfg(target_os = "windows")]
+                kill_on_close_job: None,
                 child: None,
             },
         );
