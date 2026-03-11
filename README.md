@@ -136,7 +136,7 @@ Useful flags:
 - helper 是机器级单例，通过 hub claim task，再连到对应 task 的远端 MCP WebSocket
 - `restart` 保留 `task_id`
 - `stop + start` 默认生成新 `task_id`
-- `recover` 才接管旧 `task_id`
+- `recover` 复用原 `task_id` 并提升 `generation`
 
 hub 本身只做 control plane：
 
@@ -156,6 +156,8 @@ cargo run --bin roblox_hub -- --port 44758 --no-auth
 - task：`task_id / generation / task_token / recover_token / routes`
 - helper：`helper_id / capacity / active_launches`
 
+这里的 `generation` 主要用于 control plane fencing。它应该留在 hub / server supervisor / helper 内部流转，而不是扩散成 plugin 的长期缓存键。
+
 ### Clock-p helper mode
 
 `clock-p` 的 Studio helper 现在是机器级单例：
@@ -174,12 +176,13 @@ cargo run --bin studio_helper -- --port 44750 --hub-base-url https://roblox-hub-
 默认行为：
 
 - helper 自己读取 `feishu-user_name` 和 `feishu-token`
-- helper 有稳定 `helper_id`，会持久化到本机数据目录
+- helper 有稳定 `helper_id`；Windows helper 使用 `MachineGuid` 派生，其他平台使用持久化本地 id
 - helper 注册 hub 后，会 claim task 并拿到：
   - `task_id`
   - `launch_id`
   - `mcp_base_url`
   - `rojo_base_url`
+- hub 会拒绝活跃重复 `helper_id`；helper 应在启动早期先 register hub，并把 `helper_id_conflict` 视为 fatal startup error
 - plugin 侧只需要配置 helper 端口
 - helper 还额外提供：
   - `GET /status`
@@ -195,7 +198,13 @@ MCP HTTP 服务额外开放：
 
 - `GET /ws/helper`
 
-这个 WebSocket 由 helper 主动连接。Linux helper 会保留 register / heartbeat / claim / 远端 WS 代理能力，但不提供 Win32 专属的截图、窗口定位和 Studio 本地日志读取能力。
+这个 WebSocket 由 helper 主动连接。Linux helper 提供 register / heartbeat / claim / 远端 WS 代理能力，但不提供 Win32 专属的截图、窗口定位和 Studio 本地日志读取能力。
+
+当前收口方向：
+
+- helper 是本机唯一权威配置源
+- plugin 不应长期缓存 `generation`
+- `generation` 是 hub/helper/server control plane 的 fencing 字段
 
 ### Ubuntu 交叉编译 Windows helper
 
