@@ -27,6 +27,7 @@
 - plugin 不应持久化 `generation` 或自行决定 task 任期；plugin 只应该向 helper 注册并接受 helper 下发的当前绑定信息。
 - server 数据面不把 `generation` 当业务字段扩散；只在 helper 接入时使用它做 launch fencing。
 - 后启动的同 `helper_id` helper 必须失败退出，不能顶掉前一个活跃 helper；只有前一个退出或 heartbeat 超时后，后一个 helper 才能成功注册。
+- helper 侧不要通过引入额外 `helper_session_id` 或 token 体系来解决当前问题；当前阶段优先通过稳定 `helper_id` + hub 唯一约束收口复杂度。
 
 ## 当前问题
 
@@ -139,10 +140,11 @@
   - `src/helper_ws.rs`
 - Windows 侧后续修改优先级：
   - 启动 helper 前先从 `MachineGuid` 派生稳定 `helper_id`
-  - helper 启动流程里把 hub register 前置；若 hub 返回 `helper_id_conflict`，直接打印原因并退出，不进入 claim/启动 Studio 流程
-  - 巩固 helper 对本机 Studio/plugin 的单点权威
-  - 避免 plugin 再缓存或传播 `generation`
-  - 不增加新的临时 token/fallback/启发式补丁
+- helper 启动流程里把 hub register 前置；若 hub 返回 `helper_id_conflict`，直接打印原因并退出，不进入 claim/启动 Studio 流程
+- 巩固 helper 对本机 Studio/plugin 的单点权威
+- 避免 plugin 再缓存或传播 `generation`
+- 不增加新的临时 token/fallback/启发式补丁
+- helper 对“手动打开的 Studio 例外实例”继续保持不分配 task/launch 的策略，避免误把手动 Studio 拉入控制面
 
 ## 非目标
 
