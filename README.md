@@ -176,7 +176,7 @@ cargo run --bin studio_helper -- --port 44750 --hub-base-url https://roblox-hub-
 默认行为：
 
 - helper 自己读取 `feishu-user_name` 和 `feishu-token`
-- helper 有稳定 `helper_id`；Windows 侧建议优先由 `MachineGuid` 派生，其他平台再回退到持久化本地 id
+- helper 有稳定 `helper_id`；Windows helper 使用 `MachineGuid` 派生，其他平台使用持久化本地 id
 - helper 注册 hub 后，会 claim task 并拿到：
   - `task_id`
   - `launch_id`
@@ -198,13 +198,13 @@ MCP HTTP 服务额外开放：
 
 - `GET /ws/helper`
 
-这个 WebSocket 由 helper 主动连接。Linux helper 会保留 register / heartbeat / claim / 远端 WS 代理能力，但不提供 Win32 专属的截图、窗口定位和 Studio 本地日志读取能力。
+这个 WebSocket 由 helper 主动连接。Linux helper 提供 register / heartbeat / claim / 远端 WS 代理能力，但不提供 Win32 专属的截图、窗口定位和 Studio 本地日志读取能力。
 
 当前收口方向：
 
 - helper 是本机唯一权威配置源
 - plugin 不应长期缓存 `generation`
-- `generation` 继续保留为 hub/helper/server control plane 的 fencing 字段
+- `generation` 是 hub/helper/server control plane 的 fencing 字段
 
 ### Ubuntu 交叉编译 Windows helper
 
