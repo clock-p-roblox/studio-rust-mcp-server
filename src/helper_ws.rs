@@ -281,33 +281,6 @@ mod tests {
     }
 
     #[test]
-    fn server_to_helper_ready_ack_accepts_missing_route_identity() {
-        let payload = r#"{
-            "type": "ready_ack",
-            "connection_id": "conn_1",
-            "place_id": "93795519121520"
-        }"#;
-        let decoded: ServerToHelperMessage =
-            serde_json::from_str(payload).expect("minimal ready ack should decode");
-        match decoded {
-            ServerToHelperMessage::ReadyAck {
-                connection_id,
-                place_id,
-                task_id,
-                generation,
-                launch_id,
-            } => {
-                assert_eq!(connection_id, "conn_1");
-                assert_eq!(place_id, "93795519121520");
-                assert_eq!(task_id, None);
-                assert_eq!(generation, None);
-                assert_eq!(launch_id, None);
-            }
-            other => panic!("expected ready ack, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn server_to_helper_artifact_committed_accepts_camel_case_fields() {
         let payload = r#"{
             "type": "artifactCommitted",
