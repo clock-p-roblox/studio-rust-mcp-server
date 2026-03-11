@@ -9,100 +9,100 @@ pub const MAX_ARTIFACT_CHUNK_PAYLOAD_BYTES: usize = 360 * 1024;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct HelperHello {
-    #[serde(alias = "helper_id")]
+    #[serde(rename = "helper_id", alias = "helperId")]
     pub helper_id: String,
-    #[serde(alias = "place_id")]
+    #[serde(rename = "place_id", alias = "placeId")]
     pub place_id: String,
-    #[serde(alias = "task_id")]
+    #[serde(rename = "task_id", alias = "taskId")]
     pub task_id: Option<String>,
     pub generation: Option<u32>,
-    #[serde(alias = "launch_id")]
+    #[serde(rename = "launch_id", alias = "launchId")]
     pub launch_id: Option<String>,
-    #[serde(alias = "helper_version")]
+    #[serde(rename = "helper_version", alias = "helperVersion")]
     pub helper_version: String,
     pub capabilities: Vec<String>,
-    #[serde(alias = "plugin_instance_count")]
+    #[serde(rename = "plugin_instance_count", alias = "pluginInstanceCount")]
     pub plugin_instance_count: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ArtifactBegin {
-    #[serde(alias = "upload_id")]
+    #[serde(rename = "upload_id", alias = "uploadId")]
     pub upload_id: String,
-    #[serde(alias = "request_id")]
+    #[serde(rename = "request_id", alias = "requestId")]
     pub request_id: String,
-    #[serde(alias = "session_id")]
+    #[serde(rename = "session_id", alias = "sessionId")]
     pub session_id: String,
-    #[serde(alias = "runtime_id")]
+    #[serde(rename = "runtime_id", alias = "runtimeId")]
     pub runtime_id: String,
-    #[serde(alias = "place_id")]
+    #[serde(rename = "place_id", alias = "placeId")]
     pub place_id: String,
-    #[serde(alias = "task_id")]
+    #[serde(rename = "task_id", alias = "taskId")]
     pub task_id: Option<String>,
     pub generation: Option<u32>,
-    #[serde(alias = "launch_id")]
+    #[serde(rename = "launch_id", alias = "launchId")]
     pub launch_id: Option<String>,
     pub tag: Option<String>,
-    #[serde(alias = "content_type")]
+    #[serde(rename = "content_type", alias = "contentType")]
     pub content_type: String,
-    #[serde(alias = "total_bytes")]
+    #[serde(rename = "total_bytes", alias = "totalBytes")]
     pub total_bytes: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ArtifactFinish {
-    #[serde(alias = "upload_id")]
+    #[serde(rename = "upload_id", alias = "uploadId")]
     pub upload_id: String,
-    #[serde(alias = "request_id")]
+    #[serde(rename = "request_id", alias = "requestId")]
     pub request_id: String,
-    #[serde(alias = "total_chunks")]
+    #[serde(rename = "total_chunks", alias = "totalChunks")]
     pub total_chunks: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ArtifactChunk {
-    #[serde(alias = "upload_id")]
+    #[serde(rename = "upload_id", alias = "uploadId")]
     pub upload_id: String,
     pub seq: u32,
-    #[serde(alias = "data_base64")]
+    #[serde(rename = "data_base64", alias = "dataBase64")]
     pub data_base64: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ArtifactAbort {
-    #[serde(alias = "upload_id")]
+    #[serde(rename = "upload_id", alias = "uploadId")]
     pub upload_id: String,
-    #[serde(alias = "request_id")]
+    #[serde(rename = "request_id", alias = "requestId")]
     pub request_id: String,
     pub error: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ArtifactCommitted {
-    #[serde(alias = "upload_id")]
+    #[serde(rename = "upload_id", alias = "uploadId")]
     pub upload_id: String,
-    #[serde(alias = "request_id")]
+    #[serde(rename = "request_id", alias = "requestId")]
     pub request_id: String,
-    #[serde(alias = "session_id")]
+    #[serde(rename = "session_id", alias = "sessionId")]
     pub session_id: String,
-    #[serde(alias = "runtime_id")]
+    #[serde(rename = "runtime_id", alias = "runtimeId")]
     pub runtime_id: String,
-    #[serde(alias = "place_id")]
+    #[serde(rename = "place_id", alias = "placeId")]
     pub place_id: String,
-    #[serde(alias = "task_id")]
+    #[serde(rename = "task_id", alias = "taskId")]
     pub task_id: Option<String>,
     pub generation: Option<u32>,
-    #[serde(alias = "launch_id")]
+    #[serde(rename = "launch_id", alias = "launchId")]
     pub launch_id: Option<String>,
-    #[serde(alias = "screenshot_path")]
+    #[serde(rename = "screenshot_path", alias = "screenshotPath")]
     pub screenshot_path: String,
-    #[serde(alias = "screenshot_rel_path")]
+    #[serde(rename = "screenshot_rel_path", alias = "screenshotRelPath")]
     pub screenshot_rel_path: String,
-    #[serde(alias = "artifact_dir")]
+    #[serde(rename = "artifact_dir", alias = "artifactDir")]
     pub artifact_dir: String,
-    #[serde(alias = "session_metadata_path")]
+    #[serde(rename = "session_metadata_path", alias = "sessionMetadataPath")]
     pub session_metadata_path: String,
-    #[serde(alias = "bytes_written")]
+    #[serde(rename = "bytes_written", alias = "bytesWritten")]
     pub bytes_written: usize,
 }
 
@@ -304,6 +304,46 @@ mod tests {
                 assert_eq!(launch_id, None);
             }
             other => panic!("expected ready ack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_to_helper_artifact_committed_accepts_camel_case_fields() {
+        let payload = r#"{
+            "type": "artifactCommitted",
+            "uploadId": "u_1",
+            "requestId": "req_1",
+            "sessionId": "sess_1",
+            "runtimeId": "client_1",
+            "placeId": "93795519121520",
+            "taskId": "tf2a83d456a",
+            "generation": 1,
+            "launchId": "l_123",
+            "screenshotPath": "/tmp/shot.png",
+            "screenshotRelPath": "client_1/shot.png",
+            "artifactDir": "/tmp/artifacts/sess_1",
+            "sessionMetadataPath": "/tmp/artifacts/sess_1/session.json",
+            "bytesWritten": 42
+        }"#;
+        let decoded: ServerToHelperMessage =
+            serde_json::from_str(payload).expect("camelCase artifact committed should decode");
+        match decoded {
+            ServerToHelperMessage::ArtifactCommitted(committed) => {
+                assert_eq!(committed.upload_id, "u_1");
+                assert_eq!(committed.request_id, "req_1");
+                assert_eq!(committed.session_id, "sess_1");
+                assert_eq!(committed.runtime_id, "client_1");
+                assert_eq!(committed.place_id, "93795519121520");
+                assert_eq!(committed.task_id.as_deref(), Some("tf2a83d456a"));
+                assert_eq!(committed.generation, Some(1));
+                assert_eq!(committed.launch_id.as_deref(), Some("l_123"));
+                assert_eq!(committed.screenshot_path, "/tmp/shot.png");
+                assert_eq!(committed.screenshot_rel_path, "client_1/shot.png");
+                assert_eq!(committed.artifact_dir, "/tmp/artifacts/sess_1");
+                assert_eq!(committed.session_metadata_path, "/tmp/artifacts/sess_1/session.json");
+                assert_eq!(committed.bytes_written, 42);
+            }
+            other => panic!("expected artifact committed, got {other:?}"),
         }
     }
 }

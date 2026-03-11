@@ -2462,6 +2462,40 @@ fn task_connection_key(task_id: &str, generation: u32, launch_id: &str) -> Strin
     format!("task:{task_id}:{generation}:{launch_id}")
 }
 
+fn validate_remote_ready_ack(
+    expected_place_id: &str,
+    expected_task_id: Option<&str>,
+    expected_generation: Option<u32>,
+    expected_launch_id: Option<&str>,
+    ack_place_id: &str,
+    ack_task_id: Option<&str>,
+    ack_generation: Option<u32>,
+    ack_launch_id: Option<&str>,
+) -> Result<()> {
+    if ack_place_id != expected_place_id {
+        return Err(eyre!(
+            "remote MCP ready ack place_id mismatch: expected {}, got {}",
+            expected_place_id,
+            ack_place_id,
+        ));
+    }
+    if ack_task_id != expected_task_id
+        || ack_generation != expected_generation
+        || ack_launch_id != expected_launch_id
+    {
+        return Err(eyre!(
+            "remote MCP ready ack identity mismatch: expected task={:?} generation={:?} launch={:?}, got task={:?} generation={:?} launch={:?}",
+            expected_task_id,
+            expected_generation,
+            expected_launch_id,
+            ack_task_id,
+            ack_generation,
+            ack_launch_id,
+        ));
+    }
+    Ok(())
+}
+
 fn derive_remote_helper_ws_url_from_base_url(remote_base_url: &str) -> String {
     let base = if remote_base_url.starts_with("https://") {
         remote_base_url.replacen("https://", "wss://", 1)
@@ -3123,6 +3157,7 @@ async fn run_remote_ws_session(
     let upload_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<Result<ArtifactCommitted>>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+    let mut ready_acknowledged = false;
     loop {
         tokio::select! {
             changed = stop_rx.changed() => {
@@ -3178,40 +3213,27 @@ async fn run_remote_ws_session(
                         }
                         match serde_json::from_str::<ServerToHelperMessage>(&text)? {
                             ServerToHelperMessage::ReadyAck { connection_id, place_id: ack_place_id, task_id: ack_task_id, generation: ack_generation, launch_id: ack_launch_id } => {
-                                if ack_place_id != place_id {
-                                    return Err(eyre!(
-                                        "remote MCP ready ack place_id mismatch: expected {}, got {}",
-                                        place_id,
-                                        ack_place_id,
-                                    ));
-                                }
-                                // launch-game-flow servers treat the task-scoped route itself as the
-                                // authoritative identity, so ReadyAck may omit task/generation/launch.
-                                let ack_includes_route_identity = ack_task_id.is_some()
-                                    || ack_generation.is_some()
-                                    || ack_launch_id.is_some();
-                                if ack_includes_route_identity
-                                    && (ack_task_id != task_id.map(ToOwned::to_owned)
-                                        || ack_generation != generation
-                                        || ack_launch_id != launch_id.map(ToOwned::to_owned))
-                                {
-                                    return Err(eyre!(
-                                        "remote MCP ready ack identity mismatch: expected task={:?} generation={:?} launch={:?}, got task={:?} generation={:?} launch={:?}",
-                                        task_id,
-                                        generation,
-                                        launch_id,
-                                        ack_task_id,
-                                        ack_generation,
-                                        ack_launch_id,
-                                    ));
-                                }
+                                validate_remote_ready_ack(
+                                    place_id,
+                                    task_id,
+                                    generation,
+                                    launch_id,
+                                    &ack_place_id,
+                                    ack_task_id.as_deref(),
+                                    ack_generation,
+                                    ack_launch_id.as_deref(),
+                                )?;
                                 {
                                     let mut state = app.state.lock().await;
                                     set_remote_connection_connected(&mut state, connection_key, &connection_id);
                                 }
+                                ready_acknowledged = true;
                                 tracing::info!(connection_key, place_id, connection_id, "helper websocket acknowledged by MCP server");
                             }
                             ServerToHelperMessage::ToolCall { request_id, command } => {
+                                if !ready_acknowledged {
+                                    return Err(eyre!("remote MCP server sent tool call before ready ack"));
+                                }
                                 let tool_sender = out_tx.clone();
                                 let tool_waiters = Arc::clone(&upload_waiters);
                                 let tool_app = app.clone();
@@ -3241,11 +3263,17 @@ async fn run_remote_ws_session(
                                 });
                             }
                             ServerToHelperMessage::ArtifactCommitted(committed) => {
+                                if !ready_acknowledged {
+                                    return Err(eyre!("remote MCP server sent artifact committed before ready ack"));
+                                }
                                 if let Some(tx) = upload_waiters.lock().await.remove(&committed.upload_id) {
                                     let _ = tx.send(Ok(committed));
                                 }
                             }
                             ServerToHelperMessage::ArtifactFailed { upload_id, error, .. } => {
+                                if !ready_acknowledged {
+                                    return Err(eyre!("remote MCP server sent artifact failed before ready ack"));
+                                }
                                 if let Some(tx) = upload_waiters.lock().await.remove(&upload_id) {
                                     let _ = tx.send(Err(eyre!(error)));
                                 }
@@ -4403,5 +4431,65 @@ mod tests {
         assert!(state.launch_processes.is_empty());
         assert!(state.last_remote_errors.is_empty());
         assert!(pending_termination.is_none());
+    }
+
+    #[test]
+    fn validate_remote_ready_ack_requires_exact_identity() {
+        validate_remote_ready_ack(
+            "93795519121520",
+            Some("task_a"),
+            Some(7),
+            Some("l_a"),
+            "93795519121520",
+            Some("task_a"),
+            Some(7),
+            Some("l_a"),
+        )
+        .expect("exact ready ack should pass");
+
+        let missing_identity = validate_remote_ready_ack(
+            "93795519121520",
+            Some("task_a"),
+            Some(7),
+            Some("l_a"),
+            "93795519121520",
+            None,
+            None,
+            None,
+        )
+        .expect_err("missing route identity should fail");
+        assert!(missing_identity
+            .to_string()
+            .contains("remote MCP ready ack identity mismatch"));
+
+        let partial_identity = validate_remote_ready_ack(
+            "93795519121520",
+            Some("task_a"),
+            Some(7),
+            Some("l_a"),
+            "93795519121520",
+            Some("task_a"),
+            None,
+            None,
+        )
+        .expect_err("partial route identity should fail");
+        assert!(partial_identity
+            .to_string()
+            .contains("remote MCP ready ack identity mismatch"));
+
+        let wrong_place = validate_remote_ready_ack(
+            "93795519121520",
+            Some("task_a"),
+            Some(7),
+            Some("l_a"),
+            "111",
+            Some("task_a"),
+            Some(7),
+            Some("l_a"),
+        )
+        .expect_err("place mismatch should fail");
+        assert!(wrong_place
+            .to_string()
+            .contains("remote MCP ready ack place_id mismatch"));
     }
 }
