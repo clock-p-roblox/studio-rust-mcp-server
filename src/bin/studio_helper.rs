@@ -3175,10 +3175,23 @@ async fn run_remote_ws_session(
                             note_remote_connection_activity(&mut state, connection_key);
                         }
                         match serde_json::from_str::<ServerToHelperMessage>(&text)? {
-                            ServerToHelperMessage::ReadyAck { connection_id, task_id: ack_task_id, generation: ack_generation, launch_id: ack_launch_id, .. } => {
-                                if ack_task_id != task_id.map(ToOwned::to_owned)
-                                    || ack_generation != generation
-                                    || ack_launch_id != launch_id.map(ToOwned::to_owned)
+                            ServerToHelperMessage::ReadyAck { connection_id, place_id: ack_place_id, task_id: ack_task_id, generation: ack_generation, launch_id: ack_launch_id } => {
+                                if ack_place_id != place_id {
+                                    return Err(eyre!(
+                                        "remote MCP ready ack place_id mismatch: expected {}, got {}",
+                                        place_id,
+                                        ack_place_id,
+                                    ));
+                                }
+                                // launch-game-flow servers treat the task-scoped route itself as the
+                                // authoritative identity, so ReadyAck may omit task/generation/launch.
+                                let ack_includes_route_identity = ack_task_id.is_some()
+                                    || ack_generation.is_some()
+                                    || ack_launch_id.is_some();
+                                if ack_includes_route_identity
+                                    && (ack_task_id != task_id.map(ToOwned::to_owned)
+                                        || ack_generation != generation
+                                        || ack_launch_id != launch_id.map(ToOwned::to_owned))
                                 {
                                     return Err(eyre!(
                                         "remote MCP ready ack identity mismatch: expected task={:?} generation={:?} launch={:?}, got task={:?} generation={:?} launch={:?}",
