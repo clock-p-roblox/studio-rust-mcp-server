@@ -136,7 +136,7 @@ Useful flags:
 - helper 是机器级单例，通过 hub claim task，再连到对应 task 的远端 MCP WebSocket
 - `restart` 保留 `task_id`
 - `stop + start` 默认生成新 `task_id`
-- `recover` 才接管旧 `task_id`
+- `recover` 复用原 `task_id` 并提升 `generation`
 
 hub 本身只做 control plane：
 

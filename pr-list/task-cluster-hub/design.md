@@ -14,7 +14,7 @@
 - 单机当前限制最多 4 个 Studio launch
 - `restart` 保留 `task_id`
 - `stop + start` 默认生成新 `task_id`
-- `recover` 才接管旧 `task_id`
+- `recover` 复用原 `task_id` 并提升 `generation`
 - `cluster_key = user + repo + worktree_name + place_id`
 
 ## 最新收口共识
@@ -131,7 +131,7 @@
   - helper 启动流程里把 hub register 前置；若 hub 返回 `helper_id_conflict`，直接打印原因并退出，不进入 claim/启动 Studio 流程
   - helper 对本机 Studio/plugin 维持单点权威
   - plugin 不缓存或传播 `generation`
-  - 不增加新的临时 token、回退路径或启发式补丁
+  - 不增加新的临时 token、额外路径或启发式补丁
   - helper 对“手动打开的 Studio 例外实例”保持不分配 task/launch 的策略，避免误把手动 Studio 拉入控制面
 
 ## 非目标
