@@ -123,27 +123,63 @@ Useful flags:
 - `--http-port <port>`: MCP HTTP port (default `44756`)
 - `--stdio`: run stdio MCP mode (can be combined with `--http`)
 - `--write-plugin <path>`: export bundled `MCPStudioPlugin.rbxm` and exit
+- `--task-id <task_id>`: expose task identity in `/status` and artifact metadata
+- `--workspace-path <path>`: explicit workspace identity
+- `--public-base-url <url>`: expose current public route in `/status`
+
+### Clock-p task cluster mode
+
+`clock-p` 当前的联调链路已经升级为 task 化 debug cluster：
+
+- server cluster 先向 hub 创建 task，拿到 `task_id`
+- rojo / MCP / runtime-log 都按同一个 `task_id` 暴露公网 host
+- helper 是机器级单例，通过 hub claim task，再连到对应 task 的远端 MCP WebSocket
+- `restart` 保留 `task_id`
+- `stop + start` 默认生成新 `task_id`
+- `recover` 才接管旧 `task_id`
+
+hub 本身只做 control plane：
+
+- helper register / heartbeat / claim
+- task create / heartbeat / release / recover
+
+为了覆盖极端故障场景，hub 现在会把 task 状态落盘；helper heartbeat 也会回填和校正 task claim。这样在 hub 重启、helper 重启、supervisor 过期等场景下，Linux 阶段就能先验证控制面的稳定性。
+
+本仓新增 `roblox_hub` 二进制作为 hub server：
+
+```sh
+cargo run --bin roblox_hub -- --port 44758 --no-auth
+```
+
+常见返回字段：
+
+- task：`task_id / generation / task_token / recover_token / routes`
+- helper：`helper_id / capacity / active_launches`
 
 ### Clock-p helper mode
 
-`clock-p` 当前的 Studio 联调架构额外引入了一个本地 helper：
+`clock-p` 的 Studio helper 现在是机器级单例：
 
 - `Rojo plugin -> helper -> helper 返回公网 Rojo 配置 -> plugin 直连 Rojo 公网域名`
 - `MCP plugin -> helper -> helper 通过公网 MCP WebSocket 收发工具调用`
+- `helper -> hub register / heartbeat / claim`
 - `take_screenshot -> helper 截图 -> helper 通过 MCP WebSocket 分片上传 -> MCP server 落盘到 workspace artifacts`
 
 helper 二进制是本仓库里的 `studio_helper`：
 
 ```sh
-cargo run --bin studio_helper -- --port 44750
+cargo run --bin studio_helper -- --port 44750 --hub-base-url https://roblox-hub-<user>-public.dev.clock-p.com
 ```
 
 默认行为：
 
 - helper 自己读取 `feishu-user_name` 和 `feishu-token`
-- helper 根据 `placeId` 推导域名：
-  - `https://{placeId}-rojo-{user_name}-user.dev.clock-p.com`
-  - `https://{placeId}-mcp-{user_name}-user.dev.clock-p.com`
+- helper 有稳定 `helper_id`，会持久化到本机数据目录
+- helper 注册 hub 后，会 claim task 并拿到：
+  - `task_id`
+  - `launch_id`
+  - `mcp_base_url`
+  - `rojo_base_url`
 - plugin 侧只需要配置 helper 端口
 - helper 还额外提供：
   - `GET /status`
@@ -159,7 +195,7 @@ MCP HTTP 服务额外开放：
 
 - `GET /ws/helper`
 
-这个 WebSocket 由 Windows helper 主动连接。插件与 helper 断开后，helper 也会主动关闭对应的远程 MCP WebSocket。
+这个 WebSocket 由 helper 主动连接。Linux helper 会保留 register / heartbeat / claim / 远端 WS 代理能力，但不提供 Win32 专属的截图、窗口定位和 Studio 本地日志读取能力。
 
 ### Ubuntu 交叉编译 Windows helper
 
