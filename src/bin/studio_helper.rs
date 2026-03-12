@@ -3915,7 +3915,7 @@ async fn main() -> Result<()> {
         "starting Studio helper"
     );
 
-    let initial_hub_registration = if helper.hub_base_url.is_some() {
+    let (initial_hub_registration, initial_hub_error) = if helper.hub_base_url.is_some() {
         match hub_register_helper(&helper).await {
             Ok(response) => {
                 tracing::info!(
@@ -3924,18 +3924,24 @@ async fn main() -> Result<()> {
                     heartbeat_timeout_sec = response.heartbeat_timeout_sec,
                     "registered helper with hub"
                 );
-                Some(response)
+                (Some(response), None)
             }
             Err(RegisterHelperError::HelperIdConflict(message)) => {
                 eprintln!("helper_id_conflict: {message}");
                 return Err(eyre!("helper_id_conflict: {message}"));
             }
             Err(RegisterHelperError::Other(error)) => {
-                return Err(error).wrap_err("failed to register helper with hub during startup");
+                let startup_error = summarize_error(&error.to_string());
+                tracing::warn!(
+                    helper_id = helper.helper_id,
+                    error = startup_error,
+                    "failed to register helper with hub during startup; continuing with background retry"
+                );
+                (None, Some(startup_error))
             }
         }
     } else {
-        None
+        (None, None)
     };
 
     let state = Arc::new(Mutex::new(HelperState {
@@ -3945,7 +3951,7 @@ async fn main() -> Result<()> {
         waiting_for_plugin: HashMap::new(),
         remote_connections: HashMap::new(),
         last_remote_errors: HashMap::new(),
-        hub_last_error: None,
+        hub_last_error: initial_hub_error,
         hub_last_ready_at: initial_hub_registration.as_ref().map(|_| Instant::now()),
     }));
 
