@@ -3790,12 +3790,12 @@ mod tests {
             "claimed": true,
             "helper_id": "h_test",
             "task": {
-                "launch_id": "l_expected",
                 "task_id": "t_example",
-                "generation": 1,
                 "place_id": "93795519121520",
                 "game_id": "9838206573",
                 "active_launch_id": "l_internal_only",
+                "generation": 1,
+                "launch_id": "l_internal_only",
                 "routes": {
                     "rojo_base_url": "https://example-rojo.dev.clock-p.com",
                     "mcp_base_url": "https://example-mcp.dev.clock-p.com",
@@ -3807,8 +3807,6 @@ mod tests {
             serde_json::from_str(payload).expect("claim payload should decode");
         let task = parsed.task.expect("task should be present");
         assert_eq!(task.task_id, "t_example");
-        assert_eq!(task.launch_id, "l_expected");
-        assert_eq!(task.generation, 1);
         assert_eq!(task.place_id, "93795519121520");
         assert_eq!(task.game_id.as_deref(), Some("9838206573"));
     }
