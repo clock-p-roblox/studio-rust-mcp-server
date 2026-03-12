@@ -389,6 +389,8 @@ struct ClaimTaskHubResponse {
 
 #[derive(Debug, Deserialize)]
 struct ClaimedTaskHubPayload {
+    // hub may carry internal fence fields (for example active_launch_id),
+    // but helper claim handling only relies on launch_id from this payload.
     launch_id: String,
     task_id: String,
     generation: u32,
@@ -4141,6 +4143,35 @@ mod tests {
         .expect("helper_id_conflict header should parse");
         assert_eq!(header_message, "helper_id already active");
         assert!(parse_helper_id_conflict(StatusCode::BAD_REQUEST, None, "{}").is_none());
+    }
+
+    #[test]
+    fn claim_task_response_ignores_internal_active_launch_id_field() {
+        let payload = r#"{
+            "claimed": true,
+            "helper_id": "h_test",
+            "task": {
+                "launch_id": "l_expected",
+                "task_id": "t_example",
+                "generation": 1,
+                "place_id": "93795519121520",
+                "game_id": "9838206573",
+                "active_launch_id": "l_internal_only",
+                "routes": {
+                    "rojo_base_url": "https://example-rojo.dev.clock-p.com",
+                    "mcp_base_url": "https://example-mcp.dev.clock-p.com",
+                    "runtime_log_base_url": "https://example-runtime.dev.clock-p.com"
+                }
+            }
+        }"#;
+        let parsed: ClaimTaskHubResponse =
+            serde_json::from_str(payload).expect("claim payload should decode");
+        let task = parsed.task.expect("task should be present");
+        assert_eq!(task.task_id, "t_example");
+        assert_eq!(task.launch_id, "l_expected");
+        assert_eq!(task.generation, 1);
+        assert_eq!(task.place_id, "93795519121520");
+        assert_eq!(task.game_id.as_deref(), Some("9838206573"));
     }
 
     #[cfg(target_os = "windows")]
