@@ -32,7 +32,10 @@ struct HubConfig {
 }
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Task/helper control plane for clock-p Roblox debug clusters")]
+#[command(
+    version,
+    about = "Task/helper control plane for clock-p Roblox debug clusters"
+)]
 struct Args {
     #[arg(long, default_value_t = DEFAULT_HUB_PORT)]
     port: u16,
@@ -80,7 +83,7 @@ struct HelperRecord {
     platform: String,
     capacity: usize,
     labels: Vec<String>,
-    active_launches: HashMap<String, String>,
+    active_task_ids: HashSet<String>,
     registered_at_unix_ms: u64,
     last_seen_at: Instant,
 }
@@ -96,7 +99,6 @@ struct TaskRoutes {
 struct TaskRecord {
     task_id: String,
     cluster_key: String,
-    generation: u32,
     task_token: String,
     recover_token: String,
     place_id: String,
@@ -113,7 +115,6 @@ struct TaskRecord {
     last_task_heartbeat_at_unix_ms: u64,
     last_seen_at: Instant,
     claimed_by_helper_id: Option<String>,
-    active_launch_id: Option<String>,
     released: bool,
 }
 
@@ -126,7 +127,6 @@ struct PersistedHubState {
 struct PersistedTaskRecord {
     task_id: String,
     cluster_key: String,
-    generation: u32,
     task_token: String,
     recover_token: String,
     place_id: String,
@@ -143,7 +143,6 @@ struct PersistedTaskRecord {
     #[serde(default)]
     last_task_heartbeat_at_unix_ms: u64,
     claimed_by_helper_id: Option<String>,
-    active_launch_id: Option<String>,
     released: bool,
 }
 
@@ -160,7 +159,6 @@ struct CreateTaskRequest {
 #[derive(Debug, Serialize)]
 struct CreateTaskResponse {
     task_id: String,
-    generation: u32,
     task_token: String,
     recover_token: String,
     heartbeat_interval_sec: u64,
@@ -178,7 +176,6 @@ struct RecoverTaskRequest {
 #[derive(Debug, Deserialize)]
 struct TaskHeartbeatRequest {
     task_id: String,
-    generation: u32,
     task_token: String,
     service_state: String,
     accepting_launches: bool,
@@ -191,7 +188,6 @@ struct TaskHeartbeatRequest {
 #[derive(Debug, Deserialize)]
 struct ReleaseTaskRequest {
     task_id: String,
-    generation: u32,
     task_token: String,
 }
 
@@ -215,20 +211,13 @@ struct RegisterHelperResponse {
 #[derive(Debug, Deserialize)]
 struct HelperHeartbeatRequest {
     helper_id: String,
-    active_launches: Vec<HelperLaunchState>,
+    active_task_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct HelperHeartbeatHubResponse {
     ok: bool,
-    release_launches: Vec<HelperLaunchState>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct HelperLaunchState {
-    launch_id: String,
-    task_id: String,
-    generation: u32,
+    release_task_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,9 +234,7 @@ struct ClaimTaskResponse {
 
 #[derive(Debug, Serialize)]
 struct ClaimedTaskPayload {
-    launch_id: String,
     task_id: String,
-    generation: u32,
     place_id: String,
     game_id: Option<String>,
     owner_user: String,
@@ -281,7 +268,6 @@ struct HelperStatusPayload {
 struct TaskStatusPayload {
     task_id: String,
     cluster_key: String,
-    generation: u32,
     place_id: String,
     game_id: Option<String>,
     owner_user: String,
@@ -290,7 +276,6 @@ struct TaskStatusPayload {
     service_state: String,
     accepting_launches: bool,
     claimed_by_helper_id: Option<String>,
-    active_launch_id: Option<String>,
     released: bool,
     routes: TaskRoutes,
     services: HashMap<String, String>,
@@ -298,31 +283,6 @@ struct TaskStatusPayload {
     updated_at_unix_ms: u64,
     last_task_heartbeat_at_unix_ms: u64,
     last_seen_age_ms: u128,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct LaunchIdentity {
-    task_id: String,
-    generation: u32,
-    launch_id: String,
-}
-
-impl LaunchIdentity {
-    fn from_helper_launch(launch: &HelperLaunchState) -> Self {
-        Self {
-            task_id: launch.task_id.clone(),
-            generation: launch.generation,
-            launch_id: launch.launch_id.clone(),
-        }
-    }
-
-    fn into_helper_launch_state(self) -> HelperLaunchState {
-        HelperLaunchState {
-            launch_id: self.launch_id,
-            task_id: self.task_id,
-            generation: self.generation,
-        }
-    }
 }
 
 fn normalize_bearer_token(token: &str) -> Option<String> {
@@ -345,9 +305,11 @@ fn default_feishu_token_path() -> Option<PathBuf> {
 }
 
 fn default_hub_state_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".dev.clock-p.com").join("roblox-hub").join("state.json"))
+    std::env::var_os("HOME").map(PathBuf::from).map(|home| {
+        home.join(".dev.clock-p.com")
+            .join("roblox-hub")
+            .join("state.json")
+    })
 }
 
 fn load_token_from_file(path: &PathBuf) -> Result<Option<String>> {
@@ -381,7 +343,8 @@ fn resolve_http_bearer_token(args: &Args) -> Result<Option<String>> {
 fn resolve_hub_config(args: &Args) -> Result<HubConfig> {
     let state_file = match args.state_file.as_ref() {
         Some(path) => path.clone(),
-        None => default_hub_state_path().ok_or_else(|| eyre!("cannot resolve default hub state path"))?,
+        None => default_hub_state_path()
+            .ok_or_else(|| eyre!("cannot resolve default hub state path"))?,
     };
     Ok(HubConfig {
         state_file,
@@ -396,10 +359,16 @@ fn load_persisted_tasks(config: &HubConfig) -> Result<HashMap<String, TaskRecord
         return Ok(HashMap::new());
     }
     let body = fs::read_to_string(&config.state_file).wrap_err_with(|| {
-        format!("failed to read hub state file {}", config.state_file.display())
+        format!(
+            "failed to read hub state file {}",
+            config.state_file.display()
+        )
     })?;
     let persisted: PersistedHubState = serde_json::from_str(&body).wrap_err_with(|| {
-        format!("failed to parse hub state file {}", config.state_file.display())
+        format!(
+            "failed to parse hub state file {}",
+            config.state_file.display()
+        )
     })?;
     let mut tasks = HashMap::new();
     let now = now_unix_ms();
@@ -418,7 +387,6 @@ fn load_persisted_tasks(config: &HubConfig) -> Result<HashMap<String, TaskRecord
             TaskRecord {
                 task_id: task.task_id,
                 cluster_key: task.cluster_key,
-                generation: task.generation,
                 task_token: task.task_token,
                 recover_token: task.recover_token,
                 place_id: task.place_id,
@@ -435,7 +403,6 @@ fn load_persisted_tasks(config: &HubConfig) -> Result<HashMap<String, TaskRecord
                 last_task_heartbeat_at_unix_ms,
                 last_seen_at: restored_last_seen_at,
                 claimed_by_helper_id: None,
-                active_launch_id: None,
                 released: task.released,
             },
         );
@@ -457,7 +424,6 @@ fn persist_state(state: &HubState) -> Result<()> {
             .map(|task| PersistedTaskRecord {
                 task_id: task.task_id.clone(),
                 cluster_key: task.cluster_key.clone(),
-                generation: task.generation,
                 task_token: task.task_token.clone(),
                 recover_token: task.recover_token.clone(),
                 place_id: task.place_id.clone(),
@@ -473,13 +439,15 @@ fn persist_state(state: &HubState) -> Result<()> {
                 updated_at_unix_ms: task.updated_at_unix_ms,
                 last_task_heartbeat_at_unix_ms: task.last_task_heartbeat_at_unix_ms,
                 claimed_by_helper_id: task.claimed_by_helper_id.clone(),
-                active_launch_id: task.active_launch_id.clone(),
                 released: task.released,
             })
             .collect(),
     };
     let tmp_path = state.config.state_file.with_extension("json.tmp");
-    fs::write(&tmp_path, format!("{}\n", serde_json::to_string_pretty(&payload)?))?;
+    fs::write(
+        &tmp_path,
+        format!("{}\n", serde_json::to_string_pretty(&payload)?),
+    )?;
     fs::rename(&tmp_path, &state.config.state_file)?;
     Ok(())
 }
@@ -532,7 +500,6 @@ fn new_token() -> String {
 fn clear_task_claim_state(task: &mut TaskRecord) {
     task.accepting_launches = false;
     task.claimed_by_helper_id = None;
-    task.active_launch_id = None;
 }
 
 fn clear_task_route_state(task: &mut TaskRecord) {
@@ -544,7 +511,6 @@ fn expire_task(task: &mut TaskRecord, now: u64) -> bool {
     if task.service_state == "expired"
         && !task.accepting_launches
         && task.claimed_by_helper_id.is_none()
-        && task.active_launch_id.is_none()
         && task.routes == TaskRoutes::default()
         && task.services.is_empty()
     {
@@ -561,7 +527,6 @@ fn task_status_payload(task: &TaskRecord) -> TaskStatusPayload {
     TaskStatusPayload {
         task_id: task.task_id.clone(),
         cluster_key: task.cluster_key.clone(),
-        generation: task.generation,
         place_id: task.place_id.clone(),
         game_id: task.game_id.clone(),
         owner_user: task.owner_user.clone(),
@@ -570,7 +535,6 @@ fn task_status_payload(task: &TaskRecord) -> TaskStatusPayload {
         service_state: task.service_state.clone(),
         accepting_launches: task.accepting_launches,
         claimed_by_helper_id: task.claimed_by_helper_id.clone(),
-        active_launch_id: task.active_launch_id.clone(),
         released: task.released,
         routes: task.routes.clone(),
         services: task.services.clone(),
@@ -581,21 +545,11 @@ fn task_status_payload(task: &TaskRecord) -> TaskStatusPayload {
     }
 }
 
-fn task_active_launch_identity(task: &TaskRecord) -> Option<LaunchIdentity> {
-    task.active_launch_id.as_ref().map(|launch_id| LaunchIdentity {
-        task_id: task.task_id.clone(),
-        generation: task.generation,
-        launch_id: launch_id.clone(),
-    })
-}
-
-fn task_matches_claimed_launch(task: &TaskRecord, helper_id: &str, launch: &LaunchIdentity) -> bool {
+fn task_matches_claimed_helper(task: &TaskRecord, helper_id: &str, task_id: &str) -> bool {
     !task.released
         && task.service_state != "expired"
-        && task.task_id == launch.task_id
-        && task.generation == launch.generation
+        && task.task_id == task_id
         && task.claimed_by_helper_id.as_deref() == Some(helper_id)
-        && task.active_launch_id.as_deref() == Some(launch.launch_id.as_str())
 }
 
 fn cleanup_stale_state(state: &mut HubState) -> bool {
@@ -642,7 +596,7 @@ async fn status_handler(State(state): State<SharedHubState>) -> Json<HubStatusRe
             owner_user: helper.owner_user.clone(),
             platform: helper.platform.clone(),
             capacity: helper.capacity,
-            active_launch_count: helper.active_launches.len(),
+            active_launch_count: helper.active_task_ids.len(),
             labels: helper.labels.clone(),
             registered_at_unix_ms: helper.registered_at_unix_ms,
             last_seen_age_ms: helper.last_seen_at.elapsed().as_millis(),
@@ -702,7 +656,6 @@ async fn create_task_handler(
         TaskRecord {
             task_id: task_id.clone(),
             cluster_key,
-            generation: 1,
             task_token: task_token.clone(),
             recover_token: recover_token.clone(),
             place_id: require_non_empty(&payload.place_id, "place_id")?,
@@ -719,14 +672,12 @@ async fn create_task_handler(
             last_task_heartbeat_at_unix_ms: now,
             last_seen_at: Instant::now(),
             claimed_by_helper_id: None,
-            active_launch_id: None,
             released: false,
         },
     );
     persist_state(&state)?;
     Ok(Json(CreateTaskResponse {
         task_id,
-        generation: 1,
         task_token,
         recover_token,
         heartbeat_interval_sec: state.config.heartbeat_interval_sec,
@@ -758,7 +709,6 @@ async fn recover_task_handler(
             payload.task_id
         )));
     }
-    task.generation += 1;
     task.task_token = new_token();
     if let Some(game_id) = payload.game_id.filter(|value| !value.trim().is_empty()) {
         task.game_id = Some(game_id);
@@ -771,13 +721,11 @@ async fn recover_task_handler(
     task.last_task_heartbeat_at_unix_ms = now;
     task.last_seen_at = Instant::now();
     let response_task_id = task.task_id.clone();
-    let response_generation = task.generation;
     let response_task_token = task.task_token.clone();
     let response_recover_token = task.recover_token.clone();
     persist_state(&state)?;
     Ok(Json(CreateTaskResponse {
         task_id: response_task_id,
-        generation: response_generation,
         task_token: response_task_token,
         recover_token: response_recover_token,
         heartbeat_interval_sec: state.config.heartbeat_interval_sec,
@@ -797,9 +745,6 @@ async fn task_heartbeat_handler(
         .tasks
         .get_mut(&payload.task_id)
         .ok_or_else(|| HubError(eyre!("task not found: {}", payload.task_id)))?;
-    if task.generation != payload.generation {
-        return Err(HubError(eyre!("task generation mismatch")));
-    }
     if task.task_token != payload.task_token {
         return Err(HubError(eyre!("task token mismatch")));
     }
@@ -807,7 +752,9 @@ async fn task_heartbeat_handler(
         return Err(HubError(eyre!("released task cannot accept heartbeat")));
     }
     if task.service_state == "expired" {
-        return Err(HubError(eyre!("expired task requires recover before heartbeat")));
+        return Err(HubError(eyre!(
+            "expired task requires recover before heartbeat"
+        )));
     }
     task.service_state = require_non_empty(&payload.service_state, "service_state")?;
     task.accepting_launches = payload.accepting_launches;
@@ -834,9 +781,6 @@ async fn release_task_handler(
             .tasks
             .get_mut(&payload.task_id)
             .ok_or_else(|| HubError(eyre!("task not found: {}", payload.task_id)))?;
-        if task.generation != payload.generation {
-            return Err(HubError(eyre!("task generation mismatch")));
-        }
         if task.task_token != payload.task_token {
             return Err(HubError(eyre!("task token mismatch")));
         }
@@ -850,7 +794,7 @@ async fn release_task_handler(
     };
     if let Some(helper_id) = helper_id.as_ref() {
         if let Some(helper) = state.helpers.get_mut(helper_id) {
-            helper.active_launches.retain(|_, task_id| task_id != &payload.task_id);
+            helper.active_task_ids.remove(&payload.task_id);
         }
     }
     persist_state(&state)?;
@@ -863,7 +807,9 @@ async fn register_helper_handler(
 ) -> Result<Json<RegisterHelperResponse>, Response> {
     let mut state = state.lock().await;
     if cleanup_stale_state(&mut state) {
-        persist_state(&state).map_err(HubError::from).map_err(IntoResponse::into_response)?;
+        persist_state(&state)
+            .map_err(HubError::from)
+            .map_err(IntoResponse::into_response)?;
     }
     let helper_id = require_non_empty(&payload.helper_id, "helper_id")
         .map_err(HubError::from)
@@ -888,7 +834,7 @@ async fn register_helper_handler(
                 .map_err(IntoResponse::into_response)?,
             capacity: payload.capacity,
             labels: payload.labels,
-            active_launches: HashMap::new(),
+            active_task_ids: HashSet::new(),
             registered_at_unix_ms: now,
             last_seen_at: Instant::now(),
         },
@@ -910,72 +856,52 @@ async fn helper_heartbeat_handler(
     }
     let now = now_unix_ms();
     let helper_id = payload.helper_id.clone();
-    let active_launches_by_task: HashMap<String, LaunchIdentity> = payload
-        .active_launches
-        .iter()
-        .map(|launch| (launch.task_id.clone(), LaunchIdentity::from_helper_launch(launch)))
-        .collect();
-    let mut release_launches = HashSet::new();
+    let active_task_ids: HashSet<String> = payload.active_task_ids.iter().cloned().collect();
+    let mut release_task_ids = HashSet::new();
     let mut changed = false;
 
     for task in state.tasks.values_mut() {
         if task.claimed_by_helper_id.as_deref() != Some(helper_id.as_str()) {
             continue;
         }
-        match active_launches_by_task.get(&task.task_id) {
-            Some(launch) => {
-                if !task_matches_claimed_launch(task, &helper_id, launch) {
-                    release_launches.insert(launch.clone());
-                    task.claimed_by_helper_id = None;
-                    task.active_launch_id = None;
-                    task.updated_at_unix_ms = now;
-                    changed = true;
-                }
-            }
-            None => {
-                if let Some(identity) = task_active_launch_identity(task) {
-                    release_launches.insert(identity);
-                }
-                task.claimed_by_helper_id = None;
-                task.active_launch_id = None;
-                task.updated_at_unix_ms = now;
-                changed = true;
-            }
+        if !active_task_ids.contains(&task.task_id) {
+            release_task_ids.insert(task.task_id.clone());
+            task.claimed_by_helper_id = None;
+            task.updated_at_unix_ms = now;
+            changed = true;
         }
     }
 
-    for launch in &payload.active_launches {
-        let identity = LaunchIdentity::from_helper_launch(launch);
-        let should_release = match state.tasks.get(&launch.task_id) {
-            Some(task) => !task_matches_claimed_launch(task, &helper_id, &identity),
+    for task_id in &payload.active_task_ids {
+        let should_release = match state.tasks.get(task_id) {
+            Some(task) => !task_matches_claimed_helper(task, &helper_id, task_id),
             None => true,
         };
         if should_release {
-            release_launches.insert(identity);
+            release_task_ids.insert(task_id.clone());
         }
     }
+
     let helper = state
         .helpers
         .get_mut(&helper_id)
         .ok_or_else(|| HubError(eyre!("helper not found: {}", helper_id)))?;
     helper.last_seen_at = Instant::now();
-    helper.active_launches.clear();
-    for launch in payload.active_launches {
-        let identity = LaunchIdentity::from_helper_launch(&launch);
-        if release_launches.contains(&identity) {
+    helper.active_task_ids.clear();
+    for task_id in payload.active_task_ids {
+        if release_task_ids.contains(&task_id) {
             continue;
         }
-        helper.active_launches.insert(launch.launch_id, launch.task_id);
+        helper.active_task_ids.insert(task_id);
     }
     if changed {
         persist_state(&state)?;
     }
+    let mut release_task_ids = release_task_ids.into_iter().collect::<Vec<_>>();
+    release_task_ids.sort();
     Ok(Json(HelperHeartbeatHubResponse {
         ok: true,
-        release_launches: release_launches
-            .into_iter()
-            .map(LaunchIdentity::into_helper_launch_state)
-            .collect(),
+        release_task_ids,
     }))
 }
 
@@ -993,7 +919,7 @@ async fn claim_task_handler(
         .ok_or_else(|| HubError(eyre!("helper not found: {}", payload.helper_id)))?;
     let helper_owner = helper.owner_user.clone();
     let helper_capacity = helper.capacity;
-    let helper_launch_count = helper.active_launches.len();
+    let helper_launch_count = helper.active_task_ids.len();
     let helper_id = helper.helper_id.clone();
     if helper_launch_count >= helper_capacity {
         return Ok(Json(ClaimTaskResponse {
@@ -1022,15 +948,11 @@ async fn claim_task_handler(
             task: None,
         }));
     };
-    let launch_id = format!("l_{}", &Uuid::new_v4().simple().to_string()[..10]);
     task.claimed_by_helper_id = Some(helper_id.clone());
-    task.active_launch_id = Some(launch_id.clone());
     task.updated_at_unix_ms = now_unix_ms();
     let claimed_task_id = task.task_id.clone();
     let response_task = ClaimedTaskPayload {
-        launch_id: launch_id.clone(),
         task_id: claimed_task_id.clone(),
-        generation: task.generation,
         place_id: task.place_id.clone(),
         game_id: task.game_id.clone(),
         owner_user: task.owner_user.clone(),
@@ -1040,9 +962,7 @@ async fn claim_task_handler(
     };
     if let Some(helper) = state.helpers.get_mut(&helper_id) {
         helper.last_seen_at = Instant::now();
-        helper
-            .active_launches
-            .insert(launch_id.clone(), claimed_task_id);
+        helper.active_task_ids.insert(claimed_task_id);
     }
     persist_state(&state)?;
     Ok(Json(ClaimTaskResponse {
@@ -1138,7 +1058,10 @@ async fn main() -> Result<()> {
         .route("/v1/helpers/heartbeat", post(helper_heartbeat_handler))
         .route("/v1/helpers/claim", post(claim_task_handler))
         .with_state(Arc::clone(&state))
-        .layer(middleware::from_fn_with_state(auth_state, require_http_auth));
+        .layer(middleware::from_fn_with_state(
+            auth_state,
+            require_http_auth,
+        ));
 
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, args.port)).await?;
     tracing::info!(port = args.port, "roblox hub listening on 127.0.0.1");

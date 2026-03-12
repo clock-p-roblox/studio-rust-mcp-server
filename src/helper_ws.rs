@@ -15,9 +15,6 @@ pub struct HelperHello {
     pub place_id: String,
     #[serde(rename = "task_id", alias = "taskId")]
     pub task_id: Option<String>,
-    pub generation: Option<u32>,
-    #[serde(rename = "launch_id", alias = "launchId")]
-    pub launch_id: Option<String>,
     #[serde(rename = "helper_version", alias = "helperVersion")]
     pub helper_version: String,
     pub capabilities: Vec<String>,
@@ -39,9 +36,6 @@ pub struct ArtifactBegin {
     pub place_id: String,
     #[serde(rename = "task_id", alias = "taskId")]
     pub task_id: Option<String>,
-    pub generation: Option<u32>,
-    #[serde(rename = "launch_id", alias = "launchId")]
-    pub launch_id: Option<String>,
     pub tag: Option<String>,
     #[serde(rename = "content_type", alias = "contentType")]
     pub content_type: String,
@@ -91,9 +85,6 @@ pub struct ArtifactCommitted {
     pub place_id: String,
     #[serde(rename = "task_id", alias = "taskId")]
     pub task_id: Option<String>,
-    pub generation: Option<u32>,
-    #[serde(rename = "launch_id", alias = "launchId")]
-    pub launch_id: Option<String>,
     #[serde(rename = "screenshot_path", alias = "screenshotPath")]
     pub screenshot_path: String,
     #[serde(rename = "screenshot_rel_path", alias = "screenshotRelPath")]
@@ -119,9 +110,6 @@ pub enum HelperToServerMessage {
         place_id: String,
         #[serde(alias = "taskId")]
         task_id: Option<String>,
-        generation: Option<u32>,
-        #[serde(alias = "launchId")]
-        launch_id: Option<String>,
         #[serde(alias = "pluginInstanceCount")]
         plugin_instance_count: usize,
     },
@@ -158,9 +146,6 @@ pub enum ServerToHelperMessage {
         place_id: String,
         #[serde(alias = "taskId")]
         task_id: Option<String>,
-        generation: Option<u32>,
-        #[serde(alias = "launchId")]
-        launch_id: Option<String>,
     },
     #[serde(rename = "tool_call", alias = "toolCall")]
     ToolCall {
@@ -179,9 +164,7 @@ pub enum ServerToHelperMessage {
         error: String,
     },
     #[serde(rename = "close_reason", alias = "closeReason")]
-    CloseReason {
-        reason: String,
-    },
+    CloseReason { reason: String },
 }
 
 #[cfg(test)]
@@ -194,9 +177,7 @@ mod tests {
             "type": "readyAck",
             "connectionId": "conn_1",
             "placeId": "93795519121520",
-            "taskId": "tf2a83d456a",
-            "generation": 1,
-            "launchId": "l_123"
+            "taskId": "tf2a83d456a"
         }"#;
         let decoded: ServerToHelperMessage =
             serde_json::from_str(payload).expect("camelCase ready ack should decode");
@@ -205,14 +186,10 @@ mod tests {
                 connection_id,
                 place_id,
                 task_id,
-                generation,
-                launch_id,
             } => {
                 assert_eq!(connection_id, "conn_1");
                 assert_eq!(place_id, "93795519121520");
                 assert_eq!(task_id.as_deref(), Some("tf2a83d456a"));
-                assert_eq!(generation, Some(1));
-                assert_eq!(launch_id.as_deref(), Some("l_123"));
             }
             other => panic!("expected ready ack, got {other:?}"),
         }
@@ -225,8 +202,6 @@ mod tests {
             "helper_id": "h_test",
             "place_id": "93795519121520",
             "task_id": "tf2a83d456a",
-            "generation": 1,
-            "launch_id": "l_123",
             "helper_version": "0.0.0",
             "capabilities": ["ws_tool_dispatch_v1"],
             "plugin_instance_count": 1
@@ -238,8 +213,6 @@ mod tests {
                 helper_id,
                 place_id,
                 task_id,
-                generation,
-                launch_id,
                 helper_version,
                 capabilities,
                 plugin_instance_count,
@@ -247,8 +220,6 @@ mod tests {
                 assert_eq!(helper_id, "h_test");
                 assert_eq!(place_id, "93795519121520");
                 assert_eq!(task_id.as_deref(), Some("tf2a83d456a"));
-                assert_eq!(generation, Some(1));
-                assert_eq!(launch_id.as_deref(), Some("l_123"));
                 assert_eq!(helper_version, "0.0.0");
                 assert_eq!(capabilities, vec!["ws_tool_dispatch_v1"]);
                 assert_eq!(plugin_instance_count, 1);
@@ -263,8 +234,6 @@ mod tests {
             helper_id: "h_test".to_owned(),
             place_id: "93795519121520".to_owned(),
             task_id: Some("tf2a83d456a".to_owned()),
-            generation: Some(1),
-            launch_id: Some("l_123".to_owned()),
             plugin_instance_count: 2,
         })
         .expect("heartbeat should serialize");
@@ -272,12 +241,9 @@ mod tests {
         assert_eq!(encoded["helper_id"], "h_test");
         assert_eq!(encoded["place_id"], "93795519121520");
         assert_eq!(encoded["task_id"], "tf2a83d456a");
-        assert_eq!(encoded["generation"], 1);
-        assert_eq!(encoded["launch_id"], "l_123");
         assert_eq!(encoded["plugin_instance_count"], 2);
         assert!(encoded.get("helperId").is_none());
         assert!(encoded.get("taskId").is_none());
-        assert!(encoded.get("launchId").is_none());
     }
 
     #[test]
@@ -290,8 +256,6 @@ mod tests {
             "runtimeId": "client_1",
             "placeId": "93795519121520",
             "taskId": "tf2a83d456a",
-            "generation": 1,
-            "launchId": "l_123",
             "screenshotPath": "/tmp/shot.png",
             "screenshotRelPath": "client_1/shot.png",
             "artifactDir": "/tmp/artifacts/sess_1",
@@ -308,12 +272,13 @@ mod tests {
                 assert_eq!(committed.runtime_id, "client_1");
                 assert_eq!(committed.place_id, "93795519121520");
                 assert_eq!(committed.task_id.as_deref(), Some("tf2a83d456a"));
-                assert_eq!(committed.generation, Some(1));
-                assert_eq!(committed.launch_id.as_deref(), Some("l_123"));
                 assert_eq!(committed.screenshot_path, "/tmp/shot.png");
                 assert_eq!(committed.screenshot_rel_path, "client_1/shot.png");
                 assert_eq!(committed.artifact_dir, "/tmp/artifacts/sess_1");
-                assert_eq!(committed.session_metadata_path, "/tmp/artifacts/sess_1/session.json");
+                assert_eq!(
+                    committed.session_metadata_path,
+                    "/tmp/artifacts/sess_1/session.json"
+                );
                 assert_eq!(committed.bytes_written, 42);
             }
             other => panic!("expected artifact committed, got {other:?}"),

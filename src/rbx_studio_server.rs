@@ -48,33 +48,6 @@ fn summarize_text(value: &str) -> String {
     }
 }
 
-async fn fetch_hub_task_fence(
-    hub_base_url: &str,
-    hub_bearer_token: &str,
-    task_id: &str,
-) -> Result<HubTaskFencePayload> {
-    let response = reqwest::Client::new()
-        .get(format!("{}/v1/tasks/{}", hub_base_url.trim_end_matches('/'), task_id))
-        .bearer_auth(hub_bearer_token)
-        .send()
-        .await
-        .map_err(|error| eyre!("failed to request hub task fence: {error}"))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|error| eyre!("failed to read hub task fence body: {error}"))?;
-    if !status.is_success() {
-        return Err(eyre!(
-            "hub task fence request failed with {status}: {}",
-            summarize_text(&body)
-        )
-        .into());
-    }
-    serde_json::from_str(&body)
-        .map_err(|error| eyre!("failed to decode hub task fence payload: {error}").into())
-}
-
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ToolArguments {
     args: ToolArgumentValues,
@@ -91,10 +64,7 @@ pub struct RunCommandResponse {
 pub struct AppState {
     workspace: PathBuf,
     task_id: Option<String>,
-    task_generation: Option<u32>,
     public_base_url: Option<String>,
-    hub_base_url: Option<String>,
-    hub_bearer_token: Option<String>,
     process_queue: VecDeque<ToolArguments>,
     output_map: HashMap<Uuid, mpsc::UnboundedSender<Result<String>>>,
     active_helper: Option<ActiveHelperConnection>,
@@ -109,15 +79,12 @@ pub struct StatusResponse {
     service: &'static str,
     workspace: String,
     task_id: Option<String>,
-    task_generation: Option<u32>,
     public_base_url: Option<String>,
     queued_requests: usize,
     pending_responses: usize,
     helper_connected: bool,
     helper_place_id: Option<String>,
     helper_task_id: Option<String>,
-    helper_generation: Option<u32>,
-    helper_launch_id: Option<String>,
     helper_connection_id: Option<String>,
     helper_last_message_age_ms: Option<u128>,
 }
@@ -126,20 +93,8 @@ struct ActiveHelperConnection {
     connection_id: Uuid,
     place_id: String,
     task_id: Option<String>,
-    generation: Option<u32>,
-    launch_id: Option<String>,
     sender: mpsc::UnboundedSender<OutgoingHelperFrame>,
     last_message_at: Instant,
-}
-
-#[derive(Deserialize)]
-struct HubTaskFencePayload {
-    task_id: String,
-    generation: u32,
-    service_state: String,
-    claimed_by_helper_id: Option<String>,
-    active_launch_id: Option<String>,
-    released: bool,
 }
 
 #[derive(Clone)]
@@ -153,8 +108,6 @@ struct ArtifactUploadState {
     runtime_id: String,
     place_id: String,
     task_id: Option<String>,
-    generation: Option<u32>,
-    launch_id: Option<String>,
     tag: Option<String>,
     temp_path: PathBuf,
     artifact_dir: PathBuf,
@@ -174,19 +127,13 @@ impl AppState {
     pub fn new(
         workspace: PathBuf,
         task_id: Option<String>,
-        task_generation: Option<u32>,
         public_base_url: Option<String>,
-        hub_base_url: Option<String>,
-        hub_bearer_token: Option<String>,
     ) -> Self {
         let (trigger, waiter) = watch::channel(());
         Self {
             workspace,
             task_id,
-            task_generation,
             public_base_url,
-            hub_base_url,
-            hub_bearer_token,
             process_queue: VecDeque::new(),
             output_map: HashMap::new(),
             active_helper: None,
@@ -217,7 +164,6 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
         service: "rbx-studio-mcp",
         workspace: state.workspace.to_string_lossy().into_owned(),
         task_id: state.task_id.clone(),
-        task_generation: state.task_generation,
         public_base_url: state.public_base_url.clone(),
         queued_requests: state.process_queue.len(),
         pending_responses: state.output_map.len(),
@@ -235,19 +181,6 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
                 .active_helper
                 .as_ref()
                 .and_then(|helper| helper.task_id.clone())
-        } else {
-            None
-        },
-        helper_generation: if helper_connected {
-            state.active_helper.as_ref().and_then(|helper| helper.generation)
-        } else {
-            None
-        },
-        helper_launch_id: if helper_connected {
-            state
-                .active_helper
-                .as_ref()
-                .and_then(|helper| helper.launch_id.clone())
         } else {
             None
         },
@@ -850,12 +783,8 @@ fn prepare_artifact_upload(
     if begin.content_type != "image/png" {
         return Err(eyre!("artifact upload only supports image/png").into());
     }
-    let (artifact_dir, _log_dir, screenshot_root, session_metadata_path) = ensure_session_metadata(
-        workspace,
-        &session_id,
-        &place_id,
-        begin.task_id.as_deref(),
-    )?;
+    let (artifact_dir, _log_dir, screenshot_root, session_metadata_path) =
+        ensure_session_metadata(workspace, &session_id, &place_id, begin.task_id.as_deref())?;
     let screenshot_dir = screenshot_root.join(&runtime_id);
     fs::create_dir_all(&screenshot_dir)?;
     let temp_path = screenshot_dir.join(format!(".upload-{upload_id}.part"));
@@ -870,8 +799,6 @@ fn prepare_artifact_upload(
             runtime_id,
             place_id,
             task_id: begin.task_id,
-            generation: begin.generation,
-            launch_id: begin.launch_id,
             tag: begin.tag,
             temp_path,
             artifact_dir,
@@ -1003,8 +930,6 @@ fn finalize_artifact_upload(
         runtime_id: upload.runtime_id.clone(),
         place_id: upload.place_id.clone(),
         task_id: upload.task_id.clone(),
-        generation: upload.generation,
-        launch_id: upload.launch_id.clone(),
         screenshot_path: final_path.to_string_lossy().into_owned(),
         screenshot_rel_path: workspace_relative_path(workspace, &final_path),
         artifact_dir: upload.artifact_dir.to_string_lossy().into_owned(),
@@ -1019,8 +944,6 @@ fn committed_response_body(committed: &ArtifactCommitted) -> Result<String> {
         "runtime_id": committed.runtime_id,
         "place_id": committed.place_id,
         "task_id": committed.task_id,
-        "generation": committed.generation,
-        "launch_id": committed.launch_id,
         "screenshot_path": committed.screenshot_path,
         "screenshot_rel_path": committed.screenshot_rel_path,
         "artifact_dir": committed.artifact_dir,
@@ -1090,82 +1013,7 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
         }
     };
 
-    let (expected_task_id, expected_generation, hub_base_url, hub_bearer_token) = {
-        let state = state.lock().await;
-        (
-            state.task_id.clone(),
-            state.task_generation,
-            state.hub_base_url.clone(),
-            state.hub_bearer_token.clone(),
-        )
-    };
-    if hello.task_id != expected_task_id {
-        let reason = format!(
-            "helper task_id mismatch: expected {:?}, got {:?}",
-            expected_task_id, hello.task_id
-        );
-        let _ = out_tx.send(OutgoingHelperFrame::Text(
-            serde_json::to_string(&ServerToHelperMessage::CloseReason { reason }).unwrap(),
-        ));
-        writer_task.abort();
-        return;
-    }
-    if hello.generation != expected_generation {
-        let reason = format!(
-            "helper generation mismatch: expected {:?}, got {:?}",
-            expected_generation, hello.generation
-        );
-        let _ = out_tx.send(OutgoingHelperFrame::Text(
-            serde_json::to_string(&ServerToHelperMessage::CloseReason { reason }).unwrap(),
-        ));
-        writer_task.abort();
-        return;
-    }
-    if let (Some(task_id), Some(hub_base_url), Some(hub_bearer_token)) = (
-        hello.task_id.as_deref(),
-        hub_base_url.as_deref(),
-        hub_bearer_token.as_deref(),
-    ) {
-        match fetch_hub_task_fence(hub_base_url, hub_bearer_token, task_id).await {
-            Ok(fence) => {
-                let launch_matches = fence.active_launch_id == hello.launch_id;
-                let helper_matches = fence.claimed_by_helper_id.as_deref() == Some(hello.helper_id.as_str());
-                let generation_matches = Some(fence.generation) == hello.generation;
-                let task_matches = fence.task_id == task_id;
-                if fence.released
-                    || fence.service_state == "expired"
-                    || !task_matches
-                    || !generation_matches
-                    || !helper_matches
-                    || !launch_matches
-                {
-                    let reason = format!(
-                        "helper launch fence mismatch: task={} generation={:?} helper_id={} launch_id={:?}",
-                        task_id,
-                        hello.generation,
-                        hello.helper_id,
-                        hello.launch_id,
-                    );
-                    let _ = out_tx.send(OutgoingHelperFrame::Text(
-                        serde_json::to_string(&ServerToHelperMessage::CloseReason { reason }).unwrap(),
-                    ));
-                    writer_task.abort();
-                    return;
-                }
-            }
-            Err(error) => {
-                let _ = out_tx.send(OutgoingHelperFrame::Text(
-                    serde_json::to_string(&ServerToHelperMessage::CloseReason {
-                        reason: format!("failed to validate helper launch fence: {error}"),
-                    })
-                    .unwrap(),
-                ));
-                writer_task.abort();
-                return;
-            }
-        }
-    }
-    tracing::info!(connection_id = %connection_id, place_id = hello.place_id, task_id = ?hello.task_id, generation = ?hello.generation, launch_id = ?hello.launch_id, capabilities = ?hello.capabilities, "helper websocket connected");
+    tracing::info!(connection_id = %connection_id, place_id = hello.place_id, task_id = ?hello.task_id, capabilities = ?hello.capabilities, "helper websocket connected");
     let uploads = { Arc::clone(&state.lock().await.uploads) };
     let workspace = { state.lock().await.workspace.clone() };
     {
@@ -1174,8 +1022,6 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
             connection_id,
             place_id: hello.place_id.clone(),
             task_id: hello.task_id.clone(),
-            generation: hello.generation,
-            launch_id: hello.launch_id.clone(),
             sender: out_tx.clone(),
             last_message_at: Instant::now(),
         }) {
@@ -1198,8 +1044,6 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
             connection_id: connection_id.to_string(),
             place_id: hello.place_id.clone(),
             task_id: hello.task_id.clone(),
-            generation: hello.generation,
-            launch_id: hello.launch_id.clone(),
         })
         .unwrap(),
     ));
@@ -1223,11 +1067,9 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
                         helper_id,
                         place_id,
                         task_id,
-                        generation,
-                        launch_id,
                         plugin_instance_count,
                     }) => {
-                        tracing::debug!(connection_id = %connection_id, helper_id, place_id, task_id = ?task_id, generation = ?generation, launch_id = ?launch_id, plugin_instance_count, "received helper heartbeat");
+                        tracing::debug!(connection_id = %connection_id, helper_id, place_id, task_id = ?task_id, plugin_instance_count, "received helper heartbeat");
                     }
                     Ok(HelperToServerMessage::ToolResult {
                         request_id,
