@@ -16,7 +16,7 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing_subscriber::{self, EnvFilter};
 use uuid::Uuid;
 
@@ -72,9 +72,17 @@ struct HubState {
     config: HubConfig,
     helpers: HashMap<String, HelperRecord>,
     tasks: HashMap<String, TaskRecord>,
+    state_revision: u64,
 }
 
-type SharedHubState = Arc<Mutex<HubState>>;
+type SharedHubState = Arc<RwLock<HubState>>;
+type SharedPersistLock = Arc<Mutex<()>>;
+
+#[derive(Clone)]
+struct AppState {
+    hub: SharedHubState,
+    persist_lock: SharedPersistLock,
+}
 
 #[derive(Debug)]
 struct HelperRecord {
@@ -144,6 +152,12 @@ struct PersistedTaskRecord {
     last_task_heartbeat_at_unix_ms: u64,
     claimed_by_helper_id: Option<String>,
     released: bool,
+}
+
+struct PersistSnapshot {
+    revision: u64,
+    state_file: PathBuf,
+    payload: PersistedHubState,
 }
 
 #[derive(Debug, Deserialize)]
@@ -410,14 +424,8 @@ fn load_persisted_tasks(config: &HubConfig) -> Result<HashMap<String, TaskRecord
     Ok(tasks)
 }
 
-fn persist_state(state: &HubState) -> Result<()> {
-    let parent = state
-        .config
-        .state_file
-        .parent()
-        .ok_or_else(|| eyre!("hub state file has no parent directory"))?;
-    fs::create_dir_all(parent)?;
-    let payload = PersistedHubState {
+fn build_persisted_state_payload(state: &HubState) -> PersistedHubState {
+    PersistedHubState {
         tasks: state
             .tasks
             .values()
@@ -442,14 +450,46 @@ fn persist_state(state: &HubState) -> Result<()> {
                 released: task.released,
             })
             .collect(),
-    };
-    let tmp_path = state.config.state_file.with_extension("json.tmp");
-    fs::write(
-        &tmp_path,
-        format!("{}\n", serde_json::to_string_pretty(&payload)?),
-    )?;
-    fs::rename(&tmp_path, &state.config.state_file)?;
+    }
+}
+
+fn build_persist_snapshot(state: &HubState) -> PersistSnapshot {
+    PersistSnapshot {
+        revision: state.state_revision,
+        state_file: state.config.state_file.clone(),
+        payload: build_persisted_state_payload(state),
+    }
+}
+
+fn bump_state_revision(state: &mut HubState) -> PersistSnapshot {
+    state.state_revision = state.state_revision.saturating_add(1);
+    build_persist_snapshot(state)
+}
+
+fn persist_snapshot(snapshot: &PersistSnapshot) -> Result<()> {
+    let parent = snapshot
+        .state_file
+        .parent()
+        .ok_or_else(|| eyre!("hub state file has no parent directory"))?;
+    fs::create_dir_all(parent)?;
+    let tmp_path = snapshot.state_file.with_extension("json.tmp");
+    let mut body = serde_json::to_vec(&snapshot.payload)?;
+    body.push(b'\n');
+    fs::write(&tmp_path, body)?;
+    fs::rename(&tmp_path, &snapshot.state_file)?;
     Ok(())
+}
+
+async fn persist_snapshot_if_current(app: &AppState, snapshot: PersistSnapshot) -> Result<()> {
+    let _guard = app.persist_lock.lock().await;
+    let latest_revision = {
+        let state = app.hub.read().await;
+        state.state_revision
+    };
+    if snapshot.revision < latest_revision {
+        return Ok(());
+    }
+    persist_snapshot(&snapshot)
 }
 
 async fn require_http_auth(
@@ -553,7 +593,7 @@ fn task_matches_claimed_helper(task: &TaskRecord, helper_id: &str, task_id: &str
 }
 
 fn cleanup_stale_state(state: &mut HubState) -> bool {
-    let mut changed = false;
+    let mut persisted_changed = false;
     let now = now_unix_ms();
     let stale_helpers: Vec<String> = state
         .helpers
@@ -563,12 +603,11 @@ fn cleanup_stale_state(state: &mut HubState) -> bool {
         .collect();
     for helper_id in stale_helpers {
         state.helpers.remove(&helper_id);
-        changed = true;
         for task in state.tasks.values_mut() {
             if task.claimed_by_helper_id.as_deref() == Some(helper_id.as_str()) {
                 clear_task_claim_state(task);
                 task.updated_at_unix_ms = now;
-                changed = true;
+                persisted_changed = true;
             }
         }
     }
@@ -577,17 +616,14 @@ fn cleanup_stale_state(state: &mut HubState) -> bool {
             continue;
         }
         if task.last_seen_at.elapsed() > state.config.task_heartbeat_timeout {
-            changed |= expire_task(task, now);
+            persisted_changed |= expire_task(task, now);
         }
     }
-    changed
+    persisted_changed
 }
 
-async fn status_handler(State(state): State<SharedHubState>) -> Json<HubStatusResponse> {
-    let mut state = state.lock().await;
-    if cleanup_stale_state(&mut state) {
-        let _ = persist_state(&state);
-    }
+async fn status_handler(State(app): State<AppState>) -> Json<HubStatusResponse> {
+    let state = app.hub.read().await;
     let mut helpers = state
         .helpers
         .values()
@@ -620,12 +656,9 @@ async fn status_handler(State(state): State<SharedHubState>) -> Json<HubStatusRe
 
 async fn task_status_handler(
     Path(task_id): Path<String>,
-    State(state): State<SharedHubState>,
+    State(app): State<AppState>,
 ) -> Result<Json<TaskStatusPayload>, HubError> {
-    let mut state = state.lock().await;
-    if cleanup_stale_state(&mut state) {
-        let _ = persist_state(&state);
-    }
+    let state = app.hub.read().await;
     let task = state
         .tasks
         .get(&task_id)
@@ -634,10 +667,10 @@ async fn task_status_handler(
 }
 
 async fn create_task_handler(
-    State(state): State<SharedHubState>,
+    State(app): State<AppState>,
     Json(payload): Json<CreateTaskRequest>,
 ) -> Result<Json<CreateTaskResponse>, HubError> {
-    let mut state = state.lock().await;
+    let mut state = app.hub.write().await;
     cleanup_stale_state(&mut state);
     let cluster_key = require_non_empty(&payload.cluster_key, "cluster_key")?;
     if state.tasks.values().any(|task| {
@@ -675,24 +708,26 @@ async fn create_task_handler(
             released: false,
         },
     );
-    persist_state(&state)?;
+    let snapshot = bump_state_revision(&mut state);
+    let heartbeat_interval_sec = state.config.heartbeat_interval_sec;
+    let heartbeat_timeout_sec = state.config.task_heartbeat_timeout.as_secs();
+    drop(state);
+    persist_snapshot_if_current(&app, snapshot).await?;
     Ok(Json(CreateTaskResponse {
         task_id,
         task_token,
         recover_token,
-        heartbeat_interval_sec: state.config.heartbeat_interval_sec,
-        heartbeat_timeout_sec: state.config.task_heartbeat_timeout.as_secs(),
+        heartbeat_interval_sec,
+        heartbeat_timeout_sec,
     }))
 }
 
 async fn recover_task_handler(
-    State(state): State<SharedHubState>,
+    State(app): State<AppState>,
     Json(payload): Json<RecoverTaskRequest>,
 ) -> Result<Json<CreateTaskResponse>, HubError> {
-    let mut state = state.lock().await;
-    if cleanup_stale_state(&mut state) {
-        persist_state(&state)?;
-    }
+    let mut state = app.hub.write().await;
+    let _cleanup_changed = cleanup_stale_state(&mut state);
     let task = state
         .tasks
         .get_mut(&payload.task_id)
@@ -723,24 +758,26 @@ async fn recover_task_handler(
     let response_task_id = task.task_id.clone();
     let response_task_token = task.task_token.clone();
     let response_recover_token = task.recover_token.clone();
-    persist_state(&state)?;
+    let snapshot = bump_state_revision(&mut state);
+    let heartbeat_interval_sec = state.config.heartbeat_interval_sec;
+    let heartbeat_timeout_sec = state.config.task_heartbeat_timeout.as_secs();
+    drop(state);
+    persist_snapshot_if_current(&app, snapshot).await?;
     Ok(Json(CreateTaskResponse {
         task_id: response_task_id,
         task_token: response_task_token,
         recover_token: response_recover_token,
-        heartbeat_interval_sec: state.config.heartbeat_interval_sec,
-        heartbeat_timeout_sec: state.config.task_heartbeat_timeout.as_secs(),
+        heartbeat_interval_sec,
+        heartbeat_timeout_sec,
     }))
 }
 
 async fn task_heartbeat_handler(
-    State(state): State<SharedHubState>,
+    State(app): State<AppState>,
     Json(payload): Json<TaskHeartbeatRequest>,
 ) -> Result<Json<serde_json::Value>, HubError> {
-    let mut state = state.lock().await;
-    if cleanup_stale_state(&mut state) {
-        persist_state(&state)?;
-    }
+    let mut state = app.hub.write().await;
+    let _cleanup_changed = cleanup_stale_state(&mut state);
     let task = state
         .tasks
         .get_mut(&payload.task_id)
@@ -764,18 +801,18 @@ async fn task_heartbeat_handler(
     task.updated_at_unix_ms = now;
     task.last_task_heartbeat_at_unix_ms = now;
     task.last_seen_at = Instant::now();
-    persist_state(&state)?;
+    let snapshot = bump_state_revision(&mut state);
+    drop(state);
+    persist_snapshot_if_current(&app, snapshot).await?;
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
 async fn release_task_handler(
-    State(state): State<SharedHubState>,
+    State(app): State<AppState>,
     Json(payload): Json<ReleaseTaskRequest>,
 ) -> Result<Json<serde_json::Value>, HubError> {
-    let mut state = state.lock().await;
-    if cleanup_stale_state(&mut state) {
-        persist_state(&state)?;
-    }
+    let mut state = app.hub.write().await;
+    let _cleanup_changed = cleanup_stale_state(&mut state);
     let helper_id = {
         let task = state
             .tasks
@@ -797,20 +834,18 @@ async fn release_task_handler(
             helper.active_task_ids.remove(&payload.task_id);
         }
     }
-    persist_state(&state)?;
+    let snapshot = bump_state_revision(&mut state);
+    drop(state);
+    persist_snapshot_if_current(&app, snapshot).await?;
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
 async fn register_helper_handler(
-    State(state): State<SharedHubState>,
+    State(app): State<AppState>,
     Json(payload): Json<RegisterHelperRequest>,
 ) -> Result<Json<RegisterHelperResponse>, Response> {
-    let mut state = state.lock().await;
-    if cleanup_stale_state(&mut state) {
-        persist_state(&state)
-            .map_err(HubError::from)
-            .map_err(IntoResponse::into_response)?;
-    }
+    let mut state = app.hub.write().await;
+    let cleanup_changed = cleanup_stale_state(&mut state);
     let helper_id = require_non_empty(&payload.helper_id, "helper_id")
         .map_err(HubError::from)
         .map_err(IntoResponse::into_response)?;
@@ -839,26 +874,34 @@ async fn register_helper_handler(
             last_seen_at: Instant::now(),
         },
     );
+    let cleanup_snapshot = cleanup_changed.then(|| bump_state_revision(&mut state));
+    let heartbeat_interval_sec = state.config.heartbeat_interval_sec;
+    let heartbeat_timeout_sec = state.config.helper_heartbeat_timeout.as_secs();
+    drop(state);
+    if let Some(snapshot) = cleanup_snapshot {
+        persist_snapshot_if_current(&app, snapshot)
+            .await
+            .map_err(HubError::from)
+            .map_err(IntoResponse::into_response)?;
+    }
     Ok(Json(RegisterHelperResponse {
         helper_id,
-        heartbeat_interval_sec: state.config.heartbeat_interval_sec,
-        heartbeat_timeout_sec: state.config.helper_heartbeat_timeout.as_secs(),
+        heartbeat_interval_sec,
+        heartbeat_timeout_sec,
     }))
 }
 
 async fn helper_heartbeat_handler(
-    State(state): State<SharedHubState>,
+    State(app): State<AppState>,
     Json(payload): Json<HelperHeartbeatRequest>,
 ) -> Result<Json<HelperHeartbeatHubResponse>, HubError> {
-    let mut state = state.lock().await;
-    if cleanup_stale_state(&mut state) {
-        persist_state(&state)?;
-    }
+    let mut state = app.hub.write().await;
+    let cleanup_changed = cleanup_stale_state(&mut state);
     let now = now_unix_ms();
     let helper_id = payload.helper_id.clone();
     let active_task_ids: HashSet<String> = payload.active_task_ids.iter().cloned().collect();
     let mut release_task_ids = HashSet::new();
-    let mut changed = false;
+    let mut persisted_changed = cleanup_changed;
 
     for task in state.tasks.values_mut() {
         if task.claimed_by_helper_id.as_deref() != Some(helper_id.as_str()) {
@@ -868,7 +911,7 @@ async fn helper_heartbeat_handler(
             release_task_ids.insert(task.task_id.clone());
             task.claimed_by_helper_id = None;
             task.updated_at_unix_ms = now;
-            changed = true;
+            persisted_changed = true;
         }
     }
 
@@ -894,11 +937,17 @@ async fn helper_heartbeat_handler(
         }
         helper.active_task_ids.insert(task_id);
     }
-    if changed {
-        persist_state(&state)?;
-    }
+    let snapshot = if persisted_changed {
+        Some(bump_state_revision(&mut state))
+    } else {
+        None
+    };
     let mut release_task_ids = release_task_ids.into_iter().collect::<Vec<_>>();
     release_task_ids.sort();
+    drop(state);
+    if let Some(snapshot) = snapshot {
+        persist_snapshot_if_current(&app, snapshot).await?;
+    }
     Ok(Json(HelperHeartbeatHubResponse {
         ok: true,
         release_task_ids,
@@ -906,13 +955,11 @@ async fn helper_heartbeat_handler(
 }
 
 async fn claim_task_handler(
-    State(state): State<SharedHubState>,
+    State(app): State<AppState>,
     Json(payload): Json<ClaimTaskRequest>,
 ) -> Result<Json<ClaimTaskResponse>, HubError> {
-    let mut state = state.lock().await;
-    if cleanup_stale_state(&mut state) {
-        persist_state(&state)?;
-    }
+    let mut state = app.hub.write().await;
+    let cleanup_changed = cleanup_stale_state(&mut state);
     let helper = state
         .helpers
         .get(&payload.helper_id)
@@ -942,6 +989,15 @@ async fn claim_task_handler(
         .collect::<Vec<_>>();
     candidates.sort_by_key(|task| task.created_at_unix_ms);
     let Some(task) = candidates.into_iter().next() else {
+        let snapshot = if cleanup_changed {
+            Some(bump_state_revision(&mut state))
+        } else {
+            None
+        };
+        drop(state);
+        if let Some(snapshot) = snapshot {
+            persist_snapshot_if_current(&app, snapshot).await?;
+        }
         return Ok(Json(ClaimTaskResponse {
             claimed: false,
             helper_id,
@@ -964,7 +1020,9 @@ async fn claim_task_handler(
         helper.last_seen_at = Instant::now();
         helper.active_task_ids.insert(claimed_task_id);
     }
-    persist_state(&state)?;
+    let snapshot = bump_state_revision(&mut state);
+    drop(state);
+    persist_snapshot_if_current(&app, snapshot).await?;
     Ok(Json(ClaimTaskResponse {
         claimed: true,
         helper_id,
@@ -1029,20 +1087,33 @@ async fn main() -> Result<()> {
     let auth_state = HttpAuthState {
         bearer_token: resolve_http_bearer_token(&args)?,
     };
-    let state = Arc::new(Mutex::new(HubState {
+    let hub = Arc::new(RwLock::new(HubState {
         tasks: load_persisted_tasks(&config)?,
         config,
         helpers: HashMap::new(),
+        state_revision: 0,
     }));
+    let persist_lock = Arc::new(Mutex::new(()));
+    let app_state = AppState {
+        hub: Arc::clone(&hub),
+        persist_lock: Arc::clone(&persist_lock),
+    };
 
-    let cleanup_state = Arc::clone(&state);
+    let cleanup_state = app_state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(2));
         loop {
             interval.tick().await;
-            let mut state = cleanup_state.lock().await;
-            if cleanup_stale_state(&mut state) {
-                let _ = persist_state(&state);
+            let snapshot = {
+                let mut state = cleanup_state.hub.write().await;
+                if cleanup_stale_state(&mut state) {
+                    Some(bump_state_revision(&mut state))
+                } else {
+                    None
+                }
+            };
+            if let Some(snapshot) = snapshot {
+                let _ = persist_snapshot_if_current(&cleanup_state, snapshot).await;
             }
         }
     });
@@ -1057,7 +1128,7 @@ async fn main() -> Result<()> {
         .route("/v1/helpers/register", post(register_helper_handler))
         .route("/v1/helpers/heartbeat", post(helper_heartbeat_handler))
         .route("/v1/helpers/claim", post(claim_task_handler))
-        .with_state(Arc::clone(&state))
+        .with_state(app_state)
         .layer(middleware::from_fn_with_state(
             auth_state,
             require_http_auth,
