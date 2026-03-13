@@ -4,6 +4,7 @@ local DataModelType = require(Main.Utils.DataModelType)
 local GameStopUtil = require(Main.Utils.GameStopUtil)
 local MockWebSocketService = require(Main.MockWebSocketService)
 local PluginUtils = require(Main.Utils.PluginUtils)
+local StudioModeTracker = require(Main.Utils.StudioModeTracker)
 local ToolDispatcher = require(Main.Utils.ToolDispatcher)
 local Types = require(Main.Types)
 
@@ -16,7 +17,7 @@ local DEFAULT_HELPER_PORT = "44750"
 local HELPER_PORT_SETTING_KEY = "MCP-helper-port"
 local AUTO_CONNECT_SETTING_KEY = "MCP-auto-connect"
 local LOG_PREFIX = "[MCP Plugin]"
-local STATUS_POLL_INTERVAL_SECONDS = 3
+local STATUS_POLL_INTERVAL_SECONDS = 1
 
 local STATUS_THEME = {
 	info = {
@@ -44,6 +45,7 @@ local STATUS_THEME = {
 PluginUtils.plugin = plugin
 
 local datamodelType = DataModelType.getDataModelType()
+StudioModeTracker.observeCurrentDataModel()
 if datamodelType == "Server" then
 	task.spawn(GameStopUtil.monitorForStopPlay)
 end
@@ -51,6 +53,8 @@ end
 if RunService:IsRunning() then
 	return
 end
+
+StudioModeTracker.normalizeEditState()
 
 local connMessageOut = ConsoleOutput.startListener()
 plugin.Unloading:Connect(function()
@@ -166,30 +170,27 @@ local function createDefaultStatusSections()
 	}
 end
 
-local function matchesTaskIdentity(payload: any, taskId: string?, launchId: string?)
+local function matchesTaskIdentity(payload: any, taskId: string?)
 	if type(payload) ~= "table" then
 		return false
 	end
 	if taskId ~= nil and tostring(payload.task_id) ~= taskId then
 		return false
 	end
-	if launchId ~= nil and tostring(payload.launch_id) ~= launchId then
-		return false
-	end
 	return true
 end
 
-local function findRegisteredInstance(statusPayload: any, instanceId: string, taskId: string?, launchId: string?)
+local function findRegisteredInstance(statusPayload: any, instanceId: string, taskId: string?)
 	if type(statusPayload) ~= "table" or type(statusPayload.instances) ~= "table" then
 		return nil
 	end
 
 	for _, instance in statusPayload.instances do
 		if type(instance) == "table" and tostring(instance.instance_id) == instanceId then
-			if taskId == nil and launchId == nil then
+			if taskId == nil then
 				return instance
 			end
-			if matchesTaskIdentity(instance, taskId, launchId) then
+			if matchesTaskIdentity(instance, taskId) then
 				return instance
 			end
 		end
@@ -198,27 +199,13 @@ local function findRegisteredInstance(statusPayload: any, instanceId: string, ta
 	return nil
 end
 
-local function findPlaceStatus(statusPayload: any, placeId: string)
-	if type(statusPayload) ~= "table" or type(statusPayload.place_statuses) ~= "table" then
-		return nil
-	end
-
-	for _, placeStatus in statusPayload.place_statuses do
-		if type(placeStatus) == "table" and tostring(placeStatus.place_id) == placeId then
-			return placeStatus
-		end
-	end
-
-	return nil
-end
-
-local function findClaimedTask(statusPayload: any, taskId: string, launchId: string?)
+local function findClaimedTask(statusPayload: any, taskId: string)
 	if type(statusPayload) ~= "table" or type(statusPayload.claimed_tasks) ~= "table" then
 		return nil
 	end
 
 	for _, taskInfo in statusPayload.claimed_tasks do
-		if type(taskInfo) == "table" and matchesTaskIdentity(taskInfo, taskId, launchId) then
+		if type(taskInfo) == "table" and matchesTaskIdentity(taskInfo, taskId) then
 			return taskInfo
 		end
 	end
@@ -312,9 +299,7 @@ local currentInstanceId: string? = nil
 local currentHelperBaseUrl: string? = nil
 local currentRemoteBaseUrl: string? = nil
 local currentTaskId: string? = nil
-local currentLaunchId: string? = nil
 local readyAnnounced = false
-local staleReconnectInFlight = false
 local currentStatusKind = "warning"
 local currentStatusMessage = "Not connected"
 local currentStatusDetail = "Connect to the local helper. The helper registers this Studio with a task-scoped remote MCP route."
@@ -680,6 +665,19 @@ local function recomputeSummaryStatus()
 	currentStatusDetail = helper.detail
 end
 
+local function reconcileReadyAnnouncement()
+	local isReady = currentClient ~= nil and currentStatusKind == "connected"
+	if isReady and not readyAnnounced then
+		logInfo("The MCP Studio plugin is ready for prompts.")
+		readyAnnounced = true
+		return
+	end
+
+	if not isReady then
+		readyAnnounced = false
+	end
+end
+
 local function updateStatusViews()
 	local theme = STATUS_THEME[currentStatusKind] or STATUS_THEME.warning
 	statusPill.BackgroundColor3 = theme.background
@@ -720,6 +718,7 @@ local function setStatusSection(name: string, kind: string, message: string, det
 	section.message = message
 	section.detail = detail
 	recomputeSummaryStatus()
+	reconcileReadyAnnouncement()
 	updateStatusViews()
 end
 
@@ -729,6 +728,7 @@ local function resetStatusSections(detail: string?)
 		statusSections.helper.detail = detail
 	end
 	recomputeSummaryStatus()
+	reconcileReadyAnnouncement()
 	updateStatusViews()
 	return statusSections
 end
@@ -755,7 +755,6 @@ local function unregisterCurrentInstance()
 	currentHelperBaseUrl = nil
 	currentRemoteBaseUrl = nil
 	currentTaskId = nil
-	currentLaunchId = nil
 end
 
 local function stopStatusPolling()
@@ -793,10 +792,17 @@ local function refreshStatusFromHelper()
 	local helperPort = tostring(statusPayload.helper_port or currentHelperPort)
 	setStatusSection("helper", "connected", "Connected", "Local helper reachable on port " .. helperPort .. ".")
 
-	if
-		currentInstanceId ~= nil
-		and findRegisteredInstance(statusPayload, currentInstanceId, currentTaskId, currentLaunchId) ~= nil
-	then
+	local registeredInstance = if currentInstanceId ~= nil
+		then findRegisteredInstance(statusPayload, currentInstanceId, currentTaskId)
+		else nil
+
+	if type(registeredInstance) == "table" then
+		if type(registeredInstance.task_id) == "string" and registeredInstance.task_id ~= "" then
+			currentTaskId = registeredInstance.task_id
+		end
+		if type(registeredInstance.remote_base_url) == "string" and registeredInstance.remote_base_url ~= "" then
+			currentRemoteBaseUrl = registeredInstance.remote_base_url
+		end
 		local taskSuffix = if currentTaskId ~= nil
 			then " for task " .. currentTaskId .. "."
 			else "."
@@ -814,15 +820,9 @@ local function refreshStatusFromHelper()
 	end
 
 	local claimedTask = if currentTaskId ~= nil
-		then findClaimedTask(statusPayload, currentTaskId, currentLaunchId)
+		then findClaimedTask(statusPayload, currentTaskId)
 		else nil
-	local allowPlaceFallback = currentTaskId == nil
-		and currentLaunchId == nil
-		and statusPayload.hub_base_url == nil
-	local placeStatus = if claimedTask == nil and allowPlaceFallback
-		then findPlaceStatus(statusPayload, tostring(game.PlaceId))
-		else nil
-	if type(claimedTask) ~= "table" and type(placeStatus) ~= "table" then
+	if type(claimedTask) ~= "table" then
 		local remoteDetail = if currentRemoteBaseUrl ~= nil
 			then "Helper has not opened the remote MCP bridge at " .. currentRemoteBaseUrl .. "."
 			else "Helper has not opened the remote MCP bridge for this place yet."
@@ -830,12 +830,9 @@ local function refreshStatusFromHelper()
 		return
 	end
 
-	local remoteSource = if type(claimedTask) == "table" then claimedTask else placeStatus
+	local remoteSource = claimedTask
 	if type(remoteSource.task_id) == "string" and remoteSource.task_id ~= "" then
 		currentTaskId = remoteSource.task_id
-	end
-	if type(remoteSource.launch_id) == "string" and remoteSource.launch_id ~= "" then
-		currentLaunchId = remoteSource.launch_id
 	end
 	local remoteBaseUrl = if type(remoteSource.remote_base_url) == "string" and remoteSource.remote_base_url ~= ""
 		then remoteSource.remote_base_url
@@ -924,42 +921,16 @@ local function startStatusPolling()
 end
 
 local function handleClientStatus(kind: string, message: string)
-	local function tryRecoverExpiredRegistration()
-		if staleReconnectInFlight then
-			return
-		end
-
-		staleReconnectInFlight = true
-		task.defer(function()
-			setStatusSection("registration", "warning", "Expired", "The helper forgot this plugin instance. Re-registering now.")
-			local connected = if connectCurrentClient ~= nil then connectCurrentClient() else false
-			staleReconnectInFlight = false
-			if not connected then
-				setStatusSection(
-					"registration",
-					"error",
-					"Reconnect failed",
-					"The helper instance expired and the automatic re-register attempt failed."
-				)
-			end
-		end)
-	end
-
 	local lowerMessage = string.lower(message)
 
 	if kind == "error" then
 		logWarn(message)
 		setStatusSection("helper", "error", "Error", message)
 		setStatusSection("remote", "warning", "Unknown", "Remote MCP status is unavailable while helper requests are failing.")
-		readyAnnounced = false
 		return
 	end
 
 	if kind == "connected" then
-		if not readyAnnounced then
-			logInfo("The MCP Studio plugin is ready for prompts.")
-			readyAnnounced = true
-		end
 		logInfo(message)
 		setStatusSection("helper", "connected", "Connected", message)
 		refreshStatusFromHelper()
@@ -971,12 +942,10 @@ local function handleClientStatus(kind: string, message: string)
 		if string.find(lowerMessage, "expired") then
 			setStatusSection("helper", "connected", "Connected", "Local helper responded, but the plugin registration expired.")
 			setStatusSection("registration", "warning", "Expired", message)
-			setStatusSection("remote", "warning", "Unknown", "Waiting for the plugin to re-register before remote MCP can recover.")
-			tryRecoverExpiredRegistration()
+			setStatusSection("remote", "warning", "Unknown", "Remote MCP is unavailable until the plugin registers a fresh helper instance.")
 			return
 		end
 		setStatusSection("helper", "warning", "Disconnected", message)
-		readyAnnounced = false
 		return
 	end
 
@@ -988,12 +957,6 @@ local function connectToHelper(helperPort: string)
 	local registrationPayload = {
 		place_id = tostring(game.PlaceId),
 	}
-	if currentTaskId ~= nil then
-		registrationPayload.task_id = currentTaskId
-	end
-	if currentLaunchId ~= nil then
-		registrationPayload.launch_id = currentLaunchId
-	end
 	local registration = requestJson(baseUrl, "POST", "/v1/mcp/register", registrationPayload)
 	local instanceId = registration.instance_id
 	if type(instanceId) ~= "string" or instanceId == "" then
@@ -1004,9 +967,6 @@ local function connectToHelper(helperPort: string)
 		else nil
 	local taskId = if type(registration.task_id) == "string" and registration.task_id ~= ""
 		then registration.task_id
-		else nil
-	local launchId = if type(registration.launch_id) == "string" and registration.launch_id ~= ""
-		then registration.launch_id
 		else nil
 
 	local client = MockWebSocketService:CreateClient(baseUrl)
@@ -1031,10 +991,6 @@ local function connectToHelper(helperPort: string)
 					and ("Waiting for helper to establish the remote MCP bridge at " .. remoteBaseUrl .. ".")
 					or "Waiting for helper to establish the remote MCP bridge."
 			)
-			if not readyAnnounced then
-				logInfo("The MCP Studio plugin is ready for prompts.")
-				readyAnnounced = true
-			end
 			refreshStatusFromHelper()
 		end
 	end)
@@ -1048,9 +1004,7 @@ local function connectToHelper(helperPort: string)
 			currentHelperBaseUrl = nil
 			currentRemoteBaseUrl = nil
 			currentTaskId = nil
-			currentLaunchId = nil
 			resetStatusSections("Stopped polling the local helper on port " .. helperPort .. ".")
-			readyAnnounced = false
 		end
 	end)
 
@@ -1117,7 +1071,6 @@ local function connectToHelper(helperPort: string)
 	currentHelperBaseUrl = baseUrl
 	currentRemoteBaseUrl = remoteBaseUrl
 	currentTaskId = taskId
-	currentLaunchId = launchId
 	return client, instanceId
 end
 
@@ -1129,7 +1082,6 @@ local function disconnectCurrentClient()
 		client:Close()
 	end
 	unregisterCurrentInstance()
-	readyAnnounced = false
 	logInfo("The MCP Studio plugin is stopped.")
 	resetStatusSections("Stopped polling the local helper.")
 end
@@ -1141,7 +1093,6 @@ connectCurrentClient = function()
 	end
 
 	readyAnnounced = false
-	staleReconnectInFlight = false
 	logInfo("Connecting to local helper on port " .. currentHelperPort)
 	setStatusSection(
 		"helper",

@@ -1,21 +1,24 @@
 local Main = script:FindFirstAncestor("MCPStudioPlugin")
-local PluginUtils = require(Main.Utils.PluginUtils)
+local StudioModeTracker = require(Main.Utils.StudioModeTracker)
+
 local StudioTestService = game:GetService("StudioTestService")
 
-local MCP_STOP_PLAY_MESSAGE_KEY = "MCP_STOP_PLAY_MESSAGE"
+local STOP_POLL_INTERVAL_SECONDS = 0.05
 
 local function stopPlay()
-	PluginUtils.setSettings(MCP_STOP_PLAY_MESSAGE_KEY, true)
+	return StudioModeTracker.requestStop()
 end
 
 local function monitorForStopPlay()
-	PluginUtils.setSettings(MCP_STOP_PLAY_MESSAGE_KEY, false)
+	local lastHandledStopRequestId = StudioModeTracker.getSnapshot().activeSessionId
+	StudioModeTracker.markControlReadyForActiveSession()
 	while true do
-		if PluginUtils.getSettings(MCP_STOP_PLAY_MESSAGE_KEY) then
-			PluginUtils.setSettings(MCP_STOP_PLAY_MESSAGE_KEY, false)
+		local stopRequestId = StudioModeTracker.getStopRequestId()
+		if stopRequestId > lastHandledStopRequestId then
+			lastHandledStopRequestId = stopRequestId
 			StudioTestService:EndTest({})
 		end
-		task.wait(1)
+		task.wait(STOP_POLL_INTERVAL_SECONDS)
 	end
 end
 

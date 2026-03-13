@@ -1,7 +1,7 @@
 local Main = script:FindFirstAncestor("MCPStudioPlugin")
 local ConsoleOutput = require(Main.Utils.ConsoleOutput)
-local GlobalVariables = require(Main.Utils.GlobalVariables)
 local StartStopPlay = require(Main.Tools.StartStopPlay)
+local StudioModeTracker = require(Main.Utils.StudioModeTracker)
 local Types = require(Main.Types)
 
 local HttpService = game:GetService("HttpService")
@@ -104,17 +104,20 @@ local function runScriptInPlayMode(args: Types.RunScriptInPlayModeArgs): string?
 	injectTestScript(args)
 
 	ConsoleOutput.outputMessage = ""
+	local commandId = StudioModeTracker.beginStart(args.mode)
 	local success, result = pcall(function()
 		if args.mode == "start_play" then
-			GlobalVariables.studioMode = "start_play"
 			return StudioTestService:ExecutePlayModeAsync({})
 		else
-			GlobalVariables.studioMode = "run_server"
 			return StudioTestService:ExecuteRunModeAsync({})
 		end
 	end)
 
-	GlobalVariables.studioMode = "stop"
+	if success then
+		StudioModeTracker.markStopped()
+	else
+		StudioModeTracker.recordTransitionError(commandId, tostring(result))
+	end
 	removeTestScript()
 
 	if not success then
@@ -137,8 +140,6 @@ local function handleRunScriptInPlayMode(runScriptInPlayModeArgs: Types.RunScrip
 	end
 
 	StartStopPlay({ mode = "stop" })
-	wait(0.2)
-
 	return runScriptInPlayMode(runScriptInPlayModeArgs)
 end
 

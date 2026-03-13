@@ -1023,11 +1023,6 @@ fn resolve_claimed_task_for_plugin_request(
             return Ok(task);
         }
     }
-    if task_id.is_none() {
-        return Err(eyre!(
-            "helper could not map Studio for place_id {place_id} to a claimed launch; task_id is required unless the Studio pid was launched by helper"
-        ));
-    }
     select_claimed_task(state, place_id, task_id)
 }
 
@@ -3915,26 +3910,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_claimed_task_for_plugin_request_bans_place_only_fallback() {
+    fn resolve_claimed_task_for_plugin_request_accepts_unique_place_binding() {
         let mut state = empty_helper_state();
         state.claimed_tasks.insert(
             "task_a".to_owned(),
             test_claimed_task("task_a", "93795519121520"),
         );
 
-        let error = match resolve_claimed_task_for_plugin_request(
-            &state,
-            "93795519121520",
-            None,
-            Some(999),
-        ) {
-            Ok(_) => panic!("expected place-only plugin request without pid binding to fail"),
-            Err(error) => error,
-        };
+        let selected =
+            resolve_claimed_task_for_plugin_request(&state, "93795519121520", None, Some(999))
+                .expect("unique claimed task for place should resolve without plugin task hint");
 
-        assert!(error
-            .to_string()
-            .contains("task_id is required unless the Studio pid was launched by helper"));
+        assert_eq!(selected.task_id, "task_a");
     }
 
     #[test]
@@ -3954,6 +3941,35 @@ mod tests {
         .expect("task hint should resolve with task_id only");
 
         assert_eq!(selected.task_id, "task_a");
+    }
+
+    #[test]
+    fn resolve_claimed_task_for_plugin_request_rejects_ambiguous_place_binding() {
+        let mut state = empty_helper_state();
+        state.claimed_tasks.insert(
+            "task_a".to_owned(),
+            test_claimed_task("task_a", "93795519121520"),
+        );
+        state.claimed_tasks.insert(
+            "task_b".to_owned(),
+            test_claimed_task("task_b", "93795519121520"),
+        );
+
+        let error = match resolve_claimed_task_for_plugin_request(
+            &state,
+            "93795519121520",
+            None,
+            Some(999),
+        ) {
+            Ok(_) => panic!(
+                "expected ambiguous place binding without helper pid or explicit task to fail"
+            ),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("multiple claimed tasks found for place_id 93795519121520"));
     }
 
     #[test]
