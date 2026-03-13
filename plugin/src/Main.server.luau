@@ -135,7 +135,7 @@ local function loadConnectionConfig(): (string, boolean)
 	local savedPort = PluginUtils.getSettings(HELPER_PORT_SETTING_KEY)
 	local savedAutoConnect = PluginUtils.getSettings(AUTO_CONNECT_SETTING_KEY)
 	local helperPort = if type(savedPort) == "string" then savedPort else DEFAULT_HELPER_PORT
-	local autoConnect = if type(savedAutoConnect) == "boolean" then savedAutoConnect else false
+	local autoConnect = if type(savedAutoConnect) == "boolean" then savedAutoConnect else true
 	return normalizeHelperPort(helperPort), autoConnect
 end
 
@@ -1147,11 +1147,11 @@ end)
 
 resetButton.MouseButton1Click:Connect(function()
 	currentHelperPort = DEFAULT_HELPER_PORT
-	currentAutoConnect = false
+	currentAutoConnect = true
 	helperPortInput.Text = currentHelperPort
 	saveConnectionConfig(currentHelperPort, currentAutoConnect)
 	if currentClient == nil then
-		resetStatusSections("Reset helper settings to the default local port and disabled auto connect.")
+		resetStatusSections("Reset helper settings to the default local port and enabled auto connect.")
 	else
 		setStatusSection(
 			"helper",

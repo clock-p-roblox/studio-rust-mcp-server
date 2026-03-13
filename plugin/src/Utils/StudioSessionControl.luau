@@ -33,13 +33,20 @@ local function stop(): string?
 	return "Stopped"
 end
 
-local function startMode(targetMode: Types.StartStopPlayMode, executor: () -> any, successMessage: string): string?
-	ConsoleOutput.outputMessage = ""
+local function ensureStoppedForStart(targetMode: Types.StartStopPlayMode): boolean
 	local snapshot = StudioModeTracker.getSnapshot()
 	if snapshot.mode ~= "stop" or snapshot.pendingStartId ~= 0 then
 		logTransitionStage(targetMode, "stop_before_start", string.format("current_mode=%s", snapshot.mode))
 		stop()
+		return true
 	end
+
+	return false
+end
+
+local function startMode(targetMode: Types.StartStopPlayMode, executor: () -> any, successMessage: string): (string?, boolean)
+	ConsoleOutput.outputMessage = ""
+	local restartApplied = ensureStoppedForStart(targetMode)
 
 	local commandId = StudioModeTracker.beginStart(targetMode)
 	logTransitionStage(targetMode, "requested", string.format("command_id=%d", commandId))
@@ -59,7 +66,7 @@ local function startMode(targetMode: Types.StartStopPlayMode, executor: () -> an
 
 	StudioModeTracker.waitForStart(commandId, targetMode, START_TIMEOUT_SECONDS)
 	logTransitionStage(targetMode, "observed", string.format("command_id=%d", commandId))
-	return successMessage
+	return successMessage, restartApplied
 end
 
 local function handleStartStopPlay(startStopPlayArgs: Types.StartStopPlayArgs): string?
@@ -68,15 +75,17 @@ local function handleStartStopPlay(startStopPlayArgs: Types.StartStopPlayArgs): 
 	end
 
 	if startStopPlayArgs.mode == "start_play" then
-		return startMode("start_play", function()
+		local message = startMode("start_play", function()
 			return StudioTestService:ExecutePlayModeAsync({})
 		end, "Started play")
+		return message
 	elseif startStopPlayArgs.mode == "stop" then
 		return stop()
 	elseif startStopPlayArgs.mode == "run_server" then
-		return startMode("run_server", function()
+		local message = startMode("run_server", function()
 			return StudioTestService:ExecuteRunModeAsync({})
 		end, "Ran server")
+		return message
 	end
 
 	error("Invalid mode in StartStopPlay, must be start_play, stop, or run_server")
@@ -100,24 +109,23 @@ local function handleLaunchStudioSession(launchStudioSessionArgs: Types.LaunchSt
 	local requestedMode = launchStudioSessionArgs.mode
 	local previousSnapshot = StudioModeTracker.getSnapshot()
 	local previousMode = previousSnapshot.mode
-	local restartApplied = previousSnapshot.mode ~= "stop" or previousSnapshot.pendingStartId ~= 0
 	local actions = {}
 
-	if restartApplied then
-		table.insert(actions, "stop")
-		stop()
-	end
-
-	table.insert(actions, requestedMode)
+	local restartApplied = false
 	if requestedMode == "start_play" then
-		startMode("start_play", function()
+		_, restartApplied = startMode("start_play", function()
 			return StudioTestService:ExecutePlayModeAsync({})
 		end, "Started play")
 	else
-		startMode("run_server", function()
+		_, restartApplied = startMode("run_server", function()
 			return StudioTestService:ExecuteRunModeAsync({})
 		end, "Ran server")
 	end
+
+	if restartApplied then
+		table.insert(actions, "stop")
+	end
+	table.insert(actions, requestedMode)
 
 	local finalMode = StudioModeTracker.getSnapshot().mode
 	if finalMode ~= requestedMode then
