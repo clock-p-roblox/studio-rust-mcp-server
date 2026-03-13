@@ -231,7 +231,8 @@ impl ServerHandler for RBXStudioServer {
                 website_url: None,
             },
             instructions: Some(
-                "You must aware of current studio mode before using any tools, infer the mode from conversation context or get_studio_mode.
+                "Prefer using launch_studio_session for high-level launches into start_play or run_server.
+get_studio_mode is for diagnostics and stop-path checks, not the normal launch entrypoint.
 User run_code to query data from Roblox Studio place or to change it
 After calling run_script_in_play_mode, the datamodel status will be reset to stop mode.
 Prefer using start_stop_play tool instead run_script_in_play_mode, Only used run_script_in_play_mode to run one time unit test code on server datamodel.
@@ -292,6 +293,14 @@ struct StartStopPlay {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
+struct LaunchStudioSession {
+    #[schemars(
+        description = "Target mode to launch into, must be start_play or run_server. The Windows side will stop any previous running session before launching."
+    )]
+    mode: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct RunScriptInPlayMode {
     #[schemars(description = "Code to run")]
     code: String,
@@ -307,6 +316,7 @@ enum ToolArgumentValues {
     InsertModel(InsertModel),
     GetConsoleOutput(GetConsoleOutput),
     StartStopPlay(StartStopPlay),
+    LaunchStudioSession(LaunchStudioSession),
     RunScriptInPlayMode(RunScriptInPlayMode),
     GetStudioMode(GetStudioMode),
     TakeScreenshot(TakeScreenshot),
@@ -320,6 +330,7 @@ impl ToolArgumentValues {
             ToolArgumentValues::InsertModel(_) => "insert_model",
             ToolArgumentValues::GetConsoleOutput(_) => "get_console_output",
             ToolArgumentValues::StartStopPlay(_) => "start_stop_play",
+            ToolArgumentValues::LaunchStudioSession(_) => "launch_studio_session",
             ToolArgumentValues::RunScriptInPlayMode(_) => "run_script_in_play_mode",
             ToolArgumentValues::GetStudioMode(_) => "get_studio_mode",
             ToolArgumentValues::TakeScreenshot(_) => "take_screenshot",
@@ -375,6 +386,17 @@ impl RBXStudioServer {
         Parameters(args): Parameters<StartStopPlay>,
     ) -> Result<CallToolResult, ErrorData> {
         self.generic_tool_run(ToolArgumentValues::StartStopPlay(args))
+            .await
+    }
+
+    #[tool(
+        description = "Launch Roblox Studio into start_play or run_server. This is the high-level launch entrypoint: if Studio is already running, or a previous start is still pending, Windows will stop the existing session and relaunch into the requested mode. Returns a JSON object with requested_mode, restart_applied, previous_mode, final_mode, actions, and message."
+    )]
+    async fn launch_studio_session(
+        &self,
+        Parameters(args): Parameters<LaunchStudioSession>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.generic_tool_run(ToolArgumentValues::LaunchStudioSession(args))
             .await
     }
 

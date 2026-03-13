@@ -5,6 +5,7 @@ local tools: { [string]: Types.ToolFunction } = {
 	["GetConsoleOutput"] = require(Main.Tools.GetConsoleOutput),
 	["GetStudioMode"] = require(Main.Tools.GetStudioMode),
 	["InsertModel"] = require(Main.Tools.InsertModel),
+	["LaunchStudioSession"] = require(Main.Tools.LaunchStudioSession),
 	["RunCode"] = require(Main.Tools.RunCode),
 	["RunScriptInPlayMode"] = require(Main.Tools.RunScriptInPlayMode),
 	["StartStopPlay"] = require(Main.Tools.StartStopPlay),
