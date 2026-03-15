@@ -148,7 +148,10 @@ local function observeCurrentDataModel()
 		if snapshot.activeSessionId > 0 and snapshot.mode == liveMode then
 			activeSessionId = snapshot.activeSessionId
 		else
-			activeSessionId = snapshot.activeSessionId + 1
+			-- Manual Studio launches must still advance on the same global command
+			-- timeline as start/stop requests, otherwise a stale stop_request_id from
+			-- an older session can immediately kill the new session.
+			activeSessionId = nextCommandId()
 		end
 	end
 
