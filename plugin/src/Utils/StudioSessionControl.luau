@@ -9,6 +9,8 @@ local StudioTestService = game:GetService("StudioTestService")
 
 local START_TIMEOUT_SECONDS = 15
 local STOP_TIMEOUT_SECONDS = 15
+local EXECUTE_SETTLE_STEP_SECONDS = 0.05
+local activeExecuteCommandId = 0
 
 local function logTransitionStage(mode: Types.StartStopPlayMode, stage: string, detail: string?)
 	local message = string.format("[MCP Plugin] studio_transition mode=%s stage=%s", mode, stage)
@@ -16,6 +18,18 @@ local function logTransitionStage(mode: Types.StartStopPlayMode, stage: string, 
 		message ..= " " .. detail
 	end
 	print(message)
+end
+
+local function waitForExecuteToSettle(timeoutSeconds: number)
+	local deadline = os.clock() + timeoutSeconds
+	while os.clock() < deadline do
+		if activeExecuteCommandId == 0 then
+			return
+		end
+		task.wait(EXECUTE_SETTLE_STEP_SECONDS)
+	end
+
+	error(string.format("Timed out waiting for previous start call to finish. active_command_id=%d", activeExecuteCommandId))
 end
 
 local function stop(): string?
@@ -29,6 +43,10 @@ local function stop(): string?
 	local stopRequestId = GameStopUtil.stopPlay()
 	logTransitionStage("stop", "requested", string.format("current_mode=%s stop_request_id=%d", snapshot.mode, stopRequestId))
 	StudioModeTracker.waitForStop(STOP_TIMEOUT_SECONDS)
+	if activeExecuteCommandId ~= 0 then
+		logTransitionStage("stop", "wait_for_execute_return", string.format("active_command_id=%d", activeExecuteCommandId))
+		waitForExecuteToSettle(STOP_TIMEOUT_SECONDS)
+	end
 	logTransitionStage("stop", "observed")
 	return "Stopped"
 end
@@ -47,12 +65,20 @@ end
 local function startMode(targetMode: Types.StartStopPlayMode, executor: () -> any, successMessage: string): (string?, boolean)
 	ConsoleOutput.outputMessage = ""
 	local restartApplied = ensureStoppedForStart(targetMode)
+	if activeExecuteCommandId ~= 0 then
+		logTransitionStage(targetMode, "wait_for_execute_return", string.format("active_command_id=%d", activeExecuteCommandId))
+		waitForExecuteToSettle(STOP_TIMEOUT_SECONDS)
+	end
 
 	local commandId = StudioModeTracker.beginStart(targetMode)
+	activeExecuteCommandId = commandId
 	logTransitionStage(targetMode, "requested", string.format("command_id=%d", commandId))
 
 	task.spawn(function()
 		local success, result = pcall(executor)
+		if activeExecuteCommandId == commandId then
+			activeExecuteCommandId = 0
+		end
 		if success then
 			logTransitionStage(targetMode, "execute_returned", string.format("command_id=%d", commandId))
 			StudioModeTracker.markStopped()

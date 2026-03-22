@@ -10,7 +10,9 @@ local function stopPlay()
 end
 
 local function monitorForStopPlay()
-	local lastHandledStopRequestId = StudioModeTracker.getSnapshot().activeSessionId
+	local snapshot = StudioModeTracker.getSnapshot()
+	-- Ignore stop requests that were already visible before this session became active.
+	local lastHandledStopRequestId = math.max(snapshot.activeSessionId, StudioModeTracker.getStopRequestId())
 	StudioModeTracker.markControlReadyForActiveSession()
 	while true do
 		local stopRequestId = StudioModeTracker.getStopRequestId()
