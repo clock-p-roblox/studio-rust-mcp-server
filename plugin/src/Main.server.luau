@@ -47,11 +47,6 @@ PluginUtils.plugin = plugin
 local datamodelType = DataModelType.getDataModelType()
 StudioModeTracker.observeCurrentDataModel()
 if datamodelType == "Server" then
-	-- The server DataModel is the only running context that can both observe
-	-- session shutdown and legally call BindToClose.
-	game:BindToClose(function()
-		StudioModeTracker.markStopped()
-	end)
 	task.spawn(GameStopUtil.monitorForStopPlay)
 end
 
