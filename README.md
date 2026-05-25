@@ -176,6 +176,8 @@ cargo run --bin studio_helper -- --port 44750 --hub-base-url https://roblox-hub-
 默认行为：
 
 - helper 自己读取 `feishu-user_name` 和 `feishu-token`
+- 在 Windows 用户会话里直接运行 `studio_helper.exe` 时，会自动推导 `hub_base_url = https://roblox-hub-<user>-public.dev.clock-p.com`
+- 所以正常情况下不再需要额外传 `--user-name`、`--bearer-token-file` 或 `--hub-base-url`
 - helper 有稳定 `helper_id`；Windows helper 使用 `MachineGuid` 派生，其他平台使用持久化本地 id
 - helper 注册 hub 后，会 claim task 并拿到：
   - `task_id`

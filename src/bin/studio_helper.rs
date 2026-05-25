@@ -652,6 +652,30 @@ fn derive_public_base_url(kind: &str, place_id: &str, helper: &HelperConfig) -> 
     )
 }
 
+fn derive_hub_base_url(user_name: &str, domain_suffix: &str) -> String {
+    format!("https://roblox-hub-{user_name}-public.{domain_suffix}")
+}
+
+fn resolve_hub_base_url(args: &Args, user_name: &str) -> Option<String> {
+    args.hub_base_url
+        .as_ref()
+        .and_then(|value| {
+            let trimmed = trim(value);
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            }
+        })
+        .or_else(|| {
+            if user_name.is_empty() {
+                None
+            } else {
+                Some(derive_hub_base_url(user_name, &args.domain_suffix))
+            }
+        })
+}
+
 fn derive_runtime_screenshot_upload_url(place_id: &str, helper: &HelperConfig) -> String {
     format!(
         "{}/v1/runtime-screenshots",
@@ -3548,16 +3572,18 @@ async fn main() -> Result<()> {
         .map(|candidate| candidate.source.clone())
         .unwrap_or_else(|| "unknown".to_owned());
     let helper_id = resolve_helper_id(&args)?;
+    let resolved_user_name = resolve_user_name(&args)?;
+    let resolved_hub_base_url = resolve_hub_base_url(&args, &resolved_user_name);
     let helper = HelperConfig {
         port: args.port,
         helper_id: helper_id.clone(),
         capacity: args.capacity,
-        user_name: resolve_user_name(&args)?,
+        user_name: resolved_user_name,
         bearer_token: Arc::new(Mutex::new(initial_bearer_token)),
         bearer_token_source: Arc::new(Mutex::new(initial_bearer_token_source)),
         bearer_token_candidates: Arc::new(bearer_token_candidates),
         domain_suffix: args.domain_suffix.clone(),
-        hub_base_url: args.hub_base_url.clone(),
+        hub_base_url: resolved_hub_base_url,
         studio_path: args.studio_path.clone(),
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
