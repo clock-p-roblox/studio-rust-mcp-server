@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const HELPER_WS_PATH: &str = "/ws/helper";
+pub const OFFICIAL_MCP_ADAPTER_CAPABILITY: &str = "official_mcp_adapter_v1";
 #[allow(dead_code)]
 pub const MAX_ARTIFACT_CHUNK_MESSAGE_BYTES: usize = 500 * 1024;
 #[allow(dead_code)]
@@ -98,6 +99,28 @@ pub struct ArtifactCommitted {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OfficialMcpRequest {
+    #[serde(rename = "request_id", alias = "requestId")]
+    pub request_id: String,
+    #[serde(rename = "task_id", alias = "taskId")]
+    pub task_id: String,
+    #[serde(rename = "place_id", alias = "placeId")]
+    pub place_id: String,
+    pub action: String,
+    #[serde(default)]
+    pub arguments: Value,
+    #[serde(rename = "timeout_ms", alias = "timeoutMs")]
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OfficialMcpResponse {
+    #[serde(rename = "request_id", alias = "requestId")]
+    pub request_id: String,
+    pub response: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type")]
 pub enum HelperToServerMessage {
     #[serde(rename = "hello", alias = "Hello")]
@@ -133,6 +156,14 @@ pub enum HelperToServerMessage {
     ArtifactFinish(ArtifactFinish),
     #[serde(rename = "artifact_abort", alias = "artifactAbort")]
     ArtifactAbort(ArtifactAbort),
+    #[serde(rename = "official_mcp_response", alias = "officialMcpResponse")]
+    OfficialMcpResponse(OfficialMcpResponse),
+    #[serde(rename = "official_mcp_error", alias = "officialMcpError")]
+    OfficialMcpError {
+        #[serde(alias = "requestId")]
+        request_id: String,
+        error: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -163,6 +194,8 @@ pub enum ServerToHelperMessage {
         request_id: String,
         error: String,
     },
+    #[serde(rename = "official_mcp_request", alias = "officialMcpRequest")]
+    OfficialMcpRequest(OfficialMcpRequest),
     #[serde(rename = "close_reason", alias = "closeReason")]
     CloseReason { reason: String },
 }

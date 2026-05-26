@@ -1,7 +1,8 @@
 use crate::error::{Report, Result};
 use crate::helper_ws::{
     ArtifactBegin, ArtifactChunk, ArtifactCommitted, ArtifactFinish, HelperToServerMessage,
-    ServerToHelperMessage, MAX_ARTIFACT_CHUNK_MESSAGE_BYTES,
+    OfficialMcpRequest, ServerToHelperMessage, MAX_ARTIFACT_CHUNK_MESSAGE_BYTES,
+    OFFICIAL_MCP_ADAPTER_CAPABILITY,
 };
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
@@ -86,6 +87,8 @@ pub struct StatusResponse {
     helper_place_id: Option<String>,
     helper_task_id: Option<String>,
     helper_connection_id: Option<String>,
+    helper_capabilities: Option<Vec<String>>,
+    official_mcp_adapter_state: &'static str,
     helper_last_message_age_ms: Option<u128>,
 }
 
@@ -93,6 +96,7 @@ struct ActiveHelperConnection {
     connection_id: Uuid,
     place_id: String,
     task_id: Option<String>,
+    capabilities: Vec<String>,
     sender: mpsc::UnboundedSender<OutgoingHelperFrame>,
     last_message_at: Instant,
 }
@@ -160,6 +164,25 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
         .active_helper
         .as_ref()
         .map(|helper| helper.last_message_at.elapsed().as_millis());
+    let helper_capabilities = if helper_connected {
+        state
+            .active_helper
+            .as_ref()
+            .map(|helper| helper.capabilities.clone())
+    } else {
+        None
+    };
+    let official_mcp_adapter_state = match helper_capabilities.as_ref() {
+        Some(capabilities)
+            if capabilities
+                .iter()
+                .any(|item| item == OFFICIAL_MCP_ADAPTER_CAPABILITY) =>
+        {
+            "declared"
+        }
+        Some(_) => "unsupported",
+        None => "disconnected",
+    };
     Json(StatusResponse {
         service: "rbx-studio-mcp",
         workspace: state.workspace.to_string_lossy().into_owned(),
@@ -188,6 +211,8 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
             .active_helper
             .as_ref()
             .map(|helper| helper.connection_id.to_string()),
+        helper_capabilities,
+        official_mcp_adapter_state,
         helper_last_message_age_ms,
     })
 }
@@ -282,6 +307,64 @@ struct ReadStudioLog {
     line_count: Option<u32>,
     #[schemars(description = "Optional regex used to filter matching lines.")]
     regex: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
+struct OfficialMcpPing {}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
+struct OfficialMcpVector3 {
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
+struct OfficialMcpGenerateMesh {
+    #[schemars(description = "Text prompt describing the mesh to generate.")]
+    text_prompt: String,
+    #[schemars(description = "Optional bounding box size for the generated mesh.")]
+    size: Option<OfficialMcpVector3>,
+    #[schemars(description = "Optional triangle limit, between 12 and 20000.")]
+    max_triangles: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
+struct OfficialMcpSearchCreatorStore {
+    #[schemars(description = "Creator Store search query.")]
+    query: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
+struct OfficialMcpInsertFromCreatorStore {
+    #[schemars(description = "Search id returned by official_mcp_search_creator_store.")]
+    search_id: String,
+    #[schemars(description = "Optional objectTypes returned by the search result.")]
+    object_types: Option<Vec<String>>,
+    #[schemars(description = "Optional display name for the inserted asset.")]
+    asset_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
+struct OfficialMcpStoreImage {
+    #[schemars(description = "Absolute local png/jpg/jpeg path on the Windows helper machine.")]
+    file_path: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
+struct OfficialMcpGenerateProceduralModel {
+    #[schemars(description = "User's exact prompt for the procedural model.")]
+    prompt: String,
+    #[schemars(description = "Optional IMAGEID returned by official_mcp_store_image.")]
+    attached_image_uri: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
+struct OfficialMcpWaitJobFinished {
+    #[schemars(description = "Generation id returned by official_mcp_generate_procedural_model.")]
+    generation_id: String,
+    #[schemars(description = "Optional wait timeout in seconds.")]
+    timeout: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
@@ -444,6 +527,231 @@ impl RBXStudioServer {
     ) -> Result<CallToolResult, ErrorData> {
         self.generic_tool_run(ToolArgumentValues::ReadStudioLog(args))
             .await
+    }
+
+    #[tool(
+        description = "Ping the hidden official Roblox Studio MCP adapter through the Windows helper. This only checks lifecycle and returns a summarized tools/list result; it does not expose official tools directly."
+    )]
+    async fn official_mcp_ping(
+        &self,
+        Parameters(_args): Parameters<OfficialMcpPing>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.dispatch_official_mcp("ping", serde_json::json!({}), 30_000)
+            .await
+    }
+
+    #[tool(
+        description = "Generate a textured mesh through the hidden official Roblox Studio MCP adapter. The helper binds the request to the current task_id before calling StudioMCP.exe."
+    )]
+    async fn official_mcp_generate_mesh(
+        &self,
+        Parameters(args): Parameters<OfficialMcpGenerateMesh>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("textPrompt".to_owned(), Value::String(args.text_prompt));
+        if let Some(size) = args.size {
+            arguments.insert(
+                "size".to_owned(),
+                serde_json::json!({
+                    "x": size.x,
+                    "y": size.y,
+                    "z": size.z,
+                }),
+            );
+        }
+        if let Some(max_triangles) = args.max_triangles {
+            arguments.insert("maxTriangles".to_owned(), serde_json::json!(max_triangles));
+        }
+        self.dispatch_official_mcp("generate_mesh", Value::Object(arguments), 300_000)
+            .await
+    }
+
+    #[tool(
+        description = "Search the Roblox Creator Store through the hidden official Roblox Studio MCP adapter. Use the returned searchId with official_mcp_insert_from_creator_store."
+    )]
+    async fn official_mcp_search_creator_store(
+        &self,
+        Parameters(args): Parameters<OfficialMcpSearchCreatorStore>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.dispatch_official_mcp(
+            "search_creator_store",
+            serde_json::json!({ "query": args.query }),
+            60_000,
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Insert a Creator Store asset selected from official_mcp_search_creator_store through the hidden official Roblox Studio MCP adapter."
+    )]
+    async fn official_mcp_insert_from_creator_store(
+        &self,
+        Parameters(args): Parameters<OfficialMcpInsertFromCreatorStore>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("searchId".to_owned(), Value::String(args.search_id));
+        if let Some(object_types) = args.object_types {
+            arguments.insert("objectTypes".to_owned(), serde_json::json!(object_types));
+        }
+        if let Some(asset_name) = args.asset_name {
+            arguments.insert("assetName".to_owned(), Value::String(asset_name));
+        }
+        self.dispatch_official_mcp(
+            "insert_from_creator_store",
+            Value::Object(arguments),
+            120_000,
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Convert a local Windows image file into an official MCP IMAGEID token that can be passed to official_mcp_generate_procedural_model."
+    )]
+    async fn official_mcp_store_image(
+        &self,
+        Parameters(args): Parameters<OfficialMcpStoreImage>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.dispatch_official_mcp(
+            "store_image",
+            serde_json::json!({ "filePath": args.file_path }),
+            60_000,
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Generate a procedural primitive model through the hidden official Roblox Studio MCP adapter. Use only when the user explicitly asks for primitive shapes, blocks, or geometric parts."
+    )]
+    async fn official_mcp_generate_procedural_model(
+        &self,
+        Parameters(args): Parameters<OfficialMcpGenerateProceduralModel>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("prompt".to_owned(), Value::String(args.prompt));
+        if let Some(attached_image_uri) = args.attached_image_uri {
+            arguments.insert(
+                "attachedImageUri".to_owned(),
+                Value::String(attached_image_uri),
+            );
+        }
+        self.dispatch_official_mcp(
+            "generate_procedural_model",
+            Value::Object(arguments),
+            300_000,
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Wait for an explicit official procedural generation job to finish. Do not call automatically after official_mcp_generate_procedural_model unless the user asks to wait."
+    )]
+    async fn official_mcp_wait_job_finished(
+        &self,
+        Parameters(args): Parameters<OfficialMcpWaitJobFinished>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("generationId".to_owned(), Value::String(args.generation_id));
+        if let Some(timeout) = args.timeout {
+            arguments.insert("timeout".to_owned(), serde_json::json!(timeout));
+        }
+        self.dispatch_official_mcp("wait_job_finished", Value::Object(arguments), 600_000)
+            .await
+    }
+
+    async fn dispatch_official_mcp(
+        &self,
+        action: &str,
+        arguments: Value,
+        timeout_ms: u64,
+    ) -> Result<CallToolResult, ErrorData> {
+        let request_id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Result<String>>();
+        let sender = {
+            let mut state = self.state.lock().await;
+            let Some(helper) = state.active_helper.as_ref() else {
+                return Err(ErrorData::internal_error(
+                    "No active Studio helper WebSocket connection",
+                    None,
+                ));
+            };
+            if helper.last_message_at.elapsed() > HELPER_HEARTBEAT_TIMEOUT {
+                return Err(ErrorData::internal_error(
+                    "Studio helper WebSocket connection is stale",
+                    None,
+                ));
+            }
+            if !helper
+                .capabilities
+                .iter()
+                .any(|capability| capability == OFFICIAL_MCP_ADAPTER_CAPABILITY)
+            {
+                return Err(ErrorData::internal_error(
+                    "Studio helper does not declare official_mcp_adapter_v1",
+                    None,
+                ));
+            }
+            let Some(task_id) = helper.task_id.clone().or_else(|| state.task_id.clone()) else {
+                return Err(ErrorData::internal_error(
+                    "official_mcp_ping requires task_id",
+                    None,
+                ));
+            };
+            let request = OfficialMcpRequest {
+                request_id: request_id.to_string(),
+                task_id,
+                place_id: helper.place_id.clone(),
+                action: action.to_owned(),
+                arguments,
+                timeout_ms,
+            };
+            let message =
+                serde_json::to_string(&ServerToHelperMessage::OfficialMcpRequest(request))
+                    .map_err(|error| {
+                        ErrorData::internal_error(
+                            format!("failed to encode official MCP request: {error}"),
+                            None,
+                        )
+                    })?;
+            let sender = helper.sender.clone();
+            state.output_map.insert(request_id, tx);
+            (sender, message)
+        };
+        if sender.0.send(OutgoingHelperFrame::Text(sender.1)).is_err() {
+            let mut state = self.state.lock().await;
+            state.output_map.remove(&request_id);
+            return Err(ErrorData::internal_error(
+                "helper WebSocket sender dropped before official MCP dispatch",
+                None,
+            ));
+        }
+        let wait_timeout = Duration::from_millis(timeout_ms.max(1)) + Duration::from_secs(5);
+        let result = match tokio::time::timeout(wait_timeout, rx.recv()).await {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                return Err(ErrorData::internal_error(
+                    "Couldn't receive official MCP response",
+                    None,
+                ))
+            }
+            Err(_) => {
+                let mut state = self.state.lock().await;
+                remove_request_tracking(&mut state, request_id);
+                return Err(ErrorData::internal_error(
+                    "Timed out waiting for official MCP response from Studio helper",
+                    None,
+                ));
+            }
+        };
+        {
+            let mut state = self.state.lock().await;
+            state.output_map.remove(&request_id);
+        }
+        match result {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(result)])),
+            Err(error) => Ok(CallToolResult::error(vec![Content::text(
+                error.to_string(),
+            )])),
+        }
     }
 
     async fn generic_tool_run(
@@ -1044,6 +1352,7 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
             connection_id,
             place_id: hello.place_id.clone(),
             task_id: hello.task_id.clone(),
+            capabilities: hello.capabilities.clone(),
             sender: out_tx.clone(),
             last_message_at: Instant::now(),
         }) {
@@ -1240,6 +1549,34 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
                         let mut state = state.lock().await;
                         if let Ok(request_id) = parse_request_uuid(&abort.request_id) {
                             fail_request(&mut state, request_id, &abort.error);
+                        }
+                    }
+                    Ok(HelperToServerMessage::OfficialMcpResponse(response)) => {
+                        match parse_request_uuid(&response.request_id) {
+                            Ok(parsed_id) => {
+                                let mut state = state.lock().await;
+                                if let Some(tx) = state.output_map.remove(&parsed_id) {
+                                    let _ = tx.send(Ok(response.response));
+                                }
+                            }
+                            Err(error) => tracing::warn!(
+                                error = summarize_text(&error.to_string()),
+                                "invalid helper official MCP response request_id"
+                            ),
+                        }
+                    }
+                    Ok(HelperToServerMessage::OfficialMcpError { request_id, error }) => {
+                        match parse_request_uuid(&request_id) {
+                            Ok(parsed_id) => {
+                                let mut state = state.lock().await;
+                                if let Some(tx) = state.output_map.remove(&parsed_id) {
+                                    let _ = tx.send(Err(Report::from(eyre!(error))));
+                                }
+                            }
+                            Err(error) => tracing::warn!(
+                                error = summarize_text(&error.to_string()),
+                                "invalid helper official MCP error request_id"
+                            ),
                         }
                     }
                     Ok(HelperToServerMessage::Hello(_)) => {}

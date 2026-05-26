@@ -5,7 +5,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use clap::Parser;
-use color_eyre::eyre::{eyre, Result, WrapErr};
+use color_eyre::eyre::{eyre, Report, Result, WrapErr};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -15,9 +15,14 @@ use std::env;
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::process::Child;
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::{
+    Child as TokioChild, ChildStdin as TokioChildStdin, ChildStdout as TokioChildStdout,
+    Command as TokioCommand,
+};
 use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -30,7 +35,8 @@ mod helper_ws;
 
 use helper_ws::{
     ArtifactAbort, ArtifactBegin, ArtifactChunk, ArtifactCommitted, ArtifactFinish, HelperHello,
-    HelperToServerMessage, ServerToHelperMessage, HELPER_WS_PATH, MAX_ARTIFACT_CHUNK_PAYLOAD_BYTES,
+    HelperToServerMessage, OfficialMcpRequest, OfficialMcpResponse, ServerToHelperMessage,
+    HELPER_WS_PATH, MAX_ARTIFACT_CHUNK_PAYLOAD_BYTES, OFFICIAL_MCP_ADAPTER_CAPABILITY,
 };
 
 #[cfg(target_os = "windows")]
@@ -67,7 +73,16 @@ const DEFAULT_DOMAIN_SUFFIX: &str = "dev.clock-p.com";
 const DEFAULT_HELPER_PORT: u16 = 44750;
 const LOCAL_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const PLUGIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const OFFICIAL_MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const INSTANCE_STALE_AFTER: Duration = Duration::from_secs(45);
+const ALLOWED_OFFICIAL_MCP_TOOLS: &[&str] = &[
+    "generate_mesh",
+    "search_creator_store",
+    "insert_from_creator_store",
+    "store_image",
+    "generate_procedural_model",
+    "wait_job_finished",
+];
 
 #[derive(Parser, Debug, Clone)]
 struct Args {
@@ -89,6 +104,8 @@ struct Args {
     studio_path: Option<PathBuf>,
     #[arg(long, default_value_t = 4)]
     capacity: usize,
+    #[arg(long, default_value_t = false)]
+    skip_claim_studio_launch: bool,
 }
 
 #[derive(Clone)]
@@ -103,6 +120,7 @@ struct HelperConfig {
     domain_suffix: String,
     hub_base_url: Option<String>,
     studio_path: Option<PathBuf>,
+    skip_claim_studio_launch: bool,
     client: reqwest::Client,
 }
 
@@ -128,6 +146,7 @@ struct HelperState {
     launch_processes: HashMap<String, LaunchProcessRecord>,
     waiting_for_plugin: HashMap<String, oneshot::Sender<PluginResponsePayload>>,
     remote_connections: HashMap<String, RemoteConnectionHandle>,
+    official_adapters: HashMap<String, OfficialAdapterHandle>,
     last_remote_errors: HashMap<String, String>,
     hub_last_error: Option<String>,
     hub_last_ready_at: Option<Instant>,
@@ -199,6 +218,58 @@ struct RemoteConnectionHandle {
 enum RemoteOutgoingFrame {
     Text(String),
     Pong(Vec<u8>),
+}
+
+#[derive(Clone)]
+struct OfficialAdapterHandle {
+    sender: mpsc::UnboundedSender<OfficialAdapterCommand>,
+    stop_tx: watch::Sender<bool>,
+}
+
+struct OfficialAdapterCommand {
+    request: OfficialMcpRequest,
+    response_tx: oneshot::Sender<Result<String>>,
+}
+
+struct OfficialMcpProcess {
+    child: TokioChild,
+    stdin: TokioChildStdin,
+    stdout_lines: Lines<BufReader<TokioChildStdout>>,
+    next_id: u64,
+    initialized: bool,
+    studio_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OfficialToolCallResponse {
+    #[serde(default)]
+    content: Vec<OfficialContentItem>,
+    #[serde(default, rename = "isError")]
+    is_error: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct OfficialContentItem {
+    #[serde(rename = "type")]
+    item_type: String,
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OfficialStudioList {
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    studios: Vec<OfficialStudioInfo>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct OfficialStudioInfo {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    active: Option<bool>,
 }
 
 type SharedState = Arc<Mutex<HelperState>>;
@@ -1120,6 +1191,7 @@ fn release_claimed_task(
 
     remove_instances_for_claimed_task(state, task_id);
     state.claimed_tasks.remove(task_id);
+    stop_removed_official_adapter(state, task_id);
     state
         .last_remote_errors
         .remove(&task_connection_key(task_id));
@@ -2516,17 +2588,32 @@ async fn hub_maintenance_loop(app: AppState, mut registered: bool) {
                         runtime_log_base_url: task.routes.runtime_log_base_url,
                         claimed_at: Instant::now(),
                     };
-                    #[cfg(target_os = "windows")]
-                    let launch_record = match launch_studio_for_claim(&app.helper, &claimed_task) {
-                        Ok(record) => Some(record),
-                        Err(error) => {
-                            let mut state = app.state.lock().await;
-                            state.hub_last_error = Some(summarize_error(&error.to_string()));
-                            continue;
-                        }
-                    };
-                    #[cfg(not(target_os = "windows"))]
-                    let launch_record: Option<LaunchProcessRecord> = None;
+                    let launch_record: Option<LaunchProcessRecord> =
+                        if app.helper.skip_claim_studio_launch {
+                            tracing::warn!(
+                                task_id = claimed_task.task_id.as_str(),
+                                place_id = claimed_task.place_id.as_str(),
+                                "skipping Studio launch for claimed task"
+                            );
+                            None
+                        } else {
+                            #[cfg(target_os = "windows")]
+                            {
+                                match launch_studio_for_claim(&app.helper, &claimed_task) {
+                                    Ok(record) => Some(record),
+                                    Err(error) => {
+                                        let mut state = app.state.lock().await;
+                                        state.hub_last_error =
+                                            Some(summarize_error(&error.to_string()));
+                                        continue;
+                                    }
+                                }
+                            }
+                            #[cfg(not(target_os = "windows"))]
+                            {
+                                None
+                            }
+                        };
                     let mut state = app.state.lock().await;
                     state
                         .claimed_tasks
@@ -2810,6 +2897,7 @@ async fn run_remote_ws_session(
                     "ws_tool_dispatch_v1".to_owned(),
                     "runtime_screenshot_stream_v1".to_owned(),
                     "read_studio_log_v1".to_owned(),
+                    OFFICIAL_MCP_ADAPTER_CAPABILITY.to_owned(),
                 ],
                 plugin_instance_count: {
                     let state = app.state.lock().await;
@@ -2926,6 +3014,37 @@ async fn run_remote_ws_session(
                                     }
                                 });
                             }
+                            ServerToHelperMessage::OfficialMcpRequest(request) => {
+                                if !ready_acknowledged {
+                                    return Err(eyre!("remote MCP server sent official MCP request before ready ack"));
+                                }
+                                let official_sender = out_tx.clone();
+                                let official_app = app.clone();
+                                let expected_place_id = place_id.to_owned();
+                                let expected_task_id = task_id.map(ToOwned::to_owned);
+                                tokio::spawn(async move {
+                                    let request_id = request.request_id.clone();
+                                    let result = handle_official_mcp_request(
+                                        official_app,
+                                        &expected_place_id,
+                                        expected_task_id.as_deref(),
+                                        request,
+                                    ).await;
+                                    let message = match result {
+                                        Ok(response) => HelperToServerMessage::OfficialMcpResponse(OfficialMcpResponse {
+                                            request_id,
+                                            response,
+                                        }),
+                                        Err(error) => HelperToServerMessage::OfficialMcpError {
+                                            request_id,
+                                            error: error.to_string(),
+                                        },
+                                    };
+                                    if let Ok(encoded) = encode_remote_message(&message) {
+                                        let _ = official_sender.send(RemoteOutgoingFrame::Text(encoded));
+                                    }
+                                });
+                            }
                             ServerToHelperMessage::ArtifactCommitted(committed) => {
                                 if !ready_acknowledged {
                                     return Err(eyre!("remote MCP server sent artifact committed before ready ack"));
@@ -2983,10 +3102,577 @@ async fn run_remote_ws_session(
         pending_upload_waiters = pending.len(),
         "helper remote websocket session ended"
     );
+    if let Some(task_id) = task_id {
+        if stop_and_remove_official_adapter(&app.state, task_id).await {
+            tracing::info!(
+                task_id,
+                "stopped official MCP adapter after remote websocket ended"
+            );
+        }
+    }
     if stopped_by_request {
         Ok(())
     } else {
         Err(eyre!("remote websocket session ended unexpectedly"))
+    }
+}
+
+async fn handle_official_mcp_request(
+    app: AppState,
+    expected_place_id: &str,
+    expected_task_id: Option<&str>,
+    request: OfficialMcpRequest,
+) -> Result<String> {
+    let expected_task_id = expected_task_id
+        .ok_or_else(|| eyre!("official MCP request requires task_id-bound remote connection"))?;
+    if request.task_id != expected_task_id {
+        return Err(eyre!(
+            "official MCP request task_id mismatch: expected {}, got {}",
+            expected_task_id,
+            request.task_id
+        ));
+    }
+    if request.place_id != expected_place_id {
+        return Err(eyre!(
+            "official MCP request place_id mismatch: expected {}, got {}",
+            expected_place_id,
+            request.place_id
+        ));
+    }
+    let timeout = Duration::from_millis(request.timeout_ms.max(1));
+    let timeout = timeout.min(OFFICIAL_MCP_REQUEST_TIMEOUT);
+    let handle = ensure_official_adapter_handle(&app, &request.task_id, &request.place_id).await?;
+    let (response_tx, response_rx) = oneshot::channel();
+    let task_id = request.task_id.clone();
+    if handle
+        .sender
+        .send(OfficialAdapterCommand {
+            request,
+            response_tx,
+        })
+        .is_err()
+    {
+        stop_and_remove_official_adapter(&app.state, &task_id).await;
+        return Err(eyre!("official MCP adapter worker is not running"));
+    }
+    match tokio::time::timeout(timeout, response_rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => {
+            stop_and_remove_official_adapter(&app.state, &task_id).await;
+            Err(eyre!("official MCP adapter response channel closed"))
+        }
+        Err(_) => {
+            stop_and_remove_official_adapter(&app.state, &task_id).await;
+            Err(eyre!("official MCP adapter request timed out"))
+        }
+    }
+}
+
+fn stop_removed_official_adapter(state: &mut HelperState, task_id: &str) -> bool {
+    if let Some(adapter) = state.official_adapters.remove(task_id) {
+        let _ = adapter.stop_tx.send(true);
+        true
+    } else {
+        false
+    }
+}
+
+async fn stop_and_remove_official_adapter(state: &SharedState, task_id: &str) -> bool {
+    let adapter = {
+        let mut state = state.lock().await;
+        state.official_adapters.remove(task_id)
+    };
+    if let Some(adapter) = adapter {
+        let _ = adapter.stop_tx.send(true);
+        true
+    } else {
+        false
+    }
+}
+
+async fn ensure_official_adapter_handle(
+    app: &AppState,
+    task_id: &str,
+    place_id: &str,
+) -> Result<OfficialAdapterHandle> {
+    let mut state = app.state.lock().await;
+    let claimed_task = state
+        .claimed_tasks
+        .get(task_id)
+        .ok_or_else(|| eyre!("helper has not claimed task_id {task_id}"))?;
+    if claimed_task.place_id != place_id {
+        return Err(eyre!(
+            "claimed task place_id mismatch for task_id {}: expected {}, got {}",
+            task_id,
+            claimed_task.place_id,
+            place_id
+        ));
+    }
+    let connection_key = task_connection_key(task_id);
+    let connection = state
+        .remote_connections
+        .get(&connection_key)
+        .ok_or_else(|| eyre!("official MCP adapter requires active remote connection"))?;
+    if !matches!(
+        connection.connection_state,
+        RemoteConnectionState::Connected
+    ) {
+        return Err(eyre!(
+            "official MCP adapter requires ready remote connection for task_id {}",
+            task_id
+        ));
+    }
+    if let Some(existing) = state.official_adapters.get(task_id) {
+        return Ok(existing.clone());
+    }
+
+    let (sender, mut receiver) = mpsc::unbounded_channel::<OfficialAdapterCommand>();
+    let (stop_tx, mut stop_rx) = watch::channel(false);
+    let handle = OfficialAdapterHandle {
+        sender,
+        stop_tx: stop_tx.clone(),
+    };
+    state
+        .official_adapters
+        .insert(task_id.to_owned(), handle.clone());
+    let task_id = task_id.to_owned();
+    let place_id = place_id.to_owned();
+    tokio::spawn(async move {
+        official_adapter_worker(task_id, place_id, &mut receiver, &mut stop_rx).await;
+    });
+    Ok(handle)
+}
+
+async fn official_adapter_worker(
+    task_id: String,
+    place_id: String,
+    receiver: &mut mpsc::UnboundedReceiver<OfficialAdapterCommand>,
+    stop_rx: &mut watch::Receiver<bool>,
+) {
+    let mut process: Option<OfficialMcpProcess> = None;
+    loop {
+        tokio::select! {
+            changed = stop_rx.changed() => {
+                if changed.is_ok() && *stop_rx.borrow() {
+                    break;
+                }
+            }
+            command = receiver.recv() => {
+                let Some(command) = command else {
+                    break;
+                };
+                let timeout = Duration::from_millis(command.request.timeout_ms.max(1))
+                    .min(OFFICIAL_MCP_REQUEST_TIMEOUT);
+                let result = tokio::time::timeout(
+                    timeout,
+                    official_adapter_execute_with_retry(
+                        &task_id,
+                        &place_id,
+                        &command.request,
+                        &mut process,
+                    ),
+                ).await;
+                let result = match result {
+                    Ok(result) => result,
+                    Err(_) => {
+                        if let Some(mut process) = process.take() {
+                            process.kill().await;
+                        }
+                        Err(eyre!("official MCP adapter worker request timed out"))
+                    }
+                };
+                let should_restart_after_error = match &result {
+                    Ok(_) => false,
+                    Err(error) => should_restart_official_process_after_error(error),
+                };
+                if should_restart_after_error {
+                    if let Some(mut process) = process.take() {
+                        process.kill().await;
+                    }
+                }
+                let _ = command.response_tx.send(result);
+            }
+        }
+    }
+    if let Some(mut process) = process {
+        process.kill().await;
+    }
+    tracing::info!(task_id, place_id, "official MCP adapter worker stopped");
+}
+
+async fn official_adapter_execute_with_retry(
+    task_id: &str,
+    place_id: &str,
+    request: &OfficialMcpRequest,
+    process: &mut Option<OfficialMcpProcess>,
+) -> Result<String> {
+    loop {
+        match official_adapter_execute(task_id, place_id, request, process).await {
+            Ok(response) => return Ok(response),
+            Err(error) if is_transient_official_readiness_error(&error) => {
+                tracing::warn!(
+                    task_id,
+                    place_id,
+                    action = request.action.as_str(),
+                    error = summarize_error(&error.to_string()),
+                    "official MCP adapter is waiting for Studio readiness"
+                );
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn official_adapter_execute(
+    task_id: &str,
+    place_id: &str,
+    request: &OfficialMcpRequest,
+    process: &mut Option<OfficialMcpProcess>,
+) -> Result<String> {
+    if request.action == "ping" {
+        return official_adapter_ping(task_id, place_id, process).await;
+    }
+    let official_tool = official_tool_for_action(&request.action)?;
+    ensure_official_process(process).await?;
+    let process_ref = process
+        .as_mut()
+        .ok_or_else(|| eyre!("official MCP process was not created"))?;
+    process_ref.initialize().await?;
+    let studio_summary = process_ref.ensure_active_studio().await?;
+    let result = process_ref
+        .call_tool(official_tool, request.arguments.clone())
+        .await?;
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "ok": true,
+        "adapter_state": "ready",
+        "task_id": task_id,
+        "place_id": place_id,
+        "action": request.action,
+        "official_tool": official_tool,
+        "studio": studio_summary,
+        "result": result,
+    }))?)
+}
+
+fn official_tool_for_action(action: &str) -> Result<&'static str> {
+    match action {
+        "generate_mesh" => Ok("generate_mesh"),
+        "search_creator_store" => Ok("search_creator_store"),
+        "insert_from_creator_store" => Ok("insert_from_creator_store"),
+        "store_image" => Ok("store_image"),
+        "generate_procedural_model" => Ok("generate_procedural_model"),
+        "wait_job_finished" => Ok("wait_job_finished"),
+        _ => Err(eyre!("unsupported official MCP adapter action: {}", action)),
+    }
+}
+
+fn should_restart_official_process_after_error(error: &Report) -> bool {
+    !is_transient_official_readiness_error(error)
+}
+
+fn is_transient_official_readiness_error(error: &Report) -> bool {
+    let message = error.to_string();
+    message.contains("Not connected to the WS host")
+        || message
+            .contains("previously active Studio has disconnected or doesn't have a place opened")
+}
+
+async fn ensure_official_process(process: &mut Option<OfficialMcpProcess>) -> Result<()> {
+    if process
+        .as_ref()
+        .map(|item| item.initialized)
+        .unwrap_or(false)
+    {
+        if let Some(process_ref) = process.as_mut() {
+            if process_ref.child.try_wait()?.is_some() {
+                *process = Some(spawn_official_mcp_process().await?);
+            }
+        }
+    }
+    if process.is_none() {
+        *process = Some(spawn_official_mcp_process().await?);
+    }
+    Ok(())
+}
+
+async fn official_adapter_ping(
+    task_id: &str,
+    place_id: &str,
+    process: &mut Option<OfficialMcpProcess>,
+) -> Result<String> {
+    ensure_official_process(process).await?;
+    let process_ref = process
+        .as_mut()
+        .ok_or_else(|| eyre!("official MCP process was not created"))?;
+    process_ref.initialize().await?;
+    let studio_summary = process_ref.ensure_active_studio().await?;
+    let tools = process_ref.tools_list().await?;
+    let tools_payload = tools
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let available_tool_names = tools_payload
+        .iter()
+        .filter_map(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .collect::<HashSet<_>>();
+    let missing_allowed_tools = ALLOWED_OFFICIAL_MCP_TOOLS
+        .iter()
+        .copied()
+        .filter(|tool| !available_tool_names.contains(*tool))
+        .collect::<Vec<_>>();
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "ok": true,
+        "adapter_state": "ready",
+        "task_id": task_id,
+        "place_id": place_id,
+        "studio": studio_summary,
+        "official": {
+            "tool_count": tools_payload.len(),
+            "allowed_tool_names": ALLOWED_OFFICIAL_MCP_TOOLS,
+            "missing_allowed_tools": missing_allowed_tools,
+        },
+    }))?)
+}
+
+impl OfficialMcpProcess {
+    async fn initialize(&mut self) -> Result<()> {
+        if self.initialized {
+            return Ok(());
+        }
+        let response = self
+            .request(
+                "initialize",
+                serde_json::json!({
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "clockp-helper-official-adapter",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                }),
+            )
+            .await?;
+        tracing::info!(
+            server_info = ?response.get("serverInfo"),
+            "initialized official StudioMCP.exe"
+        );
+        self.notify("notifications/initialized", serde_json::json!({}))
+            .await?;
+        self.initialized = true;
+        Ok(())
+    }
+
+    async fn ensure_active_studio(&mut self) -> Result<Value> {
+        let listed = self
+            .call_tool("list_roblox_studios", serde_json::json!({}))
+            .await?;
+        let studio_list: OfficialStudioList = parse_official_text_json(&listed)?;
+        let studio = select_official_studio(&studio_list)?;
+        self.call_tool(
+            "set_active_studio",
+            serde_json::json!({ "studio_id": studio.id }),
+        )
+        .await?;
+        self.studio_id = Some(studio.id.clone());
+        Ok(serde_json::json!({
+            "studio_id": studio.id,
+            "studio_name": studio.name,
+            "studio_count": studio_list.studios.len(),
+            "note": studio_list.note,
+            "set_active": true,
+        }))
+    }
+
+    async fn tools_list(&mut self) -> Result<Value> {
+        self.request("tools/list", serde_json::json!({})).await
+    }
+
+    async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
+        let response = self
+            .request(
+                "tools/call",
+                serde_json::json!({
+                    "name": name,
+                    "arguments": arguments,
+                }),
+            )
+            .await?;
+        let call_response: OfficialToolCallResponse = serde_json::from_value(response.clone())?;
+        if call_response.is_error {
+            return Err(eyre!(
+                "official MCP tool {} returned error: {}",
+                name,
+                summarize_official_content(&call_response.content)
+            ));
+        }
+        Ok(response)
+    }
+
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.next_id += 1;
+        let id = self.next_id;
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        self.write_json_line(&payload).await?;
+        loop {
+            let Some(line) = self.stdout_lines.next_line().await? else {
+                return Err(eyre!("official MCP process closed stdout"));
+            };
+            let response: Value = serde_json::from_str(&line)
+                .wrap_err_with(|| format!("official MCP returned non-JSON line: {line}"))?;
+            if response.get("id").and_then(Value::as_u64) != Some(id) {
+                continue;
+            }
+            if let Some(error) = response.get("error") {
+                return Err(eyre!("official MCP {method} failed: {error}"));
+            }
+            return response
+                .get("result")
+                .cloned()
+                .ok_or_else(|| eyre!("official MCP {method} response missing result"));
+        }
+    }
+
+    async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        self.write_json_line(&payload).await
+    }
+
+    async fn write_json_line(&mut self, payload: &Value) -> Result<()> {
+        let encoded = serde_json::to_string(payload)?;
+        self.stdin.write_all(encoded.as_bytes()).await?;
+        self.stdin.write_all(b"\n").await?;
+        self.stdin.flush().await?;
+        Ok(())
+    }
+
+    async fn kill(&mut self) {
+        let _ = self.child.start_kill();
+        let _ = self.child.wait().await;
+    }
+}
+
+fn parse_official_text_json<T: DeserializeOwned>(response: &Value) -> Result<T> {
+    let call_response: OfficialToolCallResponse = serde_json::from_value(response.clone())?;
+    let text = call_response
+        .content
+        .iter()
+        .find_map(|item| {
+            (item.item_type == "text")
+                .then(|| item.text.clone())
+                .flatten()
+        })
+        .ok_or_else(|| eyre!("official MCP response did not include text content"))?;
+    Ok(serde_json::from_str(&text)?)
+}
+
+fn summarize_official_content(content: &[OfficialContentItem]) -> String {
+    content
+        .iter()
+        .filter_map(|item| item.text.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn select_official_studio(list: &OfficialStudioList) -> Result<OfficialStudioInfo> {
+    if list.studios.is_empty() {
+        return Err(eyre!(
+            "official MCP found no connected Roblox Studio instances"
+        ));
+    }
+    if list.studios.len() == 1 {
+        return Ok(list.studios[0].clone());
+    }
+    Err(eyre!(
+        "official MCP found multiple Studio instances and cannot bind safely in v1"
+    ))
+}
+
+async fn spawn_official_mcp_process() -> Result<OfficialMcpProcess> {
+    let executable = resolve_official_mcp_executable()?;
+    let mut child = TokioCommand::new(&executable)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .wrap_err_with(|| format!("failed to spawn {}", executable.display()))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| eyre!("official MCP stdin was not captured"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| eyre!("official MCP stdout was not captured"))?;
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::debug!(stderr = summarize_error(&line), "official MCP stderr");
+            }
+        });
+    }
+    Ok(OfficialMcpProcess {
+        child,
+        stdin,
+        stdout_lines: BufReader::new(stdout).lines(),
+        next_id: 0,
+        initialized: false,
+        studio_id: None,
+    })
+}
+
+fn resolve_official_mcp_executable() -> Result<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        let local_app_data =
+            env::var_os("LOCALAPPDATA").ok_or_else(|| eyre!("LOCALAPPDATA is not set"))?;
+        let roblox_dir = PathBuf::from(local_app_data).join("Roblox");
+        let mcp_bat = roblox_dir.join("mcp.bat");
+        if let Ok(content) = fs::read_to_string(&mcp_bat) {
+            for fragment in content.split('"') {
+                if fragment.ends_with("StudioMCP.exe") {
+                    let path = PathBuf::from(fragment);
+                    if path.is_file() {
+                        return Ok(path);
+                    }
+                }
+            }
+        }
+        let versions_dir = roblox_dir.join("Versions");
+        if versions_dir.is_dir() {
+            for entry in fs::read_dir(&versions_dir)? {
+                let candidate = entry?.path().join("StudioMCP.exe");
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
+            }
+        }
+        Err(eyre!(
+            "cannot locate StudioMCP.exe under {}",
+            roblox_dir.display()
+        ))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err(eyre!(
+            "official StudioMCP.exe adapter is only available on Windows helper"
+        ))
     }
 }
 
@@ -3559,6 +4245,7 @@ async fn main() -> Result<()> {
         domain_suffix: args.domain_suffix.clone(),
         hub_base_url: args.hub_base_url.clone(),
         studio_path: args.studio_path.clone(),
+        skip_claim_studio_launch: args.skip_claim_studio_launch,
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
             .build()?,
@@ -3569,6 +4256,7 @@ async fn main() -> Result<()> {
         user_name = helper.user_name,
         port = args.port,
         capacity = helper.capacity,
+        skip_claim_studio_launch = helper.skip_claim_studio_launch,
         hub_base_url = helper.hub_base_url,
         domain_suffix = helper.domain_suffix,
         token_source,
@@ -3610,6 +4298,7 @@ async fn main() -> Result<()> {
         launch_processes: HashMap::new(),
         waiting_for_plugin: HashMap::new(),
         remote_connections: HashMap::new(),
+        official_adapters: HashMap::new(),
         last_remote_errors: HashMap::new(),
         hub_last_error: initial_hub_error,
         hub_last_ready_at: initial_hub_registration.as_ref().map(|_| Instant::now()),
@@ -3695,10 +4384,27 @@ mod tests {
             launch_processes: HashMap::new(),
             waiting_for_plugin: HashMap::new(),
             remote_connections: HashMap::new(),
+            official_adapters: HashMap::new(),
             last_remote_errors: HashMap::new(),
             hub_last_error: None,
             hub_last_ready_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn stop_and_remove_official_adapter_drops_stale_handle() {
+        let state = Arc::new(Mutex::new(empty_helper_state()));
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        state.lock().await.official_adapters.insert(
+            "task-a".to_owned(),
+            OfficialAdapterHandle { sender, stop_tx },
+        );
+
+        assert!(stop_and_remove_official_adapter(&state, "task-a").await);
+        assert!(!state.lock().await.official_adapters.contains_key("task-a"));
+        assert!(stop_rx.changed().await.is_ok());
+        assert!(*stop_rx.borrow());
     }
 
     #[test]
@@ -3721,6 +4427,40 @@ mod tests {
             missing.is_none(),
             "unknown task_id should not fall back by place"
         );
+    }
+
+    #[test]
+    fn official_adapter_allows_only_curated_actions() {
+        assert!(ALLOWED_OFFICIAL_MCP_TOOLS.contains(&"generate_mesh"));
+        assert!(ALLOWED_OFFICIAL_MCP_TOOLS.contains(&"search_creator_store"));
+        assert!(!ALLOWED_OFFICIAL_MCP_TOOLS.contains(&"execute_luau"));
+        assert!(!ALLOWED_OFFICIAL_MCP_TOOLS.contains(&"script_read"));
+        assert_eq!(
+            official_tool_for_action("generate_mesh").unwrap(),
+            "generate_mesh"
+        );
+        assert_eq!(
+            official_tool_for_action("search_creator_store").unwrap(),
+            "search_creator_store"
+        );
+        assert!(official_tool_for_action("execute_luau").is_err());
+        assert!(official_tool_for_action("script_read").is_err());
+    }
+
+    #[test]
+    fn official_adapter_keeps_process_while_studio_ws_host_is_starting() {
+        let transient = eyre!(
+            "official MCP tool list_roblox_studios returned error: Not connected to the WS host"
+        );
+        assert!(!should_restart_official_process_after_error(&transient));
+
+        let opening_place = eyre!(
+            "official MCP tool search_creator_store returned error: Execution is prevented because previously active Studio has disconnected or doesn't have a place opened."
+        );
+        assert!(!should_restart_official_process_after_error(&opening_place));
+
+        let fatal = eyre!("official MCP process closed stdout");
+        assert!(should_restart_official_process_after_error(&fatal));
     }
 
     #[test]
