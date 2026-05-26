@@ -96,10 +96,31 @@ fn normalize_bearer_token(token: &str) -> Option<String> {
     }
 }
 
-fn default_feishu_token_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".dev.clock-p.com").join("feishu-token"))
+fn default_feishu_token_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        paths.push(
+            PathBuf::from(appdata)
+                .join("dev.clock-p.com")
+                .join("feishu-token"),
+        );
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        paths.push(
+            PathBuf::from(home)
+                .join(".dev.clock-p.com")
+                .join("feishu-token"),
+        );
+    }
+    if let Some(user_profile) = std::env::var_os("USERPROFILE") {
+        let path = PathBuf::from(user_profile)
+            .join(".dev.clock-p.com")
+            .join("feishu-token");
+        if !paths.iter().any(|candidate| candidate == &path) {
+            paths.push(path);
+        }
+    }
+    paths
 }
 
 fn load_token_from_file(path: &PathBuf) -> Result<Option<String>> {
@@ -125,7 +146,7 @@ fn resolve_http_bearer_token(args: &Args) -> Result<Option<String>> {
         return load_token_from_file(path);
     }
 
-    if let Some(path) = default_feishu_token_path() {
+    for path in default_feishu_token_paths() {
         if path.exists() {
             return load_token_from_file(&path);
         }
