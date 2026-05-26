@@ -15,7 +15,7 @@ local StudioService = game:GetService("StudioService")
 
 local DEFAULT_HELPER_PORT = "44750"
 local HELPER_PORT_SETTING_KEY = "MCP-helper-port"
-local AUTO_CONNECT_SETTING_KEY = "MCP-auto-connect"
+local AUTO_CONNECT_SETTING_KEY = "MCP-auto-connect-v2"
 local LOG_PREFIX = "[MCP Plugin]"
 local STATUS_POLL_INTERVAL_SECONDS = 1
 
@@ -135,7 +135,7 @@ local function loadConnectionConfig(): (string, boolean)
 	local savedPort = PluginUtils.getSettings(HELPER_PORT_SETTING_KEY)
 	local savedAutoConnect = PluginUtils.getSettings(AUTO_CONNECT_SETTING_KEY)
 	local helperPort = if type(savedPort) == "string" then savedPort else DEFAULT_HELPER_PORT
-	local autoConnect = if type(savedAutoConnect) == "boolean" then savedAutoConnect else false
+	local autoConnect = if type(savedAutoConnect) == "boolean" then savedAutoConnect else true
 	return normalizeHelperPort(helperPort), autoConnect
 end
 
