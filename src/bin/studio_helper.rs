@@ -100,7 +100,7 @@ struct Args {
     domain_suffix: String,
     #[arg(long)]
     helper_id: Option<String>,
-    #[arg(long)]
+    #[arg(long, required = true)]
     hub_base_url: Option<String>,
     #[arg(long)]
     studio_path: Option<PathBuf>,
@@ -158,7 +158,7 @@ struct HelperState {
 struct ClaimedTask {
     task_id: String,
     place_id: String,
-    game_id: Option<String>,
+    universe_id: Option<String>,
     mcp_base_url: String,
     rojo_base_url: Option<String>,
     runtime_log_base_url: Option<String>,
@@ -168,7 +168,7 @@ struct ClaimedTask {
 struct LaunchProcessRecord {
     task_id: String,
     place_id: String,
-    game_id: Option<String>,
+    universe_id: Option<String>,
     studio_pid: u32,
     launched_by_helper: bool,
     #[cfg(target_os = "windows")]
@@ -337,7 +337,7 @@ struct HelperStatusResponse {
 struct ClaimedTaskStatus {
     task_id: String,
     place_id: String,
-    game_id: Option<String>,
+    universe_id: Option<String>,
     mcp_base_url: String,
     rojo_base_url: Option<String>,
     runtime_log_base_url: Option<String>,
@@ -355,7 +355,7 @@ struct ClaimedTaskStatus {
 struct LaunchProcessStatus {
     task_id: String,
     place_id: String,
-    game_id: Option<String>,
+    universe_id: Option<String>,
     studio_pid: u32,
     launched_by_helper: bool,
 }
@@ -430,7 +430,8 @@ struct ClaimTaskHubResponse {
 struct ClaimedTaskHubPayload {
     task_id: String,
     place_id: String,
-    game_id: Option<String>,
+    #[serde(default, alias = "game_id")]
+    universe_id: Option<String>,
     routes: ClaimedTaskRoutes,
 }
 
@@ -749,20 +750,6 @@ fn resolve_bearer_token_candidates(args: &Args) -> Result<Vec<ResolvedToken>> {
     Ok(unique)
 }
 
-fn derive_public_base_url(kind: &str, place_id: &str, helper: &HelperConfig) -> String {
-    format!(
-        "https://{place_id}-{kind}-{}-user.{}",
-        helper.user_name, helper.domain_suffix
-    )
-}
-
-fn derive_runtime_screenshot_upload_url(place_id: &str, helper: &HelperConfig) -> String {
-    format!(
-        "{}/v1/runtime-screenshots",
-        derive_public_base_url("runtime-log", place_id, helper)
-    )
-}
-
 fn helper_data_dir() -> Result<PathBuf> {
     if let Some(appdata) = windows_appdata_dir() {
         return Ok(appdata.join("dev.clock-p.com").join("studio-helper"));
@@ -956,8 +943,8 @@ fn launch_studio_for_claim(
     let mut command = std::process::Command::new(&studio_path);
     command.arg("-task").arg("EditPlace");
     command.arg("-placeId").arg(&task.place_id);
-    if let Some(game_id) = task.game_id.as_deref() {
-        command.arg("-universeId").arg(game_id);
+    if let Some(universe_id) = task.universe_id.as_deref() {
+        command.arg("-universeId").arg(universe_id);
     }
     if let Some(parent) = studio_path.parent() {
         command.current_dir(parent);
@@ -992,7 +979,7 @@ fn launch_studio_for_claim(
     tracing::info!(
         task_id = task.task_id.as_str(),
         place_id = task.place_id.as_str(),
-        game_id = task.game_id.as_deref(),
+        universe_id = task.universe_id.as_deref(),
         studio_pid,
         studio_path = %studio_path.display(),
         "launched Roblox Studio for claimed task"
@@ -1000,7 +987,7 @@ fn launch_studio_for_claim(
     Ok(LaunchProcessRecord {
         task_id: task.task_id.clone(),
         place_id: task.place_id.clone(),
-        game_id: task.game_id.clone(),
+        universe_id: task.universe_id.clone(),
         studio_pid,
         launched_by_helper: true,
         kill_on_close_job: Some(kill_on_close_job),
@@ -1154,7 +1141,7 @@ fn bind_launch_process_to_pid(
 ) -> Result<()> {
     if let Some(existing) = state.launch_processes.get_mut(&task.task_id) {
         existing.place_id = task.place_id.clone();
-        existing.game_id = task.game_id.clone();
+        existing.universe_id = task.universe_id.clone();
         existing.studio_pid = studio_pid;
         existing.launched_by_helper = false;
         return Ok(());
@@ -1164,7 +1151,7 @@ fn bind_launch_process_to_pid(
         LaunchProcessRecord {
             task_id: task.task_id.clone(),
             place_id: task.place_id.clone(),
-            game_id: task.game_id.clone(),
+            universe_id: task.universe_id.clone(),
             studio_pid,
             launched_by_helper: false,
             #[cfg(target_os = "windows")]
@@ -1450,14 +1437,12 @@ fn validate_runtime_screenshot_upload_url(
         return Err(eyre!("upload_url must not be empty"));
     }
 
-    let expected = match select_claimed_task(state, place_id, task_id) {
-        Ok(task) => task
-            .runtime_log_base_url
-            .as_deref()
-            .map(runtime_screenshot_upload_url_for_base_url)
-            .ok_or_else(|| eyre!("claimed task has no runtime_log_base_url"))?,
-        Err(_) => derive_runtime_screenshot_upload_url(place_id, helper),
-    };
+    let _ = helper;
+    let expected = select_claimed_task(state, place_id, task_id)?
+        .runtime_log_base_url
+        .as_deref()
+        .map(runtime_screenshot_upload_url_for_base_url)
+        .ok_or_else(|| eyre!("claimed task has no runtime_log_base_url"))?;
     if trimmed != expected {
         return Err(eyre!(
             "upload_url must match runtime screenshot sink for placeId {place_id}: {expected}"
@@ -1910,7 +1895,7 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
             ClaimedTaskStatus {
                 task_id: task.task_id.clone(),
                 place_id: task.place_id.clone(),
-                game_id: task.game_id.clone(),
+                universe_id: task.universe_id.clone(),
                 mcp_base_url: task.mcp_base_url.clone(),
                 rojo_base_url: task.rojo_base_url.clone(),
                 runtime_log_base_url: task.runtime_log_base_url.clone(),
@@ -1950,7 +1935,7 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
         .map(|launch| LaunchProcessStatus {
             task_id: launch.task_id.clone(),
             place_id: launch.place_id.clone(),
-            game_id: launch.game_id.clone(),
+            universe_id: launch.universe_id.clone(),
             studio_pid: launch.studio_pid,
             launched_by_helper: launch.launched_by_helper,
         })
@@ -2003,14 +1988,15 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
         studio_pids.dedup();
         let connection_key = claimed_task
             .as_ref()
-            .map(|task| task_connection_key(&task.task_id))
-            .unwrap_or_else(|| place_connection_key(&place_id));
-        let remote_connection = state.remote_connections.get(&connection_key);
+            .map(|task| task_connection_key(&task.task_id));
+        let remote_connection = connection_key
+            .as_ref()
+            .and_then(|key| state.remote_connections.get(key));
         place_statuses.push(HelperPlaceStatus {
             remote_base_url: claimed_task
                 .as_ref()
                 .map(|task| task.mcp_base_url.clone())
-                .unwrap_or_else(|| derive_public_base_url("mcp", &place_id, &app.helper)),
+                .unwrap_or_default(),
             place_id: place_id.clone(),
             task_id: claimed_task.as_ref().map(|task| task.task_id.clone()),
             registered_instance_count: registered_instance_ids.len(),
@@ -2026,7 +2012,9 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
                 .to_owned(),
             remote_connection_id: remote_connection
                 .and_then(|connection| connection.connection_id.clone()),
-            remote_last_error: state.last_remote_errors.get(&connection_key).cloned(),
+            remote_last_error: connection_key
+                .as_ref()
+                .and_then(|key| state.last_remote_errors.get(key).cloned()),
             remote_last_ready_age_ms: remote_connection.and_then(|connection| {
                 connection
                     .last_ready_at
@@ -2068,20 +2056,6 @@ async fn rojo_config_handler(
     let place_id = sanitize_place_id(&query.place_id)?;
     let explicit_task_id = maybe_sanitize_identifier("task_id", query.task_id.as_deref())?;
     let bearer_token = app.helper.bearer_token.lock().await.clone();
-    if app.helper.hub_base_url.is_none() {
-        let base_url = rojo_forward_base_url(app.helper.port, &place_id);
-        tracing::info!(
-            place_id,
-            base_url,
-            "resolved legacy rojo config from helper"
-        );
-        return Ok(Json(RojoConfigResponse {
-            place_id,
-            task_id: None,
-            base_url,
-            auth_header: format!("Bearer {bearer_token}"),
-        }));
-    }
     let studio_pid = resolve_peer_process_id_with_retry(peer_addr, app.helper.port).await?;
     let claimed_task = {
         let state = app.state.lock().await;
@@ -2113,9 +2087,6 @@ async fn rojo_config_handler(
 }
 
 async fn resolve_rojo_forward_target_base_url(app: &AppState, place_id: &str) -> Result<String> {
-    if app.helper.hub_base_url.is_none() {
-        return Ok(derive_public_base_url("rojo", place_id, &app.helper));
-    }
     let state = app.state.lock().await;
     let claimed_task = select_claimed_task(&state, place_id, None)?;
     claimed_task
@@ -2341,31 +2312,19 @@ async fn mcp_register_handler(
     let instance_id = Uuid::new_v4().to_string();
     let explicit_task_id = maybe_sanitize_identifier("task_id", payload.task_id.as_deref())?;
     let studio_pid = resolve_peer_process_id_with_retry(peer_addr, app.helper.port).await?;
-    let claimed_task = if app.helper.hub_base_url.is_some() {
+    let claimed_task = {
         let state = app.state.lock().await;
-        Some(
-            resolve_plugin_routing_decision(
-                &state,
-                &place_id,
-                explicit_task_id.as_deref(),
-                studio_pid,
-            )
-            .map_err(HelperError)?,
-        )
-    } else {
-        None
+        resolve_plugin_routing_decision(&state, &place_id, explicit_task_id.as_deref(), studio_pid)
+            .map_err(HelperError)?
     };
-    let remote_base_url = claimed_task
-        .as_ref()
-        .map(|task| task.mcp_base_url.clone())
-        .unwrap_or_else(|| derive_public_base_url("mcp", &place_id, &app.helper));
+    let remote_base_url = claimed_task.mcp_base_url.clone();
     {
         let mut state = app.state.lock().await;
         state.instances.insert(
             instance_id.clone(),
             PluginInstance {
                 place_id: place_id.clone(),
-                task_id: claimed_task.as_ref().map(|task| task.task_id.clone()),
+                task_id: Some(claimed_task.task_id.clone()),
                 remote_base_url: remote_base_url.clone(),
                 studio_pid,
                 last_seen_at: Instant::now(),
@@ -2373,8 +2332,8 @@ async fn mcp_register_handler(
                 notify: Arc::new(Notify::new()),
             },
         );
-        if let (Some(claimed_task), Some(studio_pid)) = (claimed_task.as_ref(), studio_pid) {
-            bind_launch_process_to_pid(&mut state, claimed_task, studio_pid)
+        if let Some(studio_pid) = studio_pid {
+            bind_launch_process_to_pid(&mut state, &claimed_task, studio_pid)
                 .map_err(HelperError)?;
         }
         sync_remote_connections(&app, &mut state);
@@ -2382,7 +2341,7 @@ async fn mcp_register_handler(
     tracing::info!(
         instance_id,
         place_id,
-        task_id = claimed_task.as_ref().map(|task| task.task_id.clone()),
+        task_id = claimed_task.task_id,
         studio_pid,
         remote_base_url,
         "registered MCP plugin instance with helper"
@@ -2390,7 +2349,7 @@ async fn mcp_register_handler(
     Ok(Json(RegisterPluginResponse {
         instance_id,
         place_id,
-        task_id: claimed_task.as_ref().map(|task| task.task_id.clone()),
+        task_id: Some(claimed_task.task_id),
         remote_base_url,
     }))
 }
@@ -2510,20 +2469,28 @@ async fn read_studio_log_debug_handler(
     Ok(Json(read_studio_log(query)?))
 }
 
-fn place_connection_key(place_id: &str) -> String {
-    format!("place:{place_id}")
-}
-
 fn task_connection_key(task_id: &str) -> String {
     format!("task:{task_id}")
 }
 
-fn validate_remote_ready_ack(expected_place_id: &str, ack_place_id: &str) -> Result<()> {
+fn validate_remote_ready_ack(
+    expected_place_id: &str,
+    expected_task_id: Option<&str>,
+    ack_place_id: &str,
+    ack_task_id: Option<&str>,
+) -> Result<()> {
     if ack_place_id != expected_place_id {
         return Err(eyre!(
             "remote MCP ready ack place_id mismatch: expected {}, got {}",
             expected_place_id,
             ack_place_id,
+        ));
+    }
+    if ack_task_id != expected_task_id {
+        return Err(eyre!(
+            "remote MCP ready ack task_id mismatch: expected {:?}, got {:?}",
+            expected_task_id,
+            ack_task_id,
         ));
     }
     Ok(())
@@ -2550,21 +2517,7 @@ fn build_active_remote_targets(app: &AppState, state: &HelperState) -> Vec<Remot
             remote_base_url: claimed_task.mcp_base_url.clone(),
         });
     }
-    if app.helper.hub_base_url.is_some() {
-        return targets;
-    }
-    let mut seen_places = HashSet::new();
-    for instance in state.instances.values() {
-        if !seen_places.insert(instance.place_id.clone()) {
-            continue;
-        }
-        targets.push(RemoteTarget {
-            connection_key: place_connection_key(&instance.place_id),
-            place_id: instance.place_id.clone(),
-            task_id: instance.task_id.clone(),
-            remote_base_url: derive_public_base_url("mcp", &instance.place_id, &app.helper),
-        });
-    }
+    let _ = app;
     targets
 }
 
@@ -2573,10 +2526,6 @@ fn remote_connection_is_active(state: &HelperState, connection_key: &str) -> boo
         .claimed_tasks
         .values()
         .any(|task| task_connection_key(&task.task_id) == connection_key)
-        || state
-            .instances
-            .values()
-            .any(|instance| place_connection_key(&instance.place_id) == connection_key)
 }
 
 fn set_remote_connection_connecting(state: &mut HelperState, connection_key: &str) {
@@ -2747,9 +2696,6 @@ async fn remote_ws_loop(app: AppState, target: RemoteTarget, mut stop_rx: watch:
 }
 
 async fn hub_maintenance_loop(app: AppState, mut registered: bool) {
-    if app.helper.hub_base_url.is_none() {
-        return;
-    }
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     loop {
         interval.tick().await;
@@ -2837,7 +2783,7 @@ async fn hub_maintenance_loop(app: AppState, mut registered: bool) {
                     let claimed_task = ClaimedTask {
                         task_id: task.task_id.clone(),
                         place_id: task.place_id,
-                        game_id: task.game_id,
+                        universe_id: task.universe_id,
                         mcp_base_url,
                         rojo_base_url: task.routes.rojo_base_url,
                         runtime_log_base_url: task.routes.runtime_log_base_url,
@@ -3232,8 +3178,8 @@ async fn run_remote_ws_session(
                             note_remote_connection_activity(&mut state, connection_key);
                         }
                         match serde_json::from_str::<ServerToHelperMessage>(&text)? {
-                            ServerToHelperMessage::ReadyAck { connection_id, place_id: ack_place_id, task_id: _ack_task_id } => {
-                                validate_remote_ready_ack(place_id, &ack_place_id)?;
+                            ServerToHelperMessage::ReadyAck { connection_id, place_id: ack_place_id, task_id: ack_task_id } => {
+                                validate_remote_ready_ack(place_id, task_id, &ack_place_id, ack_task_id.as_deref())?;
                                 {
                                     let mut state = app.state.lock().await;
                                     set_remote_connection_connected(&mut state, connection_key, &connection_id);
@@ -4481,6 +4427,11 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    if args.hub_base_url.is_none() {
+        return Err(eyre!(
+            "hub_base_url is required; studio_helper must route through hub and claimed task routes"
+        ));
+    }
     let bearer_token_candidates = resolve_bearer_token_candidates(&args)?;
     let initial_bearer_token = resolve_bearer_token(&args)?;
     let initial_bearer_token_source = bearer_token_candidates
@@ -4518,33 +4469,29 @@ async fn main() -> Result<()> {
         "starting Studio helper"
     );
 
-    let (initial_hub_registration, initial_hub_error) = if helper.hub_base_url.is_some() {
-        match hub_register_helper(&helper).await {
-            Ok(response) => {
-                tracing::info!(
-                    helper_id = helper.helper_id,
-                    heartbeat_interval_sec = response.heartbeat_interval_sec,
-                    heartbeat_timeout_sec = response.heartbeat_timeout_sec,
-                    "registered helper with hub"
-                );
-                (Some(response), None)
-            }
-            Err(RegisterHelperError::HelperIdConflict(message)) => {
-                eprintln!("helper_id_conflict: {message}");
-                return Err(eyre!("helper_id_conflict: {message}"));
-            }
-            Err(RegisterHelperError::Other(error)) => {
-                let startup_error = summarize_error(&error.to_string());
-                tracing::warn!(
-                    helper_id = helper.helper_id,
-                    error = startup_error,
-                    "failed to register helper with hub during startup; continuing with background retry"
-                );
-                (None, Some(startup_error))
-            }
+    let (initial_hub_registration, initial_hub_error) = match hub_register_helper(&helper).await {
+        Ok(response) => {
+            tracing::info!(
+                helper_id = helper.helper_id,
+                heartbeat_interval_sec = response.heartbeat_interval_sec,
+                heartbeat_timeout_sec = response.heartbeat_timeout_sec,
+                "registered helper with hub"
+            );
+            (Some(response), None)
         }
-    } else {
-        (None, None)
+        Err(RegisterHelperError::HelperIdConflict(message)) => {
+            eprintln!("helper_id_conflict: {message}");
+            return Err(eyre!("helper_id_conflict: {message}"));
+        }
+        Err(RegisterHelperError::Other(error)) => {
+            let startup_error = summarize_error(&error.to_string());
+            tracing::warn!(
+                helper_id = helper.helper_id,
+                error = startup_error,
+                "failed to register helper with hub during startup; continuing with background retry"
+            );
+            (None, Some(startup_error))
+        }
     };
 
     let state = Arc::new(Mutex::new(HelperState {
@@ -4633,7 +4580,7 @@ mod tests {
         ClaimedTask {
             task_id: task_id.to_owned(),
             place_id: place_id.to_owned(),
-            game_id: Some("999".to_owned()),
+            universe_id: Some("999".to_owned()),
             mcp_base_url: "https://example.com".to_owned(),
             rojo_base_url: Some("https://example.com".to_owned()),
             runtime_log_base_url: Some("https://example.com".to_owned()),
@@ -4693,16 +4640,21 @@ mod tests {
     fn rojo_forward_target_ws_url_uses_websocket_scheme() {
         assert_eq!(
             rojo_forward_target_ws_url(
-                "https://93795519121520-rojo.dev.clock-p.com",
+                "https://93795519121520-t_example-rojo-sunjun-user.dev.clock-p.com",
                 "api/socket/0",
                 Some("cursor=next"),
             )
             .unwrap(),
-            "wss://93795519121520-rojo.dev.clock-p.com/api/socket/0?cursor=next"
+            "wss://93795519121520-t_example-rojo-sunjun-user.dev.clock-p.com/api/socket/0?cursor=next"
         );
         assert_eq!(
-            rojo_forward_target_ws_url("http://127.0.0.1:34872", "/api/socket/1", None).unwrap(),
-            "ws://127.0.0.1:34872/api/socket/1"
+            rojo_forward_target_ws_url(
+                "http://93795519121520-t_example-rojo-sunjun-user.dev.clock-p.com",
+                "/api/socket/1",
+                None,
+            )
+            .unwrap(),
+            "ws://93795519121520-t_example-rojo-sunjun-user.dev.clock-p.com/api/socket/1"
         );
     }
 
@@ -4826,14 +4778,12 @@ mod tests {
             "task": {
                 "task_id": "t_example",
                 "place_id": "93795519121520",
-                "game_id": "9838206573",
+                "universe_id": "9838206573",
                 "active_launch_id": "l_internal_only",
-                "generation": 1,
-                "launch_id": "l_internal_only",
                 "routes": {
-                    "rojo_base_url": "https://example-rojo.dev.clock-p.com",
-                    "mcp_base_url": "https://example-mcp.dev.clock-p.com",
-                    "runtime_log_base_url": "https://example-runtime.dev.clock-p.com"
+                    "rojo_base_url": "https://93795519121520-t_example-rojo-sunjun-user.dev.clock-p.com",
+                    "mcp_base_url": "https://93795519121520-t_example-mcp-sunjun-user.dev.clock-p.com",
+                    "runtime_log_base_url": "https://93795519121520-t_example-runtime-log-sunjun-user.dev.clock-p.com"
                 }
             }
         }"#;
@@ -4842,7 +4792,27 @@ mod tests {
         let task = parsed.task.expect("task should be present");
         assert_eq!(task.task_id, "t_example");
         assert_eq!(task.place_id, "93795519121520");
-        assert_eq!(task.game_id.as_deref(), Some("9838206573"));
+        assert_eq!(task.universe_id.as_deref(), Some("9838206573"));
+    }
+
+    #[test]
+    fn claim_task_response_accepts_legacy_game_id_field() {
+        let payload = r#"{
+            "claimed": true,
+            "helper_id": "h_test",
+            "task": {
+                "task_id": "t_example",
+                "place_id": "93795519121520",
+                "game_id": "9838206573",
+                "routes": {
+                    "mcp_base_url": "https://93795519121520-t_example-mcp-sunjun-user.dev.clock-p.com"
+                }
+            }
+        }"#;
+        let parsed: ClaimTaskHubResponse =
+            serde_json::from_str(payload).expect("legacy claim payload should decode");
+        let task = parsed.task.expect("task should be present");
+        assert_eq!(task.universe_id.as_deref(), Some("9838206573"));
     }
 
     #[cfg(target_os = "windows")]
@@ -4873,7 +4843,7 @@ mod tests {
             LaunchProcessRecord {
                 task_id: "task_a".to_owned(),
                 place_id: "93795519121520".to_owned(),
-                game_id: Some("999".to_owned()),
+                universe_id: Some("999".to_owned()),
                 studio_pid: 222,
                 launched_by_helper: true,
                 kill_on_close_job: None,
@@ -4902,7 +4872,7 @@ mod tests {
             LaunchProcessRecord {
                 task_id: "task_a".to_owned(),
                 place_id: "93795519121520".to_owned(),
-                game_id: Some("999".to_owned()),
+                universe_id: Some("999".to_owned()),
                 studio_pid: 111,
                 launched_by_helper: true,
                 #[cfg(target_os = "windows")]
@@ -4915,7 +4885,7 @@ mod tests {
             LaunchProcessRecord {
                 task_id: "task_b".to_owned(),
                 place_id: "93795519121520".to_owned(),
-                game_id: Some("999".to_owned()),
+                universe_id: Some("999".to_owned()),
                 studio_pid: 222,
                 launched_by_helper: true,
                 #[cfg(target_os = "windows")]
@@ -5027,7 +4997,7 @@ mod tests {
             LaunchProcessRecord {
                 task_id: "task_a".to_owned(),
                 place_id: "93795519121520".to_owned(),
-                game_id: Some("999".to_owned()),
+                universe_id: Some("999".to_owned()),
                 studio_pid: 111,
                 launched_by_helper: false,
                 #[cfg(target_os = "windows")]
@@ -5049,18 +5019,40 @@ mod tests {
     }
 
     #[test]
-    fn validate_remote_ready_ack_only_checks_place_id() {
-        validate_remote_ready_ack("93795519121520", "93795519121520")
-            .expect("exact ready ack should pass");
+    fn validate_remote_ready_ack_checks_full_route_identity() {
+        validate_remote_ready_ack(
+            "93795519121520",
+            Some("t_example"),
+            "93795519121520",
+            Some("t_example"),
+        )
+        .expect("exact ready ack should pass");
 
-        validate_remote_ready_ack("93795519121520", "93795519121520")
-            .expect("missing route identity should still pass");
+        let missing_task =
+            validate_remote_ready_ack("93795519121520", Some("t_example"), "93795519121520", None)
+                .expect_err("missing task identity should fail");
+        assert!(missing_task
+            .to_string()
+            .contains("remote MCP ready ack task_id mismatch"));
 
-        validate_remote_ready_ack("93795519121520", "93795519121520")
-            .expect("partial route identity should still pass");
+        let wrong_task = validate_remote_ready_ack(
+            "93795519121520",
+            Some("t_example"),
+            "93795519121520",
+            Some("t_other"),
+        )
+        .expect_err("task mismatch should fail");
+        assert!(wrong_task
+            .to_string()
+            .contains("remote MCP ready ack task_id mismatch"));
 
-        let wrong_place = validate_remote_ready_ack("93795519121520", "111")
-            .expect_err("place mismatch should fail");
+        let wrong_place = validate_remote_ready_ack(
+            "93795519121520",
+            Some("t_example"),
+            "111",
+            Some("t_example"),
+        )
+        .expect_err("place mismatch should fail");
         assert!(wrong_place
             .to_string()
             .contains("remote MCP ready ack place_id mismatch"));

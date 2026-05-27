@@ -1,112 +1,42 @@
-# Quick Setup
-1. Download and Run the server: [Windows](https://github.com/Roblox/studio-rust-mcp-server/releases/latest/download/rbx-studio-mcp.exe) or [macOS](https://github.com/Roblox/studio-rust-mcp-server/releases/latest/download/macOS-rbx-studio-mcp.zip)
-2. Restart AI Client (Claude, Cursor, etc) and Roblox Studio
-3. Done!
+# clock-p Studio MCP Server
 
-# Roblox Studio MCP Server
+This repository is used by clock-p as the internal `clockp MCP` server that runs inside each debug task.
 
-This repository contains a reference implementation of the Model Context Protocol (MCP) that enables
-communication between Roblox Studio via a plugin and [Claude Desktop](https://claude.ai/download) or [Cursor](https://www.cursor.com/).
-It consists of the following Rust-based components, which communicate through internal shared
-objects.
+Do not configure this binary directly as a Claude / Cursor / Codex MCP server for clock-p Roblox workflows. Codex and other LLM operators must use the clock-p Roblox skills and high-level scripts documented in `../clock-p-platform/docs/roblox-debug-cluster-constitution.md`.
 
-- A web server built on `axum` that a Studio plugin long polls.
-- A `rmcp` server that talks to Claude via `stdio` transport.
+The current clock-p shape is:
 
-When LLM requests to run a tool, the plugin will get a request through the long polling and post a
-response. It will cause responses to be sent to the Claude app.
+- `rbx-studio-mcp --http --plugin-port ... --http-port ... --no-auth` runs inside a task tab.
+- Linux exposes task-scoped Rojo / clockp MCP / runtime-log routes through clockbridge.
+- Windows `studio_helper` registers with hub, claims one task, launches Studio, and bridges plugin/helper traffic.
+- `official MCP` is Roblox's Studio-internal MCP. clockp MCP may route selected internal capabilities to official MCP, but platform scripts and Codex do not call official MCP directly.
 
-**Please note** that this MCP server will be accessed by third-party tools, allowing them to modify
-and read the contents of your opened place. Third-party data handling and privacy practices are
-subject to their respective terms and conditions.
+### Included clockp MCP tools
 
-![Scheme](MCP-Server.png)
-
-The setup process also contains a small plugin installation and Claude Desktop configuration script.
-
-### Included tools
-
-- **run_code** - Runs a command in Roblox Studio and returns the printed output. Can be used to both make changes and retrieve information.
-- **insert_model** - Inserts a model from the Roblox Creator Store into the workspace. Returns the inserted model name.
-- **get_console_output** - Gets the console output from Roblox Studio.
-- **start_stop_play** - Starts or stops play mode or runs the server.
-- **run_script_in_play_mode** - Runs a script in play mode and automatically stops play after the script finishes or times out. Returns structured output including logs, errors, and duration.
-- **get_studio_mode** - Gets the current Studio mode (`start_play`, `run_server`, or `stop`).
-
-## Setup
-
-### Install with release binaries
-
-This MCP Server supports pretty much any MCP Client but will automatically set up only [Claude Desktop](https://claude.ai/download) and [Cursor](https://www.cursor.com/) if found.
-
-To set up automatically:
-
-1. Ensure you have [Roblox Studio](https://create.roblox.com/docs/en-us/studio/setup),
-   and [Claude Desktop](https://claude.ai/download)/[Cursor](https://www.cursor.com/) installed and started at least once.
-1. Exit MCP Clients and Roblox Studio if they are running.
-1. Download and run the installer:
-   1. Go to the [releases](https://github.com/Roblox/studio-rust-mcp-server/releases) page and
-      download the latest release for your platform.
-   1. Unzip the downloaded file if necessary and run the installer.
-   1. Restart Claude/Cursor and Roblox Studio if they are running.
-
-### Setting up manually
-
-To set up manually add following to your MCP Client config:
-
-```json
-{
-  "mcpServers": {
-    "Roblox_Studio": {
-      "args": [
-        "--stdio"
-      ],
-      "command": "Path-to-downloaded\\rbx-studio-mcp.exe"
-    }
-  }
-}
-```
-
-On macOS the path would be something like `"/Applications/RobloxStudioMCP.app/Contents/MacOS/rbx-studio-mcp"` if you move the app to the Applications directory.
-
-For Claude Desktop, go to Settings > Developer > Edit Config. This opens location of the  `claude_desktop_config.json`.
-
-Some clients require user to setup the mcp server manually for each project.
-For example, Claude Code command would look like this:
-```sh
-claude mcp add --transport stdio Roblox_Studio -- '/Applications/RobloxStudioMCP.app/Contents/MacOS/rbx-studio-mcp' --stdio
-```
+- **run_code** - Runs a command in Roblox Studio and returns printed output.
+- **insert_model** - Inserts a model from the Roblox marketplace.
+- **get_console_output** - Gets Studio console output.
+- **launch_studio_session** - Launches Studio into start_play or run_server through helper.
+- **start_stop_play** - Starts or stops play mode.
+- **run_script_in_play_mode** - Runs a one-time script in play mode.
+- **get_studio_mode** - Gets the current Studio mode.
+- **take_screenshot** - Captures the active Studio window through helper.
 
 ### Build from source
 
-To build and install the MCP reference implementation from this repository's source code:
-
-1. Ensure you have [Roblox Studio](https://create.roblox.com/docs/en-us/studio/setup) and
-   [Claude Desktop](https://claude.ai/download) installed and started at least once.
-1. Exit Claude and Roblox Studio if they are running.
-1. [Install](https://www.rust-lang.org/tools/install) Rust.
-1. Download or clone this repository.
-1. Run the following command from the root of this repository.
-   ```sh
-   cargo run
-   ```
-   This command carries out the following actions:
-      - Builds the Rust MCP server app.
-      - Sets up Claude to communicate with the MCP server.
-      - Builds and installs the Studio plugin to communicate with the MCP server.
-
-After the command completes, the Studio MCP Server is installed and ready for your prompts from
-Claude Desktop.
+```sh
+cargo build
+```
 
 ### Backend mode (domain/proxy friendly)
 
-For game backend usage, you can run this process without installer behavior and expose two local endpoints:
+For clock-p task usage, run this process without installer behavior and expose two local endpoints:
 
 - Studio plugin bridge (long polling): `http://127.0.0.1:44755`
 - MCP Streamable HTTP: `http://127.0.0.1:44756/mcp`
 
 ```sh
-cargo run -- --http
+cargo run -- --http --plugin-port 44755 --http-port 44756 --no-auth
 ```
 
 By default `--http` requires a bearer token. It checks in this order:
@@ -121,27 +51,23 @@ Useful flags:
 
 - `--plugin-port <port>`: plugin bridge port (default `44755`)
 - `--http-port <port>`: MCP HTTP port (default `44756`)
-- `--stdio`: run stdio MCP mode (can be combined with `--http`)
 - `--write-plugin <path>`: export bundled `MCPStudioPlugin.rbxm` and exit
-- `--task-id <task_id>`: expose task identity in `/status` and artifact metadata
 - `--workspace-path <path>`: explicit workspace identity
-- `--public-base-url <url>`: expose current public route in `/status`
 
 ### Clock-p task cluster mode
 
 `clock-p` 当前的联调链路已经升级为 task 化 debug cluster：
 
 - server cluster 先向 hub 创建 task，拿到 `task_id`
-- rojo / MCP / runtime-log 都按同一个 `task_id` 暴露公网 host
+- rojo / clockp MCP / runtime-log 都按同一个 `task_id` 暴露公网 host
 - helper 是机器级单例，通过 hub claim task，再连到对应 task 的远端 MCP WebSocket
-- `restart` 保留 `task_id`
-- `stop + start` 默认生成新 `task_id`
-- `recover` 复用原 `task_id` 并提升 `generation`
+- restart / stop 后重新启动都会申请新的 `task_id`
+- 当前不再使用 recover 语义
 
 hub 本身只做 control plane：
 
 - helper register / heartbeat / claim
-- task create / heartbeat / release / recover
+- task create / heartbeat / release
 
 为了覆盖极端故障场景，hub 现在会把 task 状态落盘；helper heartbeat 也会回填和校正 task claim。这样在 hub 重启、helper 重启、supervisor 过期等场景下，Linux 阶段就能先验证控制面的稳定性。
 
@@ -153,17 +79,15 @@ cargo run --bin roblox_hub -- --port 44758 --no-auth
 
 常见返回字段：
 
-- task：`task_id / generation / task_token / recover_token / routes`
+- task：`task_id / task_token / routes`
 - helper：`helper_id / capacity / active_launches`
-
-这里的 `generation` 主要用于 control plane fencing。它应该留在 hub / server supervisor / helper 内部流转，而不是扩散成 plugin 的长期缓存键。
 
 ### Clock-p helper mode
 
 `clock-p` 的 Studio helper 现在是机器级单例：
 
-- `Rojo plugin -> helper -> helper 返回公网 Rojo 配置 -> plugin 直连 Rojo 公网域名`
-- `MCP plugin -> helper -> helper 通过公网 MCP WebSocket 收发工具调用`
+- `Rojo plugin -> helper 本地 forward URL -> helper 使用当前 claimed task 的 Rojo route 转发`
+- `clockp MCP plugin -> helper -> helper 通过 task-scoped clockp MCP 通道收发工具调用`
 - `helper -> hub register / heartbeat / claim`
 - `take_screenshot -> helper 截图 -> helper 通过 MCP WebSocket 分片上传 -> MCP server 落盘到 workspace artifacts`
 
@@ -179,7 +103,6 @@ cargo run --bin studio_helper -- --port 44750 --hub-base-url https://roblox-hub-
 - helper 有稳定 `helper_id`；Windows helper 使用 `MachineGuid` 派生，其他平台使用持久化本地 id
 - helper 注册 hub 后，会 claim task 并拿到：
   - `task_id`
-  - `launch_id`
   - `mcp_base_url`
   - `rojo_base_url`
 - hub 会拒绝活跃重复 `helper_id`；helper 应在启动早期先 register hub，并把 `helper_id_conflict` 视为 fatal startup error
@@ -194,7 +117,7 @@ cargo run --bin studio_helper -- --port 44750 --hub-base-url https://roblox-hub-
   - `POST /v1/helper/runtime-screenshot`
   - `GET /v1/helper/studio-log`
 
-MCP HTTP 服务额外开放：
+clockp MCP HTTP 服务额外开放：
 
 - `GET /ws/helper`
 
@@ -203,8 +126,7 @@ MCP HTTP 服务额外开放：
 当前收口方向：
 
 - helper 是本机唯一权威配置源
-- plugin 不应长期缓存 `generation`
-- `generation` 是 hub/helper/server control plane 的 fencing 字段
+- plugin 不应自行猜测或长期缓存 task 路由
 
 ### Ubuntu 交叉编译 Windows helper
 
@@ -235,24 +157,11 @@ target/x86_64-pc-windows-gnu/release/studio_helper.exe
 
 ## Verify setup
 
-To make sure everything is set up correctly, follow these steps:
+For clock-p workflows, verify through the platform scripts:
 
-1. In Roblox Studio, click on the **Plugins** tab and verify that the MCP plugin appears. Clicking on
-   the icon toggles the MCP communication with Claude Desktop on and off, which you can verify in
-   the Roblox Studio console output.
-1. In the console, verify that `The MCP Studio plugin is ready for prompts.` appears in the output.
-   Clicking on the plugin's icon toggles MCP communication with Claude Desktop on and off,
-   which you can also verify in the console output.
-1. Verify that Claude Desktop is correctly configured by clicking on the hammer icon for MCP tools
-   beneath the text field where you enter prompts. This should open a window with the list of
-   available Roblox Studio tools (`insert_model` and `run_code`).
+```sh
+python3 ../clock-p-platform/tools/bridge/debug-cluster-status.py --workspace <workspace>
+python3 ../clock-p-platform/tools/bridge/roblox-mcp-request.py --workspace <workspace> status
+```
 
-**Note**: You can fix common issues with setup by restarting Studio and Claude Desktop. Claude
-sometimes is hidden in the system tray, so ensure you've exited it completely.
-
-## Send requests
-
-1. Open a place in Studio.
-1. Type a prompt in Claude Desktop and accept any permissions to communicate with Studio.
-1. Verify that the intended action is performed in Studio by checking the console, inspecting the
-   data model in Explorer, or visually confirming the desired changes occurred in your place.
+Codex and other LLM operators should not send requests directly to this server as their MCP client. Use `roblox-start-services` and `roblox-launch-game` skills.

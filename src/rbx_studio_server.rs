@@ -249,9 +249,9 @@ impl ServerHandler for RBXStudioServer {
             protocol_version: ProtocolVersion::LATEST,
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation {
-                name: "Roblox_Studio".to_string(),
+                name: "clockp_mcp".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
-                title: Some("Roblox Studio MCP Server".to_string()),
+                title: Some("clockp MCP".to_string()),
                 icons: None,
                 website_url: None,
             },
@@ -270,14 +270,18 @@ Prefer using start_stop_play tool instead run_script_in_play_mode, Only used run
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct RunCode {
-    #[schemars(description = "Required clock-p task_id used to route this call to the matching Studio plugin instance.")]
+    #[schemars(
+        description = "Required clock-p task_id used to route this call to the matching Studio plugin instance."
+    )]
     task_id: String,
     #[schemars(description = "Code to run")]
     command: String,
 }
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct InsertModel {
-    #[schemars(description = "Required clock-p task_id used to route this call to the matching Studio plugin instance.")]
+    #[schemars(
+        description = "Required clock-p task_id used to route this call to the matching Studio plugin instance."
+    )]
     task_id: String,
     #[schemars(description = "Query to search for the model")]
     query: String,
@@ -285,19 +289,25 @@ struct InsertModel {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct GetConsoleOutput {
-    #[schemars(description = "Required clock-p task_id used to route this call to the matching Studio plugin instance.")]
+    #[schemars(
+        description = "Required clock-p task_id used to route this call to the matching Studio plugin instance."
+    )]
     task_id: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct GetStudioMode {
-    #[schemars(description = "Required clock-p task_id used to route this call to the matching Studio plugin instance.")]
+    #[schemars(
+        description = "Required clock-p task_id used to route this call to the matching Studio plugin instance."
+    )]
     task_id: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct TakeScreenshot {
-    #[schemars(description = "Required clock-p task_id used to route this call to the matching Studio plugin instance.")]
+    #[schemars(
+        description = "Required clock-p task_id used to route this call to the matching Studio plugin instance."
+    )]
     task_id: String,
     #[schemars(
         description = "Optional session_id. When omitted, the MCP server will try to read .clock-p/current_session.json from the workspace."
@@ -311,7 +321,9 @@ struct TakeScreenshot {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct ReadStudioLog {
-    #[schemars(description = "Required clock-p task_id used to route this call to the matching Studio plugin instance.")]
+    #[schemars(
+        description = "Required clock-p task_id used to route this call to the matching Studio plugin instance."
+    )]
     task_id: String,
     #[schemars(
         description = "Optional starting line (1-indexed). Negative values count from the end."
@@ -325,7 +337,9 @@ struct ReadStudioLog {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct OfficialMcpPing {
-    #[schemars(description = "Required clock-p task_id used to bind the official Studio MCP adapter to the matching remote task.")]
+    #[schemars(
+        description = "Required clock-p task_id used to bind the official Studio MCP adapter to the matching remote task."
+    )]
     task_id: String,
 }
 
@@ -338,7 +352,9 @@ struct OfficialMcpVector3 {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct OfficialMcpGenerateMesh {
-    #[schemars(description = "Required clock-p task_id used to bind the official Studio MCP adapter to the matching remote task.")]
+    #[schemars(
+        description = "Required clock-p task_id used to bind the official Studio MCP adapter to the matching remote task."
+    )]
     task_id: String,
     #[schemars(description = "Text prompt describing the mesh to generate.")]
     text_prompt: String,
@@ -350,7 +366,9 @@ struct OfficialMcpGenerateMesh {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct OfficialMcpSearchCreatorStore {
-    #[schemars(description = "Required clock-p task_id used to bind the official Studio MCP adapter to the matching remote task.")]
+    #[schemars(
+        description = "Required clock-p task_id used to bind the official Studio MCP adapter to the matching remote task."
+    )]
     task_id: String,
     #[schemars(description = "Creator Store search query.")]
     query: String,
@@ -358,7 +376,9 @@ struct OfficialMcpSearchCreatorStore {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct OfficialMcpInsertFromCreatorStore {
-    #[schemars(description = "Required clock-p task_id used to bind the official Studio MCP adapter to the matching remote task.")]
+    #[schemars(
+        description = "Required clock-p task_id used to bind the official Studio MCP adapter to the matching remote task."
+    )]
     task_id: String,
     #[schemars(description = "Search id returned by official_mcp_search_creator_store.")]
     search_id: String,
@@ -370,7 +390,9 @@ struct OfficialMcpInsertFromCreatorStore {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct OfficialMcpStoreImage {
-    #[schemars(description = "Required clock-p task_id used to bind the official Studio MCP adapter to the matching remote task.")]
+    #[schemars(
+        description = "Required clock-p task_id used to bind the official Studio MCP adapter to the matching remote task."
+    )]
     task_id: String,
     #[schemars(description = "Absolute local png/jpg/jpeg path on the Windows helper machine.")]
     file_path: String,
@@ -378,7 +400,9 @@ struct OfficialMcpStoreImage {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct OfficialMcpGenerateProceduralModel {
-    #[schemars(description = "Required clock-p task_id used to bind the official Studio MCP adapter to the matching remote task.")]
+    #[schemars(
+        description = "Required clock-p task_id used to bind the official Studio MCP adapter to the matching remote task."
+    )]
     task_id: String,
     #[schemars(description = "User's exact prompt for the procedural model.")]
     prompt: String,
@@ -388,7 +412,9 @@ struct OfficialMcpGenerateProceduralModel {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct OfficialMcpWaitJobFinished {
-    #[schemars(description = "Required clock-p task_id used to bind the official Studio MCP adapter to the matching remote task.")]
+    #[schemars(
+        description = "Required clock-p task_id used to bind the official Studio MCP adapter to the matching remote task."
+    )]
     task_id: String,
     #[schemars(description = "Generation id returned by official_mcp_generate_procedural_model.")]
     generation_id: String,
@@ -398,7 +424,9 @@ struct OfficialMcpWaitJobFinished {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct StartStopPlay {
-    #[schemars(description = "Required clock-p task_id used to route this call to the matching Studio plugin instance.")]
+    #[schemars(
+        description = "Required clock-p task_id used to route this call to the matching Studio plugin instance."
+    )]
     task_id: String,
     #[schemars(
         description = "Mode to start or stop, must be start_play, stop, or run_server. Don't use run_server unless you are sure no client/player is needed."
@@ -408,7 +436,9 @@ struct StartStopPlay {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct LaunchStudioSession {
-    #[schemars(description = "Required clock-p task_id used to route this call to the matching Studio plugin instance.")]
+    #[schemars(
+        description = "Required clock-p task_id used to route this call to the matching Studio plugin instance."
+    )]
     task_id: String,
     #[schemars(
         description = "Target mode to launch into, must be start_play or run_server. The Windows side will stop any previous running session before launching."
@@ -418,7 +448,9 @@ struct LaunchStudioSession {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct RunScriptInPlayMode {
-    #[schemars(description = "Required clock-p task_id used to route this call to the matching Studio plugin instance.")]
+    #[schemars(
+        description = "Required clock-p task_id used to route this call to the matching Studio plugin instance."
+    )]
     task_id: String,
     #[schemars(description = "Code to run")]
     code: String,
@@ -617,7 +649,7 @@ impl RBXStudioServer {
             300_000,
             args.task_id,
         )
-            .await
+        .await
     }
 
     #[tool(
@@ -718,7 +750,7 @@ impl RBXStudioServer {
             600_000,
             args.task_id,
         )
-            .await
+        .await
     }
 
     async fn dispatch_official_mcp(
