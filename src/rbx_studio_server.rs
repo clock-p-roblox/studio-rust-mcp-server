@@ -270,23 +270,35 @@ Prefer using start_stop_play tool instead run_script_in_play_mode, Only used run
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct RunCode {
+    #[schemars(description = "Required clock-p task_id used to route this call to the matching Studio plugin instance.")]
+    task_id: String,
     #[schemars(description = "Code to run")]
     command: String,
 }
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct InsertModel {
+    #[schemars(description = "Required clock-p task_id used to route this call to the matching Studio plugin instance.")]
+    task_id: String,
     #[schemars(description = "Query to search for the model")]
     query: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
-struct GetConsoleOutput {}
+struct GetConsoleOutput {
+    #[schemars(description = "Required clock-p task_id used to route this call to the matching Studio plugin instance.")]
+    task_id: String,
+}
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
-struct GetStudioMode {}
+struct GetStudioMode {
+    #[schemars(description = "Required clock-p task_id used to route this call to the matching Studio plugin instance.")]
+    task_id: String,
+}
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct TakeScreenshot {
+    #[schemars(description = "Required clock-p task_id used to route this call to the matching Studio plugin instance.")]
+    task_id: String,
     #[schemars(
         description = "Optional session_id. When omitted, the MCP server will try to read .clock-p/current_session.json from the workspace."
     )]
@@ -299,6 +311,8 @@ struct TakeScreenshot {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct ReadStudioLog {
+    #[schemars(description = "Required clock-p task_id used to route this call to the matching Studio plugin instance.")]
+    task_id: String,
     #[schemars(
         description = "Optional starting line (1-indexed). Negative values count from the end."
     )]
@@ -310,7 +324,10 @@ struct ReadStudioLog {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
-struct OfficialMcpPing {}
+struct OfficialMcpPing {
+    #[schemars(description = "Required clock-p task_id used to bind the official Studio MCP adapter to the matching remote task.")]
+    task_id: String,
+}
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct OfficialMcpVector3 {
@@ -321,6 +338,8 @@ struct OfficialMcpVector3 {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct OfficialMcpGenerateMesh {
+    #[schemars(description = "Required clock-p task_id used to bind the official Studio MCP adapter to the matching remote task.")]
+    task_id: String,
     #[schemars(description = "Text prompt describing the mesh to generate.")]
     text_prompt: String,
     #[schemars(description = "Optional bounding box size for the generated mesh.")]
@@ -331,12 +350,16 @@ struct OfficialMcpGenerateMesh {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct OfficialMcpSearchCreatorStore {
+    #[schemars(description = "Required clock-p task_id used to bind the official Studio MCP adapter to the matching remote task.")]
+    task_id: String,
     #[schemars(description = "Creator Store search query.")]
     query: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct OfficialMcpInsertFromCreatorStore {
+    #[schemars(description = "Required clock-p task_id used to bind the official Studio MCP adapter to the matching remote task.")]
+    task_id: String,
     #[schemars(description = "Search id returned by official_mcp_search_creator_store.")]
     search_id: String,
     #[schemars(description = "Optional objectTypes returned by the search result.")]
@@ -347,12 +370,16 @@ struct OfficialMcpInsertFromCreatorStore {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct OfficialMcpStoreImage {
+    #[schemars(description = "Required clock-p task_id used to bind the official Studio MCP adapter to the matching remote task.")]
+    task_id: String,
     #[schemars(description = "Absolute local png/jpg/jpeg path on the Windows helper machine.")]
     file_path: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct OfficialMcpGenerateProceduralModel {
+    #[schemars(description = "Required clock-p task_id used to bind the official Studio MCP adapter to the matching remote task.")]
+    task_id: String,
     #[schemars(description = "User's exact prompt for the procedural model.")]
     prompt: String,
     #[schemars(description = "Optional IMAGEID returned by official_mcp_store_image.")]
@@ -361,6 +388,8 @@ struct OfficialMcpGenerateProceduralModel {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct OfficialMcpWaitJobFinished {
+    #[schemars(description = "Required clock-p task_id used to bind the official Studio MCP adapter to the matching remote task.")]
+    task_id: String,
     #[schemars(description = "Generation id returned by official_mcp_generate_procedural_model.")]
     generation_id: String,
     #[schemars(description = "Optional wait timeout in seconds.")]
@@ -369,6 +398,8 @@ struct OfficialMcpWaitJobFinished {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct StartStopPlay {
+    #[schemars(description = "Required clock-p task_id used to route this call to the matching Studio plugin instance.")]
+    task_id: String,
     #[schemars(
         description = "Mode to start or stop, must be start_play, stop, or run_server. Don't use run_server unless you are sure no client/player is needed."
     )]
@@ -377,6 +408,8 @@ struct StartStopPlay {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct LaunchStudioSession {
+    #[schemars(description = "Required clock-p task_id used to route this call to the matching Studio plugin instance.")]
+    task_id: String,
     #[schemars(
         description = "Target mode to launch into, must be start_play or run_server. The Windows side will stop any previous running session before launching."
     )]
@@ -385,6 +418,8 @@ struct LaunchStudioSession {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct RunScriptInPlayMode {
+    #[schemars(description = "Required clock-p task_id used to route this call to the matching Studio plugin instance.")]
+    task_id: String,
     #[schemars(description = "Code to run")]
     code: String,
     #[schemars(description = "Timeout in seconds, defaults to 100 seconds")]
@@ -418,6 +453,20 @@ impl ToolArgumentValues {
             ToolArgumentValues::GetStudioMode(_) => "get_studio_mode",
             ToolArgumentValues::TakeScreenshot(_) => "take_screenshot",
             ToolArgumentValues::ReadStudioLog(_) => "read_studio_log",
+        }
+    }
+
+    fn task_id(&self) -> &str {
+        match self {
+            ToolArgumentValues::RunCode(args) => &args.task_id,
+            ToolArgumentValues::InsertModel(args) => &args.task_id,
+            ToolArgumentValues::GetConsoleOutput(args) => &args.task_id,
+            ToolArgumentValues::StartStopPlay(args) => &args.task_id,
+            ToolArgumentValues::LaunchStudioSession(args) => &args.task_id,
+            ToolArgumentValues::RunScriptInPlayMode(args) => &args.task_id,
+            ToolArgumentValues::GetStudioMode(args) => &args.task_id,
+            ToolArgumentValues::TakeScreenshot(args) => &args.task_id,
+            ToolArgumentValues::ReadStudioLog(args) => &args.task_id,
         }
     }
 }
@@ -534,14 +583,14 @@ impl RBXStudioServer {
     )]
     async fn official_mcp_ping(
         &self,
-        Parameters(_args): Parameters<OfficialMcpPing>,
+        Parameters(args): Parameters<OfficialMcpPing>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.dispatch_official_mcp("ping", serde_json::json!({}), 30_000)
+        self.dispatch_official_mcp("ping", serde_json::json!({}), 30_000, args.task_id)
             .await
     }
 
     #[tool(
-        description = "Generate a textured mesh through the hidden official Roblox Studio MCP adapter. The helper binds the request to the current task_id before calling StudioMCP.exe."
+        description = "Generate a textured mesh through the hidden official Roblox Studio MCP adapter. Requires an explicit clock-p task_id and fails if it does not match the active helper connection."
     )]
     async fn official_mcp_generate_mesh(
         &self,
@@ -562,7 +611,12 @@ impl RBXStudioServer {
         if let Some(max_triangles) = args.max_triangles {
             arguments.insert("maxTriangles".to_owned(), serde_json::json!(max_triangles));
         }
-        self.dispatch_official_mcp("generate_mesh", Value::Object(arguments), 300_000)
+        self.dispatch_official_mcp(
+            "generate_mesh",
+            Value::Object(arguments),
+            300_000,
+            args.task_id,
+        )
             .await
     }
 
@@ -577,6 +631,7 @@ impl RBXStudioServer {
             "search_creator_store",
             serde_json::json!({ "query": args.query }),
             60_000,
+            args.task_id,
         )
         .await
     }
@@ -600,6 +655,7 @@ impl RBXStudioServer {
             "insert_from_creator_store",
             Value::Object(arguments),
             120_000,
+            args.task_id,
         )
         .await
     }
@@ -615,6 +671,7 @@ impl RBXStudioServer {
             "store_image",
             serde_json::json!({ "filePath": args.file_path }),
             60_000,
+            args.task_id,
         )
         .await
     }
@@ -638,6 +695,7 @@ impl RBXStudioServer {
             "generate_procedural_model",
             Value::Object(arguments),
             300_000,
+            args.task_id,
         )
         .await
     }
@@ -654,7 +712,12 @@ impl RBXStudioServer {
         if let Some(timeout) = args.timeout {
             arguments.insert("timeout".to_owned(), serde_json::json!(timeout));
         }
-        self.dispatch_official_mcp("wait_job_finished", Value::Object(arguments), 600_000)
+        self.dispatch_official_mcp(
+            "wait_job_finished",
+            Value::Object(arguments),
+            600_000,
+            args.task_id,
+        )
             .await
     }
 
@@ -663,6 +726,7 @@ impl RBXStudioServer {
         action: &str,
         arguments: Value,
         timeout_ms: u64,
+        task_id: String,
     ) -> Result<CallToolResult, ErrorData> {
         let request_id = Uuid::new_v4();
         let (tx, mut rx) = mpsc::unbounded_channel::<Result<String>>();
@@ -690,12 +754,26 @@ impl RBXStudioServer {
                     None,
                 ));
             }
-            let Some(task_id) = helper.task_id.clone().or_else(|| state.task_id.clone()) else {
+            let task_id = sanitize_identifier("task_id", &task_id).map_err(|error| {
+                ErrorData::internal_error(
+                    format!("Invalid official MCP task_id argument: {error}"),
+                    None,
+                )
+            })?;
+            let Some(helper_task_id) = helper.task_id.as_deref() else {
                 return Err(ErrorData::internal_error(
-                    "official_mcp_ping requires task_id",
+                    "Official MCP request requires a task_id-bound helper connection",
                     None,
                 ));
             };
+            if helper_task_id != task_id {
+                return Err(ErrorData::internal_error(
+                    format!(
+                        "Official MCP task_id mismatch: active_helper_task_id={helper_task_id}, requested_task_id={task_id}"
+                    ),
+                    None,
+                ));
+            }
             let request = OfficialMcpRequest {
                 request_id: request_id.to_string(),
                 task_id,
@@ -767,14 +845,35 @@ impl RBXStudioServer {
                 )
             })?
         };
+        let requested_task_id =
+            sanitize_identifier("task_id", normalized_args.task_id()).map_err(|error| {
+                ErrorData::internal_error(
+                    format!("Invalid MCP tool task_id argument: {error}"),
+                    None,
+                )
+            })?;
         let (command, id) = ToolArguments::new(normalized_args);
         let tool_name = command.tool_name();
         let (tx, mut rx) = mpsc::unbounded_channel::<Result<String>>();
         let (trigger, uploads, queued_requests, pending_responses) = {
             let mut state = self.state.lock().await;
-            if state.active_helper.is_none() {
+            let Some(helper) = state.active_helper.as_ref() else {
                 return Err(ErrorData::internal_error(
                     "No active Studio helper WebSocket connection",
+                    None,
+                ));
+            };
+            let Some(helper_task_id) = helper.task_id.as_deref() else {
+                return Err(ErrorData::internal_error(
+                    "MCP tool request requires a task_id-bound helper connection",
+                    None,
+                ));
+            };
+            if helper_task_id != requested_task_id {
+                return Err(ErrorData::internal_error(
+                    format!(
+                        "MCP tool task_id mismatch: active_helper_task_id={helper_task_id}, requested_task_id={requested_task_id}"
+                    ),
                     None,
                 ));
             }
