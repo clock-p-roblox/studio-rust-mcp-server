@@ -67,6 +67,13 @@ local function nextCommandId(): number
 	return nextId
 end
 
+local function ensureNextCommandIdAtLeast(value: number)
+	local current = readNonNegativeNumber(NEXT_COMMAND_ID_KEY)
+	if current < value then
+		PluginUtils.setSettings(NEXT_COMMAND_ID_KEY, value)
+	end
+end
+
 local function getSnapshot(): TrackerSnapshot
 	local lastError = PluginUtils.getSettings(LAST_ERROR_KEY)
 	if type(lastError) ~= "string" or lastError == "" then
@@ -97,6 +104,16 @@ local function markStopped()
 	PluginUtils.setSettings(MODE_KEY, "stop")
 	PluginUtils.setSettings(ACTIVE_SESSION_ID_KEY, 0)
 	PluginUtils.setSettings(CONTROL_READY_SESSION_ID_KEY, 0)
+	clearPendingStart()
+	clearLastError()
+end
+
+local function markStarted(commandId: number, targetMode: Types.StartStopPlayMode)
+	assert(targetMode == "start_play" or targetMode == "run_server", "markStarted expects a running mode")
+	PluginUtils.setSettings(MODE_KEY, targetMode)
+	PluginUtils.setSettings(ACTIVE_SESSION_ID_KEY, commandId)
+	PluginUtils.setSettings(CONTROL_READY_SESSION_ID_KEY, commandId)
+	ensureNextCommandIdAtLeast(commandId)
 	clearPendingStart()
 	clearLastError()
 end
@@ -157,6 +174,7 @@ local function observeCurrentDataModel()
 
 	PluginUtils.setSettings(MODE_KEY, liveMode)
 	PluginUtils.setSettings(ACTIVE_SESSION_ID_KEY, activeSessionId)
+	ensureNextCommandIdAtLeast(activeSessionId)
 	if snapshot.mode ~= liveMode or snapshot.activeSessionId ~= activeSessionId then
 		PluginUtils.setSettings(CONTROL_READY_SESSION_ID_KEY, 0)
 	end
@@ -206,7 +224,7 @@ local function waitForStart(commandId: number, targetMode: Types.StartStopPlayMo
 		if snapshot.lastErrorId == commandId and snapshot.lastError ~= nil then
 			error(snapshot.lastError)
 		end
-		if snapshot.activeSessionId == commandId and snapshot.mode == targetMode and snapshot.controlReadySessionId == commandId then
+		if snapshot.activeSessionId == commandId and snapshot.mode == targetMode then
 			return snapshot
 		end
 		task.wait(WAIT_STEP_SECONDS)
@@ -228,6 +246,7 @@ end
 local function waitForStop(timeoutSeconds: number): TrackerSnapshot
 	local deadline = os.clock() + timeoutSeconds
 	while os.clock() < deadline do
+		normalizeEditState()
 		local snapshot = getSnapshot()
 		if snapshot.mode == "stop" and snapshot.activeSessionId == 0 and snapshot.pendingStartId == 0 then
 			return snapshot
@@ -252,6 +271,7 @@ return {
 	getStopRequestId = getStopRequestId,
 	inferLiveMode = inferLiveMode,
 	markControlReadyForActiveSession = markControlReadyForActiveSession,
+	markStarted = markStarted,
 	markStopped = markStopped,
 	normalizeEditState = normalizeEditState,
 	observeCurrentDataModel = observeCurrentDataModel,

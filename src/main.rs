@@ -9,11 +9,8 @@ use clap::Parser;
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use helper_ws::HELPER_WS_PATH;
 use rbx_studio_server::*;
-use rmcp::{
-    transport::streamable_http_server::{
-        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
-    },
-    ServiceExt,
+use rmcp::transport::streamable_http_server::{
+    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 use std::fs;
 use std::io;
@@ -32,10 +29,6 @@ mod rbx_studio_server;
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Run as MCP server on stdio.
-    #[arg(short, long)]
-    stdio: bool,
-
     /// Run as MCP streamable HTTP server on /mcp.
     #[arg(long)]
     http: bool,
@@ -194,7 +187,7 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    tracing::info!(?args.stdio, ?args.http, plugin_port = args.plugin_port, http_port = args.http_port, no_auth = args.no_auth, "starting rbx-studio-mcp");
+    tracing::info!(?args.http, plugin_port = args.plugin_port, http_port = args.http_port, no_auth = args.no_auth, "starting rbx-studio-mcp");
 
     if let Some(path) = args.write_plugin.as_ref() {
         install::write_plugin_to_path(path)?;
@@ -203,7 +196,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if !args.stdio && !args.http {
+    if !args.http {
         return install::install().await;
     }
 
@@ -323,19 +316,8 @@ async fn main() -> Result<()> {
         }));
     }
 
-    if args.stdio {
-        tracing::info!("starting stdio MCP transport");
-        let service = RBXStudioServer::new(Arc::clone(&server_state))
-            .serve(rmcp::transport::stdio())
-            .await
-            .inspect_err(|e| {
-                tracing::error!("serving error: {:?}", e);
-            })?;
-        service.waiting().await?;
-    } else {
-        tracing::info!("HTTP mode running. Press Ctrl+C to stop.");
-        tokio::signal::ctrl_c().await?;
-    }
+    tracing::info!("HTTP mode running. Press Ctrl+C to stop.");
+    tokio::signal::ctrl_c().await?;
 
     close_tx.send(()).ok();
     if let Some(tx) = http_close_tx {
