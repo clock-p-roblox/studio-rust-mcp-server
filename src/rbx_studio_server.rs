@@ -1769,6 +1769,18 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
                         plugin_instance_count,
                         task_status,
                     }) => {
+                        let studio_mode = task_status
+                            .as_ref()
+                            .and_then(|status| status.studio_mode.clone());
+                        let studio_mode_age_ms = task_status
+                            .as_ref()
+                            .and_then(|status| status.studio_mode_age_ms);
+                        let official_mcp_adapter_state = task_status
+                            .as_ref()
+                            .and_then(|status| status.official_mcp_adapter_state.clone());
+                        let official_mcp_adapter_age_ms = task_status
+                            .as_ref()
+                            .and_then(|status| status.official_mcp_adapter_age_ms);
                         let mut state = state.lock().await;
                         if let Some(helper) = state.active_helper.as_mut() {
                             if helper.connection_id == connection_id {
@@ -1777,7 +1789,18 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
                                     helper.task_status.as_ref().map(|_| Instant::now());
                             }
                         }
-                        tracing::debug!(connection_id = %connection_id, helper_id, place_id, task_id = ?task_id, plugin_instance_count, "received helper heartbeat");
+                        tracing::info!(
+                            connection_id = %connection_id,
+                            helper_id,
+                            place_id,
+                            task_id = ?task_id,
+                            plugin_instance_count,
+                            studio_mode = ?studio_mode,
+                            studio_mode_age_ms = ?studio_mode_age_ms,
+                            official_mcp_adapter_state = ?official_mcp_adapter_state,
+                            official_mcp_adapter_age_ms = ?official_mcp_adapter_age_ms,
+                            "received helper heartbeat"
+                        );
                     }
                     Ok(HelperToServerMessage::ToolResult {
                         request_id,

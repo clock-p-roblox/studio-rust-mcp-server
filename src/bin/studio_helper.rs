@@ -2450,6 +2450,7 @@ async fn mcp_register_handler(
         task_id = claimed_task.task_id,
         studio_pid,
         remote_base_url,
+        studio_mode = ?payload.studio_mode,
         "registered MCP plugin instance with helper"
     );
     Ok(Json(RegisterPluginResponse {
@@ -2535,7 +2536,25 @@ async fn mcp_plugin_status_update_handler(
         payload.studio_mode.as_deref(),
     );
     if !updated {
+        tracing::warn!(
+            instance_id = payload.instance_id,
+            studio_mode = ?payload.studio_mode,
+            "rejected MCP plugin status update"
+        );
         return Ok((StatusCode::GONE, "instance expired or studio_mode invalid").into_response());
+    }
+    if let Some(instance) = state.instances.get(&payload.instance_id) {
+        tracing::info!(
+            instance_id = payload.instance_id,
+            place_id = instance.place_id,
+            task_id = ?instance.task_id,
+            studio_pid = ?instance.studio_pid,
+            studio_mode = ?instance.studio_mode,
+            studio_mode_age_ms = instance
+                .studio_mode_observed_at
+                .map(|value| value.elapsed().as_millis()),
+            "accepted MCP plugin status update"
+        );
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -2547,7 +2566,33 @@ async fn mcp_plugin_response_handler(
     let tx = {
         let mut state = app.state.lock().await;
         if let Some(instance_id) = payload.instance_id.as_deref() {
-            update_instance_studio_mode(&mut state, instance_id, payload.studio_mode.as_deref());
+            let updated = update_instance_studio_mode(
+                &mut state,
+                instance_id,
+                payload.studio_mode.as_deref(),
+            );
+            if let Some(instance) = state.instances.get(instance_id) {
+                tracing::info!(
+                    instance_id,
+                    place_id = instance.place_id,
+                    task_id = ?instance.task_id,
+                    id = payload.id,
+                    success = payload.success,
+                    studio_mode = ?instance.studio_mode,
+                    response_bytes = payload.response.len(),
+                    status_updated = updated,
+                    "helper received MCP plugin tool response status"
+                );
+            } else {
+                tracing::warn!(
+                    instance_id,
+                    id = payload.id,
+                    success = payload.success,
+                    studio_mode = ?payload.studio_mode,
+                    response_bytes = payload.response.len(),
+                    "helper received MCP plugin response for missing instance"
+                );
+            }
         }
         state.waiting_for_plugin.remove(&payload.id)
     };
@@ -2555,7 +2600,10 @@ async fn mcp_plugin_response_handler(
         let _ = tx.send(payload.clone());
         tracing::info!(
             id = payload.id,
+            instance_id = ?payload.instance_id,
             success = payload.success,
+            studio_mode = ?payload.studio_mode,
+            response_bytes = payload.response.len(),
             "helper received plugin tool response"
         );
     } else {
@@ -3596,15 +3644,18 @@ async fn run_remote_ws_session(
                 };
                 heartbeat_count += 1;
                 last_heartbeat_sent_at = Instant::now();
-                if heartbeat_count == 1 || heartbeat_count % 12 == 0 {
-                    tracing::info!(
-                        place_id,
-                        heartbeat_count,
-                        plugin_instance_count,
-                        idle_from_server_ms = last_server_message_at.elapsed().as_millis(),
-                        "sending helper remote websocket heartbeat"
-                    );
-                }
+                tracing::info!(
+                    place_id,
+                    task_id = ?task_id,
+                    heartbeat_count,
+                    plugin_instance_count,
+                    studio_mode = ?task_status.as_ref().and_then(|status| status.studio_mode.clone()),
+                    studio_mode_age_ms = ?task_status.as_ref().and_then(|status| status.studio_mode_age_ms),
+                    official_mcp_adapter_state = ?task_status.as_ref().and_then(|status| status.official_mcp_adapter_state.clone()),
+                    official_mcp_adapter_age_ms = ?task_status.as_ref().and_then(|status| status.official_mcp_adapter_age_ms),
+                    idle_from_server_ms = last_server_message_at.elapsed().as_millis(),
+                    "sending helper remote websocket heartbeat"
+                );
                 if out_tx.send(RemoteOutgoingFrame::Text(encode_remote_message(&HelperToServerMessage::Heartbeat {
                     helper_id: app.helper.helper_id.clone(),
                     place_id: place_id.to_owned(),

@@ -124,6 +124,32 @@ local function logWarn(message: string)
 	warn(LOG_PREFIX, message)
 end
 
+local function formatLogValue(value: any): string
+	if value == nil then
+		return "nil"
+	end
+	local text = tostring(value):gsub("\n", "\\n")
+	if #text > 180 then
+		return string.sub(text, 1, 177) .. "..."
+	end
+	return text
+end
+
+local function logPluginEvent(action: string, fields: { [string]: any }?)
+	local parts = { action }
+	if type(fields) == "table" then
+		local keys = {}
+		for key in fields do
+			table.insert(keys, tostring(key))
+		end
+		table.sort(keys)
+		for _, key in keys do
+			table.insert(parts, key .. "=" .. formatLogValue(fields[key]))
+		end
+	end
+	logInfo(table.concat(parts, " "))
+end
+
 local function normalizeHelperPort(value: string): string
 	local digits = trim(value):gsub("%D", "")
 	if digits == "" then
@@ -219,6 +245,7 @@ local function findClaimedTask(statusPayload: any, taskId: string)
 end
 
 local function requestJson(baseUrl: string, method: string, path: string, body: any?)
+	local startedAt = os.clock()
 	local request: { [string]: any } = {
 		Url = baseUrl .. path,
 		Method = method,
@@ -231,18 +258,44 @@ local function requestJson(baseUrl: string, method: string, path: string, body: 
 		request.Body = HttpService:JSONEncode(body)
 	end
 
+	logPluginEvent("helper_http_request", {
+		method = method,
+		path = path,
+		has_body = body ~= nil,
+		body = request.Body,
+	})
 	local ok, result = pcall(function()
 		return HttpService:RequestAsync(request)
 	end)
 	if not ok then
+		logPluginEvent("helper_http_transport_error", {
+			method = method,
+			path = path,
+			error = tostring(result),
+		})
 		error("Request to helper failed: " .. tostring(result))
 	end
 
 	local response = result
+	local elapsedMs = math.floor((os.clock() - startedAt) * 1000)
 	if not response.Success then
+		logPluginEvent("helper_http_error", {
+			method = method,
+			path = path,
+			status = response.StatusCode,
+			elapsed_ms = elapsedMs,
+			body = summarizeText(response.Body),
+		})
 		error(string.format("Helper request %s %s failed with status %d: %s", method, path, response.StatusCode, summarizeText(response.Body)))
 	end
 
+	logPluginEvent("helper_http_response", {
+		method = method,
+		path = path,
+		status = response.StatusCode,
+		elapsed_ms = elapsedMs,
+		body_size = #(response.Body or ""),
+	})
 	if response.Body == "" then
 		return {}
 	end
@@ -251,13 +304,23 @@ local function requestJson(baseUrl: string, method: string, path: string, body: 
 		return HttpService:JSONDecode(response.Body)
 	end)
 	if not decodeOk then
+		logPluginEvent("helper_http_decode_error", {
+			method = method,
+			path = path,
+			error = tostring(decoded),
+			body = summarizeText(response.Body),
+		})
 		error("Failed to decode helper JSON response: " .. tostring(decoded))
 	end
 	return decoded
 end
 
 local function currentStudioMode(): string
-	return StudioSessionControl.getStudioMode()
+	local mode = StudioSessionControl.getStudioMode()
+	logPluginEvent("studio_mode_sample", {
+		mode = mode,
+	})
+	return mode
 end
 
 local function toolCallHandler(args: Types.ToolArgs): string
@@ -754,6 +817,11 @@ end
 
 local function unregisterCurrentInstance()
 	if currentHelperBaseUrl ~= nil and currentInstanceId ~= nil then
+		logPluginEvent("plugin_unregister_request", {
+			instance_id = currentInstanceId,
+			task_id = currentTaskId,
+			base_url = currentHelperBaseUrl,
+		})
 		pcall(function()
 			requestJson(currentHelperBaseUrl, "POST", "/v1/mcp/unregister", {
 				instance_id = currentInstanceId,
@@ -768,26 +836,61 @@ end
 
 local function stopStatusPolling()
 	statusPollToken = statusPollToken + 1
+	logPluginEvent("status_poll_stop", {
+		token = statusPollToken,
+	})
 end
 
 local function refreshStatusFromHelper()
 	if currentClient == nil or currentHelperBaseUrl == nil then
+		logPluginEvent("status_poll_skip", {
+			reason = "no_client_or_helper_base_url",
+			has_client = currentClient ~= nil,
+			helper_base_url = currentHelperBaseUrl,
+		})
 		return
 	end
 
+	local localStudioMode = currentStudioMode()
+	logPluginEvent("status_poll_begin", {
+		instance_id = currentInstanceId,
+		task_id = currentTaskId,
+		place_id = tostring(game.PlaceId),
+		studio_mode = localStudioMode,
+		helper_base_url = currentHelperBaseUrl,
+	})
 	local ok, statusPayload = pcall(function()
 		if currentInstanceId ~= nil then
-			pcall(function()
+			local updateOk, updateError = pcall(function()
 				requestJson(currentHelperBaseUrl, "POST", "/v1/mcp/plugin/status", {
 					instance_id = currentInstanceId,
-					studio_mode = currentStudioMode(),
+					studio_mode = localStudioMode,
 				})
 			end)
+			if updateOk then
+				logPluginEvent("plugin_status_update_sent", {
+					instance_id = currentInstanceId,
+					task_id = currentTaskId,
+					studio_mode = localStudioMode,
+				})
+			else
+				logPluginEvent("plugin_status_update_failed", {
+					instance_id = currentInstanceId,
+					task_id = currentTaskId,
+					studio_mode = localStudioMode,
+					error = tostring(updateError),
+				})
+			end
 		end
 		return requestJson(currentHelperBaseUrl, "GET", "/status")
 	end)
 	if not ok then
 		local errorMessage = tostring(statusPayload)
+		logPluginEvent("status_poll_error", {
+			instance_id = currentInstanceId,
+			task_id = currentTaskId,
+			error = errorMessage,
+		})
 		setStatusSection("helper", "error", "Unavailable", summarizeText(errorMessage))
 		setStatusSection(
 			"registration",
@@ -808,6 +911,12 @@ local function refreshStatusFromHelper()
 
 	local helperPort = tostring(statusPayload.helper_port or currentHelperPort)
 	setStatusSection("helper", "connected", "Connected", "Local helper reachable on port " .. helperPort .. ".")
+	logPluginEvent("status_poll_helper_ready", {
+		helper_port = helperPort,
+		active_instance_count = statusPayload.active_instance_count,
+		claimed_task_count = statusPayload.claimed_task_count,
+		hub_last_error = statusPayload.hub_last_error,
+	})
 
 	local registeredInstance = if currentInstanceId ~= nil
 		then findRegisteredInstance(statusPayload, currentInstanceId, currentTaskId)
@@ -829,11 +938,23 @@ local function refreshStatusFromHelper()
 			"Registered",
 			"Helper tracks plugin instance " .. currentInstanceId .. " for PlaceId " .. tostring(game.PlaceId) .. taskSuffix
 		)
+		logPluginEvent("status_poll_registration_found", {
+			instance_id = currentInstanceId,
+			task_id = currentTaskId,
+			remote_base_url = currentRemoteBaseUrl,
+			studio_mode = registeredInstance.studio_mode,
+			studio_mode_age_ms = registeredInstance.studio_mode_age_ms,
+		})
 	else
 		local registrationDetail = if currentInstanceId ~= nil
 			then "Helper does not report plugin instance " .. currentInstanceId .. " for PlaceId " .. tostring(game.PlaceId) .. "."
 			else "The plugin has not registered an instance_id with the helper yet."
 		setStatusSection("registration", "warning", "Missing", registrationDetail)
+		logPluginEvent("status_poll_registration_missing", {
+			instance_id = currentInstanceId,
+			task_id = currentTaskId,
+			detail = registrationDetail,
+		})
 	end
 
 	local claimedTask = if currentTaskId ~= nil
@@ -844,6 +965,11 @@ local function refreshStatusFromHelper()
 			then "Helper has not opened the remote MCP bridge at " .. currentRemoteBaseUrl .. "."
 			else "Helper has not opened the remote MCP bridge for this place yet."
 		setStatusSection("remote", "warning", "Missing", remoteDetail)
+		logPluginEvent("status_poll_claim_missing", {
+			task_id = currentTaskId,
+			remote_base_url = currentRemoteBaseUrl,
+			detail = remoteDetail,
+		})
 		return
 	end
 
@@ -869,6 +995,17 @@ local function refreshStatusFromHelper()
 		else nil
 	local lastReadyAge = formatAgeMs(tonumber(remoteSource.remote_last_ready_age_ms))
 	local lastServerAge = formatAgeMs(tonumber(remoteSource.remote_last_server_message_age_ms))
+	logPluginEvent("status_poll_claim_found", {
+		task_id = currentTaskId,
+		remote_state = remoteState,
+		remote_connection_id = remoteConnectionId,
+		remote_last_error = remoteLastError,
+		studio_mode = remoteSource.studio_mode,
+		studio_mode_age_ms = remoteSource.studio_mode_age_ms,
+		official_mcp_adapter_state = remoteSource.official_mcp_adapter_state,
+		official_mcp_adapter_age_ms = remoteSource.official_mcp_adapter_age_ms,
+		official_mcp_adapter_last_error = remoteSource.official_mcp_adapter_last_error,
+	})
 
 	if remoteState == "connected" then
 		setStatusSection(
@@ -925,6 +1062,12 @@ end
 local function startStatusPolling()
 	stopStatusPolling()
 	local token = statusPollToken
+	logPluginEvent("status_poll_start", {
+		token = token,
+		instance_id = currentInstanceId,
+		task_id = currentTaskId,
+		helper_base_url = currentHelperBaseUrl,
+	})
 	task.spawn(function()
 		while token == statusPollToken do
 			if currentClient == nil or currentHelperBaseUrl == nil then
@@ -971,10 +1114,17 @@ end
 
 local function connectToHelper(helperPort: string)
 	local baseUrl = helperBaseUrl(helperPort)
+	local initialStudioMode = currentStudioMode()
 	local registrationPayload = {
 		place_id = tostring(game.PlaceId),
-		studio_mode = currentStudioMode(),
+		studio_mode = initialStudioMode,
 	}
+	logPluginEvent("plugin_register_request", {
+		helper_port = helperPort,
+		base_url = baseUrl,
+		place_id = tostring(game.PlaceId),
+		studio_mode = initialStudioMode,
+	})
 	local registration = requestJson(baseUrl, "POST", "/v1/mcp/register", registrationPayload)
 	local instanceId = registration.instance_id
 	if type(instanceId) ~= "string" or instanceId == "" then
@@ -986,21 +1136,37 @@ local function connectToHelper(helperPort: string)
 	local taskId = if type(registration.task_id) == "string" and registration.task_id ~= ""
 		then registration.task_id
 		else nil
+	logPluginEvent("plugin_register_response", {
+		instance_id = instanceId,
+		task_id = taskId,
+		remote_base_url = remoteBaseUrl,
+		place_id = tostring(game.PlaceId),
+	})
 
 	local client = MockWebSocketService:CreateClient(baseUrl)
 	client:SetReceiveEndpoint("/v1/mcp/plugin/request?instance_id=" .. instanceId)
 	client:SetSendEndpoint("/v1/mcp/plugin/response")
+	logPluginEvent("long_poll_configured", {
+		instance_id = instanceId,
+		receive_endpoint = "/v1/mcp/plugin/request?instance_id=" .. instanceId,
+		send_endpoint = "/v1/mcp/plugin/response",
+	})
 
 	client.Opened:Connect(function()
 		if isCurrentClient(client) then
 			logInfo("Started local long polling against helper on port " .. helperPort)
+			logPluginEvent("long_poll_opened", {
+				instance_id = instanceId,
+				task_id = taskId,
+				helper_port = helperPort,
+			})
 			setStatusSection("helper", "info", "Polling", "Started local long polling against helper on port " .. helperPort .. ".")
 			setStatusSection(
-			"registration",
-			"info",
-			"Registering",
-			"Registered place " .. tostring(game.PlaceId) .. " as helper instance " .. instanceId .. ((taskId ~= nil) and (" for task " .. taskId .. ".") or ".")
-		)
+				"registration",
+				"info",
+				"Registering",
+				"Registered place " .. tostring(game.PlaceId) .. " as helper instance " .. instanceId .. ((taskId ~= nil) and (" for task " .. taskId .. ".") or ".")
+			)
 			setStatusSection(
 				"remote",
 				"info",
@@ -1016,6 +1182,11 @@ local function connectToHelper(helperPort: string)
 	client.Closed:Connect(function()
 		if isCurrentClient(client) then
 			logWarn("Helper connection closed for port " .. helperPort)
+			logPluginEvent("long_poll_closed", {
+				instance_id = instanceId,
+				task_id = taskId,
+				helper_port = helperPort,
+			})
 			stopStatusPolling()
 			currentClient = nil
 			currentInstanceId = nil
@@ -1028,6 +1199,12 @@ local function connectToHelper(helperPort: string)
 
 	client.ConnectionStatusChanged:Connect(function(kind, message)
 		if isCurrentClient(client) then
+			logPluginEvent("long_poll_status_changed", {
+				instance_id = instanceId,
+				task_id = taskId,
+				kind = kind,
+				message = message,
+			})
 			handleClientStatus(kind, message)
 		end
 	end)
@@ -1037,12 +1214,22 @@ local function connectToHelper(helperPort: string)
 			return
 		end
 
+		logPluginEvent("helper_tool_message_received", {
+			instance_id = instanceId,
+			task_id = taskId,
+			bytes = #tostring(message),
+		})
 		local decodeOk, body = pcall(function()
 			return HttpService:JSONDecode(message)
 		end)
 		if not decodeOk then
 			local decodeError = "Failed to decode helper request payload: " .. tostring(body)
 			logWarn(decodeError)
+			logPluginEvent("helper_tool_decode_failed", {
+				instance_id = instanceId,
+				task_id = taskId,
+				error = decodeError,
+			})
 			setStatusSection("registration", "error", "Invalid payload", decodeError)
 			return
 		end
@@ -1050,6 +1237,11 @@ local function connectToHelper(helperPort: string)
 		if type(body) ~= "table" or body.id == nil or body.args == nil then
 			local invalidError = "Received malformed helper request payload"
 			logWarn(invalidError)
+			logPluginEvent("helper_tool_malformed", {
+				instance_id = instanceId,
+				task_id = taskId,
+				error = invalidError,
+			})
 			setStatusSection("registration", "error", "Malformed payload", invalidError)
 			return
 		end
@@ -1062,25 +1254,54 @@ local function connectToHelper(helperPort: string)
 			end
 
 			responseSent = true
+			local responseMode = currentStudioMode()
+			logPluginEvent("helper_tool_response_send", {
+				instance_id = instanceId,
+				task_id = taskId,
+				id = id,
+				success = success,
+				studio_mode = responseMode,
+				response = summarizeText(response),
+			})
 			client:Send({
 				instance_id = instanceId,
 				id = id,
 				success = success,
 				response = response,
-				studio_mode = currentStudioMode(),
+				studio_mode = responseMode,
 			})
 		end
 
 		local args = body.args :: Types.ToolArgs
 		local toolName = next(args)
 		logInfo("Received helper tool request " .. tostring(toolName) .. " (id=" .. id .. ")")
+		logPluginEvent("helper_tool_dispatch", {
+			instance_id = instanceId,
+			task_id = taskId,
+			id = id,
+			tool = toolName,
+		})
 
 		local success, response = pcall(toolCallHandler, args)
 		if success then
+			logPluginEvent("helper_tool_succeeded", {
+				instance_id = instanceId,
+				task_id = taskId,
+				id = id,
+				tool = toolName,
+				response = summarizeText(response),
+			})
 			sendResponseOnce(true, response)
 			setStatusSection("registration", "connected", "Registered", "Handled tool " .. tostring(toolName) .. ".")
 		else
 			local errorMessage = tostring(response)
+			logPluginEvent("helper_tool_failed", {
+				instance_id = instanceId,
+				task_id = taskId,
+				id = id,
+				tool = toolName,
+				error = errorMessage,
+			})
 			sendResponseOnce(false, errorMessage)
 			setStatusSection("registration", "error", "Tool failed", errorMessage)
 		end
@@ -1096,6 +1317,11 @@ end
 local function disconnectCurrentClient()
 	if currentClient ~= nil then
 		local client = currentClient
+		logPluginEvent("plugin_disconnect_begin", {
+			instance_id = currentInstanceId,
+			task_id = currentTaskId,
+			helper_base_url = currentHelperBaseUrl,
+		})
 		currentClient = nil
 		stopStatusPolling()
 		client:Close()
@@ -1113,6 +1339,10 @@ connectCurrentClient = function()
 
 	readyAnnounced = false
 	logInfo("Connecting to local helper on port " .. currentHelperPort)
+	logPluginEvent("plugin_connect_begin", {
+		helper_port = currentHelperPort,
+		place_id = tostring(game.PlaceId),
+	})
 	setStatusSection(
 		"helper",
 		"info",
@@ -1128,6 +1358,10 @@ connectCurrentClient = function()
 	if not ok then
 		local errorMessage = tostring(clientOrError)
 		logWarn(errorMessage)
+		logPluginEvent("plugin_connect_failed", {
+			helper_port = currentHelperPort,
+			error = errorMessage,
+		})
 		stopStatusPolling()
 		setStatusSection("helper", "error", "Error", errorMessage)
 		setStatusSection("registration", "warning", "Inactive", "The plugin could not register because the helper connection failed.")
@@ -1136,6 +1370,11 @@ connectCurrentClient = function()
 	end
 
 	currentClient = clientOrError
+	logPluginEvent("plugin_connect_registered", {
+		instance_id = instanceId,
+		helper_port = currentHelperPort,
+		task_id = currentTaskId,
+	})
 	setStatusSection("registration", "info", "Registering", "Registered helper instance " .. tostring(instanceId) .. " for PlaceId " .. tostring(game.PlaceId) .. ".")
 	startStatusPolling()
 	refreshStatusFromHelper()
