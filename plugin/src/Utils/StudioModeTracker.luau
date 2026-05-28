@@ -124,8 +124,27 @@ local function normalizeEditState()
 	end
 
 	if RunService:IsEdit() then
-		markStopped()
+		local snapshot = getSnapshot()
+		if snapshot.activeSessionId == 0 and snapshot.pendingStartId == 0 then
+			markStopped()
+		end
 	end
+end
+
+local function markObservedRunning(targetMode: Types.StartStopPlayMode)
+	assert(targetMode == "start_play" or targetMode == "run_server", "markObservedRunning expects a running mode")
+	local snapshot = getSnapshot()
+	local activeSessionId = snapshot.activeSessionId
+	if activeSessionId == 0 or snapshot.mode ~= targetMode then
+		activeSessionId = nextCommandId()
+	end
+
+	PluginUtils.setSettings(MODE_KEY, targetMode)
+	PluginUtils.setSettings(ACTIVE_SESSION_ID_KEY, activeSessionId)
+	PluginUtils.setSettings(CONTROL_READY_SESSION_ID_KEY, activeSessionId)
+	ensureNextCommandIdAtLeast(activeSessionId)
+	clearPendingStart()
+	clearLastError()
 end
 
 local function inferLiveMode(): Types.StartStopPlayMode
@@ -214,7 +233,11 @@ local function requestStop(): number
 	return commandId
 end
 
-local function waitForStart(commandId: number, targetMode: Types.StartStopPlayMode, timeoutSeconds: number): TrackerSnapshot
+local function waitForStart(
+	commandId: number,
+	targetMode: Types.StartStopPlayMode,
+	timeoutSeconds: number
+): TrackerSnapshot
 	local deadline = os.clock() + timeoutSeconds
 	while os.clock() < deadline do
 		local snapshot = getSnapshot()
@@ -268,6 +291,7 @@ return {
 	getStopRequestId = getStopRequestId,
 	inferLiveMode = inferLiveMode,
 	markControlReadyForActiveSession = markControlReadyForActiveSession,
+	markObservedRunning = markObservedRunning,
 	markStarted = markStarted,
 	markStopped = markStopped,
 	normalizeEditState = normalizeEditState,

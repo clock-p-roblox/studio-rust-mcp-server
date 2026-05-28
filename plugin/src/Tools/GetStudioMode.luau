@@ -1,10 +1,9 @@
 local Main = script:FindFirstAncestor("MCPStudioPlugin")
-local StudioModeTracker = require(Main.Utils.StudioModeTracker)
+local StudioSessionControl = require(Main.Utils.StudioSessionControl)
 local Types = require(Main.Types)
 
 local function handleGetStudioMode(): string?
-	local snapshot = StudioModeTracker.getSnapshot()
-	return snapshot.mode
+	return StudioSessionControl.getStudioMode()
 end
 
 return handleGetStudioMode :: Types.ToolFunction
