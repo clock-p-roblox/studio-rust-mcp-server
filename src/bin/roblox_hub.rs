@@ -60,6 +60,9 @@ struct Args {
 
     #[arg(long, default_value_t = 30)]
     helper_heartbeat_timeout_sec: u64,
+
+    #[arg(long, default_value_t = false)]
+    allow_helper_admin: bool,
 }
 
 #[derive(Clone)]
@@ -83,6 +86,7 @@ type SharedPersistLock = Arc<Mutex<()>>;
 struct AppState {
     hub: SharedHubState,
     persist_lock: SharedPersistLock,
+    allow_helper_admin: bool,
 }
 
 #[derive(Debug)]
@@ -1369,10 +1373,15 @@ async fn register_helper_handler(
 async fn block_helper_handler(
     State(app): State<AppState>,
     Json(payload): Json<BlockHelperRequest>,
-) -> Result<Json<BlockHelperResponse>, HubError> {
+) -> Result<Json<BlockHelperResponse>, Response> {
+    if !app.allow_helper_admin {
+        return Err(helper_admin_disabled_response());
+    }
     let mut state = app.hub.write().await;
     cleanup_stale_state(&mut state);
-    let helper_id = require_non_empty(&payload.helper_id, "helper_id")?;
+    let helper_id = require_non_empty(&payload.helper_id, "helper_id")
+        .map_err(HubError::from)
+        .map_err(IntoResponse::into_response)?;
     let now = now_unix_ms();
     let pending_task_ids = state
         .tasks
@@ -1447,7 +1456,10 @@ async fn block_helper_handler(
     );
     let snapshot = bump_state_revision(&mut state);
     drop(state);
-    persist_snapshot_if_current(&app, snapshot).await?;
+    persist_snapshot_if_current(&app, snapshot)
+        .await
+        .map_err(HubError::from)
+        .map_err(IntoResponse::into_response)?;
     Ok(Json(BlockHelperResponse {
         ok: true,
         helper_id,
@@ -1459,6 +1471,9 @@ async fn unblock_helper_handler(
     State(app): State<AppState>,
     Json(payload): Json<UnblockHelperRequest>,
 ) -> Result<Json<BlockHelperResponse>, Response> {
+    if !app.allow_helper_admin {
+        return Err(helper_admin_disabled_response());
+    }
     let mut state = app.hub.write().await;
     let cleanup_changed = cleanup_stale_state(&mut state);
     let helper_id = require_non_empty(&payload.helper_id, "helper_id")
@@ -1786,6 +1801,14 @@ impl HttpHubError {
     }
 }
 
+fn helper_admin_disabled_response() -> Response {
+    HttpHubError::forbidden(
+        "helper_admin_disabled",
+        "helper admin endpoints are server-admin-only and disabled for this hub process".to_owned(),
+    )
+    .into_response()
+}
+
 impl IntoResponse for HttpHubError {
     fn into_response(self) -> Response {
         let mut response = (self.status, self.message).into_response();
@@ -1818,6 +1841,7 @@ mod tests {
                 state_revision: 0,
             })),
             persist_lock: Arc::new(Mutex::new(())),
+            allow_helper_admin: true,
         }
     }
 
@@ -1874,6 +1898,49 @@ mod tests {
         state
             .helpers
             .insert(helper_id.to_owned(), test_helper(helper_id, &[task_id]));
+    }
+
+    #[tokio::test]
+    async fn helper_admin_endpoints_are_disabled_by_default() {
+        let mut app = test_app();
+        app.allow_helper_admin = false;
+
+        let response = block_helper_handler(
+            State(app.clone()),
+            Json(BlockHelperRequest {
+                helper_id: "h_test".to_owned(),
+                reason: None,
+            }),
+        )
+        .await
+        .err()
+        .expect("block helper should be rejected");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-clock-p-hub-error")
+                .and_then(|value| value.to_str().ok()),
+            Some("helper_admin_disabled")
+        );
+
+        let response = unblock_helper_handler(
+            State(app),
+            Json(UnblockHelperRequest {
+                helper_id: "h_test".to_owned(),
+            }),
+        )
+        .await
+        .err()
+        .expect("unblock helper should be rejected");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-clock-p-hub-error")
+                .and_then(|value| value.to_str().ok()),
+            Some("helper_admin_disabled")
+        );
     }
 
     #[tokio::test]
@@ -2131,6 +2198,7 @@ async fn main() -> Result<()> {
     let app_state = AppState {
         hub: Arc::clone(&hub),
         persist_lock: Arc::clone(&persist_lock),
+        allow_helper_admin: args.allow_helper_admin,
     };
 
     let cleanup_state = app_state.clone();
