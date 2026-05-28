@@ -251,6 +251,10 @@ local function requestJson(baseUrl: string, method: string, path: string, body: 
 	return decoded
 end
 
+local function currentStudioMode(): string
+	return StudioModeTracker.getSnapshot().mode
+end
+
 local function toolCallHandler(args: Types.ToolArgs): string
 	local toolName = next(args)
 	if not toolName then
@@ -767,6 +771,14 @@ local function refreshStatusFromHelper()
 	end
 
 	local ok, statusPayload = pcall(function()
+		if currentInstanceId ~= nil then
+			pcall(function()
+				requestJson(currentHelperBaseUrl, "POST", "/v1/mcp/plugin/status", {
+					instance_id = currentInstanceId,
+					studio_mode = currentStudioMode(),
+				})
+			end)
+		end
 		return requestJson(currentHelperBaseUrl, "GET", "/status")
 	end)
 	if not ok then
@@ -956,6 +968,7 @@ local function connectToHelper(helperPort: string)
 	local baseUrl = helperBaseUrl(helperPort)
 	local registrationPayload = {
 		place_id = tostring(game.PlaceId),
+		studio_mode = currentStudioMode(),
 	}
 	local registration = requestJson(baseUrl, "POST", "/v1/mcp/register", registrationPayload)
 	local instanceId = registration.instance_id
@@ -1049,6 +1062,7 @@ local function connectToHelper(helperPort: string)
 				id = id,
 				success = success,
 				response = response,
+				studio_mode = currentStudioMode(),
 			})
 		end
 

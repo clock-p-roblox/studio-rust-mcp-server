@@ -1,8 +1,8 @@
 use crate::error::{Report, Result};
 use crate::helper_ws::{
-    ArtifactBegin, ArtifactChunk, ArtifactCommitted, ArtifactFinish, HelperToServerMessage,
-    OfficialMcpRequest, ServerToHelperMessage, MAX_ARTIFACT_CHUNK_MESSAGE_BYTES,
-    OFFICIAL_MCP_ADAPTER_CAPABILITY,
+    ArtifactBegin, ArtifactChunk, ArtifactCommitted, ArtifactFinish, HelperTaskStatusSnapshot,
+    HelperToServerMessage, OfficialMcpRequest, ServerToHelperMessage,
+    MAX_ARTIFACT_CHUNK_MESSAGE_BYTES, OFFICIAL_MCP_ADAPTER_CAPABILITY,
 };
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
@@ -35,6 +35,7 @@ const LONG_POLL_DURATION: Duration = Duration::from_secs(15);
 const HELPER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const HELPER_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const HELPER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(20);
+const HELPER_TASK_STATUS_STALE_AFTER: Duration = Duration::from_secs(10);
 
 type UploadHandle = Arc<StdMutex<ArtifactUploadState>>;
 type UploadRegistry = Arc<StdMutex<HashMap<Uuid, UploadHandle>>>;
@@ -88,7 +89,11 @@ pub struct StatusResponse {
     helper_task_id: Option<String>,
     helper_connection_id: Option<String>,
     helper_capabilities: Option<Vec<String>>,
-    official_mcp_adapter_state: &'static str,
+    studio_mode: Option<String>,
+    studio_mode_age_ms: Option<u128>,
+    official_mcp_adapter_state: String,
+    official_mcp_adapter_age_ms: Option<u128>,
+    official_mcp_adapter_last_error: Option<String>,
     helper_last_message_age_ms: Option<u128>,
 }
 
@@ -99,6 +104,124 @@ struct ActiveHelperConnection {
     capabilities: Vec<String>,
     sender: mpsc::UnboundedSender<OutgoingHelperFrame>,
     last_message_at: Instant,
+    task_status: Option<HelperTaskStatusSnapshot>,
+    task_status_received_at: Option<Instant>,
+}
+
+impl ActiveHelperConnection {
+    fn current_task_status(&self) -> Option<&HelperTaskStatusSnapshot> {
+        let status = self.task_status.as_ref()?;
+        if self.task_id.as_deref() == Some(status.task_id.as_str()) {
+            Some(status)
+        } else {
+            None
+        }
+    }
+}
+
+fn compose_reported_age_ms(age_ms: Option<u128>, received_at: Option<Instant>) -> Option<u128> {
+    Some(age_ms? + received_at?.elapsed().as_millis())
+}
+
+fn ensure_reported_age_fresh(
+    action: &str,
+    label: &str,
+    age_ms: Option<u128>,
+    received_at: Instant,
+) -> Result<(), ErrorData> {
+    let Some(composed_age_ms) = compose_reported_age_ms(age_ms, Some(received_at)) else {
+        return Err(ErrorData::internal_error(
+            format!("{action} failed fast: {label}_snapshot_age_unavailable"),
+            None,
+        ));
+    };
+    if composed_age_ms > HELPER_TASK_STATUS_STALE_AFTER.as_millis() {
+        return Err(ErrorData::internal_error(
+            format!("{action} failed fast: {label}_snapshot_stale age_ms={composed_age_ms}"),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn require_stop_mode_snapshot(
+    helper: &ActiveHelperConnection,
+    action: &str,
+) -> Result<(), ErrorData> {
+    let Some(received_at) = helper.task_status_received_at else {
+        return Err(ErrorData::internal_error(
+            format!("{action} failed fast: studio_mode_snapshot_unavailable"),
+            None,
+        ));
+    };
+    if received_at.elapsed() > HELPER_TASK_STATUS_STALE_AFTER {
+        return Err(ErrorData::internal_error(
+            format!(
+                "{action} failed fast: studio_mode_snapshot_stale age_ms={}",
+                received_at.elapsed().as_millis()
+            ),
+            None,
+        ));
+    }
+    let Some(snapshot) = helper.current_task_status() else {
+        return Err(ErrorData::internal_error(
+            format!("{action} failed fast: studio_mode_snapshot_unavailable"),
+            None,
+        ));
+    };
+    ensure_reported_age_fresh(
+        action,
+        "studio_mode",
+        snapshot.studio_mode_age_ms,
+        received_at,
+    )?;
+    match snapshot.studio_mode.as_deref() {
+        Some("stop") => Ok(()),
+        Some(mode) => Err(ErrorData::internal_error(
+            format!("{action} failed fast: studio_mode_not_stop current_mode={mode}"),
+            None,
+        )),
+        None => Err(ErrorData::internal_error(
+            format!("{action} failed fast: studio_mode_unknown"),
+            None,
+        )),
+    }
+}
+
+fn require_official_adapter_ready_snapshot(
+    helper: &ActiveHelperConnection,
+    action: &str,
+) -> Result<(), ErrorData> {
+    require_stop_mode_snapshot(helper, action)?;
+    let Some(snapshot) = helper.current_task_status() else {
+        return Err(ErrorData::internal_error(
+            format!("{action} failed fast: official_mcp_adapter_snapshot_unavailable"),
+            None,
+        ));
+    };
+    let Some(received_at) = helper.task_status_received_at else {
+        return Err(ErrorData::internal_error(
+            format!("{action} failed fast: official_mcp_adapter_snapshot_unavailable"),
+            None,
+        ));
+    };
+    ensure_reported_age_fresh(
+        action,
+        "official_mcp_adapter",
+        snapshot.official_mcp_adapter_age_ms,
+        received_at,
+    )?;
+    match snapshot.official_mcp_adapter_state.as_deref() {
+        Some("ready") => Ok(()),
+        Some(state) => Err(ErrorData::internal_error(
+            format!("{action} failed fast: official_mcp_adapter_not_ready state={state}"),
+            None,
+        )),
+        None => Err(ErrorData::internal_error(
+            format!("{action} failed fast: official_mcp_adapter_snapshot_unavailable"),
+            None,
+        )),
+    }
 }
 
 #[derive(Clone)]
@@ -172,17 +295,41 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
     } else {
         None
     };
-    let official_mcp_adapter_state = match helper_capabilities.as_ref() {
-        Some(capabilities)
-            if capabilities
-                .iter()
-                .any(|item| item == OFFICIAL_MCP_ADAPTER_CAPABILITY) =>
-        {
-            "declared"
+    let task_status_received_at = state
+        .active_helper
+        .as_ref()
+        .and_then(|helper| helper.task_status_received_at);
+    let helper_task_status = state.active_helper.as_ref().and_then(|helper| {
+        if helper_connected {
+            helper.current_task_status()
+        } else {
+            None
         }
-        Some(_) => "unsupported",
-        None => "disconnected",
-    };
+    });
+    let studio_mode = helper_task_status.and_then(|status| status.studio_mode.clone());
+    let studio_mode_age_ms = helper_task_status.and_then(|status| {
+        compose_reported_age_ms(status.studio_mode_age_ms, task_status_received_at)
+    });
+    let official_mcp_adapter_state =
+        match helper_task_status.and_then(|status| status.official_mcp_adapter_state.clone()) {
+            Some(value) => value,
+            None => match helper_capabilities.as_ref() {
+                Some(capabilities)
+                    if capabilities
+                        .iter()
+                        .any(|item| item == OFFICIAL_MCP_ADAPTER_CAPABILITY) =>
+                {
+                    "not_started".to_owned()
+                }
+                Some(_) => "unsupported".to_owned(),
+                None => "disconnected".to_owned(),
+            },
+        };
+    let official_mcp_adapter_age_ms = helper_task_status.and_then(|status| {
+        compose_reported_age_ms(status.official_mcp_adapter_age_ms, task_status_received_at)
+    });
+    let official_mcp_adapter_last_error =
+        helper_task_status.and_then(|status| status.official_mcp_adapter_last_error.clone());
     Json(StatusResponse {
         service: "rbx-studio-mcp",
         workspace: state.workspace.to_string_lossy().into_owned(),
@@ -212,7 +359,11 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
             .as_ref()
             .map(|helper| helper.connection_id.to_string()),
         helper_capabilities,
+        studio_mode,
+        studio_mode_age_ms,
         official_mcp_adapter_state,
+        official_mcp_adapter_age_ms,
+        official_mcp_adapter_last_error,
         helper_last_message_age_ms,
     })
 }
@@ -276,6 +427,10 @@ struct RunCode {
     task_id: String,
     #[schemars(description = "Code to run")]
     command: String,
+    #[schemars(
+        description = "Set true only for read-only diagnostics that are safe during start_play/run_server. Omit or false for any edit-capable code."
+    )]
+    diagnostic: Option<bool>,
 }
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 struct InsertModel {
@@ -499,6 +654,14 @@ impl ToolArgumentValues {
             ToolArgumentValues::GetStudioMode(args) => &args.task_id,
             ToolArgumentValues::TakeScreenshot(args) => &args.task_id,
             ToolArgumentValues::ReadStudioLog(args) => &args.task_id,
+        }
+    }
+
+    fn requires_studio_stop_snapshot(&self) -> bool {
+        match self {
+            ToolArgumentValues::RunCode(args) => args.diagnostic != Some(true),
+            ToolArgumentValues::InsertModel(_) | ToolArgumentValues::RunScriptInPlayMode(_) => true,
+            _ => false,
         }
     }
 }
@@ -806,6 +969,9 @@ impl RBXStudioServer {
                     None,
                 ));
             }
+            if action != "ping" {
+                require_official_adapter_ready_snapshot(helper, action)?;
+            }
             let request = OfficialMcpRequest {
                 request_id: request_id.to_string(),
                 task_id,
@@ -908,6 +1074,9 @@ impl RBXStudioServer {
                     ),
                     None,
                 ));
+            }
+            if command.args.requires_studio_stop_snapshot() {
+                require_stop_mode_snapshot(helper, tool_name)?;
             }
             state.process_queue.push_back(command);
             state.output_map.insert(id, tx);
@@ -1019,6 +1188,72 @@ fn normalize_tool_arguments_for_workspace(
             Ok(ToolArgumentValues::TakeScreenshot(payload))
         }
         other => Ok(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn helper_with_task_status(status: HelperTaskStatusSnapshot) -> ActiveHelperConnection {
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        ActiveHelperConnection {
+            connection_id: Uuid::new_v4(),
+            place_id: "93795519121520".to_owned(),
+            task_id: Some(status.task_id.clone()),
+            capabilities: vec![OFFICIAL_MCP_ADAPTER_CAPABILITY.to_owned()],
+            sender,
+            last_message_at: Instant::now(),
+            task_status: Some(status),
+            task_status_received_at: Some(Instant::now()),
+        }
+    }
+
+    #[test]
+    fn stop_mode_gate_rejects_stale_reported_studio_mode_age() {
+        let helper = helper_with_task_status(HelperTaskStatusSnapshot {
+            task_id: "t_test".to_owned(),
+            studio_mode: Some("stop".to_owned()),
+            studio_mode_age_ms: Some(HELPER_TASK_STATUS_STALE_AFTER.as_millis() + 1),
+            official_mcp_adapter_state: Some("ready".to_owned()),
+            official_mcp_adapter_age_ms: Some(1),
+            official_mcp_adapter_last_error: None,
+        });
+        let error = require_stop_mode_snapshot(&helper, "insert_model").unwrap_err();
+        assert!(error.to_string().contains("studio_mode_snapshot_stale"));
+    }
+
+    #[test]
+    fn official_gate_rejects_stale_adapter_age() {
+        let helper = helper_with_task_status(HelperTaskStatusSnapshot {
+            task_id: "t_test".to_owned(),
+            studio_mode: Some("stop".to_owned()),
+            studio_mode_age_ms: Some(1),
+            official_mcp_adapter_state: Some("ready".to_owned()),
+            official_mcp_adapter_age_ms: Some(HELPER_TASK_STATUS_STALE_AFTER.as_millis() + 1),
+            official_mcp_adapter_last_error: None,
+        });
+        let error =
+            require_official_adapter_ready_snapshot(&helper, "search_creator_store").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("official_mcp_adapter_snapshot_stale"));
+    }
+
+    #[test]
+    fn run_code_requires_stop_unless_marked_diagnostic() {
+        assert!(!ToolArgumentValues::RunCode(RunCode {
+            task_id: "t_test".to_owned(),
+            command: "print('ok')".to_owned(),
+            diagnostic: Some(true),
+        })
+        .requires_studio_stop_snapshot());
+        assert!(ToolArgumentValues::RunCode(RunCode {
+            task_id: "t_test".to_owned(),
+            command: "workspace.Part:Destroy()".to_owned(),
+            diagnostic: None,
+        })
+        .requires_studio_stop_snapshot());
     }
 }
 
@@ -1486,6 +1721,8 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
             capabilities: hello.capabilities.clone(),
             sender: out_tx.clone(),
             last_message_at: Instant::now(),
+            task_status: hello.task_status.clone(),
+            task_status_received_at: hello.task_status.as_ref().map(|_| Instant::now()),
         }) {
             abort_all_uploads(&uploads);
             fail_all_pending(
@@ -1530,7 +1767,16 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
                         place_id,
                         task_id,
                         plugin_instance_count,
+                        task_status,
                     }) => {
+                        let mut state = state.lock().await;
+                        if let Some(helper) = state.active_helper.as_mut() {
+                            if helper.connection_id == connection_id {
+                                helper.task_status = task_status;
+                                helper.task_status_received_at =
+                                    helper.task_status.as_ref().map(|_| Instant::now());
+                            }
+                        }
                         tracing::debug!(connection_id = %connection_id, helper_id, place_id, task_id = ?task_id, plugin_instance_count, "received helper heartbeat");
                     }
                     Ok(HelperToServerMessage::ToolResult {

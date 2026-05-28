@@ -68,6 +68,7 @@ hub 本身只做 control plane：
 
 - helper register / heartbeat / claim
 - task create / heartbeat / release
+- helper block / drain
 
 为了覆盖极端故障场景，hub 现在会把 task 状态落盘；helper heartbeat 也会回填和校正 task claim。这样在 hub 重启、helper 重启、supervisor 过期等场景下，Linux 阶段就能先验证控制面的稳定性。
 
@@ -108,6 +109,7 @@ cargo run --bin studio_helper -- --port 44750 --hub-base-url https://roblox-hub-
   - `mcp_base_url`
   - `rojo_base_url`
 - hub 会拒绝活跃重复 `helper_id`；helper 应在启动早期先 register hub，并把 `helper_id_conflict` 视为 fatal startup error
+- hub 可以 block 某个 helper；block 后 helper 不能再 register / claim，新 claim 必须等 drain ack 或 timeout force release 后才交给其他 helper
 - plugin 侧只需要配置 helper 端口
 - helper 还额外提供：
   - `GET /status`
@@ -124,6 +126,29 @@ clockp MCP HTTP 服务额外开放：
 - `GET /ws/helper`
 
 这个 WebSocket 由 helper 主动连接。Linux helper 提供 register / heartbeat / claim / 远端 WS 代理能力，但不提供 Win32 专属的截图、窗口定位和 Studio 本地日志读取能力。
+
+### Helper block / drain
+
+`block-helper` 是 hub control plane 操作，不是 Windows 进程 kill。它的目标是阻止 helper 继续拿新 task，并请求它释放当前 task，避免旧 helper 和新 helper 同时持有同一个 task。
+
+目标状态机：
+
+- `blocked/draining`：helper 已被 block，不允许 register / claim；已 claim task 保持在该 helper 名下，等待释放。
+- `blocked/drained`：helper 后续 heartbeat 不再上报 pending task，hub 视为 ack 并清 claim。
+- `blocked/force_released`：超过 drain deadline 后，hub 强制清 pending claim；这不表示 Windows helper 或 Studio 已停止。
+
+协议约束：
+
+- blocked helper heartbeat 仍返回 200 JSON。
+- 旧 helper 的兼容释放依赖 `release_task_ids`；`ok:false` 只能作为新 helper 的拒绝/诊断信号。
+- hub 计算 `reported_active_task_ids = active_task_ids ∪ active_tasks[].task_id`。
+- `release_task_ids` 覆盖 helper 上报但 hub 不允许它继续持有的全部 task，包括 pending、claim 不匹配、不存在、expired 或 released 的 task。
+- pending task 不再出现在 `reported_active_task_ids` 时，hub 才清 `claimed_by_helper_id`。
+- drain timeout 使用独立 deadline，不使用 helper 最近 heartbeat；坏 helper 持续 heartbeat 也不能无限占住 task。
+- force release 后，如果 blocked helper 迟到 heartbeat 仍上报 task，hub 继续返回 release 指令。
+- 存在 pending drain 时，`unblock-helper` 不应静默丢弃 drain 状态。
+
+`/v1/helpers` 的 blocked helper 输出应能解释排障链路：hub 是否发过 release、helper 最后上报了哪些 task、还有哪些 pending task、drain deadline 是否已到、deadline 还剩多久、哪些 task 已 force release。Linux 侧只能验证 hub API / 协议 / 单测，不能声称 Windows helper 或 Studio 已被实机停止。
 
 当前收口方向：
 

@@ -37,8 +37,9 @@ mod helper_ws;
 
 use helper_ws::{
     ArtifactAbort, ArtifactBegin, ArtifactChunk, ArtifactCommitted, ArtifactFinish, HelperHello,
-    HelperToServerMessage, OfficialMcpRequest, OfficialMcpResponse, ServerToHelperMessage,
-    HELPER_WS_PATH, MAX_ARTIFACT_CHUNK_PAYLOAD_BYTES, OFFICIAL_MCP_ADAPTER_CAPABILITY,
+    HelperTaskStatusSnapshot, HelperToServerMessage, OfficialMcpRequest, OfficialMcpResponse,
+    ServerToHelperMessage, HELPER_WS_PATH, MAX_ARTIFACT_CHUNK_PAYLOAD_BYTES,
+    OFFICIAL_MCP_ADAPTER_CAPABILITY,
 };
 
 #[cfg(target_os = "windows")]
@@ -137,6 +138,8 @@ struct PluginInstance {
     task_id: Option<String>,
     remote_base_url: String,
     studio_pid: Option<u32>,
+    studio_mode: Option<String>,
+    studio_mode_observed_at: Option<Instant>,
     last_seen_at: Instant,
     queue: VecDeque<Value>,
     notify: Arc<Notify>,
@@ -149,9 +152,17 @@ struct HelperState {
     waiting_for_plugin: HashMap<String, oneshot::Sender<PluginResponsePayload>>,
     remote_connections: HashMap<String, RemoteConnectionHandle>,
     official_adapters: HashMap<String, OfficialAdapterHandle>,
+    official_adapter_states: HashMap<String, OfficialAdapterStateRecord>,
     last_remote_errors: HashMap<String, String>,
     hub_last_error: Option<String>,
     hub_last_ready_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone)]
+struct OfficialAdapterStateRecord {
+    state: String,
+    last_error: Option<String>,
+    observed_at: Instant,
 }
 
 #[derive(Clone)]
@@ -286,6 +297,8 @@ struct AppState {
 struct RegisterPluginRequest {
     place_id: String,
     task_id: Option<String>,
+    #[serde(default)]
+    studio_mode: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -306,12 +319,21 @@ struct PluginRequestQuery {
     instance_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct PluginStatusUpdateRequest {
+    instance_id: String,
+    #[serde(default)]
+    studio_mode: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct PluginResponsePayload {
     instance_id: Option<String>,
     id: String,
     success: bool,
     response: String,
+    #[serde(default)]
+    studio_mode: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -349,6 +371,11 @@ struct ClaimedTaskStatus {
     remote_last_error: Option<String>,
     remote_last_ready_age_ms: Option<u128>,
     remote_last_server_message_age_ms: Option<u128>,
+    studio_mode: Option<String>,
+    studio_mode_age_ms: Option<u128>,
+    official_mcp_adapter_state: String,
+    official_mcp_adapter_age_ms: Option<u128>,
+    official_mcp_adapter_last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -416,6 +443,11 @@ struct HelperHeartbeatTaskStatus {
     remote_last_error: Option<String>,
     remote_last_ready_age_ms: Option<u128>,
     remote_last_server_message_age_ms: Option<u128>,
+    studio_mode: Option<String>,
+    studio_mode_age_ms: Option<u128>,
+    official_mcp_adapter_state: String,
+    official_mcp_adapter_age_ms: Option<u128>,
+    official_mcp_adapter_last_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -460,6 +492,8 @@ struct HelperInstanceStatus {
     task_id: Option<String>,
     remote_base_url: String,
     studio_pid: Option<u32>,
+    studio_mode: Option<String>,
+    studio_mode_age_ms: Option<u128>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1906,6 +1940,10 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
             task_id: instance.task_id.clone(),
             remote_base_url: instance.remote_base_url.clone(),
             studio_pid: instance.studio_pid,
+            studio_mode: instance.studio_mode.clone(),
+            studio_mode_age_ms: instance
+                .studio_mode_observed_at
+                .map(|value| value.elapsed().as_millis()),
         })
         .collect();
     instances.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
@@ -1915,6 +1953,13 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
         .map(|task| {
             let connection_key = task_connection_key(&task.task_id);
             let remote_connection = state.remote_connections.get(&connection_key);
+            let (studio_mode, studio_mode_age_ms) =
+                task_studio_mode_snapshot(&state, &task.task_id);
+            let (
+                official_mcp_adapter_state,
+                official_mcp_adapter_age_ms,
+                official_mcp_adapter_last_error,
+            ) = task_official_adapter_snapshot(&state, &task.task_id, studio_mode.as_deref());
             let launch_process = state.launch_processes.get(&task.task_id);
             let studio_pid = launch_process.map(|launch| launch.studio_pid).or_else(|| {
                 state
@@ -1956,6 +2001,11 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
                         .last_server_message_at
                         .map(|value| value.elapsed().as_millis())
                 }),
+                studio_mode,
+                studio_mode_age_ms,
+                official_mcp_adapter_state,
+                official_mcp_adapter_age_ms,
+                official_mcp_adapter_last_error,
             }
         })
         .collect();
@@ -2358,6 +2408,9 @@ async fn mcp_register_handler(
                 task_id: Some(claimed_task.task_id.clone()),
                 remote_base_url: remote_base_url.clone(),
                 studio_pid,
+                studio_mode: normalize_studio_mode(payload.studio_mode.as_deref()),
+                studio_mode_observed_at: normalize_studio_mode(payload.studio_mode.as_deref())
+                    .map(|_| Instant::now()),
                 last_seen_at: Instant::now(),
                 queue: VecDeque::new(),
                 notify: Arc::new(Notify::new()),
@@ -2449,12 +2502,31 @@ async fn mcp_plugin_request_handler(
     }
 }
 
+async fn mcp_plugin_status_update_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<PluginStatusUpdateRequest>,
+) -> Result<Response, HelperError> {
+    let mut state = app.state.lock().await;
+    let updated = update_instance_studio_mode(
+        &mut state,
+        &payload.instance_id,
+        payload.studio_mode.as_deref(),
+    );
+    if !updated {
+        return Ok((StatusCode::GONE, "instance expired or studio_mode invalid").into_response());
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 async fn mcp_plugin_response_handler(
     State(app): State<AppState>,
     Json(payload): Json<PluginResponsePayload>,
 ) -> Result<Response, HelperError> {
     let tx = {
         let mut state = app.state.lock().await;
+        if let Some(instance_id) = payload.instance_id.as_deref() {
+            update_instance_studio_mode(&mut state, instance_id, payload.studio_mode.as_deref());
+        }
         state.waiting_for_plugin.remove(&payload.id)
     };
     if let Some(tx) = tx {
@@ -2504,6 +2576,88 @@ fn task_connection_key(task_id: &str) -> String {
     format!("task:{task_id}")
 }
 
+fn normalize_studio_mode(value: Option<&str>) -> Option<String> {
+    match value.map(str::trim) {
+        Some("stop") => Some("stop".to_owned()),
+        Some("start_play") => Some("start_play".to_owned()),
+        Some("run_server") => Some("run_server".to_owned()),
+        Some("unknown") => Some("unknown".to_owned()),
+        _ => None,
+    }
+}
+
+fn update_instance_studio_mode(
+    state: &mut HelperState,
+    instance_id: &str,
+    studio_mode: Option<&str>,
+) -> bool {
+    let Some(mode) = normalize_studio_mode(studio_mode) else {
+        return false;
+    };
+    let Some(instance) = state.instances.get_mut(instance_id) else {
+        return false;
+    };
+    instance.studio_mode = Some(mode);
+    instance.studio_mode_observed_at = Some(Instant::now());
+    instance.last_seen_at = Instant::now();
+    true
+}
+
+fn task_studio_mode_snapshot(state: &HelperState, task_id: &str) -> (Option<String>, Option<u128>) {
+    state
+        .instances
+        .values()
+        .filter(|instance| instance.task_id.as_deref() == Some(task_id))
+        .filter_map(|instance| {
+            let observed_at = instance.studio_mode_observed_at?;
+            Some((
+                instance.studio_mode.clone(),
+                observed_at.elapsed().as_millis(),
+            ))
+        })
+        .min_by_key(|(_, age)| *age)
+        .and_then(|(mode, age)| mode.map(|mode| (Some(mode), Some(age))))
+        .unwrap_or((None, None))
+}
+
+fn task_official_adapter_snapshot(
+    state: &HelperState,
+    task_id: &str,
+    studio_mode: Option<&str>,
+) -> (String, Option<u128>, Option<String>) {
+    let Some(record) = state.official_adapter_states.get(task_id) else {
+        return ("not_started".to_owned(), None, None);
+    };
+    let state_name = if record.state == "ready" {
+        match studio_mode {
+            Some("stop") => "ready".to_owned(),
+            Some(_) => "blocked_by_studio_mode".to_owned(),
+            None => "stale".to_owned(),
+        }
+    } else {
+        record.state.clone()
+    };
+    (
+        state_name,
+        Some(record.observed_at.elapsed().as_millis()),
+        record.last_error.clone(),
+    )
+}
+
+fn helper_task_status_snapshot(state: &HelperState, task_id: &str) -> HelperTaskStatusSnapshot {
+    let (studio_mode, studio_mode_age_ms) = task_studio_mode_snapshot(state, task_id);
+    let (official_state, official_age_ms, official_last_error) =
+        task_official_adapter_snapshot(state, task_id, studio_mode.as_deref());
+    HelperTaskStatusSnapshot {
+        task_id: task_id.to_owned(),
+        studio_mode,
+        studio_mode_age_ms,
+        official_mcp_adapter_state: Some(official_state),
+        official_mcp_adapter_age_ms: official_age_ms,
+        official_mcp_adapter_last_error: official_last_error,
+    }
+}
+
 fn remote_connection_state_name(
     remote_connection: Option<&RemoteConnectionHandle>,
 ) -> &'static str {
@@ -2523,6 +2677,12 @@ fn heartbeat_task_statuses(state: &HelperState) -> Vec<HelperHeartbeatTaskStatus
         .map(|task| {
             let connection_key = task_connection_key(&task.task_id);
             let remote_connection = state.remote_connections.get(&connection_key);
+            let (studio_mode, studio_mode_age_ms) = task_studio_mode_snapshot(state, &task.task_id);
+            let (
+                official_mcp_adapter_state,
+                official_mcp_adapter_age_ms,
+                official_mcp_adapter_last_error,
+            ) = task_official_adapter_snapshot(state, &task.task_id, studio_mode.as_deref());
             HelperHeartbeatTaskStatus {
                 task_id: task.task_id.clone(),
                 remote_state: remote_connection_state_name(remote_connection).to_owned(),
@@ -2539,6 +2699,11 @@ fn heartbeat_task_statuses(state: &HelperState) -> Vec<HelperHeartbeatTaskStatus
                         .last_server_message_at
                         .map(|value| value.elapsed().as_millis())
                 }),
+                studio_mode,
+                studio_mode_age_ms,
+                official_mcp_adapter_state,
+                official_mcp_adapter_age_ms,
+                official_mcp_adapter_last_error,
             }
         })
         .collect::<Vec<_>>();
@@ -3200,6 +3365,10 @@ async fn run_remote_ws_session(
                         })
                         .count()
                 },
+                task_status: {
+                    let state = app.state.lock().await;
+                    task_id.map(|task_id| helper_task_status_snapshot(&state, task_id))
+                },
             }),
         )?))
         .is_err()
@@ -3231,6 +3400,10 @@ async fn run_remote_ws_session(
                         }
                     }).count()
                 };
+                let task_status = {
+                    let state = app.state.lock().await;
+                    task_id.map(|task_id| helper_task_status_snapshot(&state, task_id))
+                };
                 heartbeat_count += 1;
                 last_heartbeat_sent_at = Instant::now();
                 if heartbeat_count == 1 || heartbeat_count % 12 == 0 {
@@ -3247,6 +3420,7 @@ async fn run_remote_ws_session(
                     place_id: place_id.to_owned(),
                     task_id: task_id.map(ToOwned::to_owned),
                     plugin_instance_count,
+                    task_status,
                 })?)).is_err() {
                     tracing::warn!(place_id, heartbeat_count, "failed to queue helper remote websocket heartbeat");
                     break;
@@ -3271,6 +3445,9 @@ async fn run_remote_ws_session(
                                     set_remote_connection_connected(&mut state, connection_key, &connection_id);
                                 }
                                 ready_acknowledged = true;
+                                if let Some(task_id) = task_id {
+                                    start_official_adapter_prewarm(app.clone(), task_id.to_owned(), place_id.to_owned());
+                                }
                                 tracing::info!(connection_key, place_id, connection_id, "helper websocket acknowledged by MCP server");
                             }
                             ServerToHelperMessage::ToolCall { request_id, command } => {
@@ -3455,7 +3632,100 @@ async fn handle_official_mcp_request(
     }
 }
 
+async fn set_official_adapter_state(
+    state: &SharedState,
+    task_id: &str,
+    status: &str,
+    last_error: Option<String>,
+) {
+    let mut state = state.lock().await;
+    state.official_adapter_states.insert(
+        task_id.to_owned(),
+        OfficialAdapterStateRecord {
+            state: status.to_owned(),
+            last_error,
+            observed_at: Instant::now(),
+        },
+    );
+}
+
+fn start_official_adapter_prewarm(app: AppState, task_id: String, place_id: String) {
+    tokio::spawn(async move {
+        set_official_adapter_state(&app.state, &task_id, "starting", None).await;
+        let handle = match ensure_official_adapter_handle(&app, &task_id, &place_id).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                set_official_adapter_state(
+                    &app.state,
+                    &task_id,
+                    "error",
+                    Some(summarize_error(&error.to_string())),
+                )
+                .await;
+                return;
+            }
+        };
+        let request = OfficialMcpRequest {
+            request_id: Uuid::new_v4().to_string(),
+            task_id: task_id.clone(),
+            place_id: place_id.clone(),
+            action: "ping".to_owned(),
+            arguments: Value::Null,
+            timeout_ms: 30_000,
+        };
+        let (response_tx, response_rx) = oneshot::channel();
+        if handle
+            .sender
+            .send(OfficialAdapterCommand {
+                request,
+                response_tx,
+            })
+            .is_err()
+        {
+            set_official_adapter_state(
+                &app.state,
+                &task_id,
+                "error",
+                Some("official MCP adapter worker is not running".to_owned()),
+            )
+            .await;
+            return;
+        }
+        match tokio::time::timeout(Duration::from_secs(35), response_rx).await {
+            Ok(Ok(Ok(_))) => set_official_adapter_state(&app.state, &task_id, "ready", None).await,
+            Ok(Ok(Err(error))) => {
+                set_official_adapter_state(
+                    &app.state,
+                    &task_id,
+                    "error",
+                    Some(summarize_error(&error.to_string())),
+                )
+                .await
+            }
+            Ok(Err(_)) => {
+                set_official_adapter_state(
+                    &app.state,
+                    &task_id,
+                    "error",
+                    Some("official MCP adapter response channel closed".to_owned()),
+                )
+                .await
+            }
+            Err(_) => {
+                set_official_adapter_state(
+                    &app.state,
+                    &task_id,
+                    "error",
+                    Some("official MCP adapter prewarm timed out".to_owned()),
+                )
+                .await
+            }
+        }
+    });
+}
+
 fn stop_removed_official_adapter(state: &mut HelperState, task_id: &str) -> bool {
+    state.official_adapter_states.remove(task_id);
     if let Some(adapter) = state.official_adapters.remove(task_id) {
         let _ = adapter.stop_tx.send(true);
         true
@@ -3467,6 +3737,7 @@ fn stop_removed_official_adapter(state: &mut HelperState, task_id: &str) -> bool
 async fn stop_and_remove_official_adapter(state: &SharedState, task_id: &str) -> bool {
     let adapter = {
         let mut state = state.lock().await;
+        state.official_adapter_states.remove(task_id);
         state.official_adapters.remove(task_id)
     };
     if let Some(adapter) = adapter {
@@ -3522,15 +3793,17 @@ async fn ensure_official_adapter_handle(
     state
         .official_adapters
         .insert(task_id.to_owned(), handle.clone());
+    let worker_state = Arc::clone(&app.state);
     let task_id = task_id.to_owned();
     let place_id = place_id.to_owned();
     tokio::spawn(async move {
-        official_adapter_worker(task_id, place_id, &mut receiver, &mut stop_rx).await;
+        official_adapter_worker(worker_state, task_id, place_id, &mut receiver, &mut stop_rx).await;
     });
     Ok(handle)
 }
 
 async fn official_adapter_worker(
+    state: SharedState,
     task_id: String,
     place_id: String,
     receiver: &mut mpsc::UnboundedReceiver<OfficialAdapterCommand>,
@@ -3548,6 +3821,7 @@ async fn official_adapter_worker(
                 let Some(command) = command else {
                     break;
                 };
+                set_official_adapter_state(&state, &task_id, "starting", None).await;
                 let timeout = Duration::from_millis(command.request.timeout_ms.max(1))
                     .min(OFFICIAL_MCP_REQUEST_TIMEOUT);
                 let result = tokio::time::timeout(
@@ -3575,6 +3849,18 @@ async fn official_adapter_worker(
                 if should_restart_after_error {
                     if let Some(mut process) = process.take() {
                         process.kill().await;
+                    }
+                }
+                match &result {
+                    Ok(_) => set_official_adapter_state(&state, &task_id, "ready", None).await,
+                    Err(error) => {
+                        set_official_adapter_state(
+                            &state,
+                            &task_id,
+                            "error",
+                            Some(summarize_error(&error.to_string())),
+                        )
+                        .await;
                     }
                 }
                 let _ = command.response_tx.send(result);
@@ -4587,6 +4873,7 @@ async fn main() -> Result<()> {
         waiting_for_plugin: HashMap::new(),
         remote_connections: HashMap::new(),
         official_adapters: HashMap::new(),
+        official_adapter_states: HashMap::new(),
         last_remote_errors: HashMap::new(),
         hub_last_error: initial_hub_error,
         hub_last_ready_at: initial_hub_registration.as_ref().map(|_| Instant::now()),
@@ -4627,6 +4914,10 @@ async fn main() -> Result<()> {
         .route("/v1/mcp/register", post(mcp_register_handler))
         .route("/v1/mcp/unregister", post(mcp_unregister_handler))
         .route("/v1/mcp/plugin/request", get(mcp_plugin_request_handler))
+        .route(
+            "/v1/mcp/plugin/status",
+            post(mcp_plugin_status_update_handler),
+        )
         .route("/v1/mcp/plugin/response", post(mcp_plugin_response_handler))
         .route("/v1/helper/screenshot", post(screenshot_debug_handler))
         .route(
@@ -4656,6 +4947,8 @@ mod tests {
             task_id: task_id.map(ToOwned::to_owned),
             remote_base_url: "https://example.com".to_owned(),
             studio_pid: Some(123),
+            studio_mode: Some("stop".to_owned()),
+            studio_mode_observed_at: Some(Instant::now()),
             last_seen_at: Instant::now() - Duration::from_millis(age_ms),
             queue: VecDeque::new(),
             notify: Arc::new(Notify::new()),
@@ -4682,6 +4975,7 @@ mod tests {
             waiting_for_plugin: HashMap::new(),
             remote_connections: HashMap::new(),
             official_adapters: HashMap::new(),
+            official_adapter_states: HashMap::new(),
             last_remote_errors: HashMap::new(),
             hub_last_error: None,
             hub_last_ready_at: None,
