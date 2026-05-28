@@ -449,7 +449,7 @@ local function handleLaunchStudioSession(launchStudioSessionArgs: Types.LaunchSt
 		end, "Ran server")
 	end
 
-	local finalMode = StudioModeTracker.getSnapshot().mode
+	local finalMode = getStudioMode()
 	if finalMode ~= requestedMode then
 		error(string.format("LaunchStudioSession ended in %s, expected %s", finalMode, requestedMode))
 	end
