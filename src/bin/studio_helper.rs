@@ -3949,6 +3949,7 @@ fn should_restart_official_process_after_error(error: &Report) -> bool {
 fn is_transient_official_readiness_error(error: &Report) -> bool {
     let message = error.to_string();
     message.contains("Not connected to the WS host")
+        || message.contains("official MCP found no connected Roblox Studio instances")
         || message
             .contains("previously active Studio has disconnected or doesn't have a place opened")
 }
@@ -5086,6 +5087,11 @@ mod tests {
             "official MCP tool list_roblox_studios returned error: Not connected to the WS host"
         );
         assert!(!should_restart_official_process_after_error(&transient));
+
+        let no_connected_studio = eyre!("official MCP found no connected Roblox Studio instances");
+        assert!(!should_restart_official_process_after_error(
+            &no_connected_studio
+        ));
 
         let opening_place = eyre!(
             "official MCP tool search_creator_store returned error: Execution is prevented because previously active Studio has disconnected or doesn't have a place opened."
