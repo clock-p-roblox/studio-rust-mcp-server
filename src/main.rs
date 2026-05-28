@@ -68,6 +68,18 @@ struct Args {
     /// Optional public base URL metadata exposed via /status.
     #[arg(long)]
     public_base_url: Option<String>,
+
+    /// Optional hub base URL used as the single source of task/helper runtime truth.
+    #[arg(long)]
+    hub_base_url: Option<String>,
+
+    /// Bearer token used when reading hub status. Accepts both raw token and "Bearer <token>".
+    #[arg(long)]
+    hub_bearer_token: Option<String>,
+
+    /// Path to bearer token file used when reading hub status.
+    #[arg(long)]
+    hub_bearer_token_file: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -148,6 +160,29 @@ fn resolve_http_bearer_token(args: &Args) -> Result<Option<String>> {
     Ok(None)
 }
 
+fn optional_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn resolve_hub_bearer_token(args: &Args) -> Result<Option<String>> {
+    if let Some(token) = args
+        .hub_bearer_token
+        .as_deref()
+        .and_then(normalize_bearer_token)
+    {
+        return Ok(Some(token));
+    }
+
+    if let Some(path) = args.hub_bearer_token_file.as_ref() {
+        return load_token_from_file(path);
+    }
+
+    Ok(None)
+}
+
 async fn require_http_auth(
     State(auth): State<HttpAuthState>,
     request: Request,
@@ -206,10 +241,33 @@ async fn main() -> Result<()> {
         Some(path) => path.clone(),
         None => std::env::current_dir()?,
     };
+    let task_id = args
+        .task_id
+        .clone()
+        .or_else(|| optional_env("SYNC_TASK_ID"));
+    let public_base_url = args
+        .public_base_url
+        .clone()
+        .or_else(|| optional_env("MCP_PUBLIC_BASE_URL"));
+    let hub_base_url = args
+        .hub_base_url
+        .clone()
+        .or_else(|| optional_env("HUB_PUBLIC_BASE_URL"))
+        .or_else(|| optional_env("CLOCK_P_HUB_BASE_URL"));
+    let hub_bearer_token = resolve_hub_bearer_token(&args)?;
+    tracing::info!(
+        task_id = ?task_id,
+        public_base_url = ?public_base_url,
+        hub_base_url = ?hub_base_url,
+        hub_auth_enabled = hub_bearer_token.is_some(),
+        "resolved clockp MCP runtime metadata"
+    );
     let server_state = Arc::new(Mutex::new(AppState::new(
         workspace,
-        args.task_id.clone(),
-        args.public_base_url.clone(),
+        task_id,
+        public_base_url,
+        hub_base_url,
+        hub_bearer_token,
     )));
     tokio::spawn(helper_health_loop(Arc::clone(&server_state)));
 

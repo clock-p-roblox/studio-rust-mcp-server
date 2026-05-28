@@ -11,6 +11,7 @@ use axum::{extract::State, Json};
 use base64::Engine as _;
 use color_eyre::eyre::{eyre, Error, OptionExt};
 use futures_util::{SinkExt, StreamExt};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
@@ -36,6 +37,7 @@ const HELPER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const HELPER_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const HELPER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(20);
 const HELPER_TASK_STATUS_STALE_AFTER: Duration = Duration::from_secs(10);
+const HUB_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 type UploadHandle = Arc<StdMutex<ArtifactUploadState>>;
 type UploadRegistry = Arc<StdMutex<HashMap<Uuid, UploadHandle>>>;
@@ -67,6 +69,7 @@ pub struct AppState {
     workspace: PathBuf,
     task_id: Option<String>,
     public_base_url: Option<String>,
+    hub_status_client: Option<HubStatusClient>,
     process_queue: VecDeque<ToolArguments>,
     output_map: HashMap<Uuid, mpsc::UnboundedSender<Result<String>>>,
     active_helper: Option<ActiveHelperConnection>,
@@ -89,12 +92,139 @@ pub struct StatusResponse {
     helper_task_id: Option<String>,
     helper_connection_id: Option<String>,
     helper_capabilities: Option<Vec<String>>,
+    status_source: String,
+    hub_base_url: Option<String>,
+    hub_snapshot_error: Option<String>,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
     official_mcp_adapter_state: String,
     official_mcp_adapter_age_ms: Option<u128>,
     official_mcp_adapter_last_error: Option<String>,
+    mcp_helper_studio_mode: Option<String>,
+    mcp_helper_studio_mode_age_ms: Option<u128>,
+    mcp_helper_official_mcp_adapter_state: Option<String>,
+    mcp_helper_official_mcp_adapter_age_ms: Option<u128>,
+    mcp_helper_official_mcp_adapter_last_error: Option<String>,
     helper_last_message_age_ms: Option<u128>,
+}
+
+#[derive(Clone)]
+pub struct HubStatusClient {
+    base_url: String,
+    bearer_token: Option<String>,
+    client: reqwest::Client,
+}
+
+#[derive(Debug, Deserialize)]
+struct HubStatusPayload {
+    ok: bool,
+    #[serde(default)]
+    helpers: Vec<HubHelperPayload>,
+    #[serde(default)]
+    tasks: Vec<HubTaskPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HubTaskPayload {
+    task_id: String,
+    #[serde(default)]
+    claimed_by_helper_id: Option<String>,
+    #[serde(default)]
+    released: bool,
+    #[serde(default)]
+    service_state: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HubHelperPayload {
+    helper_id: String,
+    #[serde(default)]
+    blocked: bool,
+    #[serde(default)]
+    last_seen_age_ms: Option<u128>,
+    #[serde(default)]
+    active_tasks: Vec<HubHelperActiveTaskPayload>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HubHelperActiveTaskPayload {
+    task_id: String,
+    #[serde(default)]
+    remote_state: String,
+    #[serde(default)]
+    studio_mode: Option<String>,
+    #[serde(default)]
+    studio_mode_age_ms: Option<u128>,
+    #[serde(default)]
+    official_mcp_adapter_state: Option<String>,
+    #[serde(default)]
+    official_mcp_adapter_age_ms: Option<u128>,
+    #[serde(default)]
+    official_mcp_adapter_last_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct HubTaskRuntimeSnapshot {
+    claimed_by_helper_id: Option<String>,
+    helper_id: Option<String>,
+    helper_blocked: bool,
+    helper_last_seen_age_ms: Option<u128>,
+    task_released: bool,
+    task_service_state: String,
+    remote_state: Option<String>,
+    studio_mode: Option<String>,
+    studio_mode_age_ms: Option<u128>,
+    official_mcp_adapter_state: Option<String>,
+    official_mcp_adapter_age_ms: Option<u128>,
+    official_mcp_adapter_last_error: Option<String>,
+}
+
+impl HubStatusClient {
+    pub fn new(base_url: Option<String>, bearer_token: Option<String>) -> Option<Self> {
+        let base_url = base_url
+            .map(|value| value.trim().trim_end_matches('/').to_owned())
+            .filter(|value| !value.is_empty())?;
+        let client = reqwest::Client::builder()
+            .timeout(HUB_STATUS_TIMEOUT)
+            .build()
+            .ok()?;
+        Some(Self {
+            base_url,
+            bearer_token,
+            client,
+        })
+    }
+
+    fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    async fn fetch_task_runtime_snapshot(&self, task_id: &str) -> Result<HubTaskRuntimeSnapshot> {
+        let url = format!("{}/status", self.base_url);
+        let mut request = self
+            .client
+            .get(&url)
+            .header(CONTENT_TYPE, "application/json");
+        if let Some(token) = self.bearer_token.as_ref() {
+            request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| eyre!("failed to request hub /status: {error}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(eyre!("hub /status returned HTTP {status}").into());
+        }
+        let payload = response
+            .json::<HubStatusPayload>()
+            .await
+            .map_err(|error| eyre!("failed to decode hub /status JSON: {error}"))?;
+        if !payload.ok {
+            return Err(eyre!("hub /status returned ok=false").into());
+        }
+        snapshot_from_hub_status_payload(payload, task_id)
+    }
 }
 
 struct ActiveHelperConnection {
@@ -127,56 +257,163 @@ fn ensure_reported_age_fresh(
     action: &str,
     label: &str,
     age_ms: Option<u128>,
-    received_at: Instant,
 ) -> Result<(), ErrorData> {
-    let Some(composed_age_ms) = compose_reported_age_ms(age_ms, Some(received_at)) else {
+    let Some(age_ms) = age_ms else {
         return Err(ErrorData::internal_error(
             format!("{action} failed fast: {label}_snapshot_age_unavailable"),
             None,
         ));
     };
-    if composed_age_ms > HELPER_TASK_STATUS_STALE_AFTER.as_millis() {
+    if age_ms > HELPER_TASK_STATUS_STALE_AFTER.as_millis() {
         return Err(ErrorData::internal_error(
-            format!("{action} failed fast: {label}_snapshot_stale age_ms={composed_age_ms}"),
+            format!("{action} failed fast: {label}_snapshot_stale age_ms={age_ms}"),
             None,
         ));
     }
     Ok(())
 }
 
-fn require_stop_mode_snapshot(
-    helper: &ActiveHelperConnection,
+fn snapshot_from_hub_status_payload(
+    payload: HubStatusPayload,
+    task_id: &str,
+) -> Result<HubTaskRuntimeSnapshot> {
+    let task = payload
+        .tasks
+        .into_iter()
+        .find(|task| task.task_id == task_id)
+        .ok_or_else(|| eyre!("task not found in hub status: {task_id}"))?;
+    let claimed_by_helper_id = task.claimed_by_helper_id.clone();
+    let mut helper_match = None;
+    let mut active_task_match = None;
+    if let Some(claimed_helper_id) = claimed_by_helper_id.as_deref() {
+        helper_match = payload
+            .helpers
+            .into_iter()
+            .find(|helper| helper.helper_id == claimed_helper_id);
+        if let Some(helper) = helper_match.as_ref() {
+            active_task_match = helper
+                .active_tasks
+                .iter()
+                .find(|active_task| active_task.task_id == task_id)
+                .cloned();
+        }
+    }
+    Ok(HubTaskRuntimeSnapshot {
+        claimed_by_helper_id,
+        helper_id: helper_match.as_ref().map(|helper| helper.helper_id.clone()),
+        helper_blocked: helper_match
+            .as_ref()
+            .map(|helper| helper.blocked)
+            .unwrap_or(false),
+        helper_last_seen_age_ms: helper_match
+            .as_ref()
+            .and_then(|helper| helper.last_seen_age_ms),
+        task_released: task.released,
+        task_service_state: task.service_state,
+        remote_state: active_task_match
+            .as_ref()
+            .map(|active_task| active_task.remote_state.clone()),
+        studio_mode: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.studio_mode.clone()),
+        studio_mode_age_ms: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.studio_mode_age_ms),
+        official_mcp_adapter_state: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.official_mcp_adapter_state.clone()),
+        official_mcp_adapter_age_ms: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.official_mcp_adapter_age_ms),
+        official_mcp_adapter_last_error: active_task_match
+            .and_then(|active_task| active_task.official_mcp_adapter_last_error),
+    })
+}
+
+async fn fetch_hub_snapshot_for_gate(
+    hub_client: Option<HubStatusClient>,
+    task_id: &str,
     action: &str,
-) -> Result<(), ErrorData> {
-    let Some(received_at) = helper.task_status_received_at else {
+) -> Result<HubTaskRuntimeSnapshot, ErrorData> {
+    let Some(hub_client) = hub_client else {
         return Err(ErrorData::internal_error(
-            format!("{action} failed fast: studio_mode_snapshot_unavailable"),
+            format!("{action} failed fast: hub_snapshot_not_configured"),
             None,
         ));
     };
-    if received_at.elapsed() > HELPER_TASK_STATUS_STALE_AFTER {
+    let snapshot = hub_client
+        .fetch_task_runtime_snapshot(task_id)
+        .await
+        .map_err(|error| {
+            ErrorData::internal_error(
+                format!("{action} failed fast: hub_snapshot_unavailable error={error}"),
+                None,
+            )
+        })?;
+    if snapshot.task_released || snapshot.task_service_state == "expired" {
         return Err(ErrorData::internal_error(
             format!(
-                "{action} failed fast: studio_mode_snapshot_stale age_ms={}",
-                received_at.elapsed().as_millis()
+                "{action} failed fast: hub_task_not_active state={} released={}",
+                snapshot.task_service_state, snapshot.task_released
             ),
             None,
         ));
     }
-    let Some(snapshot) = helper.current_task_status() else {
+    let Some(claimed_helper_id) = snapshot.claimed_by_helper_id.as_deref() else {
         return Err(ErrorData::internal_error(
-            format!("{action} failed fast: studio_mode_snapshot_unavailable"),
+            format!("{action} failed fast: hub_task_unclaimed"),
             None,
         ));
     };
-    ensure_reported_age_fresh(
-        action,
-        "studio_mode",
-        snapshot.studio_mode_age_ms,
-        received_at,
-    )?;
+    if snapshot.helper_id.as_deref() != Some(claimed_helper_id) {
+        return Err(ErrorData::internal_error(
+            format!(
+                "{action} failed fast: hub_claimed_helper_not_online claimed_helper_id={claimed_helper_id}"
+            ),
+            None,
+        ));
+    }
+    if snapshot.helper_blocked {
+        return Err(ErrorData::internal_error(
+            format!("{action} failed fast: hub_helper_blocked helper_id={claimed_helper_id}"),
+            None,
+        ));
+    }
+    if snapshot.helper_last_seen_age_ms.unwrap_or(u128::MAX)
+        > HELPER_TASK_STATUS_STALE_AFTER.as_millis()
+    {
+        return Err(ErrorData::internal_error(
+            format!(
+                "{action} failed fast: hub_helper_snapshot_stale age_ms={}",
+                snapshot.helper_last_seen_age_ms.unwrap_or(u128::MAX)
+            ),
+            None,
+        ));
+    }
+    if !matches!(
+        snapshot.remote_state.as_deref(),
+        Some("connected" | "ready")
+    ) {
+        return Err(ErrorData::internal_error(
+            format!(
+                "{action} failed fast: hub_helper_remote_not_ready state={}",
+                snapshot.remote_state.as_deref().unwrap_or("unknown")
+            ),
+            None,
+        ));
+    }
+    Ok(snapshot)
+}
+
+async fn require_stop_mode_snapshot(
+    hub_client: Option<HubStatusClient>,
+    task_id: &str,
+    action: &str,
+) -> Result<HubTaskRuntimeSnapshot, ErrorData> {
+    let snapshot = fetch_hub_snapshot_for_gate(hub_client, task_id, action).await?;
+    ensure_reported_age_fresh(action, "studio_mode", snapshot.studio_mode_age_ms)?;
     match snapshot.studio_mode.as_deref() {
-        Some("stop") => Ok(()),
+        Some("stop") => Ok(snapshot),
         Some(mode) => Err(ErrorData::internal_error(
             format!("{action} failed fast: studio_mode_not_stop current_mode={mode}"),
             None,
@@ -188,28 +425,16 @@ fn require_stop_mode_snapshot(
     }
 }
 
-fn require_official_adapter_ready_snapshot(
-    helper: &ActiveHelperConnection,
+async fn require_official_adapter_ready_snapshot(
+    hub_client: Option<HubStatusClient>,
+    task_id: &str,
     action: &str,
 ) -> Result<(), ErrorData> {
-    require_stop_mode_snapshot(helper, action)?;
-    let Some(snapshot) = helper.current_task_status() else {
-        return Err(ErrorData::internal_error(
-            format!("{action} failed fast: official_mcp_adapter_snapshot_unavailable"),
-            None,
-        ));
-    };
-    let Some(received_at) = helper.task_status_received_at else {
-        return Err(ErrorData::internal_error(
-            format!("{action} failed fast: official_mcp_adapter_snapshot_unavailable"),
-            None,
-        ));
-    };
+    let snapshot = require_stop_mode_snapshot(hub_client, task_id, action).await?;
     ensure_reported_age_fresh(
         action,
         "official_mcp_adapter",
         snapshot.official_mcp_adapter_age_ms,
-        received_at,
     )?;
     match snapshot.official_mcp_adapter_state.as_deref() {
         Some("ready") => Ok(()),
@@ -255,12 +480,15 @@ impl AppState {
         workspace: PathBuf,
         task_id: Option<String>,
         public_base_url: Option<String>,
+        hub_base_url: Option<String>,
+        hub_bearer_token: Option<String>,
     ) -> Self {
         let (trigger, waiter) = watch::channel(());
         Self {
             workspace,
             task_id,
             public_base_url,
+            hub_status_client: HubStatusClient::new(hub_base_url, hub_bearer_token),
             process_queue: VecDeque::new(),
             output_map: HashMap::new(),
             active_helper: None,
@@ -272,98 +500,158 @@ impl AppState {
 }
 
 pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResponse> {
-    let state = state.lock().await;
-    tracing::info!(
-        queued_requests = state.process_queue.len(),
-        pending_responses = state.output_map.len(),
-        "status requested"
-    );
-    let helper_connected = state
-        .active_helper
-        .as_ref()
-        .map(|helper| helper.last_message_at.elapsed() <= HELPER_HEARTBEAT_TIMEOUT)
-        .unwrap_or(false);
-    let helper_last_message_age_ms = state
-        .active_helper
-        .as_ref()
-        .map(|helper| helper.last_message_at.elapsed().as_millis());
-    let helper_capabilities = if helper_connected {
-        state
+    let (
+        workspace,
+        task_id,
+        public_base_url,
+        queued_requests,
+        pending_responses,
+        helper_connected,
+        helper_place_id,
+        helper_task_id,
+        helper_connection_id,
+        helper_capabilities,
+        helper_last_message_age_ms,
+        hub_status_client,
+        mcp_helper_studio_mode,
+        mcp_helper_studio_mode_age_ms,
+        mcp_helper_official_mcp_adapter_state,
+        mcp_helper_official_mcp_adapter_age_ms,
+        mcp_helper_official_mcp_adapter_last_error,
+    ) = {
+        let state = state.lock().await;
+        tracing::info!(
+            queued_requests = state.process_queue.len(),
+            pending_responses = state.output_map.len(),
+            "status requested"
+        );
+        let helper_connected = state
             .active_helper
             .as_ref()
-            .map(|helper| helper.capabilities.clone())
-    } else {
-        None
-    };
-    let task_status_received_at = state
-        .active_helper
-        .as_ref()
-        .and_then(|helper| helper.task_status_received_at);
-    let helper_task_status = state.active_helper.as_ref().and_then(|helper| {
-        if helper_connected {
-            helper.current_task_status()
+            .map(|helper| helper.last_message_at.elapsed() <= HELPER_HEARTBEAT_TIMEOUT)
+            .unwrap_or(false);
+        let helper_last_message_age_ms = state
+            .active_helper
+            .as_ref()
+            .map(|helper| helper.last_message_at.elapsed().as_millis());
+        let helper_capabilities = if helper_connected {
+            state
+                .active_helper
+                .as_ref()
+                .map(|helper| helper.capabilities.clone())
         } else {
             None
-        }
-    });
-    let studio_mode = helper_task_status.and_then(|status| status.studio_mode.clone());
-    let studio_mode_age_ms = helper_task_status.and_then(|status| {
-        compose_reported_age_ms(status.studio_mode_age_ms, task_status_received_at)
-    });
-    let official_mcp_adapter_state =
-        match helper_task_status.and_then(|status| status.official_mcp_adapter_state.clone()) {
-            Some(value) => value,
-            None => match helper_capabilities.as_ref() {
-                Some(capabilities)
-                    if capabilities
-                        .iter()
-                        .any(|item| item == OFFICIAL_MCP_ADAPTER_CAPABILITY) =>
-                {
-                    "not_started".to_owned()
-                }
-                Some(_) => "unsupported".to_owned(),
-                None => "disconnected".to_owned(),
-            },
         };
-    let official_mcp_adapter_age_ms = helper_task_status.and_then(|status| {
-        compose_reported_age_ms(status.official_mcp_adapter_age_ms, task_status_received_at)
-    });
-    let official_mcp_adapter_last_error =
-        helper_task_status.and_then(|status| status.official_mcp_adapter_last_error.clone());
+        let task_status_received_at = state
+            .active_helper
+            .as_ref()
+            .and_then(|helper| helper.task_status_received_at);
+        let helper_task_status = state.active_helper.as_ref().and_then(|helper| {
+            if helper_connected {
+                helper.current_task_status()
+            } else {
+                None
+            }
+        });
+        (
+            state.workspace.to_string_lossy().into_owned(),
+            state.task_id.clone(),
+            state.public_base_url.clone(),
+            state.process_queue.len(),
+            state.output_map.len(),
+            helper_connected,
+            if helper_connected {
+                state
+                    .active_helper
+                    .as_ref()
+                    .map(|helper| helper.place_id.clone())
+            } else {
+                None
+            },
+            if helper_connected {
+                state
+                    .active_helper
+                    .as_ref()
+                    .and_then(|helper| helper.task_id.clone())
+            } else {
+                None
+            },
+            state
+                .active_helper
+                .as_ref()
+                .map(|helper| helper.connection_id.to_string()),
+            helper_capabilities,
+            helper_last_message_age_ms,
+            state.hub_status_client.clone(),
+            helper_task_status.and_then(|status| status.studio_mode.clone()),
+            helper_task_status.and_then(|status| {
+                compose_reported_age_ms(status.studio_mode_age_ms, task_status_received_at)
+            }),
+            helper_task_status.and_then(|status| status.official_mcp_adapter_state.clone()),
+            helper_task_status.and_then(|status| {
+                compose_reported_age_ms(status.official_mcp_adapter_age_ms, task_status_received_at)
+            }),
+            helper_task_status.and_then(|status| status.official_mcp_adapter_last_error.clone()),
+        )
+    };
+    let mut status_source = "hub_unconfigured".to_owned();
+    let mut hub_snapshot_error = None;
+    let mut studio_mode = None;
+    let mut studio_mode_age_ms = None;
+    let mut official_mcp_adapter_state = "hub_unconfigured".to_owned();
+    let mut official_mcp_adapter_age_ms = None;
+    let mut official_mcp_adapter_last_error = None;
+    let status_task_id = task_id.clone().or_else(|| helper_task_id.clone());
+    let hub_base_url = hub_status_client
+        .as_ref()
+        .map(|client| client.base_url().to_owned());
+    if let (Some(client), Some(task_id)) = (hub_status_client.as_ref(), status_task_id.as_deref()) {
+        match client.fetch_task_runtime_snapshot(task_id).await {
+            Ok(snapshot) => {
+                status_source = "hub".to_owned();
+                studio_mode = snapshot.studio_mode;
+                studio_mode_age_ms = snapshot.studio_mode_age_ms;
+                official_mcp_adapter_state = snapshot
+                    .official_mcp_adapter_state
+                    .unwrap_or_else(|| "not_started".to_owned());
+                official_mcp_adapter_age_ms = snapshot.official_mcp_adapter_age_ms;
+                official_mcp_adapter_last_error = snapshot.official_mcp_adapter_last_error;
+            }
+            Err(error) => {
+                status_source = "hub_error".to_owned();
+                hub_snapshot_error = Some(error.to_string());
+                official_mcp_adapter_state = "hub_error".to_owned();
+            }
+        }
+    } else if status_task_id.is_none() {
+        status_source = "task_id_unconfigured".to_owned();
+        official_mcp_adapter_state = "task_id_unconfigured".to_owned();
+    }
     Json(StatusResponse {
         service: "rbx-studio-mcp",
-        workspace: state.workspace.to_string_lossy().into_owned(),
-        task_id: state.task_id.clone(),
-        public_base_url: state.public_base_url.clone(),
-        queued_requests: state.process_queue.len(),
-        pending_responses: state.output_map.len(),
+        workspace,
+        task_id: status_task_id,
+        public_base_url,
+        queued_requests,
+        pending_responses,
         helper_connected,
-        helper_place_id: if helper_connected {
-            state
-                .active_helper
-                .as_ref()
-                .map(|helper| helper.place_id.clone())
-        } else {
-            None
-        },
-        helper_task_id: if helper_connected {
-            state
-                .active_helper
-                .as_ref()
-                .and_then(|helper| helper.task_id.clone())
-        } else {
-            None
-        },
-        helper_connection_id: state
-            .active_helper
-            .as_ref()
-            .map(|helper| helper.connection_id.to_string()),
+        helper_place_id,
+        helper_task_id,
+        helper_connection_id,
         helper_capabilities,
+        status_source,
+        hub_base_url,
+        hub_snapshot_error,
         studio_mode,
         studio_mode_age_ms,
         official_mcp_adapter_state,
         official_mcp_adapter_age_ms,
         official_mcp_adapter_last_error,
+        mcp_helper_studio_mode,
+        mcp_helper_studio_mode_age_ms,
+        mcp_helper_official_mcp_adapter_state,
+        mcp_helper_official_mcp_adapter_age_ms,
+        mcp_helper_official_mcp_adapter_last_error,
         helper_last_message_age_ms,
     })
 }
@@ -925,6 +1213,16 @@ impl RBXStudioServer {
     ) -> Result<CallToolResult, ErrorData> {
         let request_id = Uuid::new_v4();
         let (tx, mut rx) = mpsc::unbounded_channel::<Result<String>>();
+        let task_id = sanitize_identifier("task_id", &task_id).map_err(|error| {
+            ErrorData::internal_error(
+                format!("Invalid official MCP task_id argument: {error}"),
+                None,
+            )
+        })?;
+        let hub_status_client = { self.state.lock().await.hub_status_client.clone() };
+        if action != "ping" {
+            require_official_adapter_ready_snapshot(hub_status_client, &task_id, action).await?;
+        }
         let sender = {
             let mut state = self.state.lock().await;
             let Some(helper) = state.active_helper.as_ref() else {
@@ -949,12 +1247,6 @@ impl RBXStudioServer {
                     None,
                 ));
             }
-            let task_id = sanitize_identifier("task_id", &task_id).map_err(|error| {
-                ErrorData::internal_error(
-                    format!("Invalid official MCP task_id argument: {error}"),
-                    None,
-                )
-            })?;
             let Some(helper_task_id) = helper.task_id.as_deref() else {
                 return Err(ErrorData::internal_error(
                     "Official MCP request requires a task_id-bound helper connection",
@@ -968,9 +1260,6 @@ impl RBXStudioServer {
                     ),
                     None,
                 ));
-            }
-            if action != "ping" {
-                require_official_adapter_ready_snapshot(helper, action)?;
             }
             let request = OfficialMcpRequest {
                 request_id: request_id.to_string(),
@@ -1052,6 +1341,10 @@ impl RBXStudioServer {
             })?;
         let (command, id) = ToolArguments::new(normalized_args);
         let tool_name = command.tool_name();
+        if command.args.requires_studio_stop_snapshot() {
+            let hub_status_client = { self.state.lock().await.hub_status_client.clone() };
+            require_stop_mode_snapshot(hub_status_client, &requested_task_id, tool_name).await?;
+        }
         let (tx, mut rx) = mpsc::unbounded_channel::<Result<String>>();
         let (trigger, uploads, queued_requests, pending_responses) = {
             let mut state = self.state.lock().await;
@@ -1074,9 +1367,6 @@ impl RBXStudioServer {
                     ),
                     None,
                 ));
-            }
-            if command.args.requires_studio_stop_snapshot() {
-                require_stop_mode_snapshot(helper, tool_name)?;
             }
             state.process_queue.push_back(command);
             state.output_map.insert(id, tx);
@@ -1195,49 +1485,63 @@ fn normalize_tool_arguments_for_workspace(
 mod tests {
     use super::*;
 
-    fn helper_with_task_status(status: HelperTaskStatusSnapshot) -> ActiveHelperConnection {
-        let (sender, _receiver) = mpsc::unbounded_channel();
-        ActiveHelperConnection {
-            connection_id: Uuid::new_v4(),
-            place_id: "93795519121520".to_owned(),
-            task_id: Some(status.task_id.clone()),
-            capabilities: vec![OFFICIAL_MCP_ADAPTER_CAPABILITY.to_owned()],
-            sender,
-            last_message_at: Instant::now(),
-            task_status: Some(status),
-            task_status_received_at: Some(Instant::now()),
-        }
-    }
-
     #[test]
     fn stop_mode_gate_rejects_stale_reported_studio_mode_age() {
-        let helper = helper_with_task_status(HelperTaskStatusSnapshot {
-            task_id: "t_test".to_owned(),
-            studio_mode: Some("stop".to_owned()),
-            studio_mode_age_ms: Some(HELPER_TASK_STATUS_STALE_AFTER.as_millis() + 1),
-            official_mcp_adapter_state: Some("ready".to_owned()),
-            official_mcp_adapter_age_ms: Some(1),
-            official_mcp_adapter_last_error: None,
-        });
-        let error = require_stop_mode_snapshot(&helper, "insert_model").unwrap_err();
+        let error = ensure_reported_age_fresh(
+            "insert_model",
+            "studio_mode",
+            Some(HELPER_TASK_STATUS_STALE_AFTER.as_millis() + 1),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("studio_mode_snapshot_stale"));
     }
 
     #[test]
     fn official_gate_rejects_stale_adapter_age() {
-        let helper = helper_with_task_status(HelperTaskStatusSnapshot {
-            task_id: "t_test".to_owned(),
-            studio_mode: Some("stop".to_owned()),
-            studio_mode_age_ms: Some(1),
-            official_mcp_adapter_state: Some("ready".to_owned()),
-            official_mcp_adapter_age_ms: Some(HELPER_TASK_STATUS_STALE_AFTER.as_millis() + 1),
-            official_mcp_adapter_last_error: None,
-        });
-        let error =
-            require_official_adapter_ready_snapshot(&helper, "search_creator_store").unwrap_err();
+        let error = ensure_reported_age_fresh(
+            "search_creator_store",
+            "official_mcp_adapter",
+            Some(HELPER_TASK_STATUS_STALE_AFTER.as_millis() + 1),
+        )
+        .unwrap_err();
         assert!(error
             .to_string()
             .contains("official_mcp_adapter_snapshot_stale"));
+    }
+
+    #[test]
+    fn hub_snapshot_parser_reads_claimed_helper_runtime_state() {
+        let payload = HubStatusPayload {
+            ok: true,
+            tasks: vec![HubTaskPayload {
+                task_id: "t_test".to_owned(),
+                claimed_by_helper_id: Some("h_test".to_owned()),
+                released: false,
+                service_state: "ready".to_owned(),
+            }],
+            helpers: vec![HubHelperPayload {
+                helper_id: "h_test".to_owned(),
+                blocked: false,
+                last_seen_age_ms: Some(3),
+                active_tasks: vec![HubHelperActiveTaskPayload {
+                    task_id: "t_test".to_owned(),
+                    remote_state: "connected".to_owned(),
+                    studio_mode: Some("stop".to_owned()),
+                    studio_mode_age_ms: Some(4),
+                    official_mcp_adapter_state: Some("ready".to_owned()),
+                    official_mcp_adapter_age_ms: Some(5),
+                    official_mcp_adapter_last_error: None,
+                }],
+            }],
+        };
+        let snapshot = snapshot_from_hub_status_payload(payload, "t_test").unwrap();
+        assert_eq!(snapshot.helper_id.as_deref(), Some("h_test"));
+        assert_eq!(snapshot.remote_state.as_deref(), Some("connected"));
+        assert_eq!(snapshot.studio_mode.as_deref(), Some("stop"));
+        assert_eq!(
+            snapshot.official_mcp_adapter_state.as_deref(),
+            Some("ready")
+        );
     }
 
     #[test]
