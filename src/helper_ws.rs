@@ -3,6 +3,7 @@ use serde_json::Value;
 
 pub const HELPER_WS_PATH: &str = "/ws/helper";
 pub const OFFICIAL_MCP_ADAPTER_CAPABILITY: &str = "official_mcp_adapter_v1";
+pub const OFFICIAL_MCP_STORE_IMAGE_BASE64_CAPABILITY: &str = "official_mcp_store_image_base64_v1";
 #[allow(dead_code)]
 pub const MAX_ARTIFACT_CHUNK_MESSAGE_BYTES: usize = 500 * 1024;
 #[allow(dead_code)]

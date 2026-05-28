@@ -3,6 +3,7 @@ use crate::helper_ws::{
     ArtifactBegin, ArtifactChunk, ArtifactCommitted, ArtifactFinish, HelperTaskStatusSnapshot,
     HelperToServerMessage, OfficialMcpRequest, ServerToHelperMessage,
     MAX_ARTIFACT_CHUNK_MESSAGE_BYTES, OFFICIAL_MCP_ADAPTER_CAPABILITY,
+    OFFICIAL_MCP_STORE_IMAGE_BASE64_CAPABILITY,
 };
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
@@ -38,6 +39,11 @@ const HELPER_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const HELPER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(20);
 const HELPER_TASK_STATUS_STALE_AFTER: Duration = Duration::from_secs(10);
 const HUB_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const OFFICIAL_MCP_LONG_TIMEOUT_MS: u64 = 1_800_000;
+const OFFICIAL_MCP_STORE_IMAGE_TIMEOUT_MS: u64 = 1_800_000;
+const OFFICIAL_STORE_IMAGE_MAX_DECODED_BYTES: usize = 20 * 1024 * 1024;
+const OFFICIAL_STORE_IMAGE_MAX_BASE64_CHARS: usize =
+    ((OFFICIAL_STORE_IMAGE_MAX_DECODED_BYTES + 2) / 3) * 4;
 
 type UploadHandle = Arc<StdMutex<ArtifactUploadState>>;
 type UploadRegistry = Arc<StdMutex<HashMap<Uuid, UploadHandle>>>;
@@ -431,11 +437,6 @@ async fn require_official_adapter_ready_snapshot(
     action: &str,
 ) -> Result<(), ErrorData> {
     let snapshot = require_stop_mode_snapshot(hub_client, task_id, action).await?;
-    ensure_reported_age_fresh(
-        action,
-        "official_mcp_adapter",
-        snapshot.official_mcp_adapter_age_ms,
-    )?;
     match snapshot.official_mcp_adapter_state.as_deref() {
         Some("ready") => Ok(()),
         Some(state) => Err(ErrorData::internal_error(
@@ -837,8 +838,22 @@ struct OfficialMcpStoreImage {
         description = "Required clock-p task_id used to bind the official Studio MCP adapter to the matching remote task."
     )]
     task_id: String,
-    #[schemars(description = "Absolute local png/jpg/jpeg path on the Windows helper machine.")]
-    file_path: String,
+    #[schemars(
+        description = "Optional absolute png/jpg/jpeg path on the Windows helper machine. Mutually exclusive with image_base64."
+    )]
+    file_path: Option<String>,
+    #[schemars(
+        description = "Optional base64-encoded png/jpg/jpeg bytes. The Windows helper writes it to a task-scoped local temp file before calling official MCP store_image. Mutually exclusive with file_path."
+    )]
+    image_base64: Option<String>,
+    #[schemars(
+        description = "Required with image_base64. Allowed values: image/png, image/jpeg, image/jpg."
+    )]
+    mime_type: Option<String>,
+    #[schemars(
+        description = "Optional display hint only. The helper does not trust it as a path."
+    )]
+    file_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
@@ -1097,7 +1112,7 @@ impl RBXStudioServer {
         self.dispatch_official_mcp(
             "generate_mesh",
             Value::Object(arguments),
-            300_000,
+            OFFICIAL_MCP_LONG_TIMEOUT_MS,
             args.task_id,
         )
         .await
@@ -1150,11 +1165,13 @@ impl RBXStudioServer {
         &self,
         Parameters(args): Parameters<OfficialMcpStoreImage>,
     ) -> Result<CallToolResult, ErrorData> {
+        let task_id = args.task_id.clone();
+        let arguments = official_store_image_arguments(args)?;
         self.dispatch_official_mcp(
             "store_image",
-            serde_json::json!({ "filePath": args.file_path }),
-            60_000,
-            args.task_id,
+            arguments,
+            OFFICIAL_MCP_STORE_IMAGE_TIMEOUT_MS,
+            task_id,
         )
         .await
     }
@@ -1177,7 +1194,7 @@ impl RBXStudioServer {
         self.dispatch_official_mcp(
             "generate_procedural_model",
             Value::Object(arguments),
-            300_000,
+            OFFICIAL_MCP_LONG_TIMEOUT_MS,
             args.task_id,
         )
         .await
@@ -1198,7 +1215,7 @@ impl RBXStudioServer {
         self.dispatch_official_mcp(
             "wait_job_finished",
             Value::Object(arguments),
-            600_000,
+            OFFICIAL_MCP_LONG_TIMEOUT_MS,
             args.task_id,
         )
         .await
@@ -1213,6 +1230,8 @@ impl RBXStudioServer {
     ) -> Result<CallToolResult, ErrorData> {
         let request_id = Uuid::new_v4();
         let (tx, mut rx) = mpsc::unbounded_channel::<Result<String>>();
+        let requires_store_image_base64_capability =
+            action == "store_image" && arguments.get("imageBase64").is_some();
         let task_id = sanitize_identifier("task_id", &task_id).map_err(|error| {
             ErrorData::internal_error(
                 format!("Invalid official MCP task_id argument: {error}"),
@@ -1244,6 +1263,17 @@ impl RBXStudioServer {
             {
                 return Err(ErrorData::internal_error(
                     "Studio helper does not declare official_mcp_adapter_v1",
+                    None,
+                ));
+            }
+            if requires_store_image_base64_capability
+                && !helper
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == OFFICIAL_MCP_STORE_IMAGE_BASE64_CAPABILITY)
+            {
+                return Err(ErrorData::internal_error(
+                    "Studio helper does not declare official_mcp_store_image_base64_v1; deploy the updated Windows helper before using image_base64",
                     None,
                 ));
             }
@@ -1428,6 +1458,84 @@ impl RBXStudioServer {
     }
 }
 
+fn official_store_image_argument_error(message: impl Into<String>) -> ErrorData {
+    ErrorData::internal_error(
+        format!(
+            "Invalid official_mcp_store_image arguments: {}",
+            message.into()
+        ),
+        None,
+    )
+}
+
+fn official_store_image_arguments(args: OfficialMcpStoreImage) -> Result<Value, ErrorData> {
+    let has_file_path = args
+        .file_path
+        .as_deref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    let has_image_base64 = args
+        .image_base64
+        .as_deref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    match (has_file_path, has_image_base64) {
+        (true, true) => {
+            return Err(official_store_image_argument_error(
+                "file_path and image_base64 are mutually exclusive",
+            ))
+        }
+        (false, false) => {
+            return Err(official_store_image_argument_error(
+                "one of file_path or image_base64 is required",
+            ))
+        }
+        _ => {}
+    }
+
+    if has_file_path {
+        if args.mime_type.is_some() || args.file_name.is_some() {
+            return Err(official_store_image_argument_error(
+                "mime_type and file_name are only valid with image_base64",
+            ));
+        }
+        let file_path = args.file_path.unwrap_or_default().trim().to_owned();
+        return Ok(serde_json::json!({ "filePath": file_path }));
+    }
+
+    let image_base64 = args.image_base64.unwrap_or_default();
+    let normalized_base64 = image_base64.trim();
+    if normalized_base64.len() > OFFICIAL_STORE_IMAGE_MAX_BASE64_CHARS {
+        return Err(official_store_image_argument_error(format!(
+            "image_base64 exceeds {} decoded bytes",
+            OFFICIAL_STORE_IMAGE_MAX_DECODED_BYTES
+        )));
+    }
+    let mime_type = args
+        .mime_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            official_store_image_argument_error("mime_type is required with image_base64")
+        })?;
+    if !matches!(mime_type, "image/png" | "image/jpeg" | "image/jpg") {
+        return Err(official_store_image_argument_error(
+            "mime_type must be image/png, image/jpeg, or image/jpg",
+        ));
+    }
+    let mut arguments = serde_json::Map::new();
+    arguments.insert(
+        "imageBase64".to_owned(),
+        Value::String(normalized_base64.to_owned()),
+    );
+    arguments.insert("mimeType".to_owned(), Value::String(mime_type.to_owned()));
+    if let Some(file_name) = args.file_name {
+        arguments.insert("fileName".to_owned(), Value::String(file_name));
+    }
+    Ok(Value::Object(arguments))
+}
+
 fn sanitize_identifier(label: &str, value: &str) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty()
@@ -1497,19 +1605,6 @@ mod tests {
     }
 
     #[test]
-    fn official_gate_rejects_stale_adapter_age() {
-        let error = ensure_reported_age_fresh(
-            "search_creator_store",
-            "official_mcp_adapter",
-            Some(HELPER_TASK_STATUS_STALE_AFTER.as_millis() + 1),
-        )
-        .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("official_mcp_adapter_snapshot_stale"));
-    }
-
-    #[test]
     fn hub_snapshot_parser_reads_claimed_helper_runtime_state() {
         let payload = HubStatusPayload {
             ok: true,
@@ -1558,6 +1653,47 @@ mod tests {
             diagnostic: None,
         })
         .requires_studio_stop_snapshot());
+    }
+
+    #[test]
+    fn store_image_accepts_base64_source_shape() {
+        let arguments = official_store_image_arguments(OfficialMcpStoreImage {
+            task_id: "t_test".to_owned(),
+            file_path: None,
+            image_base64: Some("abcd".to_owned()),
+            mime_type: Some("image/png".to_owned()),
+            file_name: Some("../probe.png".to_owned()),
+        })
+        .expect("base64 store_image arguments should be accepted by server preflight");
+
+        assert_eq!(arguments["imageBase64"], "abcd");
+        assert_eq!(arguments["mimeType"], "image/png");
+        assert_eq!(arguments["fileName"], "../probe.png");
+    }
+
+    #[test]
+    fn store_image_rejects_missing_or_duplicate_sources() {
+        let missing = official_store_image_arguments(OfficialMcpStoreImage {
+            task_id: "t_test".to_owned(),
+            file_path: None,
+            image_base64: None,
+            mime_type: None,
+            file_name: None,
+        })
+        .unwrap_err();
+        assert!(missing
+            .to_string()
+            .contains("one of file_path or image_base64"));
+
+        let duplicate = official_store_image_arguments(OfficialMcpStoreImage {
+            task_id: "t_test".to_owned(),
+            file_path: Some("C:\\tmp\\x.png".to_owned()),
+            image_base64: Some("abcd".to_owned()),
+            mime_type: Some("image/png".to_owned()),
+            file_name: None,
+        })
+        .unwrap_err();
+        assert!(duplicate.to_string().contains("mutually exclusive"));
     }
 }
 

@@ -22,6 +22,7 @@ regex = "1.12"
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 base64 = "0.22"
+tower-http = { version = "0.6", features = ["limit"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 native-dialog = "0.9"

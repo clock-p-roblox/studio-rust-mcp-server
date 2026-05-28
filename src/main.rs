@@ -18,11 +18,14 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tower_http::limit::RequestBodyLimitLayer;
 use tracing_subscriber::{self, EnvFilter};
 mod error;
 mod helper_ws;
 mod install;
 mod rbx_studio_server;
+
+const MCP_HTTP_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
 /// Simple MCP proxy for Roblox Studio
 /// Run without arguments to install the plugin
@@ -349,6 +352,9 @@ async fn main() -> Result<()> {
             .route(HELPER_WS_PATH, get(helper_ws_handler))
             .nest_service("/mcp", streamable_http_service)
             .with_state(Arc::clone(&server_state))
+            .layer(RequestBodyLimitLayer::new(
+                MCP_HTTP_REQUEST_BODY_LIMIT_BYTES,
+            ))
             .layer(middleware::from_fn_with_state(
                 auth_state,
                 require_http_auth,

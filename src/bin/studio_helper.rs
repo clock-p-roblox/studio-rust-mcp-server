@@ -39,7 +39,7 @@ use helper_ws::{
     ArtifactAbort, ArtifactBegin, ArtifactChunk, ArtifactCommitted, ArtifactFinish, HelperHello,
     HelperTaskStatusSnapshot, HelperToServerMessage, OfficialMcpRequest, OfficialMcpResponse,
     ServerToHelperMessage, HELPER_WS_PATH, MAX_ARTIFACT_CHUNK_PAYLOAD_BYTES,
-    OFFICIAL_MCP_ADAPTER_CAPABILITY,
+    OFFICIAL_MCP_ADAPTER_CAPABILITY, OFFICIAL_MCP_STORE_IMAGE_BASE64_CAPABILITY,
 };
 
 #[cfg(target_os = "windows")]
@@ -76,7 +76,10 @@ const DEFAULT_DOMAIN_SUFFIX: &str = "dev.clock-p.com";
 const DEFAULT_HELPER_PORT: u16 = 44750;
 const LOCAL_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const PLUGIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-const OFFICIAL_MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+const OFFICIAL_MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(1800);
+const OFFICIAL_STORE_IMAGE_MAX_DECODED_BYTES: usize = 20 * 1024 * 1024;
+const OFFICIAL_STORE_IMAGE_MAX_BASE64_CHARS: usize =
+    ((OFFICIAL_STORE_IMAGE_MAX_DECODED_BYTES + 2) / 3) * 4;
 const INSTANCE_STALE_AFTER: Duration = Duration::from_secs(45);
 const REMOTE_WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const REMOTE_WS_STALE_RESTART_AFTER: Duration = Duration::from_secs(30);
@@ -262,6 +265,23 @@ struct OfficialMcpProcess {
     next_id: u64,
     initialized: bool,
     studio_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct TempOfficialImage {
+    path: PathBuf,
+}
+
+impl Drop for TempOfficialImage {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_file(&self.path) {
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %error,
+                "failed to remove temporary official MCP image file"
+            );
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -3585,6 +3605,7 @@ async fn run_remote_ws_session(
                     "runtime_screenshot_stream_v1".to_owned(),
                     "read_studio_log_v1".to_owned(),
                     OFFICIAL_MCP_ADAPTER_CAPABILITY.to_owned(),
+                    OFFICIAL_MCP_STORE_IMAGE_BASE64_CAPABILITY.to_owned(),
                 ],
                 plugin_instance_count: {
                     let state = app.state.lock().await;
@@ -3884,7 +3905,7 @@ async fn handle_official_mcp_request(
         stop_and_remove_official_adapter(&app.state, &task_id).await;
         return Err(eyre!("official MCP adapter worker is not running"));
     }
-    match tokio::time::timeout(timeout, response_rx).await {
+    match tokio::time::timeout(timeout + Duration::from_secs(5), response_rx).await {
         Ok(Ok(result)) => result,
         Ok(Err(_)) => {
             stop_and_remove_official_adapter(&app.state, &task_id).await;
@@ -4178,9 +4199,15 @@ async fn official_adapter_execute(
         .ok_or_else(|| eyre!("official MCP process was not created"))?;
     process_ref.initialize().await?;
     let studio_summary = process_ref.ensure_active_studio().await?;
-    let result = process_ref
-        .call_tool(official_tool, request.arguments.clone())
-        .await?;
+    let (arguments, cleanup_guard) = prepare_official_tool_arguments(
+        task_id,
+        &request.request_id,
+        &request.action,
+        request.arguments.clone(),
+    )?;
+    let result = process_ref.call_tool(official_tool, arguments).await;
+    drop(cleanup_guard);
+    let result = result?;
     Ok(serde_json::to_string_pretty(&serde_json::json!({
         "ok": true,
         "adapter_state": "ready",
@@ -4215,6 +4242,145 @@ fn is_transient_official_readiness_error(error: &Report) -> bool {
         || message.contains("official MCP found no connected Roblox Studio instances")
         || message
             .contains("previously active Studio has disconnected or doesn't have a place opened")
+}
+
+fn prepare_official_tool_arguments(
+    task_id: &str,
+    request_id: &str,
+    action: &str,
+    arguments: Value,
+) -> Result<(Value, Option<TempOfficialImage>)> {
+    if action != "store_image" {
+        return Ok((arguments, None));
+    }
+    prepare_official_store_image_arguments(task_id, request_id, arguments)
+}
+
+fn prepare_official_store_image_arguments(
+    task_id: &str,
+    request_id: &str,
+    arguments: Value,
+) -> Result<(Value, Option<TempOfficialImage>)> {
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| eyre!("store_image arguments must be a JSON object"))?;
+    let file_path = string_field(object, &["filePath", "file_path"]);
+    let image_base64 = string_field(object, &["imageBase64", "image_base64"]);
+    match (
+        file_path
+            .map(|value| !trim(value).is_empty())
+            .unwrap_or(false),
+        image_base64
+            .map(|value| !trim(value).is_empty())
+            .unwrap_or(false),
+    ) {
+        (true, true) => {
+            return Err(eyre!(
+                "store_image requires exactly one of filePath or imageBase64"
+            ))
+        }
+        (false, false) => return Err(eyre!("store_image requires filePath or imageBase64")),
+        _ => {}
+    }
+    if let Some(path) = file_path {
+        if string_field(object, &["mimeType", "mime_type"]).is_some()
+            || string_field(object, &["fileName", "file_name"]).is_some()
+        {
+            return Err(eyre!(
+                "store_image mimeType/fileName are only valid with imageBase64"
+            ));
+        }
+        return Ok((serde_json::json!({ "filePath": trim(path) }), None));
+    }
+
+    let image_base64 = trim(image_base64.expect("image_base64 presence checked"));
+    if image_base64.len() > OFFICIAL_STORE_IMAGE_MAX_BASE64_CHARS {
+        return Err(eyre!(
+            "store_image imageBase64 exceeds {} decoded bytes",
+            OFFICIAL_STORE_IMAGE_MAX_DECODED_BYTES
+        ));
+    }
+    let mime_type = trim(
+        string_field(object, &["mimeType", "mime_type"])
+            .ok_or_else(|| eyre!("store_image mimeType is required with imageBase64"))?,
+    );
+    let extension = official_image_extension_for_mime(&mime_type)?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(image_base64)
+        .map_err(|error| eyre!("store_image imageBase64 decode failed: {error}"))?;
+    if decoded.len() > OFFICIAL_STORE_IMAGE_MAX_DECODED_BYTES {
+        return Err(eyre!(
+            "store_image decoded image exceeds {} bytes",
+            OFFICIAL_STORE_IMAGE_MAX_DECODED_BYTES
+        ));
+    }
+    ensure_official_image_magic(&mime_type, &decoded)?;
+    let task_id = sanitize_identifier("task_id", task_id)?;
+    let request_id = sanitize_identifier("request_id", request_id)?;
+    let hint = string_field(object, &["fileName", "file_name"])
+        .map(sanitize_image_file_hint)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "image".to_owned());
+    let output_dir = helper_data_dir()?.join("official-images").join(&task_id);
+    fs::create_dir_all(&output_dir)?;
+    let output_path = output_dir.join(format!("{request_id}-{hint}.{extension}"));
+    fs::write(&output_path, decoded)?;
+    tracing::info!(
+        path = %output_path.display(),
+        task_id,
+        "wrote temporary official MCP store_image input"
+    );
+    Ok((
+        serde_json::json!({ "filePath": output_path.to_string_lossy() }),
+        Some(TempOfficialImage { path: output_path }),
+    ))
+}
+
+fn string_field<'a>(object: &'a serde_json::Map<String, Value>, names: &[&str]) -> Option<&'a str> {
+    names
+        .iter()
+        .find_map(|name| object.get(*name).and_then(Value::as_str))
+}
+
+fn official_image_extension_for_mime(mime_type: &str) -> Result<&'static str> {
+    match mime_type {
+        "image/png" => Ok("png"),
+        "image/jpeg" | "image/jpg" => Ok("jpg"),
+        _ => Err(eyre!(
+            "store_image mimeType must be image/png, image/jpeg, or image/jpg"
+        )),
+    }
+}
+
+fn ensure_official_image_magic(mime_type: &str, bytes: &[u8]) -> Result<()> {
+    let valid = match mime_type {
+        "image/png" => bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
+        "image/jpeg" | "image/jpg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        _ => false,
+    };
+    if !valid {
+        return Err(eyre!(
+            "store_image imageBase64 content does not match mimeType"
+        ));
+    }
+    Ok(())
+}
+
+fn sanitize_image_file_hint(value: &str) -> String {
+    let mut sanitized = trim(value)
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.len() > 40 {
+        sanitized.truncate(40);
+    }
+    sanitized.trim_matches('_').trim_matches('-').to_owned()
 }
 
 async fn ensure_official_process(process: &mut Option<OfficialMcpProcess>) -> Result<()> {
@@ -5856,5 +6022,69 @@ mod tests {
         assert!(wrong_place
             .to_string()
             .contains("remote MCP ready ack place_id mismatch"));
+    }
+
+    #[test]
+    fn store_image_legacy_file_path_passes_through() {
+        let (arguments, cleanup) = prepare_official_store_image_arguments(
+            "t_example",
+            "req_example",
+            serde_json::json!({ "filePath": "C:\\tmp\\probe.png" }),
+        )
+        .expect("legacy Windows filePath should pass through");
+
+        assert!(cleanup.is_none());
+        assert_eq!(arguments["filePath"], "C:\\tmp\\probe.png");
+    }
+
+    #[test]
+    fn store_image_base64_writes_task_scoped_temp_file() {
+        let png_base64 =
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+        let (arguments, cleanup) = prepare_official_store_image_arguments(
+            "t_example",
+            "req_example",
+            serde_json::json!({
+                "imageBase64": png_base64,
+                "mimeType": "image/png",
+                "fileName": "..\\bad name.png",
+            }),
+        )
+        .expect("base64 image should be written to helper temp storage");
+        let cleanup = cleanup.expect("base64 mode should create a temp cleanup guard");
+        let path = cleanup.path.clone();
+
+        assert_eq!(
+            arguments["filePath"].as_str(),
+            Some(path.to_string_lossy().as_ref())
+        );
+        assert!(path.exists());
+        assert!(path
+            .components()
+            .any(|component| component.as_os_str() == "official-images"));
+        assert!(path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .ends_with(".png"));
+
+        drop(cleanup);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn store_image_base64_rejects_mime_mismatch() {
+        let jpeg_header_as_base64 = "/9j/AA==";
+        let error = prepare_official_store_image_arguments(
+            "t_example",
+            "req_example",
+            serde_json::json!({
+                "imageBase64": jpeg_header_as_base64,
+                "mimeType": "image/png",
+            }),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("does not match mimeType"));
     }
 }

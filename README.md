@@ -91,6 +91,8 @@ cargo run --bin roblox_hub -- --port 44758 --no-auth
 - `clockp MCP plugin -> helper -> helper 通过 task-scoped clockp MCP 通道收发工具调用`
 - `helper -> hub register / heartbeat / claim`
 - `take_screenshot -> helper 截图 -> helper 通过 MCP WebSocket 分片上传 -> MCP server 落盘到 workspace artifacts`
+- `official_mcp_store_image(image_base64, mime_type) -> helper 写入 Windows 本机 task-scoped 临时图片 -> helper 调用 hidden official MCP store_image(filePath)`
+- official MCP 长任务的同步等待上限是 30 分钟；LLM / Codex 操作时超过 3 分钟仍未返回，应先汇报并检查状态后再决定是否继续等。
 
 helper 二进制是本仓库里的 `studio_helper`：
 
