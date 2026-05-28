@@ -473,8 +473,10 @@ struct ClaimTaskHubResponse {
 struct ClaimedTaskHubPayload {
     task_id: String,
     place_id: String,
-    #[serde(default, alias = "game_id")]
+    #[serde(default)]
     universe_id: Option<String>,
+    #[serde(default)]
+    game_id: Option<String>,
     routes: ClaimedTaskRoutes,
 }
 
@@ -3034,7 +3036,7 @@ async fn hub_maintenance_loop(app: AppState, mut registered: bool) {
                     let claimed_task = ClaimedTask {
                         task_id: task.task_id.clone(),
                         place_id: task.place_id,
-                        universe_id: task.universe_id,
+                        universe_id: task.universe_id.or(task.game_id),
                         mcp_base_url,
                         rojo_base_url: task.routes.rojo_base_url,
                         runtime_log_base_url: task.routes.runtime_log_base_url,
@@ -5192,7 +5194,29 @@ mod tests {
         let parsed: ClaimTaskHubResponse =
             serde_json::from_str(payload).expect("legacy claim payload should decode");
         let task = parsed.task.expect("task should be present");
+        assert_eq!(task.game_id.as_deref(), Some("9838206573"));
+    }
+
+    #[test]
+    fn claim_task_response_accepts_both_universe_id_and_game_id_fields() {
+        let payload = r#"{
+            "claimed": true,
+            "helper_id": "h_test",
+            "task": {
+                "task_id": "t_example",
+                "place_id": "93795519121520",
+                "universe_id": "9838206573",
+                "game_id": "9838206573",
+                "routes": {
+                    "mcp_base_url": "https://93795519121520-t_example-mcp-sunjun-user.dev.clock-p.com"
+                }
+            }
+        }"#;
+        let parsed: ClaimTaskHubResponse =
+            serde_json::from_str(payload).expect("claim payload with both id fields should decode");
+        let task = parsed.task.expect("task should be present");
         assert_eq!(task.universe_id.as_deref(), Some("9838206573"));
+        assert_eq!(task.game_id.as_deref(), Some("9838206573"));
     }
 
     #[cfg(target_os = "windows")]

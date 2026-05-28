@@ -13,7 +13,10 @@ local CONTROL_READY_SESSION_ID_KEY = "MCP_STUDIO_MODE_TRACKER_CONTROL_READY_SESS
 local STOP_REQUEST_ID_KEY = "MCP_STUDIO_MODE_TRACKER_STOP_REQUEST_ID"
 local LAST_ERROR_ID_KEY = "MCP_STUDIO_MODE_TRACKER_LAST_ERROR_ID"
 local LAST_ERROR_KEY = "MCP_STUDIO_MODE_TRACKER_LAST_ERROR"
+local RUNNING_OBSERVED_AT_MS_KEY = "MCP_STUDIO_MODE_TRACKER_RUNNING_OBSERVED_AT_MS"
 local WAIT_STEP_SECONDS = 0.05
+local RUNNING_OBSERVATION_INTERVAL_SECONDS = 0.5
+local RUNNING_OBSERVATION_STALE_MS = 5000
 
 export type TrackerSnapshot = {
 	mode: Types.StartStopPlayMode,
@@ -74,6 +77,19 @@ local function ensureNextCommandIdAtLeast(value: number)
 	end
 end
 
+local function nowUnixMs(): number
+	return DateTime.now().UnixTimestampMillis
+end
+
+local function markRunningObserved()
+	PluginUtils.setSettings(RUNNING_OBSERVED_AT_MS_KEY, nowUnixMs())
+end
+
+local function hasFreshRunningObservation(): boolean
+	local observedAt = readNonNegativeNumber(RUNNING_OBSERVED_AT_MS_KEY)
+	return observedAt > 0 and (nowUnixMs() - observedAt) <= RUNNING_OBSERVATION_STALE_MS
+end
+
 local function getSnapshot(): TrackerSnapshot
 	local lastError = PluginUtils.getSettings(LAST_ERROR_KEY)
 	if type(lastError) ~= "string" or lastError == "" then
@@ -104,6 +120,7 @@ local function markStopped()
 	PluginUtils.setSettings(MODE_KEY, "stop")
 	PluginUtils.setSettings(ACTIVE_SESSION_ID_KEY, 0)
 	PluginUtils.setSettings(CONTROL_READY_SESSION_ID_KEY, 0)
+	PluginUtils.setSettings(RUNNING_OBSERVED_AT_MS_KEY, 0)
 	clearPendingStart()
 	clearLastError()
 end
@@ -114,16 +131,42 @@ local function markStarted(commandId: number, targetMode: Types.StartStopPlayMod
 	PluginUtils.setSettings(ACTIVE_SESSION_ID_KEY, commandId)
 	PluginUtils.setSettings(CONTROL_READY_SESSION_ID_KEY, commandId)
 	ensureNextCommandIdAtLeast(commandId)
+	markRunningObserved()
+	clearPendingStart()
+	clearLastError()
+end
+
+local function markObservedRunning(targetMode: Types.StartStopPlayMode)
+	assert(targetMode == "start_play" or targetMode == "run_server", "markObservedRunning expects a running mode")
+	local snapshot = getSnapshot()
+	local activeSessionId = snapshot.activeSessionId
+	if activeSessionId == 0 or snapshot.mode ~= targetMode then
+		activeSessionId = nextCommandId()
+	end
+
+	PluginUtils.setSettings(MODE_KEY, targetMode)
+	PluginUtils.setSettings(ACTIVE_SESSION_ID_KEY, activeSessionId)
+	PluginUtils.setSettings(CONTROL_READY_SESSION_ID_KEY, activeSessionId)
+	ensureNextCommandIdAtLeast(activeSessionId)
+	markRunningObserved()
 	clearPendingStart()
 	clearLastError()
 end
 
 local function normalizeEditState()
 	if RunService:IsRunning() then
+		markRunningObserved()
 		return
 	end
 
 	if RunService:IsEdit() then
+		local snapshot = getSnapshot()
+		if
+			(snapshot.mode == "start_play" or snapshot.mode == "run_server" or snapshot.activeSessionId > 0)
+			and hasFreshRunningObservation()
+		then
+			return
+		end
 		markStopped()
 	end
 end
@@ -175,11 +218,21 @@ local function observeCurrentDataModel()
 	PluginUtils.setSettings(MODE_KEY, liveMode)
 	PluginUtils.setSettings(ACTIVE_SESSION_ID_KEY, activeSessionId)
 	ensureNextCommandIdAtLeast(activeSessionId)
+	markRunningObserved()
 	if snapshot.mode ~= liveMode or snapshot.activeSessionId ~= activeSessionId then
 		PluginUtils.setSettings(CONTROL_READY_SESSION_ID_KEY, 0)
 	end
 	clearPendingStart()
 	clearLastError()
+end
+
+local function startRunningObservationHeartbeat()
+	task.spawn(function()
+		while RunService:IsRunning() do
+			observeCurrentDataModel()
+			task.wait(RUNNING_OBSERVATION_INTERVAL_SECONDS)
+		end
+	end)
 end
 
 local function beginStart(targetMode: Types.StartStopPlayMode): number
@@ -271,12 +324,14 @@ return {
 	getStopRequestId = getStopRequestId,
 	inferLiveMode = inferLiveMode,
 	markControlReadyForActiveSession = markControlReadyForActiveSession,
+	markObservedRunning = markObservedRunning,
 	markStarted = markStarted,
 	markStopped = markStopped,
 	normalizeEditState = normalizeEditState,
 	observeCurrentDataModel = observeCurrentDataModel,
 	recordTransitionError = recordTransitionError,
 	requestStop = requestStop,
+	startRunningObservationHeartbeat = startRunningObservationHeartbeat,
 	waitForStart = waitForStart,
 	waitForStop = waitForStop,
 }

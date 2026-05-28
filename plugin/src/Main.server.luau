@@ -4,6 +4,7 @@ local DataModelType = require(Main.Utils.DataModelType)
 local GameStopUtil = require(Main.Utils.GameStopUtil)
 local MockWebSocketService = require(Main.MockWebSocketService)
 local PluginUtils = require(Main.Utils.PluginUtils)
+local StudioSessionControl = require(Main.Utils.StudioSessionControl)
 local StudioModeTracker = require(Main.Utils.StudioModeTracker)
 local ToolDispatcher = require(Main.Utils.ToolDispatcher)
 local Types = require(Main.Types)
@@ -51,6 +52,10 @@ if datamodelType == "Server" then
 end
 
 if RunService:IsRunning() then
+	StudioModeTracker.startRunningObservationHeartbeat()
+	plugin.Unloading:Connect(function()
+		StudioModeTracker.markStopped()
+	end)
 	return
 end
 
@@ -252,7 +257,7 @@ local function requestJson(baseUrl: string, method: string, path: string, body: 
 end
 
 local function currentStudioMode(): string
-	return StudioModeTracker.getSnapshot().mode
+	return StudioSessionControl.getStudioMode()
 end
 
 local function toolCallHandler(args: Types.ToolArgs): string

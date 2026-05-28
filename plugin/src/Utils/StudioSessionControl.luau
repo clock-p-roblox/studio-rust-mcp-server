@@ -13,10 +13,17 @@ local POLL_INTERVAL_SECONDS = 0.25
 local HELPER_PORT_SETTING_KEY = "MCP-helper-port"
 local DEFAULT_HELPER_PORT = "44750"
 local LOG_PAGE_SIZE = 400
+local MODE_LOG_PAGE_SIZE = 2_000
 
 type LogBaseline = {
 	path: string,
 	totalLines: number,
+}
+
+type ModeLogInference = {
+	mode: Types.StartStopPlayMode,
+	path: string,
+	lineNumber: number,
 }
 
 type AsyncCallState = {
@@ -38,6 +45,9 @@ local START_PLAY_MARKERS = {
 	"PlaySoloPlayableTotalTime",
 	"PlaySoloSuccess",
 }
+
+local lastModeInferencePath: string? = nil
+local lastModeInferenceLineNumber = 0
 
 local function logTransitionStage(mode: Types.StartStopPlayMode, stage: string, detail: string?)
 	local message = string.format("[MCP Plugin] studio_transition mode=%s stage=%s", mode, stage)
@@ -119,6 +129,70 @@ local function tryFindLogMarker(baseline: LogBaseline, markers: { string }): str
 	return nil
 end
 
+local function inferStudioModeFromRecentLog(): ModeLogInference?
+	local payload = requestStudioLog(-MODE_LOG_PAGE_SIZE, MODE_LOG_PAGE_SIZE)
+	local lines = payload.lines
+	if type(lines) ~= "table" then
+		return nil
+	end
+
+	local path = tostring(payload.path or "")
+	local startLine = 1
+	local range = payload.range
+	if type(range) == "table" then
+		startLine = tonumber(range[1]) or startLine
+	end
+
+	local inference: ModeLogInference? = nil
+	for index, line in ipairs(lines) do
+		local text = tostring(line)
+		if lineMatchesAny(text, START_PLAY_MARKERS) then
+			inference = {
+				mode = "start_play",
+				path = path,
+				lineNumber = startLine + index - 1,
+			}
+		elseif lineMatchesAny(text, STOP_MARKERS) then
+			inference = {
+				mode = "stop",
+				path = path,
+				lineNumber = startLine + index - 1,
+			}
+		end
+	end
+
+	return inference
+end
+
+local function isNewModeInference(inference: ModeLogInference): boolean
+	return inference.path ~= lastModeInferencePath or inference.lineNumber ~= lastModeInferenceLineNumber
+end
+
+local function rememberModeInference(inference: ModeLogInference)
+	lastModeInferencePath = inference.path
+	lastModeInferenceLineNumber = inference.lineNumber
+end
+
+local function getStudioMode(): Types.StartStopPlayMode
+	local success, inference = pcall(inferStudioModeFromRecentLog)
+	if success and type(inference) == "table" then
+		if inference.mode == "stop" then
+			rememberModeInference(inference)
+			StudioModeTracker.markStopped()
+			return "stop"
+		elseif inference.mode == "start_play" or inference.mode == "run_server" then
+			if isNewModeInference(inference) then
+				rememberModeInference(inference)
+				StudioModeTracker.markObservedRunning(inference.mode)
+				return inference.mode
+			end
+		end
+	end
+
+	StudioModeTracker.normalizeEditState()
+	return StudioModeTracker.getSnapshot().mode
+end
+
 local function isPreviousTestStillInProgress(errorMessage: string): boolean
 	return string.find(errorMessage, "previous", 1, true) ~= nil
 		and string.find(errorMessage, "still in progress", 1, true) ~= nil
@@ -171,9 +245,9 @@ end
 
 local function stop(force: boolean?): string?
 	ConsoleOutput.outputMessage = ""
-	StudioModeTracker.normalizeEditState()
+	local currentMode = getStudioMode()
 	local snapshot = StudioModeTracker.getSnapshot()
-	if force ~= true and snapshot.mode == "stop" and snapshot.pendingStartId == 0 then
+	if force ~= true and currentMode == "stop" and snapshot.pendingStartId == 0 and snapshot.activeSessionId == 0 then
 		logTransitionStage("stop", "noop")
 		return "Stopped"
 	end
@@ -183,7 +257,7 @@ local function stop(force: boolean?): string?
 	logTransitionStage(
 		"stop",
 		"requested",
-		string.format("current_mode=%s stop_request_id=%d force=%s", snapshot.mode, stopRequestId, tostring(force == true))
+		string.format("current_mode=%s stop_request_id=%d force=%s", currentMode, stopRequestId, tostring(force == true))
 	)
 
 	local stopCall = startAsyncCall(function()
@@ -244,9 +318,10 @@ end
 
 local function startPlayMode(successMessage: string): string?
 	ConsoleOutput.outputMessage = ""
+	local currentMode = getStudioMode()
 	local snapshot = StudioModeTracker.getSnapshot()
-	if snapshot.mode ~= "stop" or snapshot.pendingStartId ~= 0 then
-		logTransitionStage("start_play", "stop_before_start", string.format("current_mode=%s", snapshot.mode))
+	if currentMode ~= "stop" or snapshot.pendingStartId ~= 0 then
+		logTransitionStage("start_play", "stop_before_start", string.format("current_mode=%s", currentMode))
 		stop(false)
 	end
 
@@ -289,9 +364,10 @@ end
 
 local function startRunServerMode(executor: () -> any, successMessage: string): string?
 	ConsoleOutput.outputMessage = ""
+	local currentMode = getStudioMode()
 	local snapshot = StudioModeTracker.getSnapshot()
-	if snapshot.mode ~= "stop" or snapshot.pendingStartId ~= 0 then
-		logTransitionStage("run_server", "stop_before_start", string.format("current_mode=%s", snapshot.mode))
+	if currentMode ~= "stop" or snapshot.pendingStartId ~= 0 then
+		logTransitionStage("run_server", "stop_before_start", string.format("current_mode=%s", currentMode))
 		stop(false)
 	end
 
@@ -344,9 +420,9 @@ local function handleLaunchStudioSession(launchStudioSessionArgs: Types.LaunchSt
 	end
 
 	local requestedMode = launchStudioSessionArgs.mode
+	local previousMode = getStudioMode()
 	local previousSnapshot = StudioModeTracker.getSnapshot()
-	local previousMode = previousSnapshot.mode
-	local restartApplied = previousSnapshot.mode ~= "stop" or previousSnapshot.pendingStartId ~= 0
+	local restartApplied = previousMode ~= "stop" or previousSnapshot.pendingStartId ~= 0
 	local actions = {}
 
 	if restartApplied then
@@ -379,6 +455,7 @@ local function handleLaunchStudioSession(launchStudioSessionArgs: Types.LaunchSt
 end
 
 return {
+	getStudioMode = getStudioMode,
 	handleLaunchStudioSession = handleLaunchStudioSession,
 	handleStartStopPlay = handleStartStopPlay,
 }
