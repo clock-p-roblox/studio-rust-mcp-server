@@ -2309,7 +2309,7 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
                                 helper.task_status = task_status;
                             }
                         }
-                        tracing::info!(
+                        tracing::debug!(
                             connection_id = %connection_id,
                             helper_id,
                             place_id,

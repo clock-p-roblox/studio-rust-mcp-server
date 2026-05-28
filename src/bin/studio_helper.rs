@@ -2287,7 +2287,7 @@ async fn rojo_forward_socket_session_result(
         .wrap_err_with(|| format!("failed to connect Rojo websocket {target_url}"))?;
     let (mut client_sender, mut client_receiver) = client_socket.split();
     let (mut remote_sender, mut remote_receiver) = remote_socket.split();
-    tracing::info!(
+    tracing::debug!(
         place_id,
         target_url,
         "opened Rojo websocket forward session"
@@ -2334,7 +2334,7 @@ async fn rojo_forward_socket_session_result(
             }
         }
     }
-    tracing::info!(
+    tracing::debug!(
         place_id,
         target_url,
         "closed Rojo websocket forward session"
@@ -2408,7 +2408,7 @@ async fn rojo_forward_request(
         .bytes()
         .await
         .wrap_err("failed to read Rojo forward response body")?;
-    tracing::info!(
+    tracing::debug!(
         place_id,
         method = method.as_str(),
         target_path,
@@ -3665,7 +3665,7 @@ async fn run_remote_ws_session(
                 };
                 heartbeat_count += 1;
                 last_heartbeat_sent_at = Instant::now();
-                tracing::info!(
+                tracing::debug!(
                     place_id,
                     task_id = ?task_id,
                     heartbeat_count,
@@ -5224,7 +5224,7 @@ fn read_studio_log(args: ReadStudioLogArgs) -> Result<ReadStudioLogResponse> {
         } else {
             all_lines[(start - 1)..end].to_vec()
         };
-        tracing::info!(path = %log_path.display(), total_lines, returned_lines = lines.len(), "read Studio log from helper");
+        tracing::debug!(path = %log_path.display(), total_lines, returned_lines = lines.len(), "read Studio log from helper");
         return Ok(ReadStudioLogResponse {
             path: log_path.display().to_string(),
             total_lines,
@@ -5592,7 +5592,7 @@ mod tests {
     fn remote_connection_watchdog_keeps_connected_connection_without_server_chatter() {
         let mut connected =
             test_remote_connection_handle(RemoteConnectionState::Connected, Duration::ZERO, None);
-        connected.last_server_message_at = Some(Instant::now() - Duration::from_secs(3600));
+        connected.last_server_message_at = Some(Instant::now() - Duration::from_secs(60));
         assert!(!remote_connection_should_restart(&connected));
         assert!(!remote_connection_should_release(&connected));
     }

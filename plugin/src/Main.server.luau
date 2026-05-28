@@ -18,6 +18,7 @@ local DEFAULT_HELPER_PORT = "44750"
 local HELPER_PORT_SETTING_KEY = "MCP-helper-port"
 local AUTO_CONNECT_SETTING_KEY = "MCP-auto-connect-v2"
 local LOG_PREFIX = "[MCP Plugin]"
+local VERBOSE_LOGS = false
 local STATUS_POLL_INTERVAL_SECONDS = 1
 
 local STATUS_THEME = {
@@ -117,7 +118,9 @@ local function joinSentences(parts: { string }): string
 end
 
 local function logInfo(message: string)
-	print(LOG_PREFIX, message)
+	if VERBOSE_LOGS then
+		print(LOG_PREFIX, message)
+	end
 end
 
 local function logWarn(message: string)
@@ -135,7 +138,24 @@ local function formatLogValue(value: any): string
 	return text
 end
 
+local IMPORTANT_PLUGIN_EVENTS = {
+	helper_http_transport_error = true,
+	helper_http_error = true,
+	helper_http_decode_error = true,
+	helper_tool_decode_failed = true,
+	helper_tool_failed = true,
+	helper_tool_malformed = true,
+	long_poll_closed = true,
+	plugin_connect_failed = true,
+	plugin_status_update_failed = true,
+	status_poll_error = true,
+}
+
 local function logPluginEvent(action: string, fields: { [string]: any }?)
+	if not VERBOSE_LOGS and IMPORTANT_PLUGIN_EVENTS[action] ~= true then
+		return
+	end
+
 	local parts = { action }
 	if type(fields) == "table" then
 		local keys = {}
