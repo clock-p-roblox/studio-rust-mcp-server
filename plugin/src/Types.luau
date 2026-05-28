@@ -4,6 +4,7 @@ export type InsertModelArgs = {
 
 export type RunCodeArgs = {
 	command: string,
+	diagnostic: boolean?,
 }
 
 export type TestMode = "start_play" | "run_server"

@@ -21,6 +21,33 @@ pub struct HelperHello {
     pub capabilities: Vec<String>,
     #[serde(rename = "plugin_instance_count", alias = "pluginInstanceCount")]
     pub plugin_instance_count: usize,
+    #[serde(default, rename = "task_status", alias = "taskStatus")]
+    pub task_status: Option<HelperTaskStatusSnapshot>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct HelperTaskStatusSnapshot {
+    #[serde(rename = "task_id", alias = "taskId")]
+    pub task_id: String,
+    #[serde(rename = "studio_mode", alias = "studioMode")]
+    pub studio_mode: Option<String>,
+    #[serde(rename = "studio_mode_age_ms", alias = "studioModeAgeMs")]
+    pub studio_mode_age_ms: Option<u128>,
+    #[serde(
+        rename = "official_mcp_adapter_state",
+        alias = "officialMcpAdapterState"
+    )]
+    pub official_mcp_adapter_state: Option<String>,
+    #[serde(
+        rename = "official_mcp_adapter_age_ms",
+        alias = "officialMcpAdapterAgeMs"
+    )]
+    pub official_mcp_adapter_age_ms: Option<u128>,
+    #[serde(
+        rename = "official_mcp_adapter_last_error",
+        alias = "officialMcpAdapterLastError"
+    )]
+    pub official_mcp_adapter_last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -135,6 +162,8 @@ pub enum HelperToServerMessage {
         task_id: Option<String>,
         #[serde(alias = "pluginInstanceCount")]
         plugin_instance_count: usize,
+        #[serde(default, alias = "taskStatus")]
+        task_status: Option<HelperTaskStatusSnapshot>,
     },
     #[serde(rename = "tool_result", alias = "toolResult")]
     ToolResult {
@@ -202,7 +231,9 @@ pub enum ServerToHelperMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::{HelperHello, HelperToServerMessage, ServerToHelperMessage};
+    use super::{
+        HelperHello, HelperTaskStatusSnapshot, HelperToServerMessage, ServerToHelperMessage,
+    };
 
     #[test]
     fn server_to_helper_ready_ack_accepts_camel_case_identity_fields() {
@@ -249,6 +280,7 @@ mod tests {
                 helper_version,
                 capabilities,
                 plugin_instance_count,
+                task_status,
             }) => {
                 assert_eq!(helper_id, "h_test");
                 assert_eq!(place_id, "93795519121520");
@@ -256,6 +288,7 @@ mod tests {
                 assert_eq!(helper_version, "0.0.0");
                 assert_eq!(capabilities, vec!["ws_tool_dispatch_v1"]);
                 assert_eq!(plugin_instance_count, 1);
+                assert!(task_status.is_none());
             }
             other => panic!("expected hello, got {other:?}"),
         }
@@ -268,6 +301,14 @@ mod tests {
             place_id: "93795519121520".to_owned(),
             task_id: Some("tf2a83d456a".to_owned()),
             plugin_instance_count: 2,
+            task_status: Some(HelperTaskStatusSnapshot {
+                task_id: "tf2a83d456a".to_owned(),
+                studio_mode: Some("stop".to_owned()),
+                studio_mode_age_ms: Some(42),
+                official_mcp_adapter_state: Some("ready".to_owned()),
+                official_mcp_adapter_age_ms: Some(7),
+                official_mcp_adapter_last_error: None,
+            }),
         })
         .expect("heartbeat should serialize");
         assert_eq!(encoded["type"], "heartbeat");
@@ -275,6 +316,12 @@ mod tests {
         assert_eq!(encoded["place_id"], "93795519121520");
         assert_eq!(encoded["task_id"], "tf2a83d456a");
         assert_eq!(encoded["plugin_instance_count"], 2);
+        assert_eq!(encoded["task_status"]["task_id"], "tf2a83d456a");
+        assert_eq!(encoded["task_status"]["studio_mode"], "stop");
+        assert_eq!(
+            encoded["task_status"]["official_mcp_adapter_state"],
+            "ready"
+        );
         assert!(encoded.get("helperId").is_none());
         assert!(encoded.get("taskId").is_none());
     }

@@ -106,6 +106,11 @@ struct HelperActiveTaskRecord {
     remote_last_error: Option<String>,
     remote_last_ready_age_ms: Option<u128>,
     remote_last_server_message_age_ms: Option<u128>,
+    studio_mode: Option<String>,
+    studio_mode_age_ms: Option<u128>,
+    official_mcp_adapter_state: Option<String>,
+    official_mcp_adapter_age_ms: Option<u128>,
+    official_mcp_adapter_last_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +118,13 @@ struct BlockedHelperRecord {
     helper_id: String,
     reason: Option<String>,
     blocked_at_unix_ms: u64,
+    drain_started_at_unix_ms: u64,
+    drain_deadline_at_unix_ms: u64,
+    pending_task_ids: HashSet<String>,
+    last_reported_task_ids: HashSet<String>,
+    last_release_requested_at_unix_ms: Option<u64>,
+    last_seen_at_unix_ms: Option<u64>,
+    force_released_task_ids: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -158,6 +170,20 @@ struct PersistedBlockedHelperRecord {
     #[serde(default)]
     reason: Option<String>,
     blocked_at_unix_ms: u64,
+    #[serde(default)]
+    drain_started_at_unix_ms: u64,
+    #[serde(default)]
+    drain_deadline_at_unix_ms: u64,
+    #[serde(default)]
+    pending_task_ids: Vec<String>,
+    #[serde(default)]
+    last_reported_task_ids: Vec<String>,
+    #[serde(default)]
+    last_release_requested_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    last_seen_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    force_released_task_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -279,6 +305,16 @@ struct HelperActiveTaskHeartbeat {
     remote_last_ready_age_ms: Option<u128>,
     #[serde(default)]
     remote_last_server_message_age_ms: Option<u128>,
+    #[serde(default)]
+    studio_mode: Option<String>,
+    #[serde(default)]
+    studio_mode_age_ms: Option<u128>,
+    #[serde(default)]
+    official_mcp_adapter_state: Option<String>,
+    #[serde(default)]
+    official_mcp_adapter_age_ms: Option<u128>,
+    #[serde(default)]
+    official_mcp_adapter_last_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -364,6 +400,11 @@ struct HelperActiveTaskPayload {
     remote_last_error: Option<String>,
     remote_last_ready_age_ms: Option<u128>,
     remote_last_server_message_age_ms: Option<u128>,
+    studio_mode: Option<String>,
+    studio_mode_age_ms: Option<u128>,
+    official_mcp_adapter_state: Option<String>,
+    official_mcp_adapter_age_ms: Option<u128>,
+    official_mcp_adapter_last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -371,6 +412,17 @@ struct BlockedHelperPayload {
     helper_id: String,
     reason: Option<String>,
     blocked_at_unix_ms: u64,
+    drain_status: String,
+    drain_started_at_unix_ms: u64,
+    drain_deadline_at_unix_ms: u64,
+    drain_deadline_elapsed: bool,
+    drain_deadline_remaining_ms: u64,
+    drain_age_ms: u64,
+    pending_task_ids: Vec<String>,
+    last_reported_task_ids: Vec<String>,
+    last_release_requested_at_unix_ms: Option<u64>,
+    last_seen_age_ms: Option<u64>,
+    force_released_task_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -516,6 +568,38 @@ fn load_persisted_state(
     let mut blocked_helpers = HashMap::new();
     let now = now_unix_ms();
     let now_instant = Instant::now();
+    for helper in persisted.blocked_helpers {
+        let Ok(helper_id) = require_non_empty(&helper.helper_id, "helper_id") else {
+            continue;
+        };
+        let drain_started_at_unix_ms = if helper.drain_started_at_unix_ms == 0 {
+            helper.blocked_at_unix_ms
+        } else {
+            helper.drain_started_at_unix_ms
+        };
+        let drain_deadline_at_unix_ms = if helper.drain_deadline_at_unix_ms == 0 {
+            helper
+                .blocked_at_unix_ms
+                .saturating_add(duration_ms(config.helper_heartbeat_timeout))
+        } else {
+            helper.drain_deadline_at_unix_ms
+        };
+        blocked_helpers.insert(
+            helper_id.clone(),
+            BlockedHelperRecord {
+                helper_id,
+                reason: normalize_optional_text(helper.reason),
+                blocked_at_unix_ms: helper.blocked_at_unix_ms,
+                drain_started_at_unix_ms,
+                drain_deadline_at_unix_ms,
+                pending_task_ids: helper.pending_task_ids.into_iter().collect(),
+                last_reported_task_ids: helper.last_reported_task_ids.into_iter().collect(),
+                last_release_requested_at_unix_ms: helper.last_release_requested_at_unix_ms,
+                last_seen_at_unix_ms: helper.last_seen_at_unix_ms,
+                force_released_task_ids: helper.force_released_task_ids.into_iter().collect(),
+            },
+        );
+    }
     for task in persisted.tasks {
         let last_task_heartbeat_at_unix_ms = if task.last_task_heartbeat_at_unix_ms == 0 {
             task.updated_at_unix_ms
@@ -525,6 +609,17 @@ fn load_persisted_state(
         let elapsed_ms = now.saturating_sub(last_task_heartbeat_at_unix_ms);
         let elapsed = Duration::from_millis(elapsed_ms);
         let restored_last_seen_at = now_instant.checked_sub(elapsed).unwrap_or(now_instant);
+        let claimed_by_helper_id = task.claimed_by_helper_id.as_ref().and_then(|helper_id| {
+            blocked_helpers
+                .get(helper_id)
+                .filter(|helper| {
+                    helper.pending_task_ids.contains(&task.task_id)
+                        && now < helper.drain_deadline_at_unix_ms
+                        && !task.released
+                        && task.service_state != "expired"
+                })
+                .map(|_| helper_id.clone())
+        });
         tasks.insert(
             task.task_id.clone(),
             TaskRecord {
@@ -545,23 +640,24 @@ fn load_persisted_state(
                 updated_at_unix_ms: task.updated_at_unix_ms,
                 last_task_heartbeat_at_unix_ms,
                 last_seen_at: restored_last_seen_at,
-                claimed_by_helper_id: None,
+                claimed_by_helper_id,
                 released: task.released,
             },
         );
     }
-    for helper in persisted.blocked_helpers {
-        let Ok(helper_id) = require_non_empty(&helper.helper_id, "helper_id") else {
-            continue;
-        };
-        blocked_helpers.insert(
-            helper_id.clone(),
-            BlockedHelperRecord {
-                helper_id,
-                reason: normalize_optional_text(helper.reason),
-                blocked_at_unix_ms: helper.blocked_at_unix_ms,
-            },
-        );
+    for helper in blocked_helpers.values_mut() {
+        let helper_id = helper.helper_id.clone();
+        let pending_task_ids = helper.pending_task_ids.iter().cloned().collect::<Vec<_>>();
+        for task_id in pending_task_ids {
+            let keep_pending = tasks
+                .get(&task_id)
+                .map(|task| task.claimed_by_helper_id.as_deref() == Some(helper_id.as_str()))
+                .unwrap_or(false);
+            if !keep_pending {
+                helper.pending_task_ids.remove(&task_id);
+                helper.force_released_task_ids.insert(task_id);
+            }
+        }
     }
     Ok((tasks, blocked_helpers))
 }
@@ -574,6 +670,13 @@ fn build_persisted_state_payload(state: &HubState) -> PersistedHubState {
             helper_id: helper.helper_id.clone(),
             reason: helper.reason.clone(),
             blocked_at_unix_ms: helper.blocked_at_unix_ms,
+            drain_started_at_unix_ms: helper.drain_started_at_unix_ms,
+            drain_deadline_at_unix_ms: helper.drain_deadline_at_unix_ms,
+            pending_task_ids: sorted_strings(&helper.pending_task_ids),
+            last_reported_task_ids: sorted_strings(&helper.last_reported_task_ids),
+            last_release_requested_at_unix_ms: helper.last_release_requested_at_unix_ms,
+            last_seen_at_unix_ms: helper.last_seen_at_unix_ms,
+            force_released_task_ids: sorted_strings(&helper.force_released_task_ids),
         })
         .collect::<Vec<_>>();
     blocked_helpers.sort_by(|left, right| left.helper_id.cmp(&right.helper_id));
@@ -673,6 +776,16 @@ fn now_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn duration_ms(value: Duration) -> u64 {
+    value.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn sorted_strings(values: &HashSet<String>) -> Vec<String> {
+    let mut values = values.iter().cloned().collect::<Vec<_>>();
+    values.sort();
+    values
+}
+
 fn require_non_empty(value: &str, label: &str) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -745,6 +858,7 @@ fn task_status_payload(task: &TaskRecord) -> TaskStatusPayload {
 }
 
 fn helper_status_payload(helper: &HelperRecord, blocked: bool) -> HelperStatusPayload {
+    let age_delta = helper.last_seen_at.elapsed().as_millis();
     let mut active_tasks = helper
         .active_task_ids
         .iter()
@@ -757,6 +871,13 @@ fn helper_status_payload(helper: &HelperRecord, blocked: bool) -> HelperStatusPa
                     remote_last_error: task.remote_last_error.clone(),
                     remote_last_ready_age_ms: task.remote_last_ready_age_ms,
                     remote_last_server_message_age_ms: task.remote_last_server_message_age_ms,
+                    studio_mode: task.studio_mode.clone(),
+                    studio_mode_age_ms: task.studio_mode_age_ms.map(|age| age + age_delta),
+                    official_mcp_adapter_state: task.official_mcp_adapter_state.clone(),
+                    official_mcp_adapter_age_ms: task
+                        .official_mcp_adapter_age_ms
+                        .map(|age| age + age_delta),
+                    official_mcp_adapter_last_error: task.official_mcp_adapter_last_error.clone(),
                 }
             } else {
                 HelperActiveTaskPayload {
@@ -766,6 +887,11 @@ fn helper_status_payload(helper: &HelperRecord, blocked: bool) -> HelperStatusPa
                     remote_last_error: None,
                     remote_last_ready_age_ms: None,
                     remote_last_server_message_age_ms: None,
+                    studio_mode: None,
+                    studio_mode_age_ms: None,
+                    official_mcp_adapter_state: None,
+                    official_mcp_adapter_age_ms: None,
+                    official_mcp_adapter_last_error: None,
                 }
             }
         })
@@ -786,10 +912,34 @@ fn helper_status_payload(helper: &HelperRecord, blocked: bool) -> HelperStatusPa
 }
 
 fn blocked_helper_payload(helper: &BlockedHelperRecord) -> BlockedHelperPayload {
+    let now = now_unix_ms();
     BlockedHelperPayload {
         helper_id: helper.helper_id.clone(),
         reason: helper.reason.clone(),
         blocked_at_unix_ms: helper.blocked_at_unix_ms,
+        drain_status: blocked_helper_drain_status(helper).to_owned(),
+        drain_started_at_unix_ms: helper.drain_started_at_unix_ms,
+        drain_deadline_at_unix_ms: helper.drain_deadline_at_unix_ms,
+        drain_deadline_elapsed: now >= helper.drain_deadline_at_unix_ms,
+        drain_deadline_remaining_ms: helper.drain_deadline_at_unix_ms.saturating_sub(now),
+        drain_age_ms: now.saturating_sub(helper.drain_started_at_unix_ms),
+        pending_task_ids: sorted_strings(&helper.pending_task_ids),
+        last_reported_task_ids: sorted_strings(&helper.last_reported_task_ids),
+        last_release_requested_at_unix_ms: helper.last_release_requested_at_unix_ms,
+        last_seen_age_ms: helper
+            .last_seen_at_unix_ms
+            .map(|last_seen| now.saturating_sub(last_seen)),
+        force_released_task_ids: sorted_strings(&helper.force_released_task_ids),
+    }
+}
+
+fn blocked_helper_drain_status(helper: &BlockedHelperRecord) -> &'static str {
+    if !helper.pending_task_ids.is_empty() {
+        "draining"
+    } else if !helper.force_released_task_ids.is_empty() {
+        "force_released"
+    } else {
+        "drained"
     }
 }
 
@@ -814,6 +964,52 @@ fn clear_helper_claims(state: &mut HubState, helper_id: &str, now: u64) -> bool 
     changed
 }
 
+fn clear_helper_task_claim(state: &mut HubState, helper_id: &str, task_id: &str, now: u64) -> bool {
+    let mut changed = false;
+    if let Some(task) = state.tasks.get_mut(task_id) {
+        if task.claimed_by_helper_id.as_deref() == Some(helper_id) {
+            task.claimed_by_helper_id = None;
+            task.updated_at_unix_ms = now;
+            changed = true;
+        }
+    }
+    if let Some(helper) = state.helpers.get_mut(helper_id) {
+        helper.active_task_ids.remove(task_id);
+        helper.active_tasks.remove(task_id);
+    }
+    changed
+}
+
+fn force_due_blocked_helper_drains(state: &mut HubState, now: u64) -> bool {
+    let helper_ids = state
+        .blocked_helpers
+        .iter()
+        .filter(|(_, helper)| {
+            !helper.pending_task_ids.is_empty() && now >= helper.drain_deadline_at_unix_ms
+        })
+        .map(|(helper_id, _)| helper_id.clone())
+        .collect::<Vec<_>>();
+    let mut changed = false;
+    for helper_id in helper_ids {
+        let pending_task_ids = state
+            .blocked_helpers
+            .get(&helper_id)
+            .map(|helper| helper.pending_task_ids.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for task_id in &pending_task_ids {
+            clear_helper_task_claim(state, &helper_id, task_id, now);
+        }
+        if let Some(helper) = state.blocked_helpers.get_mut(&helper_id) {
+            for task_id in pending_task_ids {
+                helper.pending_task_ids.remove(&task_id);
+                helper.force_released_task_ids.insert(task_id);
+            }
+        }
+        changed = true;
+    }
+    changed
+}
+
 fn task_matches_claimed_helper(task: &TaskRecord, helper_id: &str, task_id: &str) -> bool {
     !task.released
         && task.service_state != "expired"
@@ -824,6 +1020,7 @@ fn task_matches_claimed_helper(task: &TaskRecord, helper_id: &str, task_id: &str
 fn cleanup_stale_state(state: &mut HubState) -> bool {
     let mut persisted_changed = false;
     let now = now_unix_ms();
+    persisted_changed |= force_due_blocked_helper_drains(state, now);
     let stale_helpers: Vec<String> = state
         .helpers
         .iter()
@@ -832,7 +1029,9 @@ fn cleanup_stale_state(state: &mut HubState) -> bool {
         .collect();
     for helper_id in stale_helpers {
         state.helpers.remove(&helper_id);
-        persisted_changed |= clear_helper_claims(state, &helper_id, now);
+        if !state.blocked_helpers.contains_key(&helper_id) {
+            persisted_changed |= clear_helper_claims(state, &helper_id, now);
+        }
     }
     for task in state.tasks.values_mut() {
         if task.released {
@@ -1175,14 +1374,75 @@ async fn block_helper_handler(
     cleanup_stale_state(&mut state);
     let helper_id = require_non_empty(&payload.helper_id, "helper_id")?;
     let now = now_unix_ms();
+    let pending_task_ids = state
+        .tasks
+        .values()
+        .filter(|task| task.claimed_by_helper_id.as_deref() == Some(helper_id.as_str()))
+        .map(|task| task.task_id.clone())
+        .collect::<HashSet<_>>();
+    let last_reported_task_ids = state
+        .helpers
+        .get(&helper_id)
+        .map(|helper| helper.active_task_ids.clone())
+        .unwrap_or_default();
     state.helpers.remove(&helper_id);
-    clear_helper_claims(&mut state, &helper_id, now);
+    let drain_timeout_ms = duration_ms(state.config.helper_heartbeat_timeout);
+    let mut existing = state.blocked_helpers.remove(&helper_id);
+    let drain_started_at_unix_ms = existing
+        .as_ref()
+        .map(|helper| helper.drain_started_at_unix_ms)
+        .unwrap_or(now);
+    let drain_deadline_at_unix_ms = existing
+        .as_ref()
+        .map(|helper| helper.drain_deadline_at_unix_ms)
+        .unwrap_or_else(|| now.saturating_add(drain_timeout_ms));
+    let mut pending_task_ids = existing
+        .as_mut()
+        .map(|helper| {
+            helper
+                .pending_task_ids
+                .union(&pending_task_ids)
+                .cloned()
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or(pending_task_ids);
+    pending_task_ids.retain(|task_id| {
+        state
+            .tasks
+            .get(task_id)
+            .map(|task| task.claimed_by_helper_id.as_deref() == Some(helper_id.as_str()))
+            .unwrap_or(false)
+    });
+    let last_reported_task_ids = if last_reported_task_ids.is_empty() {
+        existing
+            .as_ref()
+            .map(|helper| helper.last_reported_task_ids.clone())
+            .unwrap_or_default()
+    } else {
+        last_reported_task_ids
+    };
+    let force_released_task_ids = existing
+        .as_ref()
+        .map(|helper| helper.force_released_task_ids.clone())
+        .unwrap_or_default();
     state.blocked_helpers.insert(
         helper_id.clone(),
         BlockedHelperRecord {
             helper_id: helper_id.clone(),
-            reason: normalize_optional_text(payload.reason),
+            reason: normalize_optional_text(payload.reason)
+                .or_else(|| existing.as_ref().and_then(|helper| helper.reason.clone())),
             blocked_at_unix_ms: now,
+            drain_started_at_unix_ms,
+            drain_deadline_at_unix_ms,
+            pending_task_ids,
+            last_reported_task_ids,
+            last_release_requested_at_unix_ms: existing
+                .as_ref()
+                .and_then(|helper| helper.last_release_requested_at_unix_ms),
+            last_seen_at_unix_ms: existing
+                .as_ref()
+                .and_then(|helper| helper.last_seen_at_unix_ms),
+            force_released_task_ids,
         },
     );
     let snapshot = bump_state_revision(&mut state);
@@ -1198,10 +1458,29 @@ async fn block_helper_handler(
 async fn unblock_helper_handler(
     State(app): State<AppState>,
     Json(payload): Json<UnblockHelperRequest>,
-) -> Result<Json<BlockHelperResponse>, HubError> {
+) -> Result<Json<BlockHelperResponse>, Response> {
     let mut state = app.hub.write().await;
     let cleanup_changed = cleanup_stale_state(&mut state);
-    let helper_id = require_non_empty(&payload.helper_id, "helper_id")?;
+    let helper_id = require_non_empty(&payload.helper_id, "helper_id")
+        .map_err(HubError::from)
+        .map_err(IntoResponse::into_response)?;
+    if let Some(helper) = state.blocked_helpers.get(&helper_id) {
+        if !helper.pending_task_ids.is_empty() {
+            let message = format!(
+                "helper drain is still pending: {helper_id}; pending_task_ids={:?}",
+                sorted_strings(&helper.pending_task_ids)
+            );
+            let cleanup_snapshot = cleanup_changed.then(|| bump_state_revision(&mut state));
+            drop(state);
+            if let Some(snapshot) = cleanup_snapshot {
+                persist_snapshot_if_current(&app, snapshot)
+                    .await
+                    .map_err(HubError::from)
+                    .map_err(IntoResponse::into_response)?;
+            }
+            return Err(HttpHubError::conflict("helper_drain_pending", message).into_response());
+        }
+    }
     let removed = state.blocked_helpers.remove(&helper_id).is_some();
     let snapshot = if cleanup_changed || removed {
         Some(bump_state_revision(&mut state))
@@ -1210,7 +1489,10 @@ async fn unblock_helper_handler(
     };
     drop(state);
     if let Some(snapshot) = snapshot {
-        persist_snapshot_if_current(&app, snapshot).await?;
+        persist_snapshot_if_current(&app, snapshot)
+            .await
+            .map_err(HubError::from)
+            .map_err(IntoResponse::into_response)?;
     }
     Ok(Json(BlockHelperResponse {
         ok: true,
@@ -1236,9 +1518,36 @@ async fn helper_heartbeat_handler(
         active_task_ids.insert(active_task.task_id.clone());
     }
     if state.blocked_helpers.contains_key(&helper_id) {
-        let claim_changed = clear_helper_claims(&mut state, &helper_id, now);
+        let release_task_ids = sorted_strings(&active_task_ids);
+        let acked_task_ids = state
+            .blocked_helpers
+            .get(&helper_id)
+            .map(|helper| {
+                helper
+                    .pending_task_ids
+                    .iter()
+                    .filter(|task_id| !active_task_ids.contains(*task_id))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut persisted_changed = true;
+        for task_id in &acked_task_ids {
+            persisted_changed |= clear_helper_task_claim(&mut state, &helper_id, task_id, now);
+        }
         state.helpers.remove(&helper_id);
-        let snapshot = if cleanup_changed || claim_changed {
+        if let Some(helper) = state.blocked_helpers.get_mut(&helper_id) {
+            for task_id in acked_task_ids {
+                helper.pending_task_ids.remove(&task_id);
+            }
+            helper.last_seen_at_unix_ms = Some(now);
+            helper.last_reported_task_ids = active_task_ids;
+            if !release_task_ids.is_empty() {
+                helper.last_release_requested_at_unix_ms = Some(now);
+            }
+        }
+        persisted_changed |= force_due_blocked_helper_drains(&mut state, now);
+        let snapshot = if persisted_changed {
             Some(bump_state_revision(&mut state))
         } else {
             None
@@ -1249,7 +1558,7 @@ async fn helper_heartbeat_handler(
         }
         return Ok(Json(HelperHeartbeatHubResponse {
             ok: false,
-            release_task_ids: Vec::new(),
+            release_task_ids,
         }));
     }
     let mut release_task_ids = HashSet::new();
@@ -1312,6 +1621,11 @@ async fn helper_heartbeat_handler(
                 remote_last_error: active_task.remote_last_error,
                 remote_last_ready_age_ms: active_task.remote_last_ready_age_ms,
                 remote_last_server_message_age_ms: active_task.remote_last_server_message_age_ms,
+                studio_mode: active_task.studio_mode,
+                studio_mode_age_ms: active_task.studio_mode_age_ms,
+                official_mcp_adapter_state: active_task.official_mcp_adapter_state,
+                official_mcp_adapter_age_ms: active_task.official_mcp_adapter_age_ms,
+                official_mcp_adapter_last_error: active_task.official_mcp_adapter_last_error,
             },
         );
     }
@@ -1479,6 +1793,313 @@ impl IntoResponse for HttpHubError {
             response.headers_mut().insert("x-clock-p-hub-error", value);
         }
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app() -> AppState {
+        let state_file =
+            std::env::temp_dir().join(format!("roblox-hub-test-{}.json", Uuid::new_v4().simple()));
+        let config = HubConfig {
+            state_file,
+            task_heartbeat_timeout: Duration::from_secs(30),
+            helper_heartbeat_timeout: Duration::from_secs(30),
+            heartbeat_interval_sec: HEARTBEAT_INTERVAL_SECS,
+        };
+        AppState {
+            hub: Arc::new(RwLock::new(HubState {
+                config,
+                helpers: HashMap::new(),
+                blocked_helpers: HashMap::new(),
+                tasks: HashMap::new(),
+                state_revision: 0,
+            })),
+            persist_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    fn test_task(task_id: &str, helper_id: Option<&str>) -> TaskRecord {
+        let now = now_unix_ms();
+        TaskRecord {
+            task_id: task_id.to_owned(),
+            cluster_key: "cluster".to_owned(),
+            task_token: "task-token".to_owned(),
+            recover_token: "recover-token".to_owned(),
+            place_id: "place".to_owned(),
+            universe_id: Some("universe".to_owned()),
+            owner_user: "user".to_owned(),
+            repo: "repo".to_owned(),
+            worktree_name: "worktree".to_owned(),
+            service_state: "ready".to_owned(),
+            accepting_launches: true,
+            services: HashMap::new(),
+            routes: TaskRoutes {
+                mcp_base_url: Some("http://127.0.0.1:1".to_owned()),
+                ..TaskRoutes::default()
+            },
+            created_at_unix_ms: now,
+            updated_at_unix_ms: now,
+            last_task_heartbeat_at_unix_ms: now,
+            last_seen_at: Instant::now(),
+            claimed_by_helper_id: helper_id.map(str::to_owned),
+            released: false,
+        }
+    }
+
+    fn test_helper(helper_id: &str, active_task_ids: &[&str]) -> HelperRecord {
+        HelperRecord {
+            helper_id: helper_id.to_owned(),
+            owner_user: "user".to_owned(),
+            platform: "test".to_owned(),
+            capacity: 4,
+            labels: Vec::new(),
+            active_task_ids: active_task_ids
+                .iter()
+                .map(|task_id| (*task_id).to_owned())
+                .collect(),
+            active_tasks: HashMap::new(),
+            registered_at_unix_ms: now_unix_ms(),
+            last_seen_at: Instant::now(),
+        }
+    }
+
+    async fn seed_claimed_task(app: &AppState, helper_id: &str, task_id: &str) {
+        let mut state = app.hub.write().await;
+        state
+            .tasks
+            .insert(task_id.to_owned(), test_task(task_id, Some(helper_id)));
+        state
+            .helpers
+            .insert(helper_id.to_owned(), test_helper(helper_id, &[task_id]));
+    }
+
+    #[tokio::test]
+    async fn blocked_helper_drains_by_heartbeat_ack() {
+        let app = test_app();
+        seed_claimed_task(&app, "h_test", "t1").await;
+
+        let _ = block_helper_handler(
+            State(app.clone()),
+            Json(BlockHelperRequest {
+                helper_id: "h_test".to_owned(),
+                reason: Some("test".to_owned()),
+            }),
+        )
+        .await
+        .expect("block helper should succeed");
+
+        {
+            let state = app.hub.read().await;
+            assert_eq!(
+                state.tasks["t1"].claimed_by_helper_id.as_deref(),
+                Some("h_test")
+            );
+            assert!(!state.helpers.contains_key("h_test"));
+            assert!(state.blocked_helpers["h_test"]
+                .pending_task_ids
+                .contains("t1"));
+        }
+
+        let response = helper_heartbeat_handler(
+            State(app.clone()),
+            Json(HelperHeartbeatRequest {
+                helper_id: "h_test".to_owned(),
+                active_task_ids: vec!["t1".to_owned()],
+                active_tasks: Vec::new(),
+            }),
+        )
+        .await
+        .expect("blocked heartbeat should respond")
+        .0;
+        assert!(!response.ok);
+        assert_eq!(response.release_task_ids, vec!["t1".to_owned()]);
+        {
+            let state = app.hub.read().await;
+            assert_eq!(
+                state.tasks["t1"].claimed_by_helper_id.as_deref(),
+                Some("h_test")
+            );
+            assert!(!state.helpers.contains_key("h_test"));
+        }
+
+        let response = helper_heartbeat_handler(
+            State(app.clone()),
+            Json(HelperHeartbeatRequest {
+                helper_id: "h_test".to_owned(),
+                active_task_ids: Vec::new(),
+                active_tasks: Vec::new(),
+            }),
+        )
+        .await
+        .expect("ack heartbeat should respond")
+        .0;
+        assert!(!response.ok);
+        assert!(response.release_task_ids.is_empty());
+        let state = app.hub.read().await;
+        assert!(state.tasks["t1"].claimed_by_helper_id.is_none());
+        assert!(state.blocked_helpers["h_test"].pending_task_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn blocked_helper_active_tasks_field_counts_as_active_report() {
+        let app = test_app();
+        seed_claimed_task(&app, "h_test", "t1").await;
+        let _ = block_helper_handler(
+            State(app.clone()),
+            Json(BlockHelperRequest {
+                helper_id: "h_test".to_owned(),
+                reason: None,
+            }),
+        )
+        .await
+        .expect("block helper should succeed");
+
+        let response = helper_heartbeat_handler(
+            State(app.clone()),
+            Json(HelperHeartbeatRequest {
+                helper_id: "h_test".to_owned(),
+                active_task_ids: Vec::new(),
+                active_tasks: vec![HelperActiveTaskHeartbeat {
+                    task_id: "t1".to_owned(),
+                    remote_state: "retrying".to_owned(),
+                    remote_connection_id: None,
+                    remote_last_error: Some("still active".to_owned()),
+                    remote_last_ready_age_ms: None,
+                    remote_last_server_message_age_ms: None,
+                    studio_mode: Some("start_play".to_owned()),
+                    studio_mode_age_ms: Some(15),
+                    official_mcp_adapter_state: Some("blocked_by_studio_mode".to_owned()),
+                    official_mcp_adapter_age_ms: Some(15),
+                    official_mcp_adapter_last_error: None,
+                }],
+            }),
+        )
+        .await
+        .expect("blocked heartbeat should respond")
+        .0;
+        assert_eq!(response.release_task_ids, vec!["t1".to_owned()]);
+        let state = app.hub.read().await;
+        assert_eq!(
+            state.tasks["t1"].claimed_by_helper_id.as_deref(),
+            Some("h_test")
+        );
+        assert!(state.blocked_helpers["h_test"]
+            .pending_task_ids
+            .contains("t1"));
+        assert!(state.blocked_helpers["h_test"]
+            .last_reported_task_ids
+            .contains("t1"));
+    }
+
+    #[tokio::test]
+    async fn pending_drain_survives_hub_reload_before_deadline() {
+        let app = test_app();
+        seed_claimed_task(&app, "h_test", "t1").await;
+        let _ = block_helper_handler(
+            State(app.clone()),
+            Json(BlockHelperRequest {
+                helper_id: "h_test".to_owned(),
+                reason: Some("reload".to_owned()),
+            }),
+        )
+        .await
+        .expect("block helper should succeed");
+        let config = {
+            let state = app.hub.read().await;
+            state.config.clone()
+        };
+
+        let (tasks, blocked_helpers) =
+            load_persisted_state(&config).expect("persisted hub state should reload");
+        assert_eq!(tasks["t1"].claimed_by_helper_id.as_deref(), Some("h_test"));
+        assert!(blocked_helpers["h_test"].pending_task_ids.contains("t1"));
+        assert!(!blocked_helpers["h_test"]
+            .force_released_task_ids
+            .contains("t1"));
+    }
+
+    #[tokio::test]
+    async fn blocked_helper_force_releases_after_drain_deadline() {
+        let app = test_app();
+        seed_claimed_task(&app, "h_test", "t1").await;
+        {
+            let mut state = app.hub.write().await;
+            let now = now_unix_ms();
+            state.blocked_helpers.insert(
+                "h_test".to_owned(),
+                BlockedHelperRecord {
+                    helper_id: "h_test".to_owned(),
+                    reason: Some("test".to_owned()),
+                    blocked_at_unix_ms: now.saturating_sub(10_000),
+                    drain_started_at_unix_ms: now.saturating_sub(10_000),
+                    drain_deadline_at_unix_ms: now.saturating_sub(1),
+                    pending_task_ids: HashSet::from(["t1".to_owned()]),
+                    last_reported_task_ids: HashSet::from(["t1".to_owned()]),
+                    last_release_requested_at_unix_ms: Some(now.saturating_sub(5_000)),
+                    last_seen_at_unix_ms: Some(now.saturating_sub(5_000)),
+                    force_released_task_ids: HashSet::new(),
+                },
+            );
+            assert!(cleanup_stale_state(&mut state));
+        }
+        let state = app.hub.read().await;
+        assert!(state.tasks["t1"].claimed_by_helper_id.is_none());
+        assert!(state.blocked_helpers["h_test"].pending_task_ids.is_empty());
+        assert!(state.blocked_helpers["h_test"]
+            .force_released_task_ids
+            .contains("t1"));
+        let payload = blocked_helper_payload(&state.blocked_helpers["h_test"]);
+        assert_eq!(payload.drain_status, "force_released");
+        assert!(payload.drain_deadline_elapsed);
+        drop(state);
+
+        let response = helper_heartbeat_handler(
+            State(app),
+            Json(HelperHeartbeatRequest {
+                helper_id: "h_test".to_owned(),
+                active_task_ids: vec!["t1".to_owned()],
+                active_tasks: Vec::new(),
+            }),
+        )
+        .await
+        .expect("late blocked heartbeat should still respond")
+        .0;
+        assert_eq!(response.release_task_ids, vec!["t1".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn unblock_rejects_pending_drain() {
+        let app = test_app();
+        seed_claimed_task(&app, "h_test", "t1").await;
+        let _ = block_helper_handler(
+            State(app.clone()),
+            Json(BlockHelperRequest {
+                helper_id: "h_test".to_owned(),
+                reason: None,
+            }),
+        )
+        .await
+        .expect("block helper should succeed");
+
+        let response = unblock_helper_handler(
+            State(app),
+            Json(UnblockHelperRequest {
+                helper_id: "h_test".to_owned(),
+            }),
+        )
+        .await
+        .expect_err("pending drain should reject unblock");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-clock-p-hub-error")
+                .and_then(|value| value.to_str().ok()),
+            Some("helper_drain_pending")
+        );
     }
 }
 
