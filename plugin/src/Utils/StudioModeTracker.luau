@@ -161,6 +161,9 @@ local function normalizeEditState()
 
 	if RunService:IsEdit() then
 		local snapshot = getSnapshot()
+		if snapshot.pendingStartId > 0 then
+			return
+		end
 		if
 			(snapshot.mode == "start_play" or snapshot.mode == "run_server" or snapshot.activeSessionId > 0)
 			and hasFreshRunningObservation()
@@ -270,7 +273,11 @@ local function requestStop(): number
 	return commandId
 end
 
-local function waitForStart(commandId: number, targetMode: Types.StartStopPlayMode, timeoutSeconds: number): TrackerSnapshot
+local function waitForStart(
+	commandId: number,
+	targetMode: Types.StartStopPlayMode,
+	timeoutSeconds: number
+): TrackerSnapshot
 	local deadline = os.clock() + timeoutSeconds
 	while os.clock() < deadline do
 		local snapshot = getSnapshot()

@@ -1,8 +1,8 @@
 local Main = script:FindFirstAncestor("MCPStudioPlugin")
-local Types = require(Main.Types)
 local ConsoleOutput = require(Main.Utils.ConsoleOutput)
 local PluginUtils = require(Main.Utils.PluginUtils)
 local StudioModeTracker = require(Main.Utils.StudioModeTracker)
+local Types = require(Main.Types)
 
 local HttpService = game:GetService("HttpService")
 local StudioTestService = game:GetService("StudioTestService")
@@ -73,7 +73,8 @@ local function helperBaseUrl(): string
 end
 
 local function requestStudioLog(startLine: number, lineCount: number)
-	local url = string.format("%s/v1/helper/studio-log?start_line=%d&line_count=%d", helperBaseUrl(), startLine, lineCount)
+	local url =
+		string.format("%s/v1/helper/studio-log?start_line=%d&line_count=%d", helperBaseUrl(), startLine, lineCount)
 	local response = HttpService:RequestAsync({
 		Url = url,
 		Method = "GET",
@@ -257,7 +258,12 @@ local function stop(force: boolean?): string?
 	logTransitionStage(
 		"stop",
 		"requested",
-		string.format("current_mode=%s stop_request_id=%d force=%s", currentMode, stopRequestId, tostring(force == true))
+		string.format(
+			"current_mode=%s stop_request_id=%d force=%s",
+			currentMode,
+			stopRequestId,
+			tostring(force == true)
+		)
 	)
 
 	local stopCall = startAsyncCall(function()
@@ -286,7 +292,11 @@ local function waitForStartPlayLogOrRetry(
 		end)
 		if success and matchedLine ~= nil then
 			StudioModeTracker.markStarted(commandId, "start_play")
-			logTransitionStage("start_play", "observed", string.format("command_id=%d matched_line=%s", commandId, matchedLine))
+			logTransitionStage(
+				"start_play",
+				"observed",
+				string.format("command_id=%d matched_line=%s", commandId, matchedLine)
+			)
 			return true, nil
 		elseif not success then
 			lastLogError = tostring(matchedLine)
