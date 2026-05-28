@@ -4284,7 +4284,11 @@ fn is_official_business_tool_error(error: &Report) -> bool {
     }
     let summary = summary.to_ascii_lowercase();
     match tool_name {
-        "wait_job_finished" => summary.contains("workflow failed"),
+        "wait_job_finished" => {
+            summary.contains("workflow failed")
+                || summary.contains("no job found")
+                || summary.contains("generation id")
+        }
         "generate_mesh"
         | "generate_procedural_model"
         | "search_creator_store"
@@ -5772,6 +5776,14 @@ mod tests {
             &workflow_failed
         ));
         assert!(official_adapter_error_keeps_ready(&workflow_failed));
+
+        let missing_generation = eyre!(
+            "official MCP tool wait_job_finished returned error: No job found with generation ID: generation-id-does-not-exist"
+        );
+        assert!(!should_restart_official_process_after_error(
+            &missing_generation
+        ));
+        assert!(official_adapter_error_keeps_ready(&missing_generation));
 
         let generate_failed =
             eyre!("official MCP tool generate_mesh returned error: policy rejected input");
