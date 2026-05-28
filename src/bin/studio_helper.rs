@@ -78,6 +78,11 @@ const LOCAL_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const PLUGIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const OFFICIAL_MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const INSTANCE_STALE_AFTER: Duration = Duration::from_secs(45);
+const REMOTE_WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const REMOTE_WS_STALE_RESTART_AFTER: Duration = Duration::from_secs(30);
+const REMOTE_WS_STALE_RELEASE_AFTER: Duration = Duration::from_secs(180);
+const REMOTE_WS_PING_INTERVAL: Duration = Duration::from_secs(15);
+const REMOTE_WS_PONG_TIMEOUT: Duration = Duration::from_secs(45);
 const ALLOWED_OFFICIAL_MCP_TOOLS: &[&str] = &[
     "generate_mesh",
     "search_creator_store",
@@ -213,15 +218,20 @@ enum RemoteConnectionState {
     Connecting,
     Connected,
     Retrying,
+    Error,
 }
 
 struct RemoteConnectionHandle {
+    worker_id: Uuid,
     stop_tx: watch::Sender<bool>,
     sender: mpsc::UnboundedSender<RemoteOutgoingFrame>,
     remote_base_url: String,
     place_id: String,
     task_id: Option<String>,
     connection_state: RemoteConnectionState,
+    state_changed_at: Instant,
+    retrying_since: Option<Instant>,
+    consecutive_failures: u32,
     connection_id: Option<String>,
     last_ready_at: Option<Instant>,
     last_server_message_at: Option<Instant>,
@@ -230,6 +240,7 @@ struct RemoteConnectionHandle {
 #[derive(Clone)]
 enum RemoteOutgoingFrame {
     Text(String),
+    Ping(Vec<u8>),
     Pong(Vec<u8>),
 }
 
@@ -1257,11 +1268,18 @@ fn release_claimed_task(
     };
 
     remove_instances_for_claimed_task(state, task_id);
+    let connection_key = task_connection_key(task_id);
+    if let Some(remote_connection) = state.remote_connections.remove(&connection_key) {
+        let _ = remote_connection.stop_tx.send(true);
+        tracing::info!(
+            task_id,
+            connection_key,
+            "stopped remote websocket for released claimed task"
+        );
+    }
     state.claimed_tasks.remove(task_id);
     stop_removed_official_adapter(state, task_id);
-    state
-        .last_remote_errors
-        .remove(&task_connection_key(task_id));
+    state.last_remote_errors.remove(&connection_key);
     tracing::info!(task_id, reason, "released claimed task from helper state");
     pending_termination
 }
@@ -1987,6 +2005,7 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
                         RemoteConnectionState::Connecting => "connecting",
                         RemoteConnectionState::Connected => "connected",
                         RemoteConnectionState::Retrying => "retrying",
+                        RemoteConnectionState::Error => "error",
                     })
                     .unwrap_or("disconnected")
                     .to_owned(),
@@ -2090,6 +2109,7 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
                     RemoteConnectionState::Connecting => "connecting",
                     RemoteConnectionState::Connected => "connected",
                     RemoteConnectionState::Retrying => "retrying",
+                    RemoteConnectionState::Error => "error",
                 })
                 .unwrap_or("disconnected")
                 .to_owned(),
@@ -2668,6 +2688,7 @@ fn remote_connection_state_name(
             RemoteConnectionState::Connecting => "connecting",
             RemoteConnectionState::Connected => "connected",
             RemoteConnectionState::Retrying => "retrying",
+            RemoteConnectionState::Error => "error",
         })
         .unwrap_or("disconnected")
 }
@@ -2768,9 +2789,33 @@ fn remote_connection_is_active(state: &HelperState, connection_key: &str) -> boo
         .any(|task| task_connection_key(&task.task_id) == connection_key)
 }
 
-fn set_remote_connection_connecting(state: &mut HelperState, connection_key: &str) {
+fn remote_connection_matches_worker(
+    state: &HelperState,
+    connection_key: &str,
+    worker_id: Uuid,
+) -> bool {
+    state
+        .remote_connections
+        .get(connection_key)
+        .map(|connection| connection.worker_id == worker_id)
+        .unwrap_or(false)
+}
+
+fn set_remote_connection_connecting(
+    state: &mut HelperState,
+    connection_key: &str,
+    worker_id: Uuid,
+) {
     if let Some(connection) = state.remote_connections.get_mut(connection_key) {
+        if connection.worker_id != worker_id {
+            return;
+        }
+        let now = Instant::now();
         connection.connection_state = RemoteConnectionState::Connecting;
+        connection.state_changed_at = now;
+        if connection.retrying_since.is_none() {
+            connection.retrying_since = Some(now);
+        }
         connection.connection_id = None;
         connection.last_server_message_at = None;
     }
@@ -2779,11 +2824,18 @@ fn set_remote_connection_connecting(state: &mut HelperState, connection_key: &st
 fn set_remote_connection_connected(
     state: &mut HelperState,
     connection_key: &str,
+    worker_id: Uuid,
     connection_id: &str,
 ) {
     if let Some(connection) = state.remote_connections.get_mut(connection_key) {
         let now = Instant::now();
+        if connection.worker_id != worker_id {
+            return;
+        }
         connection.connection_state = RemoteConnectionState::Connected;
+        connection.state_changed_at = now;
+        connection.retrying_since = None;
+        connection.consecutive_failures = 0;
         connection.connection_id = Some(connection_id.to_owned());
         connection.last_ready_at = Some(now);
         connection.last_server_message_at = Some(now);
@@ -2791,20 +2843,102 @@ fn set_remote_connection_connected(
     state.last_remote_errors.remove(connection_key);
 }
 
-fn note_remote_connection_activity(state: &mut HelperState, connection_key: &str) {
+fn note_remote_connection_activity(state: &mut HelperState, connection_key: &str, worker_id: Uuid) {
     if let Some(connection) = state.remote_connections.get_mut(connection_key) {
+        if connection.worker_id != worker_id {
+            return;
+        }
         connection.last_server_message_at = Some(Instant::now());
     }
 }
 
-fn set_remote_connection_retrying(state: &mut HelperState, connection_key: &str, error: &str) {
+fn set_remote_connection_retrying(
+    state: &mut HelperState,
+    connection_key: &str,
+    worker_id: Uuid,
+    error: &str,
+) {
+    let mut matched_worker = false;
     if let Some(connection) = state.remote_connections.get_mut(connection_key) {
+        if connection.worker_id != worker_id {
+            return;
+        }
+        matched_worker = true;
+        let now = Instant::now();
         connection.connection_state = RemoteConnectionState::Retrying;
+        connection.state_changed_at = now;
+        if connection.retrying_since.is_none() {
+            connection.retrying_since = Some(now);
+        }
+        connection.consecutive_failures = connection.consecutive_failures.saturating_add(1);
+        connection.connection_id = None;
+    }
+    if matched_worker {
+        state
+            .last_remote_errors
+            .insert(connection_key.to_owned(), summarize_error(error));
+    }
+}
+
+fn set_remote_connection_error(state: &mut HelperState, connection_key: &str, error: &str) {
+    if let Some(connection) = state.remote_connections.get_mut(connection_key) {
+        connection.connection_state = RemoteConnectionState::Error;
+        connection.state_changed_at = Instant::now();
         connection.connection_id = None;
     }
     state
         .last_remote_errors
         .insert(connection_key.to_owned(), summarize_error(error));
+}
+
+fn remote_connection_should_restart(connection: &RemoteConnectionHandle) -> bool {
+    match connection.connection_state {
+        RemoteConnectionState::Connecting | RemoteConnectionState::Retrying => {
+            connection.state_changed_at.elapsed() >= REMOTE_WS_STALE_RESTART_AFTER
+        }
+        RemoteConnectionState::Connected | RemoteConnectionState::Error => false,
+    }
+}
+
+fn remote_connection_should_release(connection: &RemoteConnectionHandle) -> bool {
+    connection
+        .retrying_since
+        .map(|started_at| started_at.elapsed() >= REMOTE_WS_STALE_RELEASE_AFTER)
+        .unwrap_or(false)
+}
+
+fn spawn_remote_connection(
+    app: &AppState,
+    state: &mut HelperState,
+    target: RemoteTarget,
+    retrying_since: Option<Instant>,
+    consecutive_failures: u32,
+) {
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let (sender, _receiver) = mpsc::unbounded_channel::<RemoteOutgoingFrame>();
+    let worker_id = Uuid::new_v4();
+    state.remote_connections.insert(
+        target.connection_key.clone(),
+        RemoteConnectionHandle {
+            worker_id,
+            stop_tx,
+            sender,
+            remote_base_url: target.remote_base_url.clone(),
+            place_id: target.place_id.clone(),
+            task_id: target.task_id.clone(),
+            connection_state: RemoteConnectionState::Connecting,
+            state_changed_at: Instant::now(),
+            retrying_since,
+            consecutive_failures,
+            connection_id: None,
+            last_ready_at: None,
+            last_server_message_at: None,
+        },
+    );
+    let worker_app = app.clone();
+    tokio::spawn(async move {
+        remote_ws_loop(worker_app, target, worker_id, stop_rx).await;
+    });
 }
 
 fn sync_remote_connections(app: &AppState, state: &mut HelperState) {
@@ -2829,38 +2963,66 @@ fn sync_remote_connections(app: &AppState, state: &mut HelperState) {
         }
         state.last_remote_errors.remove(&connection_key);
     }
+    let mut task_ids_to_release = Vec::new();
     for target in active_targets {
-        if state
-            .remote_connections
-            .contains_key(&target.connection_key)
-        {
+        if let Some(connection) = state.remote_connections.get(&target.connection_key) {
+            if remote_connection_should_release(connection) {
+                let message = format!(
+                    "remote websocket did not recover after {}s",
+                    REMOTE_WS_STALE_RELEASE_AFTER.as_secs()
+                );
+                tracing::warn!(
+                    connection_key = target.connection_key,
+                    place_id = target.place_id,
+                    task_id = ?target.task_id,
+                    consecutive_failures = connection.consecutive_failures,
+                    "releasing claimed task after remote websocket retry timeout"
+                );
+                set_remote_connection_error(state, &target.connection_key, &message);
+                if let Some(task_id) = target.task_id.as_ref() {
+                    task_ids_to_release.push(task_id.clone());
+                }
+                continue;
+            }
+            if remote_connection_should_restart(connection) {
+                let retrying_since = connection.retrying_since;
+                let consecutive_failures = connection.consecutive_failures;
+                let old_stop_tx = connection.stop_tx.clone();
+                let _ = old_stop_tx.send(true);
+                state.remote_connections.remove(&target.connection_key);
+                state.last_remote_errors.insert(
+                    target.connection_key.clone(),
+                    "remote websocket retry watchdog restarted stale connection".to_owned(),
+                );
+                tracing::warn!(
+                    connection_key = target.connection_key,
+                    place_id = target.place_id,
+                    task_id = ?target.task_id,
+                    consecutive_failures,
+                    "restarting stale helper remote websocket loop"
+                );
+                spawn_remote_connection(app, state, target, retrying_since, consecutive_failures);
+            }
             continue;
         }
-        let (stop_tx, stop_rx) = watch::channel(false);
-        let (sender, _receiver) = mpsc::unbounded_channel::<RemoteOutgoingFrame>();
-        state.remote_connections.insert(
-            target.connection_key.clone(),
-            RemoteConnectionHandle {
-                stop_tx,
-                sender,
-                remote_base_url: target.remote_base_url.clone(),
-                place_id: target.place_id.clone(),
-                task_id: target.task_id.clone(),
-                connection_state: RemoteConnectionState::Connecting,
-                connection_id: None,
-                last_ready_at: None,
-                last_server_message_at: None,
-            },
+        spawn_remote_connection(app, state, target, None, 0);
+    }
+    for task_id in task_ids_to_release {
+        let _ = release_claimed_task(
+            state,
+            &task_id,
+            false,
+            "remote websocket retry watchdog timed out",
         );
-        let worker_app = app.clone();
-        let worker_target = target.clone();
-        tokio::spawn(async move {
-            remote_ws_loop(worker_app, worker_target, stop_rx).await;
-        });
     }
 }
 
-async fn remote_ws_loop(app: AppState, target: RemoteTarget, mut stop_rx: watch::Receiver<bool>) {
+async fn remote_ws_loop(
+    app: AppState,
+    target: RemoteTarget,
+    worker_id: Uuid,
+    mut stop_rx: watch::Receiver<bool>,
+) {
     let ws_url = derive_remote_helper_ws_url_from_base_url(&target.remote_base_url);
     tracing::info!(
         connection_key = target.connection_key,
@@ -2876,19 +3038,22 @@ async fn remote_ws_loop(app: AppState, target: RemoteTarget, mut stop_rx: watch:
             let mut state = app.state.lock().await;
             cleanup_stale_instances(&mut state.instances);
             if !remote_connection_is_active(&state, &target.connection_key) {
-                state.remote_connections.remove(&target.connection_key);
-                state.last_remote_errors.remove(&target.connection_key);
+                if remote_connection_matches_worker(&state, &target.connection_key, worker_id) {
+                    state.remote_connections.remove(&target.connection_key);
+                    state.last_remote_errors.remove(&target.connection_key);
+                }
                 break;
             }
         }
 
         {
             let mut state = app.state.lock().await;
-            set_remote_connection_connecting(&mut state, &target.connection_key);
+            set_remote_connection_connecting(&mut state, &target.connection_key, worker_id);
         }
         let result = run_remote_ws_session(
             app.clone(),
             &target.connection_key,
+            worker_id,
             &target.place_id,
             target.task_id.as_deref(),
             &ws_url,
@@ -2909,6 +3074,7 @@ async fn remote_ws_loop(app: AppState, target: RemoteTarget, mut stop_rx: watch:
                     set_remote_connection_retrying(
                         &mut state,
                         &target.connection_key,
+                        worker_id,
                         &error.to_string(),
                     );
                 }
@@ -2926,8 +3092,10 @@ async fn remote_ws_loop(app: AppState, target: RemoteTarget, mut stop_rx: watch:
         }
     }
     let mut state = app.state.lock().await;
-    state.remote_connections.remove(&target.connection_key);
-    state.last_remote_errors.remove(&target.connection_key);
+    if remote_connection_matches_worker(&state, &target.connection_key, worker_id) {
+        state.remote_connections.remove(&target.connection_key);
+        state.last_remote_errors.remove(&target.connection_key);
+    }
     tracing::info!(
         connection_key = target.connection_key,
         place_id = target.place_id,
@@ -3114,8 +3282,8 @@ async fn connect_remote_ws(
             AUTHORIZATION,
             format!("Bearer {}", candidate.value).parse()?,
         );
-        match connect_async(request).await {
-            Ok((stream, _response)) => {
+        match tokio::time::timeout(REMOTE_WS_CONNECT_TIMEOUT, connect_async(request)).await {
+            Ok(Ok((stream, _response))) => {
                 if candidate.value != current_token {
                     *helper.bearer_token.lock().await = candidate.value.clone();
                     *helper.bearer_token_source.lock().await = candidate.source.clone();
@@ -3126,8 +3294,14 @@ async fn connect_remote_ws(
                 }
                 return Ok(stream);
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 last_error = Some(error.to_string());
+            }
+            Err(_) => {
+                last_error = Some(format!(
+                    "websocket connect timed out after {}s",
+                    REMOTE_WS_CONNECT_TIMEOUT.as_secs()
+                ));
             }
         }
     }
@@ -3305,12 +3479,20 @@ async fn stream_runtime_screenshot(
 async fn run_remote_ws_session(
     app: AppState,
     connection_key: &str,
+    worker_id: Uuid,
     place_id: &str,
     task_id: Option<&str>,
     ws_url: &str,
     stop_rx: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     let stream = connect_remote_ws(&app.helper, ws_url).await?;
+    {
+        let state = app.state.lock().await;
+        if *stop_rx.borrow() || !remote_connection_matches_worker(&state, connection_key, worker_id)
+        {
+            return Ok(());
+        }
+    }
     let (mut writer, mut reader) = stream.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<RemoteOutgoingFrame>();
     let mut last_server_message_at = Instant::now();
@@ -3320,15 +3502,18 @@ async fn run_remote_ws_session(
     {
         let mut state = app.state.lock().await;
         if let Some(connection) = state.remote_connections.get_mut(connection_key) {
-            connection.sender = out_tx.clone();
+            if connection.worker_id == worker_id {
+                connection.sender = out_tx.clone();
+            }
         }
-        set_remote_connection_connecting(&mut state, connection_key);
+        set_remote_connection_connecting(&mut state, connection_key, worker_id);
         state.last_remote_errors.remove(connection_key);
     }
     let writer_task = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
             let message = match frame {
                 RemoteOutgoingFrame::Text(text) => WsMessage::Text(text.into()),
+                RemoteOutgoingFrame::Ping(payload) => WsMessage::Ping(payload.into()),
                 RemoteOutgoingFrame::Pong(payload) => WsMessage::Pong(payload.into()),
             };
             if let Err(error) = writer.send(message).await {
@@ -3382,7 +3567,10 @@ async fn run_remote_ws_session(
     let upload_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<Result<ArtifactCommitted>>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+    let mut ping = tokio::time::interval(REMOTE_WS_PING_INTERVAL);
+    let mut last_pong_at = Instant::now();
     let mut ready_acknowledged = false;
+    let mut session_error: Option<Report> = None;
     loop {
         tokio::select! {
             changed = stop_rx.changed() => {
@@ -3428,6 +3616,20 @@ async fn run_remote_ws_session(
                     break;
                 }
             }
+            _ = ping.tick() => {
+                if last_pong_at.elapsed() > REMOTE_WS_PONG_TIMEOUT {
+                    session_error = Some(eyre!(
+                        "remote websocket pong timed out after {}ms",
+                        last_pong_at.elapsed().as_millis()
+                    ));
+                    break;
+                }
+                let payload = Uuid::new_v4().as_bytes().to_vec();
+                if out_tx.send(RemoteOutgoingFrame::Ping(payload)).is_err() {
+                    tracing::warn!(place_id, "failed to queue helper remote websocket ping");
+                    break;
+                }
+            }
             message = reader.next() => {
                 let Some(message) = message else {
                     break;
@@ -3437,14 +3639,14 @@ async fn run_remote_ws_session(
                         last_server_message_at = Instant::now();
                         {
                             let mut state = app.state.lock().await;
-                            note_remote_connection_activity(&mut state, connection_key);
+                            note_remote_connection_activity(&mut state, connection_key, worker_id);
                         }
                         match serde_json::from_str::<ServerToHelperMessage>(&text)? {
                             ServerToHelperMessage::ReadyAck { connection_id, place_id: ack_place_id, task_id: ack_task_id } => {
                                 validate_remote_ready_ack(place_id, task_id, &ack_place_id, ack_task_id.as_deref())?;
                                 {
                                     let mut state = app.state.lock().await;
-                                    set_remote_connection_connected(&mut state, connection_key, &connection_id);
+                                    set_remote_connection_connected(&mut state, connection_key, worker_id, &connection_id);
                                 }
                                 ready_acknowledged = true;
                                 if let Some(task_id) = task_id {
@@ -3536,16 +3738,24 @@ async fn run_remote_ws_session(
                         last_server_message_at = Instant::now();
                         {
                             let mut state = app.state.lock().await;
-                            note_remote_connection_activity(&mut state, connection_key);
+                            note_remote_connection_activity(&mut state, connection_key, worker_id);
                         }
                         let _ = out_tx.send(RemoteOutgoingFrame::Pong(payload));
                     }
                     WsMessage::Close(_) => break,
-                    WsMessage::Binary(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => {
+                    WsMessage::Pong(_) => {
+                        last_pong_at = Instant::now();
                         last_server_message_at = Instant::now();
                         {
                             let mut state = app.state.lock().await;
-                            note_remote_connection_activity(&mut state, connection_key);
+                            note_remote_connection_activity(&mut state, connection_key, worker_id);
+                        }
+                    }
+                    WsMessage::Binary(_) | WsMessage::Frame(_) => {
+                        last_server_message_at = Instant::now();
+                        {
+                            let mut state = app.state.lock().await;
+                            note_remote_connection_activity(&mut state, connection_key, worker_id);
                         }
                     }
                 }
@@ -3578,6 +3788,8 @@ async fn run_remote_ws_session(
     }
     if stopped_by_request {
         Ok(())
+    } else if let Some(error) = session_error {
+        Err(error)
     } else {
         Err(eyre!("remote websocket session ended unexpectedly"))
     }
@@ -4983,6 +5195,133 @@ mod tests {
             hub_last_error: None,
             hub_last_ready_at: None,
         }
+    }
+
+    fn test_remote_connection_handle(
+        state: RemoteConnectionState,
+        state_age: Duration,
+        retrying_age: Option<Duration>,
+    ) -> RemoteConnectionHandle {
+        let (stop_tx, _stop_rx) = watch::channel(false);
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        RemoteConnectionHandle {
+            worker_id: Uuid::new_v4(),
+            stop_tx,
+            sender,
+            remote_base_url: "https://example.com".to_owned(),
+            place_id: "93795519121520".to_owned(),
+            task_id: Some("task-a".to_owned()),
+            connection_state: state,
+            state_changed_at: Instant::now() - state_age,
+            retrying_since: retrying_age.map(|age| Instant::now() - age),
+            consecutive_failures: 1,
+            connection_id: None,
+            last_ready_at: None,
+            last_server_message_at: None,
+        }
+    }
+
+    #[test]
+    fn remote_connection_watchdog_restarts_stale_retrying_connection() {
+        let fresh_retrying = test_remote_connection_handle(
+            RemoteConnectionState::Retrying,
+            REMOTE_WS_STALE_RESTART_AFTER - Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
+        );
+        assert!(!remote_connection_should_restart(&fresh_retrying));
+        assert!(!remote_connection_should_release(&fresh_retrying));
+
+        let stale_retrying = test_remote_connection_handle(
+            RemoteConnectionState::Retrying,
+            REMOTE_WS_STALE_RESTART_AFTER + Duration::from_secs(1),
+            Some(Duration::from_secs(10)),
+        );
+        assert!(remote_connection_should_restart(&stale_retrying));
+        assert!(!remote_connection_should_release(&stale_retrying));
+    }
+
+    #[test]
+    fn remote_connection_watchdog_restarts_stale_connecting_connection() {
+        let stale_connecting = test_remote_connection_handle(
+            RemoteConnectionState::Connecting,
+            REMOTE_WS_STALE_RESTART_AFTER + Duration::from_secs(1),
+            Some(Duration::from_secs(10)),
+        );
+        assert!(remote_connection_should_restart(&stale_connecting));
+        assert!(!remote_connection_should_release(&stale_connecting));
+    }
+
+    #[test]
+    fn remote_connection_watchdog_keeps_connected_connection_without_server_chatter() {
+        let mut connected =
+            test_remote_connection_handle(RemoteConnectionState::Connected, Duration::ZERO, None);
+        connected.last_server_message_at = Some(Instant::now() - Duration::from_secs(3600));
+        assert!(!remote_connection_should_restart(&connected));
+        assert!(!remote_connection_should_release(&connected));
+    }
+
+    #[test]
+    fn remote_ws_pong_timeout_exceeds_ping_interval() {
+        assert!(REMOTE_WS_PONG_TIMEOUT > REMOTE_WS_PING_INTERVAL);
+        assert!(REMOTE_WS_PONG_TIMEOUT > REMOTE_WS_CONNECT_TIMEOUT);
+    }
+
+    #[test]
+    fn remote_connection_watchdog_releases_long_unrecovered_retrying_connection() {
+        let stale_retrying = test_remote_connection_handle(
+            RemoteConnectionState::Retrying,
+            REMOTE_WS_STALE_RESTART_AFTER + Duration::from_secs(1),
+            Some(REMOTE_WS_STALE_RELEASE_AFTER + Duration::from_secs(1)),
+        );
+        assert!(remote_connection_should_restart(&stale_retrying));
+        assert!(remote_connection_should_release(&stale_retrying));
+    }
+
+    #[test]
+    fn release_claimed_task_stops_remote_connection_worker() {
+        let mut state = empty_helper_state();
+        state.claimed_tasks.insert(
+            "task-a".to_owned(),
+            test_claimed_task("task-a", "93795519121520"),
+        );
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        state.remote_connections.insert(
+            task_connection_key("task-a"),
+            RemoteConnectionHandle {
+                worker_id: Uuid::new_v4(),
+                stop_tx,
+                sender,
+                remote_base_url: "https://example.com".to_owned(),
+                place_id: "93795519121520".to_owned(),
+                task_id: Some("task-a".to_owned()),
+                connection_state: RemoteConnectionState::Retrying,
+                state_changed_at: Instant::now(),
+                retrying_since: Some(Instant::now()),
+                consecutive_failures: 1,
+                connection_id: None,
+                last_ready_at: None,
+                last_server_message_at: None,
+            },
+        );
+
+        let pending = release_claimed_task(&mut state, "task-a", false, "test release");
+        assert!(pending.is_none());
+        assert!(!state.claimed_tasks.contains_key("task-a"));
+        assert!(!state
+            .remote_connections
+            .contains_key(&task_connection_key("task-a")));
+        assert!(*stop_rx.borrow_and_update());
+    }
+
+    #[test]
+    fn remote_connection_state_name_reports_error_state() {
+        let error_connection =
+            test_remote_connection_handle(RemoteConnectionState::Error, Duration::ZERO, None);
+        assert_eq!(
+            remote_connection_state_name(Some(&error_connection)),
+            "error"
+        );
     }
 
     #[tokio::test]
