@@ -71,6 +71,7 @@ struct HttpAuthState {
 struct HubState {
     config: HubConfig,
     helpers: HashMap<String, HelperRecord>,
+    blocked_helpers: HashMap<String, BlockedHelperRecord>,
     tasks: HashMap<String, TaskRecord>,
     state_revision: u64,
 }
@@ -92,8 +93,26 @@ struct HelperRecord {
     capacity: usize,
     labels: Vec<String>,
     active_task_ids: HashSet<String>,
+    active_tasks: HashMap<String, HelperActiveTaskRecord>,
     registered_at_unix_ms: u64,
     last_seen_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct HelperActiveTaskRecord {
+    task_id: String,
+    remote_state: String,
+    remote_connection_id: Option<String>,
+    remote_last_error: Option<String>,
+    remote_last_ready_age_ms: Option<u128>,
+    remote_last_server_message_age_ms: Option<u128>,
+}
+
+#[derive(Debug, Clone)]
+struct BlockedHelperRecord {
+    helper_id: String,
+    reason: Option<String>,
+    blocked_at_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -110,7 +129,7 @@ struct TaskRecord {
     task_token: String,
     recover_token: String,
     place_id: String,
-    game_id: Option<String>,
+    universe_id: Option<String>,
     owner_user: String,
     repo: String,
     worktree_name: String,
@@ -129,6 +148,16 @@ struct TaskRecord {
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedHubState {
     tasks: Vec<PersistedTaskRecord>,
+    #[serde(default)]
+    blocked_helpers: Vec<PersistedBlockedHelperRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedBlockedHelperRecord {
+    helper_id: String,
+    #[serde(default)]
+    reason: Option<String>,
+    blocked_at_unix_ms: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -138,7 +167,8 @@ struct PersistedTaskRecord {
     task_token: String,
     recover_token: String,
     place_id: String,
-    game_id: Option<String>,
+    #[serde(default, alias = "game_id")]
+    universe_id: Option<String>,
     owner_user: String,
     repo: String,
     worktree_name: String,
@@ -167,7 +197,10 @@ struct CreateTaskRequest {
     repo: String,
     worktree_name: String,
     place_id: String,
-    game_id: Option<String>,
+    #[serde(default)]
+    universe_id: Option<String>,
+    #[serde(default, rename = "game_id")]
+    legacy_game_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -184,7 +217,10 @@ struct RecoverTaskRequest {
     cluster_key: String,
     task_id: String,
     recover_token: String,
-    game_id: Option<String>,
+    #[serde(default)]
+    universe_id: Option<String>,
+    #[serde(default, rename = "game_id")]
+    legacy_game_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -225,7 +261,36 @@ struct RegisterHelperResponse {
 #[derive(Debug, Deserialize)]
 struct HelperHeartbeatRequest {
     helper_id: String,
+    #[serde(default)]
     active_task_ids: Vec<String>,
+    #[serde(default)]
+    active_tasks: Vec<HelperActiveTaskHeartbeat>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HelperActiveTaskHeartbeat {
+    task_id: String,
+    remote_state: String,
+    #[serde(default)]
+    remote_connection_id: Option<String>,
+    #[serde(default)]
+    remote_last_error: Option<String>,
+    #[serde(default)]
+    remote_last_ready_age_ms: Option<u128>,
+    #[serde(default)]
+    remote_last_server_message_age_ms: Option<u128>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockHelperRequest {
+    helper_id: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UnblockHelperRequest {
+    helper_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -250,7 +315,8 @@ struct ClaimTaskResponse {
 struct ClaimedTaskPayload {
     task_id: String,
     place_id: String,
-    game_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    universe_id: Option<String>,
     owner_user: String,
     repo: String,
     worktree_name: String,
@@ -263,7 +329,17 @@ struct HubStatusResponse {
     helper_count: usize,
     task_count: usize,
     helpers: Vec<HelperStatusPayload>,
+    blocked_helpers: Vec<BlockedHelperPayload>,
     tasks: Vec<TaskStatusPayload>,
+}
+
+#[derive(Debug, Serialize)]
+struct HelperListResponse {
+    ok: bool,
+    helper_count: usize,
+    blocked_helper_count: usize,
+    helpers: Vec<HelperStatusPayload>,
+    blocked_helpers: Vec<BlockedHelperPayload>,
 }
 
 #[derive(Debug, Serialize)]
@@ -273,9 +349,35 @@ struct HelperStatusPayload {
     platform: String,
     capacity: usize,
     active_launch_count: usize,
+    active_tasks: Vec<HelperActiveTaskPayload>,
     labels: Vec<String>,
+    blocked: bool,
     registered_at_unix_ms: u64,
     last_seen_age_ms: u128,
+}
+
+#[derive(Debug, Serialize)]
+struct HelperActiveTaskPayload {
+    task_id: String,
+    remote_state: String,
+    remote_connection_id: Option<String>,
+    remote_last_error: Option<String>,
+    remote_last_ready_age_ms: Option<u128>,
+    remote_last_server_message_age_ms: Option<u128>,
+}
+
+#[derive(Debug, Serialize)]
+struct BlockedHelperPayload {
+    helper_id: String,
+    reason: Option<String>,
+    blocked_at_unix_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct BlockHelperResponse {
+    ok: bool,
+    helper_id: String,
+    blocked: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -283,7 +385,7 @@ struct TaskStatusPayload {
     task_id: String,
     cluster_key: String,
     place_id: String,
-    game_id: Option<String>,
+    universe_id: Option<String>,
     owner_user: String,
     repo: String,
     worktree_name: String,
@@ -389,9 +491,14 @@ fn resolve_hub_config(args: &Args) -> Result<HubConfig> {
     })
 }
 
-fn load_persisted_tasks(config: &HubConfig) -> Result<HashMap<String, TaskRecord>> {
+fn load_persisted_state(
+    config: &HubConfig,
+) -> Result<(
+    HashMap<String, TaskRecord>,
+    HashMap<String, BlockedHelperRecord>,
+)> {
     if !config.state_file.exists() {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), HashMap::new()));
     }
     let body = fs::read_to_string(&config.state_file).wrap_err_with(|| {
         format!(
@@ -406,6 +513,7 @@ fn load_persisted_tasks(config: &HubConfig) -> Result<HashMap<String, TaskRecord
         )
     })?;
     let mut tasks = HashMap::new();
+    let mut blocked_helpers = HashMap::new();
     let now = now_unix_ms();
     let now_instant = Instant::now();
     for task in persisted.tasks {
@@ -425,7 +533,7 @@ fn load_persisted_tasks(config: &HubConfig) -> Result<HashMap<String, TaskRecord
                 task_token: task.task_token,
                 recover_token: task.recover_token,
                 place_id: task.place_id,
-                game_id: task.game_id,
+                universe_id: task.universe_id,
                 owner_user: task.owner_user,
                 repo: task.repo,
                 worktree_name: task.worktree_name,
@@ -442,11 +550,35 @@ fn load_persisted_tasks(config: &HubConfig) -> Result<HashMap<String, TaskRecord
             },
         );
     }
-    Ok(tasks)
+    for helper in persisted.blocked_helpers {
+        let Ok(helper_id) = require_non_empty(&helper.helper_id, "helper_id") else {
+            continue;
+        };
+        blocked_helpers.insert(
+            helper_id.clone(),
+            BlockedHelperRecord {
+                helper_id,
+                reason: normalize_optional_text(helper.reason),
+                blocked_at_unix_ms: helper.blocked_at_unix_ms,
+            },
+        );
+    }
+    Ok((tasks, blocked_helpers))
 }
 
 fn build_persisted_state_payload(state: &HubState) -> PersistedHubState {
+    let mut blocked_helpers = state
+        .blocked_helpers
+        .values()
+        .map(|helper| PersistedBlockedHelperRecord {
+            helper_id: helper.helper_id.clone(),
+            reason: helper.reason.clone(),
+            blocked_at_unix_ms: helper.blocked_at_unix_ms,
+        })
+        .collect::<Vec<_>>();
+    blocked_helpers.sort_by(|left, right| left.helper_id.cmp(&right.helper_id));
     PersistedHubState {
+        blocked_helpers,
         tasks: state
             .tasks
             .values()
@@ -456,7 +588,7 @@ fn build_persisted_state_payload(state: &HubState) -> PersistedHubState {
                 task_token: task.task_token.clone(),
                 recover_token: task.recover_token.clone(),
                 place_id: task.place_id.clone(),
-                game_id: task.game_id.clone(),
+                universe_id: task.universe_id.clone(),
                 owner_user: task.owner_user.clone(),
                 repo: task.repo.clone(),
                 worktree_name: task.worktree_name.clone(),
@@ -549,6 +681,12 @@ fn require_non_empty(value: &str, label: &str) -> Result<String> {
     Ok(trimmed.to_owned())
 }
 
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|raw| raw.trim().to_owned())
+        .filter(|trimmed| !trimmed.is_empty())
+}
+
 fn new_task_id() -> String {
     let short = Uuid::new_v4().simple().to_string();
     format!("t{}", &short[..10])
@@ -589,7 +727,7 @@ fn task_status_payload(task: &TaskRecord) -> TaskStatusPayload {
         task_id: task.task_id.clone(),
         cluster_key: task.cluster_key.clone(),
         place_id: task.place_id.clone(),
-        game_id: task.game_id.clone(),
+        universe_id: task.universe_id.clone(),
         owner_user: task.owner_user.clone(),
         repo: task.repo.clone(),
         worktree_name: task.worktree_name.clone(),
@@ -604,6 +742,76 @@ fn task_status_payload(task: &TaskRecord) -> TaskStatusPayload {
         last_task_heartbeat_at_unix_ms: task.last_task_heartbeat_at_unix_ms,
         last_seen_age_ms: task.last_seen_at.elapsed().as_millis(),
     }
+}
+
+fn helper_status_payload(helper: &HelperRecord, blocked: bool) -> HelperStatusPayload {
+    let mut active_tasks = helper
+        .active_task_ids
+        .iter()
+        .map(|task_id| {
+            if let Some(task) = helper.active_tasks.get(task_id) {
+                HelperActiveTaskPayload {
+                    task_id: task.task_id.clone(),
+                    remote_state: task.remote_state.clone(),
+                    remote_connection_id: task.remote_connection_id.clone(),
+                    remote_last_error: task.remote_last_error.clone(),
+                    remote_last_ready_age_ms: task.remote_last_ready_age_ms,
+                    remote_last_server_message_age_ms: task.remote_last_server_message_age_ms,
+                }
+            } else {
+                HelperActiveTaskPayload {
+                    task_id: task_id.clone(),
+                    remote_state: "unknown".to_owned(),
+                    remote_connection_id: None,
+                    remote_last_error: None,
+                    remote_last_ready_age_ms: None,
+                    remote_last_server_message_age_ms: None,
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    active_tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+    HelperStatusPayload {
+        helper_id: helper.helper_id.clone(),
+        owner_user: helper.owner_user.clone(),
+        platform: helper.platform.clone(),
+        capacity: helper.capacity,
+        active_launch_count: helper.active_task_ids.len(),
+        active_tasks,
+        labels: helper.labels.clone(),
+        blocked,
+        registered_at_unix_ms: helper.registered_at_unix_ms,
+        last_seen_age_ms: helper.last_seen_at.elapsed().as_millis(),
+    }
+}
+
+fn blocked_helper_payload(helper: &BlockedHelperRecord) -> BlockedHelperPayload {
+    BlockedHelperPayload {
+        helper_id: helper.helper_id.clone(),
+        reason: helper.reason.clone(),
+        blocked_at_unix_ms: helper.blocked_at_unix_ms,
+    }
+}
+
+fn request_universe_id(
+    universe_id: Option<String>,
+    legacy_game_id: Option<String>,
+) -> Option<String> {
+    universe_id
+        .or(legacy_game_id)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn clear_helper_claims(state: &mut HubState, helper_id: &str, now: u64) -> bool {
+    let mut changed = false;
+    for task in state.tasks.values_mut() {
+        if task.claimed_by_helper_id.as_deref() == Some(helper_id) {
+            task.claimed_by_helper_id = None;
+            task.updated_at_unix_ms = now;
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn task_matches_claimed_helper(task: &TaskRecord, helper_id: &str, task_id: &str) -> bool {
@@ -624,13 +832,7 @@ fn cleanup_stale_state(state: &mut HubState) -> bool {
         .collect();
     for helper_id in stale_helpers {
         state.helpers.remove(&helper_id);
-        for task in state.tasks.values_mut() {
-            if task.claimed_by_helper_id.as_deref() == Some(helper_id.as_str()) {
-                clear_task_claim_state(task);
-                task.updated_at_unix_ms = now;
-                persisted_changed = true;
-            }
-        }
+        persisted_changed |= clear_helper_claims(state, &helper_id, now);
     }
     for task in state.tasks.values_mut() {
         if task.released {
@@ -648,18 +850,20 @@ async fn status_handler(State(app): State<AppState>) -> Json<HubStatusResponse> 
     let mut helpers = state
         .helpers
         .values()
-        .map(|helper| HelperStatusPayload {
-            helper_id: helper.helper_id.clone(),
-            owner_user: helper.owner_user.clone(),
-            platform: helper.platform.clone(),
-            capacity: helper.capacity,
-            active_launch_count: helper.active_task_ids.len(),
-            labels: helper.labels.clone(),
-            registered_at_unix_ms: helper.registered_at_unix_ms,
-            last_seen_age_ms: helper.last_seen_at.elapsed().as_millis(),
+        .map(|helper| {
+            helper_status_payload(
+                helper,
+                state.blocked_helpers.contains_key(&helper.helper_id),
+            )
         })
         .collect::<Vec<_>>();
     helpers.sort_by(|left, right| left.helper_id.cmp(&right.helper_id));
+    let mut blocked_helpers = state
+        .blocked_helpers
+        .values()
+        .map(blocked_helper_payload)
+        .collect::<Vec<_>>();
+    blocked_helpers.sort_by(|left, right| left.helper_id.cmp(&right.helper_id));
     let mut tasks = state
         .tasks
         .values()
@@ -671,7 +875,36 @@ async fn status_handler(State(app): State<AppState>) -> Json<HubStatusResponse> 
         helper_count: helpers.len(),
         task_count: tasks.len(),
         helpers,
+        blocked_helpers,
         tasks,
+    })
+}
+
+async fn helpers_handler(State(app): State<AppState>) -> Json<HelperListResponse> {
+    let state = app.hub.read().await;
+    let mut helpers = state
+        .helpers
+        .values()
+        .map(|helper| {
+            helper_status_payload(
+                helper,
+                state.blocked_helpers.contains_key(&helper.helper_id),
+            )
+        })
+        .collect::<Vec<_>>();
+    helpers.sort_by(|left, right| left.helper_id.cmp(&right.helper_id));
+    let mut blocked_helpers = state
+        .blocked_helpers
+        .values()
+        .map(blocked_helper_payload)
+        .collect::<Vec<_>>();
+    blocked_helpers.sort_by(|left, right| left.helper_id.cmp(&right.helper_id));
+    Json(HelperListResponse {
+        ok: true,
+        helper_count: helpers.len(),
+        blocked_helper_count: blocked_helpers.len(),
+        helpers,
+        blocked_helpers,
     })
 }
 
@@ -713,7 +946,7 @@ async fn create_task_handler(
             task_token: task_token.clone(),
             recover_token: recover_token.clone(),
             place_id: require_non_empty(&payload.place_id, "place_id")?,
-            game_id: payload.game_id.filter(|value| !value.trim().is_empty()),
+            universe_id: request_universe_id(payload.universe_id, payload.legacy_game_id),
             owner_user: require_non_empty(&payload.owner_user, "owner_user")?,
             repo: require_non_empty(&payload.repo, "repo")?,
             worktree_name: require_non_empty(&payload.worktree_name, "worktree_name")?,
@@ -766,8 +999,8 @@ async fn recover_task_handler(
         )));
     }
     task.task_token = new_token();
-    if let Some(game_id) = payload.game_id.filter(|value| !value.trim().is_empty()) {
-        task.game_id = Some(game_id);
+    if let Some(universe_id) = request_universe_id(payload.universe_id, payload.legacy_game_id) {
+        task.universe_id = Some(universe_id);
     }
     task.service_state = "recovering".to_owned();
     clear_task_claim_state(task);
@@ -853,6 +1086,7 @@ async fn release_task_handler(
     if let Some(helper_id) = helper_id.as_ref() {
         if let Some(helper) = state.helpers.get_mut(helper_id) {
             helper.active_task_ids.remove(&payload.task_id);
+            helper.active_tasks.remove(&payload.task_id);
         }
     }
     let snapshot = bump_state_revision(&mut state);
@@ -870,11 +1104,31 @@ async fn register_helper_handler(
     let helper_id = require_non_empty(&payload.helper_id, "helper_id")
         .map_err(HubError::from)
         .map_err(IntoResponse::into_response)?;
+    if state.blocked_helpers.contains_key(&helper_id) {
+        let message = format!("helper_id is blocked: {helper_id}");
+        let cleanup_snapshot = cleanup_changed.then(|| bump_state_revision(&mut state));
+        drop(state);
+        if let Some(snapshot) = cleanup_snapshot {
+            persist_snapshot_if_current(&app, snapshot)
+                .await
+                .map_err(HubError::from)
+                .map_err(IntoResponse::into_response)?;
+        }
+        return Err(HttpHubError::forbidden("helper_id_blocked", message).into_response());
+    }
     if let Some(existing) = state.helpers.get(&helper_id) {
         let age_ms = existing.last_seen_at.elapsed().as_millis();
         let message = format!(
             "helper_id already active: {helper_id}; existing helper is still alive (last_seen_age_ms={age_ms})"
         );
+        let cleanup_snapshot = cleanup_changed.then(|| bump_state_revision(&mut state));
+        drop(state);
+        if let Some(snapshot) = cleanup_snapshot {
+            persist_snapshot_if_current(&app, snapshot)
+                .await
+                .map_err(HubError::from)
+                .map_err(IntoResponse::into_response)?;
+        }
         return Err(HttpHubError::conflict("helper_id_conflict", message).into_response());
     }
     let now = now_unix_ms();
@@ -891,6 +1145,7 @@ async fn register_helper_handler(
             capacity: payload.capacity,
             labels: payload.labels,
             active_task_ids: HashSet::new(),
+            active_tasks: HashMap::new(),
             registered_at_unix_ms: now,
             last_seen_at: Instant::now(),
         },
@@ -912,6 +1167,58 @@ async fn register_helper_handler(
     }))
 }
 
+async fn block_helper_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<BlockHelperRequest>,
+) -> Result<Json<BlockHelperResponse>, HubError> {
+    let mut state = app.hub.write().await;
+    cleanup_stale_state(&mut state);
+    let helper_id = require_non_empty(&payload.helper_id, "helper_id")?;
+    let now = now_unix_ms();
+    state.helpers.remove(&helper_id);
+    clear_helper_claims(&mut state, &helper_id, now);
+    state.blocked_helpers.insert(
+        helper_id.clone(),
+        BlockedHelperRecord {
+            helper_id: helper_id.clone(),
+            reason: normalize_optional_text(payload.reason),
+            blocked_at_unix_ms: now,
+        },
+    );
+    let snapshot = bump_state_revision(&mut state);
+    drop(state);
+    persist_snapshot_if_current(&app, snapshot).await?;
+    Ok(Json(BlockHelperResponse {
+        ok: true,
+        helper_id,
+        blocked: true,
+    }))
+}
+
+async fn unblock_helper_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<UnblockHelperRequest>,
+) -> Result<Json<BlockHelperResponse>, HubError> {
+    let mut state = app.hub.write().await;
+    let cleanup_changed = cleanup_stale_state(&mut state);
+    let helper_id = require_non_empty(&payload.helper_id, "helper_id")?;
+    let removed = state.blocked_helpers.remove(&helper_id).is_some();
+    let snapshot = if cleanup_changed || removed {
+        Some(bump_state_revision(&mut state))
+    } else {
+        None
+    };
+    drop(state);
+    if let Some(snapshot) = snapshot {
+        persist_snapshot_if_current(&app, snapshot).await?;
+    }
+    Ok(Json(BlockHelperResponse {
+        ok: true,
+        helper_id,
+        blocked: false,
+    }))
+}
+
 async fn helper_heartbeat_handler(
     State(app): State<AppState>,
     Json(payload): Json<HelperHeartbeatRequest>,
@@ -920,7 +1227,31 @@ async fn helper_heartbeat_handler(
     let cleanup_changed = cleanup_stale_state(&mut state);
     let now = now_unix_ms();
     let helper_id = payload.helper_id.clone();
-    let active_task_ids: HashSet<String> = payload.active_task_ids.iter().cloned().collect();
+    let mut active_task_ids = payload
+        .active_task_ids
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    for active_task in &payload.active_tasks {
+        active_task_ids.insert(active_task.task_id.clone());
+    }
+    if state.blocked_helpers.contains_key(&helper_id) {
+        let claim_changed = clear_helper_claims(&mut state, &helper_id, now);
+        state.helpers.remove(&helper_id);
+        let snapshot = if cleanup_changed || claim_changed {
+            Some(bump_state_revision(&mut state))
+        } else {
+            None
+        };
+        drop(state);
+        if let Some(snapshot) = snapshot {
+            persist_snapshot_if_current(&app, snapshot).await?;
+        }
+        return Ok(Json(HelperHeartbeatHubResponse {
+            ok: false,
+            release_task_ids: Vec::new(),
+        }));
+    }
     let mut release_task_ids = HashSet::new();
     let mut persisted_changed = cleanup_changed;
 
@@ -936,7 +1267,7 @@ async fn helper_heartbeat_handler(
         }
     }
 
-    for task_id in &payload.active_task_ids {
+    for task_id in &active_task_ids {
         let should_release = match state.tasks.get(task_id) {
             Some(task) => !task_matches_claimed_helper(task, &helper_id, task_id),
             None => true,
@@ -946,17 +1277,43 @@ async fn helper_heartbeat_handler(
         }
     }
 
-    let helper = state
-        .helpers
-        .get_mut(&helper_id)
-        .ok_or_else(|| HubError(eyre!("helper not found: {}", helper_id)))?;
+    let helper = state.helpers.get_mut(&helper_id);
+    let Some(helper) = helper else {
+        let snapshot = if persisted_changed {
+            Some(bump_state_revision(&mut state))
+        } else {
+            None
+        };
+        drop(state);
+        if let Some(snapshot) = snapshot {
+            persist_snapshot_if_current(&app, snapshot).await?;
+        }
+        return Err(HubError(eyre!("helper not found: {}", helper_id)));
+    };
     helper.last_seen_at = Instant::now();
     helper.active_task_ids.clear();
-    for task_id in payload.active_task_ids {
+    helper.active_tasks.clear();
+    for task_id in active_task_ids {
         if release_task_ids.contains(&task_id) {
             continue;
         }
         helper.active_task_ids.insert(task_id);
+    }
+    for active_task in payload.active_tasks {
+        if !helper.active_task_ids.contains(&active_task.task_id) {
+            continue;
+        }
+        helper.active_tasks.insert(
+            active_task.task_id.clone(),
+            HelperActiveTaskRecord {
+                task_id: active_task.task_id,
+                remote_state: active_task.remote_state,
+                remote_connection_id: active_task.remote_connection_id,
+                remote_last_error: active_task.remote_last_error,
+                remote_last_ready_age_ms: active_task.remote_last_ready_age_ms,
+                remote_last_server_message_age_ms: active_task.remote_last_server_message_age_ms,
+            },
+        );
     }
     let snapshot = if persisted_changed {
         Some(bump_state_revision(&mut state))
@@ -981,6 +1338,22 @@ async fn claim_task_handler(
 ) -> Result<Json<ClaimTaskResponse>, HubError> {
     let mut state = app.hub.write().await;
     let cleanup_changed = cleanup_stale_state(&mut state);
+    if state.blocked_helpers.contains_key(&payload.helper_id) {
+        let snapshot = if cleanup_changed {
+            Some(bump_state_revision(&mut state))
+        } else {
+            None
+        };
+        drop(state);
+        if let Some(snapshot) = snapshot {
+            persist_snapshot_if_current(&app, snapshot).await?;
+        }
+        return Ok(Json(ClaimTaskResponse {
+            claimed: false,
+            helper_id: payload.helper_id,
+            task: None,
+        }));
+    }
     let helper = state
         .helpers
         .get(&payload.helper_id)
@@ -990,6 +1363,15 @@ async fn claim_task_handler(
     let helper_launch_count = helper.active_task_ids.len();
     let helper_id = helper.helper_id.clone();
     if helper_launch_count >= helper_capacity {
+        let snapshot = if cleanup_changed {
+            Some(bump_state_revision(&mut state))
+        } else {
+            None
+        };
+        drop(state);
+        if let Some(snapshot) = snapshot {
+            persist_snapshot_if_current(&app, snapshot).await?;
+        }
         return Ok(Json(ClaimTaskResponse {
             claimed: false,
             helper_id,
@@ -1031,7 +1413,7 @@ async fn claim_task_handler(
     let response_task = ClaimedTaskPayload {
         task_id: claimed_task_id.clone(),
         place_id: task.place_id.clone(),
-        game_id: task.game_id.clone(),
+        universe_id: task.universe_id.clone(),
         owner_user: task.owner_user.clone(),
         repo: task.repo.clone(),
         worktree_name: task.worktree_name.clone(),
@@ -1073,6 +1455,14 @@ impl IntoResponse for HubError {
 }
 
 impl HttpHubError {
+    fn forbidden(code: &'static str, message: String) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message,
+            code,
+        }
+    }
+
     fn conflict(code: &'static str, message: String) -> Self {
         Self {
             status: StatusCode::CONFLICT,
@@ -1108,8 +1498,10 @@ async fn main() -> Result<()> {
     let auth_state = HttpAuthState {
         bearer_token: resolve_http_bearer_token(&args)?,
     };
+    let (tasks, blocked_helpers) = load_persisted_state(&config)?;
     let hub = Arc::new(RwLock::new(HubState {
-        tasks: load_persisted_tasks(&config)?,
+        tasks,
+        blocked_helpers,
         config,
         helpers: HashMap::new(),
         state_revision: 0,
@@ -1146,9 +1538,12 @@ async fn main() -> Result<()> {
         .route("/v1/tasks/recover", post(recover_task_handler))
         .route("/v1/tasks/heartbeat", post(task_heartbeat_handler))
         .route("/v1/tasks/release", post(release_task_handler))
+        .route("/v1/helpers", get(helpers_handler))
         .route("/v1/helpers/register", post(register_helper_handler))
         .route("/v1/helpers/heartbeat", post(helper_heartbeat_handler))
         .route("/v1/helpers/claim", post(claim_task_handler))
+        .route("/v1/helpers/block", post(block_helper_handler))
+        .route("/v1/helpers/unblock", post(unblock_helper_handler))
         .with_state(app_state)
         .layer(middleware::from_fn_with_state(
             auth_state,

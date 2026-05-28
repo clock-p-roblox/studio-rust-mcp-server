@@ -405,6 +405,17 @@ impl std::error::Error for RegisterHelperError {}
 struct HelperHeartbeatHubRequest {
     helper_id: String,
     active_task_ids: Vec<String>,
+    active_tasks: Vec<HelperHeartbeatTaskStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct HelperHeartbeatTaskStatus {
+    task_id: String,
+    remote_state: String,
+    remote_connection_id: Option<String>,
+    remote_last_error: Option<String>,
+    remote_last_ready_age_ms: Option<u128>,
+    remote_last_server_message_age_ms: Option<u128>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1219,6 +1230,24 @@ fn release_claimed_task(
     pending_termination
 }
 
+fn release_all_claimed_tasks(
+    state: &mut HelperState,
+    terminate_helper_spawned: bool,
+    reason: &str,
+) -> Vec<PendingLaunchTermination> {
+    let mut task_ids = state.claimed_tasks.keys().cloned().collect::<Vec<_>>();
+    task_ids.sort();
+    let mut pending_terminations = Vec::new();
+    for task_id in task_ids {
+        if let Some(pending_termination) =
+            release_claimed_task(state, &task_id, terminate_helper_spawned, reason)
+        {
+            pending_terminations.push(pending_termination);
+        }
+    }
+    pending_terminations
+}
+
 async fn terminate_pending_launch_termination(pending: PendingLaunchTermination) {
     let PendingLaunchTermination {
         task_id,
@@ -1402,6 +1431,7 @@ async fn hub_register_helper(
 async fn hub_helper_heartbeat(
     helper: &HelperConfig,
     active_task_ids: Vec<String>,
+    active_tasks: Vec<HelperHeartbeatTaskStatus>,
 ) -> Result<HelperHeartbeatHubResponse> {
     hub_post_json(
         helper,
@@ -1409,6 +1439,7 @@ async fn hub_helper_heartbeat(
         &HelperHeartbeatHubRequest {
             helper_id: helper.helper_id.clone(),
             active_task_ids,
+            active_tasks,
         },
     )
     .await
@@ -2473,6 +2504,48 @@ fn task_connection_key(task_id: &str) -> String {
     format!("task:{task_id}")
 }
 
+fn remote_connection_state_name(
+    remote_connection: Option<&RemoteConnectionHandle>,
+) -> &'static str {
+    remote_connection
+        .map(|connection| match connection.connection_state {
+            RemoteConnectionState::Connecting => "connecting",
+            RemoteConnectionState::Connected => "connected",
+            RemoteConnectionState::Retrying => "retrying",
+        })
+        .unwrap_or("disconnected")
+}
+
+fn heartbeat_task_statuses(state: &HelperState) -> Vec<HelperHeartbeatTaskStatus> {
+    let mut active_tasks = state
+        .claimed_tasks
+        .values()
+        .map(|task| {
+            let connection_key = task_connection_key(&task.task_id);
+            let remote_connection = state.remote_connections.get(&connection_key);
+            HelperHeartbeatTaskStatus {
+                task_id: task.task_id.clone(),
+                remote_state: remote_connection_state_name(remote_connection).to_owned(),
+                remote_connection_id: remote_connection
+                    .and_then(|connection| connection.connection_id.clone()),
+                remote_last_error: state.last_remote_errors.get(&connection_key).cloned(),
+                remote_last_ready_age_ms: remote_connection.and_then(|connection| {
+                    connection
+                        .last_ready_at
+                        .map(|value| value.elapsed().as_millis())
+                }),
+                remote_last_server_message_age_ms: remote_connection.and_then(|connection| {
+                    connection
+                        .last_server_message_at
+                        .map(|value| value.elapsed().as_millis())
+                }),
+            }
+        })
+        .collect::<Vec<_>>();
+    active_tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+    active_tasks
+}
+
 fn validate_remote_ready_ack(
     expected_place_id: &str,
     expected_task_id: Option<&str>,
@@ -2720,22 +2793,35 @@ async fn hub_maintenance_loop(app: AppState, mut registered: bool) {
             }
         }
 
-        let active_task_ids = {
+        let (active_task_ids, active_tasks) = {
             let state = app.state.lock().await;
-            state
+            let mut active_task_ids = state
                 .claimed_tasks
                 .values()
                 .map(|task| task.task_id.clone())
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            active_task_ids.sort();
+            let active_tasks = heartbeat_task_statuses(&state);
+            (active_task_ids, active_tasks)
         };
 
-        match hub_helper_heartbeat(&app.helper, active_task_ids).await {
+        match hub_helper_heartbeat(&app.helper, active_task_ids, active_tasks).await {
             Ok(response) => {
                 let pending_terminations = {
                     let mut state = app.state.lock().await;
-                    state.hub_last_error = None;
-                    state.hub_last_ready_at = Some(Instant::now());
                     let mut pending_terminations = Vec::new();
+                    if response.ok {
+                        state.hub_last_error = None;
+                        state.hub_last_ready_at = Some(Instant::now());
+                    } else {
+                        state.hub_last_error = Some("hub rejected helper heartbeat".to_owned());
+                        state.hub_last_ready_at = None;
+                        pending_terminations.extend(release_all_claimed_tasks(
+                            &mut state,
+                            true,
+                            "hub rejected helper heartbeat",
+                        ));
+                    }
                     for task_id in response.release_task_ids {
                         if let Some(pending_termination) = release_claimed_task(
                             &mut state,
