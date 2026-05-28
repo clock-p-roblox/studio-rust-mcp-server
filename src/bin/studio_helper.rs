@@ -4284,11 +4284,7 @@ fn is_official_business_tool_error(error: &Report) -> bool {
     }
     let summary = summary.to_ascii_lowercase();
     match tool_name {
-        "wait_job_finished" => {
-            summary.contains("workflow failed")
-                || summary.contains("no job found")
-                || summary.contains("generation id")
-        }
+        "wait_job_finished" => is_official_wait_job_business_error_summary(&summary),
         "generate_mesh"
         | "generate_procedural_model"
         | "search_creator_store"
@@ -4296,6 +4292,24 @@ fn is_official_business_tool_error(error: &Report) -> bool {
         | "store_image" => is_official_business_error_summary(&summary),
         _ => false,
     }
+}
+
+fn is_official_wait_job_business_error_summary(summary: &str) -> bool {
+    if summary.contains("workflow failed") || summary.contains("no job found") {
+        return true;
+    }
+    let squashed: String = summary
+        .chars()
+        .filter(|character| !matches!(character, ' ' | '_' | '-'))
+        .collect();
+    let references_job_id = summary.contains("job id")
+        || squashed.contains("jobid")
+        || squashed.contains("generationid");
+    references_job_id
+        && (summary.contains("invalid")
+            || summary.contains("missing")
+            || summary.contains("required")
+            || summary.contains("malformed"))
 }
 
 fn is_official_request_argument_error(error: &Report) -> bool {
@@ -5784,6 +5798,35 @@ mod tests {
             &missing_generation
         ));
         assert!(official_adapter_error_keeps_ready(&missing_generation));
+
+        let required_generation_id =
+            eyre!("official MCP tool wait_job_finished returned error: generationId required");
+        assert!(!should_restart_official_process_after_error(
+            &required_generation_id
+        ));
+        assert!(official_adapter_error_keeps_ready(&required_generation_id));
+
+        let missing_generation_id =
+            eyre!("official MCP tool wait_job_finished returned error: generation_id missing");
+        assert!(!should_restart_official_process_after_error(
+            &missing_generation_id
+        ));
+        assert!(official_adapter_error_keeps_ready(&missing_generation_id));
+
+        let required_job_id =
+            eyre!("official MCP tool wait_job_finished returned error: job id required");
+        assert!(!should_restart_official_process_after_error(
+            &required_job_id
+        ));
+        assert!(official_adapter_error_keeps_ready(&required_job_id));
+
+        let poll_generation_failed = eyre!(
+            "official MCP tool wait_job_finished returned error: failed to poll generation ID result"
+        );
+        assert!(should_restart_official_process_after_error(
+            &poll_generation_failed
+        ));
+        assert!(!official_adapter_error_keeps_ready(&poll_generation_failed));
 
         let generate_failed =
             eyre!("official MCP tool generate_mesh returned error: policy rejected input");
