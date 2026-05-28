@@ -4107,6 +4107,10 @@ async fn official_adapter_worker(
                 let Some(command) = command else {
                     break;
                 };
+                if let Err(error) = validate_official_adapter_request(&command.request) {
+                    let _ = command.response_tx.send(Err(error));
+                    continue;
+                }
                 set_official_adapter_state(&state, &task_id, "starting", None).await;
                 let timeout = Duration::from_millis(command.request.timeout_ms.max(1))
                     .min(OFFICIAL_MCP_REQUEST_TIMEOUT);
@@ -4139,6 +4143,9 @@ async fn official_adapter_worker(
                 }
                 match &result {
                     Ok(_) => set_official_adapter_state(&state, &task_id, "ready", None).await,
+                    Err(error) if official_adapter_error_keeps_ready(error) => {
+                        set_official_adapter_state(&state, &task_id, "ready", None).await;
+                    }
                     Err(error) => {
                         set_official_adapter_state(
                             &state,
@@ -4232,8 +4239,28 @@ fn official_tool_for_action(action: &str) -> Result<&'static str> {
     }
 }
 
+fn validate_official_adapter_request(request: &OfficialMcpRequest) -> Result<()> {
+    if request.action != "ping" {
+        official_tool_for_action(&request.action)?;
+    }
+    Ok(())
+}
+
 fn should_restart_official_process_after_error(error: &Report) -> bool {
     !is_transient_official_readiness_error(error)
+        && !official_adapter_error_keeps_ready(error)
+        && !official_adapter_error_preserves_state(error)
+}
+
+fn official_adapter_error_keeps_ready(error: &Report) -> bool {
+    !is_transient_official_readiness_error(error)
+        && (is_official_business_tool_error(error) || is_official_request_argument_error(error))
+}
+
+fn official_adapter_error_preserves_state(error: &Report) -> bool {
+    let message = error.to_string();
+    message.starts_with("unsupported official MCP adapter action:")
+        || message.starts_with("Invalid official MCP")
 }
 
 fn is_transient_official_readiness_error(error: &Report) -> bool {
@@ -4242,6 +4269,81 @@ fn is_transient_official_readiness_error(error: &Report) -> bool {
         || message.contains("official MCP found no connected Roblox Studio instances")
         || message
             .contains("previously active Studio has disconnected or doesn't have a place opened")
+}
+
+fn is_official_business_tool_error(error: &Report) -> bool {
+    let message = error.to_string();
+    let Some(rest) = message.strip_prefix("official MCP tool ") else {
+        return false;
+    };
+    let Some((tool_name, summary)) = rest.split_once(" returned error:") else {
+        return false;
+    };
+    if is_official_channel_error_summary(summary) {
+        return false;
+    }
+    let summary = summary.to_ascii_lowercase();
+    match tool_name {
+        "wait_job_finished" => summary.contains("workflow failed"),
+        "generate_mesh"
+        | "generate_procedural_model"
+        | "search_creator_store"
+        | "insert_from_creator_store"
+        | "store_image" => is_official_business_error_summary(&summary),
+        _ => false,
+    }
+}
+
+fn is_official_request_argument_error(error: &Report) -> bool {
+    let message = error.to_string();
+    message.starts_with("store_image ")
+}
+
+fn is_official_business_error_summary(summary: &str) -> bool {
+    [
+        "policy",
+        "moderation",
+        "prompt",
+        "input",
+        "argument",
+        "parameter",
+        "invalid",
+        "malformed",
+        "not found",
+        "no result",
+        "file",
+        "image",
+        "mime",
+        "content",
+        "asset",
+    ]
+    .iter()
+    .any(|needle| summary.contains(needle))
+}
+
+fn is_official_channel_error_summary(summary: &str) -> bool {
+    let summary = summary.to_ascii_lowercase();
+    [
+        "not connected",
+        "connection",
+        "ws host",
+        "websocket",
+        "active studio",
+        "studio unavailable",
+        "studio has disconnected",
+        "no connected roblox studio",
+        "adapter failure",
+        "internal adapter",
+        "timed out",
+        "timeout",
+        "stdio",
+        "json-rpc",
+        "protocol",
+        "closed stdout",
+        "process closed",
+    ]
+    .iter()
+    .any(|needle| summary.contains(needle))
 }
 
 fn prepare_official_tool_arguments(
@@ -5643,19 +5745,100 @@ mod tests {
             "official MCP tool list_roblox_studios returned error: Not connected to the WS host"
         );
         assert!(!should_restart_official_process_after_error(&transient));
+        assert!(!official_adapter_error_keeps_ready(&transient));
 
         let no_connected_studio = eyre!("official MCP found no connected Roblox Studio instances");
         assert!(!should_restart_official_process_after_error(
             &no_connected_studio
         ));
+        assert!(!official_adapter_error_keeps_ready(&no_connected_studio));
 
         let opening_place = eyre!(
             "official MCP tool search_creator_store returned error: Execution is prevented because previously active Studio has disconnected or doesn't have a place opened."
         );
         assert!(!should_restart_official_process_after_error(&opening_place));
+        assert!(!official_adapter_error_keeps_ready(&opening_place));
 
         let fatal = eyre!("official MCP process closed stdout");
         assert!(should_restart_official_process_after_error(&fatal));
+        assert!(!official_adapter_error_keeps_ready(&fatal));
+    }
+
+    #[test]
+    fn official_adapter_keeps_ready_for_tool_and_request_failures() {
+        let workflow_failed =
+            eyre!("official MCP tool wait_job_finished returned error: Workflow failed");
+        assert!(!should_restart_official_process_after_error(
+            &workflow_failed
+        ));
+        assert!(official_adapter_error_keeps_ready(&workflow_failed));
+
+        let generate_failed =
+            eyre!("official MCP tool generate_mesh returned error: policy rejected input");
+        assert!(!should_restart_official_process_after_error(
+            &generate_failed
+        ));
+        assert!(official_adapter_error_keeps_ready(&generate_failed));
+
+        let generate_channel_failed =
+            eyre!("official MCP tool generate_mesh returned error: Studio connection lost");
+        assert!(should_restart_official_process_after_error(
+            &generate_channel_failed
+        ));
+        assert!(!official_adapter_error_keeps_ready(
+            &generate_channel_failed
+        ));
+
+        let search_channel_failed =
+            eyre!("official MCP tool search_creator_store returned error: Studio connection lost");
+        assert!(should_restart_official_process_after_error(
+            &search_channel_failed
+        ));
+        assert!(!official_adapter_error_keeps_ready(&search_channel_failed));
+
+        let insert_channel_failed = eyre!(
+            "official MCP tool insert_from_creator_store returned error: Roblox Studio unavailable"
+        );
+        assert!(should_restart_official_process_after_error(
+            &insert_channel_failed
+        ));
+        assert!(!official_adapter_error_keeps_ready(&insert_channel_failed));
+
+        let store_image_channel_failed =
+            eyre!("official MCP tool store_image returned error: internal adapter failure");
+        assert!(should_restart_official_process_after_error(
+            &store_image_channel_failed
+        ));
+        assert!(!official_adapter_error_keeps_ready(
+            &store_image_channel_failed
+        ));
+
+        let store_image_file_failed =
+            eyre!("official MCP tool store_image returned error: file not found");
+        assert!(!should_restart_official_process_after_error(
+            &store_image_file_failed
+        ));
+        assert!(official_adapter_error_keeps_ready(&store_image_file_failed));
+
+        let internal_studio_tool_failed =
+            eyre!("official MCP tool list_roblox_studios returned error: unexpected failure");
+        assert!(should_restart_official_process_after_error(
+            &internal_studio_tool_failed
+        ));
+        assert!(!official_adapter_error_keeps_ready(
+            &internal_studio_tool_failed
+        ));
+
+        let bad_image = eyre!("store_image imageBase64 content does not match mimeType");
+        assert!(!should_restart_official_process_after_error(&bad_image));
+        assert!(official_adapter_error_keeps_ready(&bad_image));
+
+        let unsupported_action = eyre!("unsupported official MCP adapter action: unknown_action");
+        assert!(!should_restart_official_process_after_error(
+            &unsupported_action
+        ));
+        assert!(!official_adapter_error_keeps_ready(&unsupported_action));
+        assert!(official_adapter_error_preserves_state(&unsupported_action));
     }
 
     #[test]
