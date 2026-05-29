@@ -1,7 +1,5 @@
 local Main = script:FindFirstAncestor("MCPStudioPlugin")
 local ConsoleOutput = require(Main.Utils.ConsoleOutput)
-local DataModelType = require(Main.Utils.DataModelType)
-local GameStopUtil = require(Main.Utils.GameStopUtil)
 local MockWebSocketService = require(Main.MockWebSocketService)
 local PluginUtils = require(Main.Utils.PluginUtils)
 local StudioSessionControl = require(Main.Utils.StudioSessionControl)
@@ -45,17 +43,10 @@ local STATUS_THEME = {
 
 PluginUtils.plugin = plugin
 
-local datamodelType = DataModelType.getDataModelType()
 StudioModeTracker.observeCurrentDataModel()
-if datamodelType == "Server" then
-	task.spawn(GameStopUtil.monitorForStopPlay)
-end
 
 if RunService:IsRunning() then
 	StudioModeTracker.startRunningObservationHeartbeat()
-	plugin.Unloading:Connect(function()
-		StudioModeTracker.markStopped()
-	end)
 	return
 end
 
@@ -397,6 +388,7 @@ local currentStatusDetail = "Connect to the local helper. The helper registers t
 local statusSections = createDefaultStatusSections()
 local statusPollToken = 0
 local connectCurrentClient = nil
+local toolDispatchBusy = false
 
 local panel = Instance.new("ScrollingFrame")
 panel.Size = UDim2.fromScale(1, 1)
@@ -851,6 +843,7 @@ local function unregisterCurrentInstance()
 	currentHelperBaseUrl = nil
 	currentRemoteBaseUrl = nil
 	currentTaskId = nil
+	StudioSessionControl.configureHelperContext(nil, nil)
 end
 
 local function stopStatusPolling()
@@ -1155,6 +1148,7 @@ local function connectToHelper(helperPort: string)
 	local taskId = if type(registration.task_id) == "string" and registration.task_id ~= ""
 		then registration.task_id
 		else nil
+	StudioSessionControl.configureHelperContext(baseUrl, instanceId)
 	logPluginEvent("plugin_register_response", {
 		instance_id = instanceId,
 		task_id = taskId,
@@ -1212,6 +1206,7 @@ local function connectToHelper(helperPort: string)
 			currentHelperBaseUrl = nil
 			currentRemoteBaseUrl = nil
 			currentTaskId = nil
+			StudioSessionControl.configureHelperContext(nil, nil)
 			resetStatusSections("Stopped polling the local helper on port " .. helperPort .. ".")
 		end
 	end)
@@ -1293,27 +1288,46 @@ local function connectToHelper(helperPort: string)
 
 		local args = body.args :: Types.ToolArgs
 		local toolName = next(args)
-		logInfo("Received helper tool request " .. tostring(toolName) .. " (id=" .. id .. ")")
-		logPluginEvent("helper_tool_dispatch", {
-			instance_id = instanceId,
-			task_id = taskId,
-			id = id,
-			tool = toolName,
-		})
-
-		local success, response = pcall(toolCallHandler, args)
-		if success then
-			logPluginEvent("helper_tool_succeeded", {
+		while toolDispatchBusy do
+			task.wait(0.1)
+		end
+		toolDispatchBusy = true
+		local dispatchOk, dispatchError = pcall(function()
+			logInfo("Received helper tool request " .. tostring(toolName) .. " (id=" .. id .. ")")
+			logPluginEvent("helper_tool_dispatch", {
 				instance_id = instanceId,
 				task_id = taskId,
 				id = id,
 				tool = toolName,
-				response = summarizeText(response),
 			})
-			sendResponseOnce(true, response)
-			setStatusSection("registration", "connected", "Registered", "Handled tool " .. tostring(toolName) .. ".")
-		else
-			local errorMessage = tostring(response)
+
+			local success, response = pcall(toolCallHandler, args)
+			if success then
+				logPluginEvent("helper_tool_succeeded", {
+					instance_id = instanceId,
+					task_id = taskId,
+					id = id,
+					tool = toolName,
+					response = summarizeText(response),
+				})
+				sendResponseOnce(true, response)
+				setStatusSection("registration", "connected", "Registered", "Handled tool " .. tostring(toolName) .. ".")
+			else
+				local errorMessage = tostring(response)
+				logPluginEvent("helper_tool_failed", {
+					instance_id = instanceId,
+					task_id = taskId,
+					id = id,
+					tool = toolName,
+					error = errorMessage,
+				})
+				sendResponseOnce(false, errorMessage)
+				setStatusSection("registration", "error", "Tool failed", errorMessage)
+			end
+		end)
+		toolDispatchBusy = false
+		if not dispatchOk then
+			local errorMessage = tostring(dispatchError)
 			logPluginEvent("helper_tool_failed", {
 				instance_id = instanceId,
 				task_id = taskId,
