@@ -149,7 +149,7 @@ function MockWebSocketClient._OpenImpl(self: MockWebSocketClientPrivate)
 					self:_EmitStatus(ConnectionHealth.Info, "Received tool request from " .. self._receiveEndpoint)
 					self._MessageReceivedEvent:Fire(response.Body)
 					continue
-				elseif response.StatusCode == 423 then
+				elseif response.StatusCode == 204 or response.StatusCode == 423 then
 					if not self._lastHealthy then
 						self._lastHealthy = true
 						self:_EmitStatus(ConnectionHealth.Connected, "Connected to " .. self._uri)

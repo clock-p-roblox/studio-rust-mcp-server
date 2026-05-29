@@ -5,6 +5,7 @@ local StudioModeTracker = require(Main.Utils.StudioModeTracker)
 local Types = require(Main.Types)
 
 local HttpService = game:GetService("HttpService")
+local ServerScriptService = game:GetService("ServerScriptService")
 local StudioTestService = game:GetService("StudioTestService")
 
 local START_TIMEOUT_SECONDS = 60
@@ -14,6 +15,7 @@ local HELPER_PORT_SETTING_KEY = "MCP-helper-port"
 local DEFAULT_HELPER_PORT = "44750"
 local LOG_PAGE_SIZE = 400
 local MODE_LOG_PAGE_SIZE = 2_000
+local SESSION_CONTROL_SCRIPT_NAME = "MCPStudioSessionControl"
 
 type LogBaseline = {
 	path: string,
@@ -48,6 +50,14 @@ local START_PLAY_MARKERS = {
 
 local lastModeInferencePath: string? = nil
 local lastModeInferenceLineNumber = 0
+local currentHelperBaseUrl: string? = nil
+local currentInstanceId: string? = nil
+local lastHelperStopRequestId = 0
+
+local function configureHelperContext(helperUrl: string?, instanceId: string?)
+	currentHelperBaseUrl = helperUrl
+	currentInstanceId = instanceId
+end
 
 local function logTransitionStage(mode: Types.StartStopPlayMode, stage: string, detail: string?)
 	local message = string.format("[MCP Plugin] studio_transition mode=%s stage=%s", mode, stage)
@@ -72,9 +82,101 @@ local function helperBaseUrl(): string
 	return "http://127.0.0.1:" .. normalizeHelperPort(PluginUtils.getSettings(HELPER_PORT_SETTING_KEY))
 end
 
+local function activeHelperBaseUrl(): string
+	return currentHelperBaseUrl or helperBaseUrl()
+end
+
+local function removeSessionControlScript()
+	local existing = ServerScriptService:FindFirstChild(SESSION_CONTROL_SCRIPT_NAME)
+	if existing then
+		existing:Destroy()
+	end
+end
+
+local function luaStringLiteral(value: string): string
+	return HttpService:JSONEncode(value)
+end
+
+local function installSessionControlScript(targetMode: Types.StartStopPlayMode)
+	if currentInstanceId == nil or currentInstanceId == "" then
+		logTransitionStage(targetMode, "control_script_skipped", "reason=missing_instance_id")
+		return
+	end
+
+	removeSessionControlScript()
+	local helperUrl = activeHelperBaseUrl()
+	local instanceId = currentInstanceId
+	local afterId = lastHelperStopRequestId
+	local source = string.format(
+		[[
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+local StudioTestService = game:GetService("StudioTestService")
+
+if not RunService:IsServer() then
+	return
+end
+
+local helperBaseUrl = %s
+local instanceId = %s
+local afterId = %d
+local pollIntervalSeconds = 0.25
+
+local function pollStopRequest()
+	local url = string.format("%%s/v1/mcp/plugin/stop-request?instance_id=%%s&after_id=%%d", helperBaseUrl, instanceId, afterId)
+	local response = HttpService:RequestAsync({
+		Url = url,
+		Method = "GET",
+	})
+	if not response.Success then
+		return nil
+	end
+	local ok, payload = pcall(function()
+		return HttpService:JSONDecode(response.Body)
+	end)
+	if not ok or type(payload) ~= "table" then
+		return nil
+	end
+	return payload
+end
+
+while true do
+	local payload = pollStopRequest()
+	if payload ~= nil then
+		local stopRequestId = tonumber(payload.stop_request_id) or afterId
+		if payload.stop_requested == true and stopRequestId > afterId then
+			print(string.format("[MCP Plugin] session_control_stop stop_request_id=%%d", stopRequestId))
+			local ok, errorMessage = pcall(function()
+				StudioTestService:EndTest({
+					stopped_by = "mcp_session_control",
+					stop_request_id = stopRequestId,
+				})
+			end)
+			if not ok then
+				print(string.format("[MCP Plugin] session_control_stop_ignored stop_request_id=%%d error=%%s", stopRequestId, tostring(errorMessage)))
+			end
+			return
+		end
+		afterId = math.max(afterId, stopRequestId)
+	end
+	task.wait(pollIntervalSeconds)
+end
+]],
+		luaStringLiteral(helperUrl),
+		luaStringLiteral(instanceId),
+		afterId
+	)
+
+	local controlScript = Instance.new("Script")
+	controlScript.Name = SESSION_CONTROL_SCRIPT_NAME
+	controlScript.Source = source
+	controlScript.Parent = ServerScriptService
+	logTransitionStage(targetMode, "control_script_installed", string.format("instance_id=%s after_id=%d", instanceId, afterId))
+end
+
 local function requestStudioLog(startLine: number, lineCount: number)
 	local url =
-		string.format("%s/v1/helper/studio-log?start_line=%d&line_count=%d", helperBaseUrl(), startLine, lineCount)
+		string.format("%s/v1/helper/studio-log?start_line=%d&line_count=%d", activeHelperBaseUrl(), startLine, lineCount)
 	local response = HttpService:RequestAsync({
 		Url = url,
 		Method = "GET",
@@ -254,7 +356,37 @@ local function stop(force: boolean?): string?
 	end
 
 	local baseline = captureLogBaseline()
-	local stopRequestId = StudioModeTracker.requestStop()
+	local stopRequestId = 0
+	local helperStopSignaled = false
+	if currentInstanceId ~= nil and currentInstanceId ~= "" then
+		local signalOk, signalResult = pcall(function()
+			local response = HttpService:RequestAsync({
+				Url = activeHelperBaseUrl() .. "/v1/mcp/plugin/stop-request",
+				Method = "POST",
+				Headers = {
+					["Content-Type"] = "application/json",
+				},
+				Body = HttpService:JSONEncode({
+					instance_id = currentInstanceId,
+				}),
+			})
+			if not response.Success then
+				error(string.format("HTTP %d: %s", response.StatusCode, response.Body))
+			end
+			return HttpService:JSONDecode(response.Body)
+		end)
+		if signalOk and type(signalResult) == "table" then
+			lastHelperStopRequestId = math.max(lastHelperStopRequestId, tonumber(signalResult.stop_request_id) or 0)
+			stopRequestId = lastHelperStopRequestId
+			helperStopSignaled = true
+			logTransitionStage("stop", "helper_stop_signaled", string.format("stop_request_id=%d", lastHelperStopRequestId))
+		else
+			logTransitionStage("stop", "helper_stop_signal_failed", tostring(signalResult))
+		end
+	end
+	if not helperStopSignaled then
+		error("Unable to signal the running Studio session to stop through the helper")
+	end
 	logTransitionStage(
 		"stop",
 		"requested",
@@ -266,15 +398,10 @@ local function stop(force: boolean?): string?
 		)
 	)
 
-	local stopCall = startAsyncCall(function()
-		return StudioTestService:EndTest({})
-	end)
 	local matchedLine = waitForStopLog(baseline, STOP_TIMEOUT_SECONDS)
-	if stopCall.done and stopCall.success == false then
-		logTransitionStage("stop", "edit_end_test_ignored", tostring(stopCall.errorMessage))
-	end
 
 	StudioModeTracker.markStopped()
+	removeSessionControlScript()
 	logTransitionStage("stop", "observed", string.format("matched_line=%s", matchedLine))
 	return "Stopped"
 end
@@ -342,6 +469,7 @@ local function startPlayMode(successMessage: string): string?
 		local commandId = StudioModeTracker.beginStart("start_play")
 		attempt += 1
 		local baseline = captureLogBaseline()
+		installSessionControlScript("start_play")
 		logTransitionStage("start_play", "requested", string.format("command_id=%d attempt=%d", commandId, attempt))
 		local startCall = startAsyncCall(function()
 			return StudioTestService:ExecutePlayModeAsync({})
@@ -382,6 +510,7 @@ local function startRunServerMode(executor: () -> any, successMessage: string): 
 	end
 
 	local commandId = StudioModeTracker.beginStart("run_server")
+	installSessionControlScript("run_server")
 	logTransitionStage("run_server", "requested", string.format("command_id=%d", commandId))
 
 	local success, result = pcall(executor)
@@ -465,6 +594,7 @@ local function handleLaunchStudioSession(launchStudioSessionArgs: Types.LaunchSt
 end
 
 return {
+	configureHelperContext = configureHelperContext,
 	getStudioMode = getStudioMode,
 	handleLaunchStudioSession = handleLaunchStudioSession,
 	handleStartStopPlay = handleStartStopPlay,

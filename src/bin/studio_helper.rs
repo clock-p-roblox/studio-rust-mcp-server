@@ -148,6 +148,7 @@ struct PluginInstance {
     studio_pid: Option<u32>,
     studio_mode: Option<String>,
     studio_mode_observed_at: Option<Instant>,
+    stop_request_id: u64,
     last_seen_at: Instant,
     queue: VecDeque<Value>,
     notify: Arc<Notify>,
@@ -355,6 +356,24 @@ struct PluginStatusUpdateRequest {
     instance_id: String,
     #[serde(default)]
     studio_mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginStopRequestPayload {
+    instance_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginStopRequestQuery {
+    instance_id: String,
+    #[serde(default)]
+    after_id: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct PluginStopRequestResponse {
+    stop_requested: bool,
+    stop_request_id: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -2453,6 +2472,7 @@ async fn mcp_register_handler(
                 studio_mode: normalize_studio_mode(payload.studio_mode.as_deref()),
                 studio_mode_observed_at: normalize_studio_mode(payload.studio_mode.as_deref())
                     .map(|_| Instant::now()),
+                stop_request_id: 0,
                 last_seen_at: Instant::now(),
                 queue: VecDeque::new(),
                 notify: Arc::new(Notify::new()),
@@ -2507,6 +2527,49 @@ async fn mcp_unregister_handler(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+async fn mcp_plugin_stop_request_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<PluginStopRequestPayload>,
+) -> Result<Json<PluginStopRequestResponse>, HelperError> {
+    let mut state = app.state.lock().await;
+    let Some(instance) = state.instances.get_mut(&payload.instance_id) else {
+        return Err(HelperError(eyre!(
+            "plugin instance expired: {}",
+            payload.instance_id
+        )));
+    };
+    instance.stop_request_id = instance.stop_request_id.saturating_add(1);
+    instance.last_seen_at = Instant::now();
+    tracing::info!(
+        instance_id = payload.instance_id,
+        place_id = instance.place_id,
+        task_id = ?instance.task_id,
+        stop_request_id = instance.stop_request_id,
+        "recorded MCP plugin stop request"
+    );
+    Ok(Json(PluginStopRequestResponse {
+        stop_requested: true,
+        stop_request_id: instance.stop_request_id,
+    }))
+}
+
+async fn mcp_plugin_stop_request_status_handler(
+    State(app): State<AppState>,
+    Query(query): Query<PluginStopRequestQuery>,
+) -> Result<Response, HelperError> {
+    let mut state = app.state.lock().await;
+    let Some(instance) = state.instances.get_mut(&query.instance_id) else {
+        return Ok((StatusCode::GONE, "instance expired").into_response());
+    };
+    instance.last_seen_at = Instant::now();
+    let after_id = query.after_id.unwrap_or(0);
+    Ok(Json(PluginStopRequestResponse {
+        stop_requested: instance.stop_request_id > after_id,
+        stop_request_id: instance.stop_request_id,
+    })
+    .into_response())
+}
+
 async fn mcp_plugin_request_handler(
     State(app): State<AppState>,
     Query(query): Query<PluginRequestQuery>,
@@ -2541,7 +2604,7 @@ async fn mcp_plugin_request_handler(
             Some(command) => Ok(Json(command).into_response()),
             None => Ok((StatusCode::GONE, "instance expired").into_response()),
         },
-        Err(_) => Ok((StatusCode::LOCKED, String::new()).into_response()),
+        Err(_) => Ok(StatusCode::NO_CONTENT.into_response()),
     }
 }
 
@@ -5467,6 +5530,10 @@ async fn main() -> Result<()> {
         .route("/v1/mcp/unregister", post(mcp_unregister_handler))
         .route("/v1/mcp/plugin/request", get(mcp_plugin_request_handler))
         .route(
+            "/v1/mcp/plugin/stop-request",
+            get(mcp_plugin_stop_request_status_handler).post(mcp_plugin_stop_request_handler),
+        )
+        .route(
             "/v1/mcp/plugin/status",
             post(mcp_plugin_status_update_handler),
         )
@@ -5501,6 +5568,7 @@ mod tests {
             studio_pid: Some(123),
             studio_mode: Some("stop".to_owned()),
             studio_mode_observed_at: Some(Instant::now()),
+            stop_request_id: 0,
             last_seen_at: Instant::now() - Duration::from_millis(age_ms),
             queue: VecDeque::new(),
             notify: Arc::new(Notify::new()),

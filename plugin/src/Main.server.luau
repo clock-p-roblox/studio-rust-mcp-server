@@ -1,7 +1,5 @@
 local Main = script:FindFirstAncestor("MCPStudioPlugin")
 local ConsoleOutput = require(Main.Utils.ConsoleOutput)
-local DataModelType = require(Main.Utils.DataModelType)
-local GameStopUtil = require(Main.Utils.GameStopUtil)
 local MockWebSocketService = require(Main.MockWebSocketService)
 local PluginUtils = require(Main.Utils.PluginUtils)
 local StudioSessionControl = require(Main.Utils.StudioSessionControl)
@@ -46,17 +44,10 @@ local STATUS_THEME = {
 
 PluginUtils.plugin = plugin
 
-local datamodelType = DataModelType.getDataModelType()
 StudioModeTracker.observeCurrentDataModel()
-if datamodelType == "Server" then
-	task.spawn(GameStopUtil.monitorForStopPlay)
-end
 
 if RunService:IsRunning() then
 	StudioModeTracker.startRunningObservationHeartbeat()
-	plugin.Unloading:Connect(function()
-		StudioModeTracker.markStopped()
-	end)
 	return
 end
 
@@ -117,8 +108,8 @@ local function joinSentences(parts: { string }): string
 	return table.concat(filtered, " ")
 end
 
-local function logInfo(message: string)
-	if VERBOSE_LOGS then
+local function logInfo(message: string, force: boolean?)
+	if force or VERBOSE_LOGS then
 		print(LOG_PREFIX, message)
 	end
 end
@@ -126,6 +117,21 @@ end
 local function logWarn(message: string)
 	warn(LOG_PREFIX, message)
 end
+
+local QUIET_PLUGIN_EVENT_ACTIONS = {
+	helper_http_request = true,
+	helper_http_response = true,
+	long_poll_status_changed = true,
+	plugin_status_update_sent = true,
+	status_poll_begin = true,
+	status_poll_claim_found = true,
+	status_poll_helper_ready = true,
+	status_poll_registration_found = true,
+	status_poll_skip = true,
+	status_poll_start = true,
+	status_poll_stop = true,
+	studio_mode_sample = true,
+}
 
 local function formatLogValue(value: any): string
 	if value == nil then
@@ -152,7 +158,11 @@ local IMPORTANT_PLUGIN_EVENTS = {
 }
 
 local function logPluginEvent(action: string, fields: { [string]: any }?)
-	if not VERBOSE_LOGS and IMPORTANT_PLUGIN_EVENTS[action] ~= true then
+	if VERBOSE_LOGS then
+		if QUIET_PLUGIN_EVENT_ACTIONS[action] then
+			return
+		end
+	elseif IMPORTANT_PLUGIN_EVENTS[action] ~= true then
 		return
 	end
 
@@ -167,7 +177,7 @@ local function logPluginEvent(action: string, fields: { [string]: any }?)
 			table.insert(parts, key .. "=" .. formatLogValue(fields[key]))
 		end
 	end
-	logInfo(table.concat(parts, " "))
+	logInfo(table.concat(parts, " "), true)
 end
 
 local function normalizeHelperPort(value: string): string
@@ -398,6 +408,7 @@ local currentStatusDetail = "Connect to the local helper. The helper registers t
 local statusSections = createDefaultStatusSections()
 local statusPollToken = 0
 local connectCurrentClient = nil
+local toolDispatchBusy = false
 
 local panel = Instance.new("ScrollingFrame")
 panel.Size = UDim2.fromScale(1, 1)
@@ -852,6 +863,7 @@ local function unregisterCurrentInstance()
 	currentHelperBaseUrl = nil
 	currentRemoteBaseUrl = nil
 	currentTaskId = nil
+	StudioSessionControl.configureHelperContext(nil, nil)
 end
 
 local function stopStatusPolling()
@@ -1156,6 +1168,7 @@ local function connectToHelper(helperPort: string)
 	local taskId = if type(registration.task_id) == "string" and registration.task_id ~= ""
 		then registration.task_id
 		else nil
+	StudioSessionControl.configureHelperContext(baseUrl, instanceId)
 	logPluginEvent("plugin_register_response", {
 		instance_id = instanceId,
 		task_id = taskId,
@@ -1213,6 +1226,7 @@ local function connectToHelper(helperPort: string)
 			currentHelperBaseUrl = nil
 			currentRemoteBaseUrl = nil
 			currentTaskId = nil
+			StudioSessionControl.configureHelperContext(nil, nil)
 			resetStatusSections("Stopped polling the local helper on port " .. helperPort .. ".")
 		end
 	end)
@@ -1294,27 +1308,46 @@ local function connectToHelper(helperPort: string)
 
 		local args = body.args :: Types.ToolArgs
 		local toolName = next(args)
-		logInfo("Received helper tool request " .. tostring(toolName) .. " (id=" .. id .. ")")
-		logPluginEvent("helper_tool_dispatch", {
-			instance_id = instanceId,
-			task_id = taskId,
-			id = id,
-			tool = toolName,
-		})
-
-		local success, response = pcall(toolCallHandler, args)
-		if success then
-			logPluginEvent("helper_tool_succeeded", {
+		while toolDispatchBusy do
+			task.wait(0.1)
+		end
+		toolDispatchBusy = true
+		local dispatchOk, dispatchError = pcall(function()
+			logInfo("Received helper tool request " .. tostring(toolName) .. " (id=" .. id .. ")")
+			logPluginEvent("helper_tool_dispatch", {
 				instance_id = instanceId,
 				task_id = taskId,
 				id = id,
 				tool = toolName,
-				response = summarizeText(response),
 			})
-			sendResponseOnce(true, response)
-			setStatusSection("registration", "connected", "Registered", "Handled tool " .. tostring(toolName) .. ".")
-		else
-			local errorMessage = tostring(response)
+
+			local success, response = pcall(toolCallHandler, args)
+			if success then
+				logPluginEvent("helper_tool_succeeded", {
+					instance_id = instanceId,
+					task_id = taskId,
+					id = id,
+					tool = toolName,
+					response = summarizeText(response),
+				})
+				sendResponseOnce(true, response)
+				setStatusSection("registration", "connected", "Registered", "Handled tool " .. tostring(toolName) .. ".")
+			else
+				local errorMessage = tostring(response)
+				logPluginEvent("helper_tool_failed", {
+					instance_id = instanceId,
+					task_id = taskId,
+					id = id,
+					tool = toolName,
+					error = errorMessage,
+				})
+				sendResponseOnce(false, errorMessage)
+				setStatusSection("registration", "error", "Tool failed", errorMessage)
+			end
+		end)
+		toolDispatchBusy = false
+		if not dispatchOk then
+			local errorMessage = tostring(dispatchError)
 			logPluginEvent("helper_tool_failed", {
 				instance_id = instanceId,
 				task_id = taskId,
