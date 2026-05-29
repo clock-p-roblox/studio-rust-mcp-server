@@ -2608,7 +2608,7 @@ pub async fn request_handler(State(state): State<PackedState>) -> Result<impl In
         Ok(result) => Ok(Json(result?).into_response()),
         _ => {
             tracing::debug!("plugin long poll timed out with no queued tool");
-            Ok((StatusCode::LOCKED, String::new()).into_response())
+            Ok(StatusCode::NO_CONTENT.into_response())
         }
     }
 }

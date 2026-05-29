@@ -124,6 +124,21 @@ local function logWarn(message: string)
 	warn(LOG_PREFIX, message)
 end
 
+local QUIET_PLUGIN_EVENT_ACTIONS = {
+	helper_http_request = true,
+	helper_http_response = true,
+	long_poll_status_changed = true,
+	plugin_status_update_sent = true,
+	status_poll_begin = true,
+	status_poll_claim_found = true,
+	status_poll_helper_ready = true,
+	status_poll_registration_found = true,
+	status_poll_skip = true,
+	status_poll_start = true,
+	status_poll_stop = true,
+	studio_mode_sample = true,
+}
+
 local function formatLogValue(value: any): string
 	if value == nil then
 		return "nil"
@@ -136,6 +151,10 @@ local function formatLogValue(value: any): string
 end
 
 local function logPluginEvent(action: string, fields: { [string]: any }?)
+	if QUIET_PLUGIN_EVENT_ACTIONS[action] then
+		return
+	end
+
 	local parts = { action }
 	if type(fields) == "table" then
 		local keys = {}

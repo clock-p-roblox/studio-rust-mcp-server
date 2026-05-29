@@ -2541,7 +2541,7 @@ async fn mcp_plugin_request_handler(
             Some(command) => Ok(Json(command).into_response()),
             None => Ok((StatusCode::GONE, "instance expired").into_response()),
         },
-        Err(_) => Ok((StatusCode::LOCKED, String::new()).into_response()),
+        Err(_) => Ok(StatusCode::NO_CONTENT.into_response()),
     }
 }
 
