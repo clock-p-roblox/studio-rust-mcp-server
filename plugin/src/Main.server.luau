@@ -43,13 +43,11 @@ local STATUS_THEME = {
 
 PluginUtils.plugin = plugin
 
-StudioModeTracker.observeCurrentDataModel()
-
 if RunService:IsRunning() then
-	StudioModeTracker.startRunningObservationHeartbeat()
 	return
 end
 
+StudioModeTracker.observeCurrentDataModel()
 StudioModeTracker.normalizeEditState()
 
 local connMessageOut = ConsoleOutput.startListener()
