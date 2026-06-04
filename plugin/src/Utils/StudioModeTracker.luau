@@ -291,16 +291,19 @@ local function waitForStart(
 	end
 
 	local snapshot = getSnapshot()
-	error(
-		string.format(
-			"Timed out waiting for Studio to enter %s. mode=%s active_session_id=%d control_ready_session_id=%d pending_start_id=%d",
-			targetMode,
-			snapshot.mode,
-			snapshot.activeSessionId,
-			snapshot.controlReadySessionId,
-			snapshot.pendingStartId
-		)
+	local errorMessage = string.format(
+		"Timed out waiting for Studio to enter %s. mode=%s active_session_id=%d control_ready_session_id=%d pending_start_id=%d",
+		targetMode,
+		snapshot.mode,
+		snapshot.activeSessionId,
+		snapshot.controlReadySessionId,
+		snapshot.pendingStartId
 	)
+	if snapshot.pendingStartId == commandId then
+		clearPendingStart()
+	end
+	writeLastError(commandId, errorMessage)
+	error(errorMessage)
 end
 
 local function waitForStop(timeoutSeconds: number): TrackerSnapshot

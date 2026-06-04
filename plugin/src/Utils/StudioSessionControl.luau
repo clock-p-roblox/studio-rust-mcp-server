@@ -350,8 +350,18 @@ local function stop(force: boolean?): string?
 	ConsoleOutput.outputMessage = ""
 	local currentMode = getStudioMode()
 	local snapshot = StudioModeTracker.getSnapshot()
-	if force ~= true and currentMode == "stop" and snapshot.pendingStartId == 0 and snapshot.activeSessionId == 0 then
-		logTransitionStage("stop", "noop")
+	if force ~= true and currentMode == "stop" and snapshot.activeSessionId == 0 then
+		StudioModeTracker.markStopped()
+		removeSessionControlScript()
+		if snapshot.pendingStartId > 0 then
+			logTransitionStage(
+				"stop",
+				"noop_cleared_stale_pending",
+				string.format("pending_start_id=%d", snapshot.pendingStartId)
+			)
+		else
+			logTransitionStage("stop", "noop")
+		end
 		return "Stopped"
 	end
 
@@ -442,15 +452,15 @@ local function waitForStartPlayLogOrRetry(
 	end
 
 	local snapshot = StudioModeTracker.getSnapshot()
-	error(
-		string.format(
-			"Timed out waiting for Studio to enter start_play. mode=%s active_session_id=%d pending_start_id=%d last_log_error=%s",
-			snapshot.mode,
-			snapshot.activeSessionId,
-			snapshot.pendingStartId,
-			tostring(lastLogError)
-		)
+	local errorMessage = string.format(
+		"Timed out waiting for Studio to enter start_play. mode=%s active_session_id=%d pending_start_id=%d last_log_error=%s",
+		snapshot.mode,
+		snapshot.activeSessionId,
+		snapshot.pendingStartId,
+		tostring(lastLogError)
 	)
+	StudioModeTracker.recordTransitionError(commandId, errorMessage)
+	error(errorMessage)
 end
 
 local function startPlayMode(successMessage: string): string?
@@ -464,9 +474,11 @@ local function startPlayMode(successMessage: string): string?
 
 	local deadline = os.clock() + START_TIMEOUT_SECONDS
 	local attempt = 0
+	local lastCommandId = 0
 
 	while os.clock() < deadline do
 		local commandId = StudioModeTracker.beginStart("start_play")
+		lastCommandId = commandId
 		attempt += 1
 		local baseline = captureLogBaseline()
 		installSessionControlScript("start_play")
@@ -490,14 +502,14 @@ local function startPlayMode(successMessage: string): string?
 	end
 
 	local snapshotAfterTimeout = StudioModeTracker.getSnapshot()
-	error(
-		string.format(
-			"Timed out waiting for Studio to accept start_play. mode=%s active_session_id=%d pending_start_id=%d",
-			snapshotAfterTimeout.mode,
-			snapshotAfterTimeout.activeSessionId,
-			snapshotAfterTimeout.pendingStartId
-		)
+	local errorMessage = string.format(
+		"Timed out waiting for Studio to accept start_play. mode=%s active_session_id=%d pending_start_id=%d",
+		snapshotAfterTimeout.mode,
+		snapshotAfterTimeout.activeSessionId,
+		snapshotAfterTimeout.pendingStartId
 	)
+	StudioModeTracker.recordTransitionError(lastCommandId, errorMessage)
+	error(errorMessage)
 end
 
 local function startRunServerMode(executor: () -> any, successMessage: string): string?
