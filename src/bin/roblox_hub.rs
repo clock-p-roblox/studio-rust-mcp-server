@@ -158,6 +158,7 @@ struct TaskRecord {
     last_task_heartbeat_at_unix_ms: u64,
     last_seen_at: Instant,
     claimed_by_helper_id: Option<String>,
+    claimed_at_unix_ms: Option<u64>,
     released: bool,
 }
 
@@ -211,6 +212,8 @@ struct PersistedTaskRecord {
     #[serde(default)]
     last_task_heartbeat_at_unix_ms: u64,
     claimed_by_helper_id: Option<String>,
+    #[serde(default)]
+    claimed_at_unix_ms: Option<u64>,
     released: bool,
 }
 
@@ -624,6 +627,7 @@ fn load_persisted_state(
                 })
                 .map(|_| helper_id.clone())
         });
+        let claimed_at_unix_ms = claimed_by_helper_id.as_ref().and(task.claimed_at_unix_ms);
         tasks.insert(
             task.task_id.clone(),
             TaskRecord {
@@ -645,6 +649,7 @@ fn load_persisted_state(
                 last_task_heartbeat_at_unix_ms,
                 last_seen_at: restored_last_seen_at,
                 claimed_by_helper_id,
+                claimed_at_unix_ms,
                 released: task.released,
             },
         );
@@ -707,6 +712,7 @@ fn build_persisted_state_payload(state: &HubState) -> PersistedHubState {
                 updated_at_unix_ms: task.updated_at_unix_ms,
                 last_task_heartbeat_at_unix_ms: task.last_task_heartbeat_at_unix_ms,
                 claimed_by_helper_id: task.claimed_by_helper_id.clone(),
+                claimed_at_unix_ms: task.claimed_at_unix_ms,
                 released: task.released,
             })
             .collect(),
@@ -816,6 +822,7 @@ fn new_token() -> String {
 fn clear_task_claim_state(task: &mut TaskRecord) {
     task.accepting_launches = false;
     task.claimed_by_helper_id = None;
+    task.claimed_at_unix_ms = None;
 }
 
 fn clear_task_route_state(task: &mut TaskRecord) {
@@ -961,6 +968,7 @@ fn clear_helper_claims(state: &mut HubState, helper_id: &str, now: u64) -> bool 
     for task in state.tasks.values_mut() {
         if task.claimed_by_helper_id.as_deref() == Some(helper_id) {
             task.claimed_by_helper_id = None;
+            task.claimed_at_unix_ms = None;
             task.updated_at_unix_ms = now;
             changed = true;
         }
@@ -973,6 +981,7 @@ fn clear_helper_task_claim(state: &mut HubState, helper_id: &str, task_id: &str,
     if let Some(task) = state.tasks.get_mut(task_id) {
         if task.claimed_by_helper_id.as_deref() == Some(helper_id) {
             task.claimed_by_helper_id = None;
+            task.claimed_at_unix_ms = None;
             task.updated_at_unix_ms = now;
             changed = true;
         }
@@ -1019,6 +1028,58 @@ fn task_matches_claimed_helper(task: &TaskRecord, helper_id: &str, task_id: &str
         && task.service_state != "expired"
         && task.task_id == task_id
         && task.claimed_by_helper_id.as_deref() == Some(helper_id)
+}
+
+fn task_claim_sort_key(task: &TaskRecord) -> (u64, u64, &str) {
+    (
+        task.claimed_at_unix_ms.unwrap_or(task.created_at_unix_ms),
+        task.created_at_unix_ms,
+        task.task_id.as_str(),
+    )
+}
+
+fn helper_claimed_place_ids(state: &HubState, helper_id: &str) -> HashSet<String> {
+    state
+        .tasks
+        .values()
+        .filter(|task| {
+            !task.released
+                && task.service_state != "expired"
+                && task.claimed_by_helper_id.as_deref() == Some(helper_id)
+        })
+        .map(|task| task.place_id.clone())
+        .collect()
+}
+
+fn duplicate_reported_place_task_ids(
+    tasks: &HashMap<String, TaskRecord>,
+    helper_id: &str,
+    active_task_ids: &HashSet<String>,
+) -> HashSet<String> {
+    let mut keeper_by_place: HashMap<String, (&str, (u64, u64, &str))> = HashMap::new();
+    let mut duplicates = HashSet::new();
+    let mut reported_tasks = active_task_ids
+        .iter()
+        .filter_map(|task_id| tasks.get(task_id))
+        .filter(|task| task_matches_claimed_helper(task, helper_id, &task.task_id))
+        .collect::<Vec<_>>();
+    reported_tasks.sort_by_key(|task| task_claim_sort_key(task));
+    for task in reported_tasks {
+        let sort_key = task_claim_sort_key(task);
+        match keeper_by_place.get(&task.place_id).copied() {
+            Some((kept_task_id, kept_key)) if sort_key < kept_key => {
+                duplicates.insert(kept_task_id.to_owned());
+                keeper_by_place.insert(task.place_id.clone(), (task.task_id.as_str(), sort_key));
+            }
+            Some(_) => {
+                duplicates.insert(task.task_id.clone());
+            }
+            None => {
+                keeper_by_place.insert(task.place_id.clone(), (task.task_id.as_str(), sort_key));
+            }
+        }
+    }
+    duplicates
 }
 
 fn cleanup_stale_state(state: &mut HubState) -> bool {
@@ -1162,6 +1223,7 @@ async fn create_task_handler(
             last_task_heartbeat_at_unix_ms: now,
             last_seen_at: Instant::now(),
             claimed_by_helper_id: None,
+            claimed_at_unix_ms: None,
             released: false,
         },
     );
@@ -1586,6 +1648,17 @@ async fn helper_heartbeat_handler(
         if !active_task_ids.contains(&task.task_id) {
             release_task_ids.insert(task.task_id.clone());
             task.claimed_by_helper_id = None;
+            task.claimed_at_unix_ms = None;
+            task.updated_at_unix_ms = now;
+            persisted_changed = true;
+        }
+    }
+
+    for task_id in duplicate_reported_place_task_ids(&state.tasks, &helper_id, &active_task_ids) {
+        release_task_ids.insert(task_id.clone());
+        if let Some(task) = state.tasks.get_mut(&task_id) {
+            task.claimed_by_helper_id = None;
+            task.claimed_at_unix_ms = None;
             task.updated_at_unix_ms = now;
             persisted_changed = true;
         }
@@ -1691,6 +1764,7 @@ async fn claim_task_handler(
     let helper_capacity = helper.capacity;
     let helper_launch_count = helper.active_task_ids.len();
     let helper_id = helper.helper_id.clone();
+    let helper_claimed_place_ids = helper_claimed_place_ids(&state, &helper_id);
     if helper_launch_count >= helper_capacity {
         let snapshot = if cleanup_changed {
             Some(bump_state_revision(&mut state))
@@ -1716,6 +1790,7 @@ async fn claim_task_handler(
                 && task.accepting_launches
                 && task.claimed_by_helper_id.is_none()
                 && task.owner_user == helper_owner
+                && !helper_claimed_place_ids.contains(&task.place_id)
                 && task.routes.mcp_base_url.is_some()
         })
         .collect::<Vec<_>>();
@@ -1736,8 +1811,10 @@ async fn claim_task_handler(
             task: None,
         }));
     };
+    let now = now_unix_ms();
     task.claimed_by_helper_id = Some(helper_id.clone());
-    task.updated_at_unix_ms = now_unix_ms();
+    task.claimed_at_unix_ms = Some(now);
+    task.updated_at_unix_ms = now;
     let claimed_task_id = task.task_id.clone();
     let response_task = ClaimedTaskPayload {
         task_id: claimed_task_id.clone(),
@@ -1869,6 +1946,7 @@ mod tests {
             last_task_heartbeat_at_unix_ms: now,
             last_seen_at: Instant::now(),
             claimed_by_helper_id: helper_id.map(str::to_owned),
+            claimed_at_unix_ms: helper_id.map(|_| now),
             released: false,
         }
     }
@@ -1890,6 +1968,22 @@ mod tests {
         }
     }
 
+    fn test_active_task_heartbeat(task_id: &str) -> HelperActiveTaskHeartbeat {
+        HelperActiveTaskHeartbeat {
+            task_id: task_id.to_owned(),
+            remote_state: "connected".to_owned(),
+            remote_connection_id: Some(format!("conn_{task_id}")),
+            remote_last_error: None,
+            remote_last_ready_age_ms: Some(10),
+            remote_last_server_message_age_ms: Some(5),
+            studio_mode: Some("stop".to_owned()),
+            studio_mode_age_ms: Some(20),
+            official_mcp_adapter_state: Some("ready".to_owned()),
+            official_mcp_adapter_age_ms: Some(20),
+            official_mcp_adapter_last_error: None,
+        }
+    }
+
     async fn seed_claimed_task(app: &AppState, helper_id: &str, task_id: &str) {
         let mut state = app.hub.write().await;
         state
@@ -1898,6 +1992,176 @@ mod tests {
         state
             .helpers
             .insert(helper_id.to_owned(), test_helper(helper_id, &[task_id]));
+    }
+
+    #[tokio::test]
+    async fn claim_skips_same_place_already_claimed_by_helper() {
+        let app = test_app();
+        {
+            let mut state = app.hub.write().await;
+            state
+                .helpers
+                .insert("h_test".to_owned(), test_helper("h_test", &["t1"]));
+            let mut claimed = test_task("t1", Some("h_test"));
+            claimed.place_id = "place_a".to_owned();
+            let mut duplicate = test_task("t2", None);
+            duplicate.place_id = "place_a".to_owned();
+            let mut other_place = test_task("t3", None);
+            other_place.place_id = "place_b".to_owned();
+            other_place.created_at_unix_ms = other_place.created_at_unix_ms.saturating_add(1);
+            state.tasks.insert("t1".to_owned(), claimed);
+            state.tasks.insert("t2".to_owned(), duplicate);
+            state.tasks.insert("t3".to_owned(), other_place);
+        }
+
+        let response = claim_task_handler(
+            State(app.clone()),
+            Json(ClaimTaskRequest {
+                helper_id: "h_test".to_owned(),
+            }),
+        )
+        .await
+        .expect("claim should succeed")
+        .0;
+
+        assert!(response.claimed);
+        assert_eq!(
+            response.task.as_ref().map(|task| task.task_id.as_str()),
+            Some("t3")
+        );
+        let state = app.hub.read().await;
+        assert!(state.tasks["t2"].claimed_by_helper_id.is_none());
+        assert_eq!(
+            state.tasks["t3"].claimed_by_helper_id.as_deref(),
+            Some("h_test")
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_returns_empty_when_only_same_place_candidate_exists() {
+        let app = test_app();
+        {
+            let mut state = app.hub.write().await;
+            state
+                .helpers
+                .insert("h_test".to_owned(), test_helper("h_test", &["t1"]));
+            let mut claimed = test_task("t1", Some("h_test"));
+            claimed.place_id = "place_a".to_owned();
+            let mut duplicate = test_task("t2", None);
+            duplicate.place_id = "place_a".to_owned();
+            state.tasks.insert("t1".to_owned(), claimed);
+            state.tasks.insert("t2".to_owned(), duplicate);
+        }
+
+        let response = claim_task_handler(
+            State(app.clone()),
+            Json(ClaimTaskRequest {
+                helper_id: "h_test".to_owned(),
+            }),
+        )
+        .await
+        .expect("claim should return clean empty response")
+        .0;
+
+        assert!(!response.claimed);
+        assert!(response.task.is_none());
+        let state = app.hub.read().await;
+        assert!(state.tasks["t2"].claimed_by_helper_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_releases_later_claimed_same_place_duplicate() {
+        let app = test_app();
+        {
+            let mut state = app.hub.write().await;
+            state.helpers.insert(
+                "h_test".to_owned(),
+                test_helper("h_test", &["t_old", "t_new"]),
+            );
+            let now = now_unix_ms();
+            let mut old_task = test_task("t_old", Some("h_test"));
+            old_task.place_id = "place_a".to_owned();
+            old_task.created_at_unix_ms = now.saturating_sub(2_000);
+            old_task.claimed_at_unix_ms = Some(now.saturating_sub(1_000));
+            let mut new_task = test_task("t_new", Some("h_test"));
+            new_task.place_id = "place_a".to_owned();
+            new_task.created_at_unix_ms = now.saturating_sub(1_000);
+            new_task.claimed_at_unix_ms = Some(now);
+            state.tasks.insert("t_old".to_owned(), old_task);
+            state.tasks.insert("t_new".to_owned(), new_task);
+        }
+
+        let response = helper_heartbeat_handler(
+            State(app.clone()),
+            Json(HelperHeartbeatRequest {
+                helper_id: "h_test".to_owned(),
+                active_task_ids: vec!["t_old".to_owned(), "t_new".to_owned()],
+                active_tasks: Vec::new(),
+            }),
+        )
+        .await
+        .expect("heartbeat should converge duplicates")
+        .0;
+
+        assert!(response.ok);
+        assert_eq!(response.release_task_ids, vec!["t_new".to_owned()]);
+        let state = app.hub.read().await;
+        assert_eq!(
+            state.tasks["t_old"].claimed_by_helper_id.as_deref(),
+            Some("h_test")
+        );
+        assert!(state.tasks["t_new"].claimed_by_helper_id.is_none());
+        assert!(state.helpers["h_test"].active_task_ids.contains("t_old"));
+        assert!(!state.helpers["h_test"].active_task_ids.contains("t_new"));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_releases_same_place_duplicate_reported_only_in_active_tasks() {
+        let app = test_app();
+        {
+            let mut state = app.hub.write().await;
+            state.helpers.insert(
+                "h_test".to_owned(),
+                test_helper("h_test", &["t_old", "t_new"]),
+            );
+            let now = now_unix_ms();
+            let mut old_task = test_task("t_old", Some("h_test"));
+            old_task.place_id = "place_a".to_owned();
+            old_task.created_at_unix_ms = now.saturating_sub(2_000);
+            old_task.claimed_at_unix_ms = Some(now.saturating_sub(1_000));
+            let mut new_task = test_task("t_new", Some("h_test"));
+            new_task.place_id = "place_a".to_owned();
+            new_task.created_at_unix_ms = now.saturating_sub(1_000);
+            new_task.claimed_at_unix_ms = Some(now);
+            state.tasks.insert("t_old".to_owned(), old_task);
+            state.tasks.insert("t_new".to_owned(), new_task);
+        }
+
+        let response = helper_heartbeat_handler(
+            State(app.clone()),
+            Json(HelperHeartbeatRequest {
+                helper_id: "h_test".to_owned(),
+                active_task_ids: Vec::new(),
+                active_tasks: vec![
+                    test_active_task_heartbeat("t_old"),
+                    test_active_task_heartbeat("t_new"),
+                ],
+            }),
+        )
+        .await
+        .expect("heartbeat active_tasks field should converge duplicates")
+        .0;
+
+        assert!(response.ok);
+        assert_eq!(response.release_task_ids, vec!["t_new".to_owned()]);
+        let state = app.hub.read().await;
+        assert_eq!(
+            state.tasks["t_old"].claimed_by_helper_id.as_deref(),
+            Some("h_test")
+        );
+        assert!(state.tasks["t_new"].claimed_by_helper_id.is_none());
+        assert!(state.helpers["h_test"].active_tasks.contains_key("t_old"));
+        assert!(!state.helpers["h_test"].active_tasks.contains_key("t_new"));
     }
 
     #[tokio::test]

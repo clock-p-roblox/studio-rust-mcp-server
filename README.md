@@ -110,6 +110,7 @@ cargo run --bin studio_helper -- --port 44750 --hub-base-url https://roblox-hub-
   - `task_id`
   - `mcp_base_url`
   - `rojo_base_url`
+- 同一个 helper 不会同时持有同一个 `place_id` 的多个 task；hub claim 会跳过同 place 候选，heartbeat 发现重复时会要求 helper 释放多余 task
 - hub 会拒绝活跃重复 `helper_id`；helper 应在启动早期先 register hub，并把 `helper_id_conflict` 视为 fatal startup error
 - hub 可以 block 某个 helper；block 后 helper 不能再 register / claim，新 claim 必须等 drain ack 或 timeout force release 后才交给其他 helper
 - plugin 侧只需要配置 helper 端口
