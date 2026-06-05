@@ -608,8 +608,8 @@ struct RojoConfigResponse {
     auth_header: String,
 }
 
-fn rojo_forward_base_url(helper_port: u16, place_id: &str) -> String {
-    format!("http://127.0.0.1:{helper_port}/rojo-forward/{place_id}")
+fn rojo_forward_base_url(helper_port: u16, place_id: &str, task_id: &str) -> String {
+    format!("http://127.0.0.1:{helper_port}/rojo-forward/{place_id}/task/{task_id}")
 }
 
 fn rojo_forward_target_path(path: &str, query: Option<&str>) -> String {
@@ -1240,7 +1240,6 @@ fn bind_launch_process_to_pid(
         existing.place_id = task.place_id.clone();
         existing.universe_id = task.universe_id.clone();
         existing.studio_pid = studio_pid;
-        existing.launched_by_helper = false;
         return Ok(());
     }
     state.launch_processes.insert(
@@ -2212,7 +2211,7 @@ async fn rojo_config_handler(
         .rojo_base_url
         .clone()
         .ok_or_else(|| HelperError(eyre!("claimed task has no rojo_base_url")))?;
-    let local_base_url = rojo_forward_base_url(app.helper.port, &place_id);
+    let local_base_url = rojo_forward_base_url(app.helper.port, &place_id, &claimed_task.task_id);
     tracing::info!(
         place_id,
         task_id = claimed_task.task_id,
@@ -2228,9 +2227,13 @@ async fn rojo_config_handler(
     }))
 }
 
-async fn resolve_rojo_forward_target_base_url(app: &AppState, place_id: &str) -> Result<String> {
+async fn resolve_rojo_forward_target_base_url(
+    app: &AppState,
+    place_id: &str,
+    task_id: Option<&str>,
+) -> Result<String> {
     let state = app.state.lock().await;
-    let claimed_task = select_claimed_task(&state, place_id, None)?;
+    let claimed_task = select_claimed_task(&state, place_id, task_id)?;
     claimed_task
         .rojo_base_url
         .ok_or_else(|| eyre!("claimed task has no rojo_base_url"))
@@ -2244,7 +2247,17 @@ async fn rojo_forward_root_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, HelperError> {
-    rojo_forward_request(app, place_id, String::new(), method, uri, headers, body).await
+    rojo_forward_request(
+        app,
+        place_id,
+        None,
+        String::new(),
+        method,
+        uri,
+        headers,
+        body,
+    )
+    .await
 }
 
 async fn rojo_forward_path_handler(
@@ -2255,7 +2268,49 @@ async fn rojo_forward_path_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, HelperError> {
-    rojo_forward_request(app, place_id, path, method, uri, headers, body).await
+    rojo_forward_request(app, place_id, None, path, method, uri, headers, body).await
+}
+
+async fn rojo_forward_task_root_handler(
+    State(app): State<AppState>,
+    AxumPath((place_id, task_id)): AxumPath<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, HelperError> {
+    rojo_forward_request(
+        app,
+        place_id,
+        Some(task_id),
+        String::new(),
+        method,
+        uri,
+        headers,
+        body,
+    )
+    .await
+}
+
+async fn rojo_forward_task_path_handler(
+    State(app): State<AppState>,
+    AxumPath((place_id, task_id, path)): AxumPath<(String, String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, HelperError> {
+    rojo_forward_request(
+        app,
+        place_id,
+        Some(task_id),
+        path,
+        method,
+        uri,
+        headers,
+        body,
+    )
+    .await
 }
 
 async fn rojo_forward_socket_handler(
@@ -2266,28 +2321,61 @@ async fn rojo_forward_socket_handler(
 ) -> Result<Response, HelperError> {
     let place_id = sanitize_place_id(&place_id)?;
     let cursor = sanitize_identifier("cursor", &cursor)?;
-    let target_base_url = resolve_rojo_forward_target_base_url(&app, &place_id).await?;
+    let target_base_url = resolve_rojo_forward_target_base_url(&app, &place_id, None).await?;
     let target_url = rojo_forward_target_ws_url(
         &target_base_url,
         &format!("api/socket/{cursor}"),
         uri.query(),
     )?;
     Ok(ws
-        .on_upgrade(move |socket| rojo_forward_socket_session(app, place_id, target_url, socket))
+        .on_upgrade(move |socket| {
+            rojo_forward_socket_session(app, place_id, None, target_url, socket)
+        })
+        .into_response())
+}
+
+async fn rojo_forward_task_socket_handler(
+    State(app): State<AppState>,
+    AxumPath((place_id, task_id, cursor)): AxumPath<(String, String, String)>,
+    uri: Uri,
+    ws: WebSocketUpgrade,
+) -> Result<Response, HelperError> {
+    let place_id = sanitize_place_id(&place_id)?;
+    let task_id = sanitize_identifier("task_id", &task_id)?;
+    let cursor = sanitize_identifier("cursor", &cursor)?;
+    let target_base_url =
+        resolve_rojo_forward_target_base_url(&app, &place_id, Some(&task_id)).await?;
+    let target_url = rojo_forward_target_ws_url(
+        &target_base_url,
+        &format!("api/socket/{cursor}"),
+        uri.query(),
+    )?;
+    Ok(ws
+        .on_upgrade(move |socket| {
+            rojo_forward_socket_session(app, place_id, Some(task_id), target_url, socket)
+        })
         .into_response())
 }
 
 async fn rojo_forward_socket_session(
     app: AppState,
     place_id: String,
+    task_id: Option<String>,
     target_url: String,
     client_socket: WebSocket,
 ) {
-    if let Err(error) =
-        rojo_forward_socket_session_result(app, &place_id, &target_url, client_socket).await
+    if let Err(error) = rojo_forward_socket_session_result(
+        app,
+        &place_id,
+        task_id.as_deref(),
+        &target_url,
+        client_socket,
+    )
+    .await
     {
         tracing::warn!(
             place_id,
+            task_id,
             target_url,
             error = %error,
             "Rojo websocket forward session ended with error"
@@ -2298,6 +2386,7 @@ async fn rojo_forward_socket_session(
 async fn rojo_forward_socket_session_result(
     app: AppState,
     place_id: &str,
+    task_id: Option<&str>,
     target_url: &str,
     client_socket: WebSocket,
 ) -> Result<()> {
@@ -2308,6 +2397,7 @@ async fn rojo_forward_socket_session_result(
     let (mut remote_sender, mut remote_receiver) = remote_socket.split();
     tracing::debug!(
         place_id,
+        task_id,
         target_url,
         "opened Rojo websocket forward session"
     );
@@ -2355,6 +2445,7 @@ async fn rojo_forward_socket_session_result(
     }
     tracing::debug!(
         place_id,
+        task_id,
         target_url,
         "closed Rojo websocket forward session"
     );
@@ -2385,6 +2476,7 @@ fn rojo_remote_ws_to_client(message: WsMessage) -> Option<AxumWsMessage> {
 async fn rojo_forward_request(
     app: AppState,
     place_id: String,
+    task_id: Option<String>,
     path: String,
     method: Method,
     uri: Uri,
@@ -2392,7 +2484,9 @@ async fn rojo_forward_request(
     body: Bytes,
 ) -> Result<Response, HelperError> {
     let place_id = sanitize_place_id(&place_id)?;
-    let target_base_url = resolve_rojo_forward_target_base_url(&app, &place_id).await?;
+    let task_id = maybe_sanitize_identifier("task_id", task_id.as_deref())?;
+    let target_base_url =
+        resolve_rojo_forward_target_base_url(&app, &place_id, task_id.as_deref()).await?;
     let target_path = rojo_forward_target_path(&path, uri.query());
     let target_url = format!("{}{}", target_base_url.trim_end_matches('/'), target_path);
     let bearer_token = app.helper.bearer_token.lock().await.clone();
@@ -2429,6 +2523,7 @@ async fn rojo_forward_request(
         .wrap_err("failed to read Rojo forward response body")?;
     tracing::debug!(
         place_id,
+        task_id,
         method = method.as_str(),
         target_path,
         status = status.as_u16(),
@@ -2627,7 +2722,7 @@ async fn mcp_plugin_status_update_handler(
         return Ok((StatusCode::GONE, "instance expired or studio_mode invalid").into_response());
     }
     if let Some(instance) = state.instances.get(&payload.instance_id) {
-        tracing::info!(
+        tracing::debug!(
             instance_id = payload.instance_id,
             place_id = instance.place_id,
             task_id = ?instance.task_id,
@@ -2648,36 +2743,39 @@ async fn mcp_plugin_response_handler(
 ) -> Result<Response, HelperError> {
     let tx = {
         let mut state = app.state.lock().await;
-        if let Some(instance_id) = payload.instance_id.as_deref() {
-            let updated = update_instance_studio_mode(
-                &mut state,
-                instance_id,
-                payload.studio_mode.as_deref(),
-            );
-            if let Some(instance) = state.instances.get(instance_id) {
-                tracing::info!(
+        let tx = state.waiting_for_plugin.remove(&payload.id);
+        if tx.is_some() {
+            if let Some(instance_id) = payload.instance_id.as_deref() {
+                let updated = update_instance_studio_mode(
+                    &mut state,
                     instance_id,
-                    place_id = instance.place_id,
-                    task_id = ?instance.task_id,
-                    id = payload.id,
-                    success = payload.success,
-                    studio_mode = ?instance.studio_mode,
-                    response_bytes = payload.response.len(),
-                    status_updated = updated,
-                    "helper received MCP plugin tool response status"
+                    payload.studio_mode.as_deref(),
                 );
-            } else {
-                tracing::warn!(
-                    instance_id,
-                    id = payload.id,
-                    success = payload.success,
-                    studio_mode = ?payload.studio_mode,
-                    response_bytes = payload.response.len(),
-                    "helper received MCP plugin response for missing instance"
-                );
+                if let Some(instance) = state.instances.get(instance_id) {
+                    tracing::info!(
+                        instance_id,
+                        place_id = instance.place_id,
+                        task_id = ?instance.task_id,
+                        id = payload.id,
+                        success = payload.success,
+                        studio_mode = ?instance.studio_mode,
+                        response_bytes = payload.response.len(),
+                        status_updated = updated,
+                        "helper received MCP plugin tool response status"
+                    );
+                } else {
+                    tracing::warn!(
+                        instance_id,
+                        id = payload.id,
+                        success = payload.success,
+                        studio_mode = ?payload.studio_mode,
+                        response_bytes = payload.response.len(),
+                        "helper received MCP plugin response for missing instance"
+                    );
+                }
             }
         }
-        state.waiting_for_plugin.remove(&payload.id)
+        tx
     };
     if let Some(tx) = tx {
         let _ = tx.send(payload.clone());
@@ -5517,6 +5615,18 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/status", get(helper_status))
         .route("/v1/rojo/config", get(rojo_config_handler))
+        .route(
+            "/rojo-forward/{place_id}/task/{task_id}",
+            any(rojo_forward_task_root_handler),
+        )
+        .route(
+            "/rojo-forward/{place_id}/task/{task_id}/api/socket/{cursor}",
+            get(rojo_forward_task_socket_handler),
+        )
+        .route(
+            "/rojo-forward/{place_id}/task/{task_id}/{*path}",
+            any(rojo_forward_task_path_handler),
+        )
         .route("/rojo-forward/{place_id}", any(rojo_forward_root_handler))
         .route(
             "/rojo-forward/{place_id}/api/socket/{cursor}",
@@ -5746,10 +5856,10 @@ mod tests {
     }
 
     #[test]
-    fn rojo_forward_base_url_uses_single_helper_port() {
+    fn rojo_forward_base_url_uses_single_helper_port_and_task_path() {
         assert_eq!(
-            rojo_forward_base_url(44750, "93795519121520"),
-            "http://127.0.0.1:44750/rojo-forward/93795519121520"
+            rojo_forward_base_url(44750, "93795519121520", "tff2f06bc6a"),
+            "http://127.0.0.1:44750/rojo-forward/93795519121520/task/tff2f06bc6a"
         );
     }
 
@@ -6251,6 +6361,53 @@ mod tests {
         assert!(error
             .to_string()
             .contains("multiple claimed tasks found for place_id 93795519121520"));
+    }
+
+    #[test]
+    fn task_scoped_rojo_forward_resolves_ambiguous_place_binding() {
+        let mut state = empty_helper_state();
+        state.claimed_tasks.insert(
+            "task_a".to_owned(),
+            test_claimed_task("task_a", "93795519121520"),
+        );
+        state.claimed_tasks.insert(
+            "task_b".to_owned(),
+            test_claimed_task("task_b", "93795519121520"),
+        );
+
+        let selected = select_claimed_task(&state, "93795519121520", Some("task_b"))
+            .expect("task-scoped Rojo forward should not depend on place uniqueness");
+
+        assert_eq!(selected.task_id, "task_b");
+    }
+
+    #[test]
+    fn bind_launch_process_preserves_helper_launch_ownership() {
+        let mut state = empty_helper_state();
+        let claimed_task = test_claimed_task("task_a", "93795519121520");
+        state.launch_processes.insert(
+            "task_a".to_owned(),
+            LaunchProcessRecord {
+                task_id: "task_a".to_owned(),
+                place_id: "93795519121520".to_owned(),
+                universe_id: Some("999".to_owned()),
+                studio_pid: 111,
+                launched_by_helper: true,
+                #[cfg(target_os = "windows")]
+                kill_on_close_job: None,
+                child: None,
+            },
+        );
+
+        bind_launch_process_to_pid(&mut state, &claimed_task, 222)
+            .expect("plugin registration should update pid binding");
+
+        let launch = state
+            .launch_processes
+            .get("task_a")
+            .expect("launch process should stay tracked");
+        assert_eq!(launch.studio_pid, 222);
+        assert!(launch.launched_by_helper);
     }
 
     #[test]

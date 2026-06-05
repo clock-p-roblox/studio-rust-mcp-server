@@ -18,6 +18,7 @@ local AUTO_CONNECT_SETTING_KEY = "MCP-auto-connect-v2"
 local LOG_PREFIX = "[MCP Plugin]"
 local VERBOSE_LOGS = false
 local STATUS_POLL_INTERVAL_SECONDS = 1
+local TOOL_DISPATCH_BUSY_TIMEOUT_SECONDS = 8
 
 local STATUS_THEME = {
 	info = {
@@ -147,6 +148,7 @@ local IMPORTANT_PLUGIN_EVENTS = {
 	helper_http_error = true,
 	helper_http_decode_error = true,
 	helper_tool_decode_failed = true,
+	helper_tool_busy_timeout = true,
 	helper_tool_failed = true,
 	helper_tool_malformed = true,
 	long_poll_closed = true,
@@ -407,6 +409,7 @@ local statusSections = createDefaultStatusSections()
 local statusPollToken = 0
 local connectCurrentClient = nil
 local toolDispatchBusy = false
+local toolDispatchToken = 0
 
 local panel = Instance.new("ScrollingFrame")
 panel.Size = UDim2.fromScale(1, 1)
@@ -1306,9 +1309,37 @@ local function connectToHelper(helperPort: string)
 
 		local args = body.args :: Types.ToolArgs
 		local toolName = next(args)
+		local busyWaitStartedAt = os.clock()
 		while toolDispatchBusy do
+			if os.clock() - busyWaitStartedAt >= TOOL_DISPATCH_BUSY_TIMEOUT_SECONDS then
+				toolDispatchToken += 1
+				toolDispatchBusy = false
+				local errorMessage = "Timed out waiting for previous helper tool dispatch; reconnecting helper plugin"
+				logWarn(errorMessage)
+				logPluginEvent("helper_tool_busy_timeout", {
+					instance_id = instanceId,
+					task_id = taskId,
+					id = id,
+					tool = toolName,
+					timeout_seconds = TOOL_DISPATCH_BUSY_TIMEOUT_SECONDS,
+				})
+				sendResponseOnce(false, errorMessage)
+				setStatusSection("registration", "error", "Tool dispatch busy", errorMessage)
+				task.defer(function()
+					if isCurrentClient(client) then
+						client:Close()
+						task.wait(0.2)
+						if connectCurrentClient ~= nil then
+							connectCurrentClient()
+						end
+					end
+				end)
+				return
+			end
 			task.wait(0.1)
 		end
+		toolDispatchToken += 1
+		local dispatchToken = toolDispatchToken
 		toolDispatchBusy = true
 		local dispatchOk, dispatchError = pcall(function()
 			logInfo("Received helper tool request " .. tostring(toolName) .. " (id=" .. id .. ")")
@@ -1329,7 +1360,9 @@ local function connectToHelper(helperPort: string)
 					response = summarizeText(response),
 				})
 				sendResponseOnce(true, response)
-				setStatusSection("registration", "connected", "Registered", "Handled tool " .. tostring(toolName) .. ".")
+				if isCurrentClient(client) then
+					setStatusSection("registration", "connected", "Registered", "Handled tool " .. tostring(toolName) .. ".")
+				end
 			else
 				local errorMessage = tostring(response)
 				logPluginEvent("helper_tool_failed", {
@@ -1340,10 +1373,14 @@ local function connectToHelper(helperPort: string)
 					error = errorMessage,
 				})
 				sendResponseOnce(false, errorMessage)
-				setStatusSection("registration", "error", "Tool failed", errorMessage)
+				if isCurrentClient(client) then
+					setStatusSection("registration", "error", "Tool failed", errorMessage)
+				end
 			end
 		end)
-		toolDispatchBusy = false
+		if dispatchToken == toolDispatchToken then
+			toolDispatchBusy = false
+		end
 		if not dispatchOk then
 			local errorMessage = tostring(dispatchError)
 			logPluginEvent("helper_tool_failed", {
@@ -1354,7 +1391,9 @@ local function connectToHelper(helperPort: string)
 				error = errorMessage,
 			})
 			sendResponseOnce(false, errorMessage)
-			setStatusSection("registration", "error", "Tool failed", errorMessage)
+			if isCurrentClient(client) then
+				setStatusSection("registration", "error", "Tool failed", errorMessage)
+			end
 		end
 	end)
 

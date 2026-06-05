@@ -42,8 +42,16 @@ end)
 
 local startTime = os.clock()
 local isTimeout = false
+local ended = false
+local ok = false
+local result = nil
 
 local function endTest()
+	if ended then
+		return
+	end
+	ended = true
+
 	local duration = os.clock() - startTime
 	task.wait(0.1)
 
@@ -70,11 +78,16 @@ end
 
 task.spawn(function()
 	wait(]] .. timeoutStr .. [[)
+	if ended then
+		return
+	end
 	isTimeout = true
+	ok = false
+	result = "Timed out waiting for test script to finish"
 	endTest()
 end)
 
-local ok, result = pcall(function()
+ok, result = pcall(function()
 ]] .. userCode .. [[
 
 end)
