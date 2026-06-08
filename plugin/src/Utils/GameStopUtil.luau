@@ -18,7 +18,12 @@ local function monitorForStopPlay()
 		local stopRequestId = StudioModeTracker.getStopRequestId()
 		if stopRequestId > lastHandledStopRequestId then
 			lastHandledStopRequestId = stopRequestId
-			StudioTestService:EndTest({})
+			local ok, errorMessage = pcall(function()
+				StudioTestService:EndTest({})
+			end)
+			if not ok then
+				print(string.format("[MCP Plugin] game_stop_ignored stop_request_id=%d error=%s", stopRequestId, tostring(errorMessage)))
+			end
 		end
 		task.wait(STOP_POLL_INTERVAL_SECONDS)
 	end

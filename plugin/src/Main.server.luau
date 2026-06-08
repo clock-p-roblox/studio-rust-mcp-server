@@ -884,44 +884,47 @@ local function refreshStatusFromHelper()
 		return
 	end
 
+	local helperBaseUrlForPoll = currentHelperBaseUrl
+	local instanceIdForPoll = currentInstanceId
+	local taskIdForPoll = currentTaskId
 	local localStudioMode = currentStudioMode()
 	logPluginEvent("status_poll_begin", {
-		instance_id = currentInstanceId,
-		task_id = currentTaskId,
+		instance_id = instanceIdForPoll,
+		task_id = taskIdForPoll,
 		place_id = tostring(game.PlaceId),
 		studio_mode = localStudioMode,
-		helper_base_url = currentHelperBaseUrl,
+		helper_base_url = helperBaseUrlForPoll,
 	})
 	local ok, statusPayload = pcall(function()
-		if currentInstanceId ~= nil then
+		if instanceIdForPoll ~= nil then
 			local updateOk, updateError = pcall(function()
-				requestJson(currentHelperBaseUrl, "POST", "/v1/mcp/plugin/status", {
-					instance_id = currentInstanceId,
+				requestJson(helperBaseUrlForPoll, "POST", "/v1/mcp/plugin/status", {
+					instance_id = instanceIdForPoll,
 					studio_mode = localStudioMode,
 				})
 			end)
 			if updateOk then
 				logPluginEvent("plugin_status_update_sent", {
-					instance_id = currentInstanceId,
-					task_id = currentTaskId,
+					instance_id = instanceIdForPoll,
+					task_id = taskIdForPoll,
 					studio_mode = localStudioMode,
 				})
 			else
 				logPluginEvent("plugin_status_update_failed", {
-					instance_id = currentInstanceId,
-					task_id = currentTaskId,
+					instance_id = instanceIdForPoll,
+					task_id = taskIdForPoll,
 					studio_mode = localStudioMode,
 					error = tostring(updateError),
 				})
 			end
 		end
-		return requestJson(currentHelperBaseUrl, "GET", "/status")
+		return requestJson(helperBaseUrlForPoll, "GET", "/status")
 	end)
 	if not ok then
 		local errorMessage = tostring(statusPayload)
 		logPluginEvent("status_poll_error", {
-			instance_id = currentInstanceId,
-			task_id = currentTaskId,
+			instance_id = instanceIdForPoll,
+			task_id = taskIdForPoll,
 			error = errorMessage,
 		})
 		setStatusSection("helper", "error", "Unavailable", summarizeText(errorMessage))

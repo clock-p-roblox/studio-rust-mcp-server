@@ -16,7 +16,6 @@ local LAST_ERROR_KEY = "MCP_STUDIO_MODE_TRACKER_LAST_ERROR"
 local RUNNING_OBSERVED_AT_MS_KEY = "MCP_STUDIO_MODE_TRACKER_RUNNING_OBSERVED_AT_MS"
 local WAIT_STEP_SECONDS = 0.05
 local RUNNING_OBSERVATION_INTERVAL_SECONDS = 0.5
-local RUNNING_OBSERVATION_STALE_MS = 5000
 
 export type TrackerSnapshot = {
 	mode: Types.StartStopPlayMode,
@@ -83,11 +82,6 @@ end
 
 local function markRunningObserved()
 	PluginUtils.setSettings(RUNNING_OBSERVED_AT_MS_KEY, nowUnixMs())
-end
-
-local function hasFreshRunningObservation(): boolean
-	local observedAt = readNonNegativeNumber(RUNNING_OBSERVED_AT_MS_KEY)
-	return observedAt > 0 and (nowUnixMs() - observedAt) <= RUNNING_OBSERVATION_STALE_MS
 end
 
 local function getSnapshot(): TrackerSnapshot
@@ -164,10 +158,7 @@ local function normalizeEditState()
 		if snapshot.pendingStartId > 0 then
 			return
 		end
-		if
-			(snapshot.mode == "start_play" or snapshot.mode == "run_server" or snapshot.activeSessionId > 0)
-			and hasFreshRunningObservation()
-		then
+		if snapshot.mode == "start_play" or snapshot.mode == "run_server" or snapshot.activeSessionId > 0 then
 			return
 		end
 		markStopped()

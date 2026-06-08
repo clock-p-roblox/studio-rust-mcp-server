@@ -75,7 +75,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 const DEFAULT_DOMAIN_SUFFIX: &str = "dev.clock-p.com";
 const DEFAULT_HELPER_PORT: u16 = 44750;
 const LOCAL_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(15);
-const PLUGIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const PLUGIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const PLUGIN_STUDIO_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(150);
 const OFFICIAL_MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(1800);
 const OFFICIAL_STORE_IMAGE_MAX_DECODED_BYTES: usize = 20 * 1024 * 1024;
 const OFFICIAL_STORE_IMAGE_MAX_BASE64_CHARS: usize =
@@ -154,11 +155,18 @@ struct PluginInstance {
     notify: Arc<Notify>,
 }
 
+struct PendingPluginResponse {
+    instance_id: String,
+    tool_name: String,
+    started_at: Instant,
+    response_tx: oneshot::Sender<PluginResponsePayload>,
+}
+
 struct HelperState {
     instances: HashMap<String, PluginInstance>,
     claimed_tasks: HashMap<String, ClaimedTask>,
     launch_processes: HashMap<String, LaunchProcessRecord>,
-    waiting_for_plugin: HashMap<String, oneshot::Sender<PluginResponsePayload>>,
+    waiting_for_plugin: HashMap<String, PendingPluginResponse>,
     remote_connections: HashMap<String, RemoteConnectionHandle>,
     official_adapters: HashMap<String, OfficialAdapterHandle>,
     official_adapter_states: HashMap<String, OfficialAdapterStateRecord>,
@@ -1687,6 +1695,47 @@ fn extract_tool_name_and_args(command: &Value) -> Result<(String, Value)> {
     Ok((name.clone(), payload.clone()))
 }
 
+fn is_studio_control_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "LaunchStudioSession"
+            | "StartStopPlay"
+            | "RunScriptInPlayMode"
+            | "launch_studio_session"
+            | "start_stop_play"
+            | "run_script_in_play_mode"
+    )
+}
+
+fn ensure_studio_control_slot_available(
+    state: &HelperState,
+    instance_id: &str,
+    tool_name: &str,
+) -> Result<()> {
+    if !is_studio_control_tool(tool_name) {
+        return Ok(());
+    }
+    if let Some((request_id, pending)) = state.waiting_for_plugin.iter().find(|(_, pending)| {
+        pending.instance_id == instance_id && is_studio_control_tool(&pending.tool_name)
+    }) {
+        return Err(eyre!(
+            "Studio control tool {tool_name} rejected because {} request {} is still in progress for the same Studio plugin instance for {}ms; wait for that response before retrying",
+            pending.tool_name,
+            request_id,
+            pending.started_at.elapsed().as_millis()
+        ));
+    }
+    Ok(())
+}
+
+fn plugin_request_timeout_for_tool(tool_name: &str) -> Duration {
+    if is_studio_control_tool(tool_name) {
+        PLUGIN_STUDIO_CONTROL_REQUEST_TIMEOUT
+    } else {
+        PLUGIN_REQUEST_TIMEOUT
+    }
+}
+
 fn summarize_error(value: &str) -> String {
     const LIMIT: usize = 180;
     let trimmed = value.trim();
@@ -1972,7 +2021,7 @@ fn find_studio_capture_target_for_pid(studio_pid: u32) -> Result<(HWND, HWND, St
 
 async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse> {
     let mut state = app.state.lock().await;
-    cleanup_stale_instances(&mut state.instances);
+    cleanup_stale_instances(&mut state);
     reconcile_launch_processes(&mut state);
     sync_remote_connections(&app, &mut state);
     let mut active_places: Vec<_> = state
@@ -2743,8 +2792,12 @@ async fn mcp_plugin_response_handler(
 ) -> Result<Response, HelperError> {
     let tx = {
         let mut state = app.state.lock().await;
-        let tx = state.waiting_for_plugin.remove(&payload.id);
-        if tx.is_some() {
+        let pending = state.waiting_for_plugin.remove(&payload.id);
+        if pending.is_some() {
+            let pending_tool_name = pending
+                .as_ref()
+                .map(|pending| pending.tool_name.clone())
+                .unwrap_or_else(|| "unknown".to_owned());
             if let Some(instance_id) = payload.instance_id.as_deref() {
                 let updated = update_instance_studio_mode(
                     &mut state,
@@ -2757,6 +2810,7 @@ async fn mcp_plugin_response_handler(
                         place_id = instance.place_id,
                         task_id = ?instance.task_id,
                         id = payload.id,
+                        tool = pending_tool_name.as_str(),
                         success = payload.success,
                         studio_mode = ?instance.studio_mode,
                         response_bytes = payload.response.len(),
@@ -2767,6 +2821,7 @@ async fn mcp_plugin_response_handler(
                     tracing::warn!(
                         instance_id,
                         id = payload.id,
+                        tool = pending_tool_name.as_str(),
                         success = payload.success,
                         studio_mode = ?payload.studio_mode,
                         response_bytes = payload.response.len(),
@@ -2775,7 +2830,7 @@ async fn mcp_plugin_response_handler(
                 }
             }
         }
-        tx
+        pending.map(|pending| pending.response_tx)
     };
     if let Some(tx) = tx {
         let _ = tx.send(payload.clone());
@@ -3265,7 +3320,7 @@ async fn remote_ws_loop(
         }
         {
             let mut state = app.state.lock().await;
-            cleanup_stale_instances(&mut state.instances);
+            cleanup_stale_instances(&mut state);
             if !remote_connection_is_active(&state, &target.connection_key) {
                 if remote_connection_matches_worker(&state, &target.connection_key, worker_id) {
                     state.remote_connections.remove(&target.connection_key);
@@ -5007,14 +5062,16 @@ async fn forward_to_plugin(
     command: Value,
 ) -> Result<String> {
     let request_id = extract_command_id(&command)?;
+    let (tool_name, _) = extract_tool_name_and_args(&command)?;
     let (instance_id, notify) = {
         let mut state = app.state.lock().await;
-        cleanup_stale_instances(&mut state.instances);
+        cleanup_stale_instances(&mut state);
         sync_remote_connections(&app, &mut state);
         let selected_instance_id = select_instance_for_route(place_id, task_id, &state.instances)
             .ok_or_else(|| {
             eyre!("no active Studio plugin registered for placeId {place_id}")
         })?;
+        ensure_studio_control_slot_available(&state, &selected_instance_id, &tool_name)?;
         let instance = state
             .instances
             .get_mut(&selected_instance_id)
@@ -5022,7 +5079,15 @@ async fn forward_to_plugin(
         instance.queue.push_back(command);
         let notify = Arc::clone(&instance.notify);
         let (tx, rx) = oneshot::channel();
-        state.waiting_for_plugin.insert(request_id.clone(), tx);
+        state.waiting_for_plugin.insert(
+            request_id.clone(),
+            PendingPluginResponse {
+                instance_id: selected_instance_id.clone(),
+                tool_name: tool_name.clone(),
+                started_at: Instant::now(),
+                response_tx: tx,
+            },
+        );
         (selected_instance_id, (notify, rx))
     };
     notify.0.notify_waiters();
@@ -5031,14 +5096,19 @@ async fn forward_to_plugin(
         place_id,
         task_id,
         id = request_id,
+        tool = tool_name,
         "forwarded MCP command from helper to local plugin"
     );
-    let response = match tokio::time::timeout(PLUGIN_REQUEST_TIMEOUT, notify.1).await {
+    let request_timeout = plugin_request_timeout_for_tool(&tool_name);
+    let response = match tokio::time::timeout(request_timeout, notify.1).await {
         Ok(result) => result?,
         Err(_) => {
             let mut state = app.state.lock().await;
             state.waiting_for_plugin.remove(&request_id);
-            return Err(eyre!("timed out waiting for local plugin response"));
+            return Err(eyre!(
+                "timed out waiting {}ms for local plugin response to {tool_name}",
+                request_timeout.as_millis()
+            ));
         }
     };
     if response.success {
@@ -5048,14 +5118,26 @@ async fn forward_to_plugin(
     }
 }
 
-fn cleanup_stale_instances(instances: &mut HashMap<String, PluginInstance>) {
-    instances.retain(|instance_id, instance| {
-        let keep = instance.last_seen_at.elapsed() <= INSTANCE_STALE_AFTER;
+fn cleanup_stale_instances(state: &mut HelperState) {
+    let waiting_instance_ids: HashSet<String> = state
+        .waiting_for_plugin
+        .values()
+        .map(|pending| pending.instance_id.clone())
+        .collect();
+    state.instances.retain(|instance_id, instance| {
+        let has_pending_response = waiting_instance_ids.contains(instance_id);
+        let keep = has_pending_response || instance.last_seen_at.elapsed() <= INSTANCE_STALE_AFTER;
         if !keep {
             tracing::warn!(
                 instance_id,
                 place_id = instance.place_id,
                 "dropping stale helper plugin instance"
+            );
+        } else if has_pending_response && instance.last_seen_at.elapsed() > INSTANCE_STALE_AFTER {
+            tracing::debug!(
+                instance_id,
+                place_id = instance.place_id,
+                "keeping stale helper plugin instance while waiting for tool response"
             );
         }
         keep
@@ -5600,7 +5682,7 @@ async fn main() -> Result<()> {
         loop {
             interval.tick().await;
             let mut state = maintenance_app.state.lock().await;
-            cleanup_stale_instances(&mut state.instances);
+            cleanup_stale_instances(&mut state);
             reconcile_launch_processes(&mut state);
             sync_remote_connections(&maintenance_app, &mut state);
         }
@@ -5710,6 +5792,111 @@ mod tests {
             hub_last_error: None,
             hub_last_ready_at: None,
         }
+    }
+
+    #[test]
+    fn cleanup_stale_instances_keeps_instance_waiting_for_plugin_response() {
+        let mut state = empty_helper_state();
+        state.instances.insert(
+            "instance-a".to_owned(),
+            test_instance(
+                "93795519121520",
+                Some("task-a"),
+                INSTANCE_STALE_AFTER.as_millis() as u64 + 1_000,
+            ),
+        );
+        let (response_tx, _response_rx) = oneshot::channel();
+        state.waiting_for_plugin.insert(
+            "request-a".to_owned(),
+            PendingPluginResponse {
+                instance_id: "instance-a".to_owned(),
+                tool_name: "RunCode".to_owned(),
+                started_at: Instant::now(),
+                response_tx,
+            },
+        );
+
+        cleanup_stale_instances(&mut state);
+
+        assert!(state.instances.contains_key("instance-a"));
+    }
+
+    #[test]
+    fn cleanup_stale_instances_drops_stale_instance_without_pending_response() {
+        let mut state = empty_helper_state();
+        state.instances.insert(
+            "instance-a".to_owned(),
+            test_instance(
+                "93795519121520",
+                Some("task-a"),
+                INSTANCE_STALE_AFTER.as_millis() as u64 + 1_000,
+            ),
+        );
+
+        cleanup_stale_instances(&mut state);
+
+        assert!(!state.instances.contains_key("instance-a"));
+    }
+
+    #[test]
+    fn studio_control_slot_rejects_parallel_control_command_for_same_instance() {
+        let mut state = empty_helper_state();
+        let (response_tx, _response_rx) = oneshot::channel();
+        state.waiting_for_plugin.insert(
+            "request-a".to_owned(),
+            PendingPluginResponse {
+                instance_id: "instance-a".to_owned(),
+                tool_name: "LaunchStudioSession".to_owned(),
+                started_at: Instant::now() - Duration::from_millis(250),
+                response_tx,
+            },
+        );
+
+        let result = ensure_studio_control_slot_available(&state, "instance-a", "StartStopPlay");
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("LaunchStudioSession request request-a is still in progress"));
+    }
+
+    #[test]
+    fn studio_control_slot_allows_non_control_command_during_control_command() {
+        let mut state = empty_helper_state();
+        let (response_tx, _response_rx) = oneshot::channel();
+        state.waiting_for_plugin.insert(
+            "request-a".to_owned(),
+            PendingPluginResponse {
+                instance_id: "instance-a".to_owned(),
+                tool_name: "LaunchStudioSession".to_owned(),
+                started_at: Instant::now(),
+                response_tx,
+            },
+        );
+
+        assert!(ensure_studio_control_slot_available(&state, "instance-a", "RunCode").is_ok());
+    }
+
+    #[test]
+    fn studio_control_tools_use_extended_plugin_timeout() {
+        assert_eq!(
+            plugin_request_timeout_for_tool("RunCode"),
+            PLUGIN_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            plugin_request_timeout_for_tool("LaunchStudioSession"),
+            PLUGIN_STUDIO_CONTROL_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            plugin_request_timeout_for_tool("StartStopPlay"),
+            PLUGIN_STUDIO_CONTROL_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            plugin_request_timeout_for_tool("RunScriptInPlayMode"),
+            PLUGIN_STUDIO_CONTROL_REQUEST_TIMEOUT
+        );
+        assert!(PLUGIN_STUDIO_CONTROL_REQUEST_TIMEOUT > PLUGIN_REQUEST_TIMEOUT);
     }
 
     fn test_remote_connection_handle(

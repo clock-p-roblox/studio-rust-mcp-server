@@ -35,6 +35,7 @@ use uuid::Uuid;
 pub const STUDIO_PLUGIN_PORT: u16 = 44755;
 const LONG_POLL_DURATION: Duration = Duration::from_secs(15);
 const HELPER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const HELPER_STUDIO_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(155);
 const HELPER_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const HELPER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(20);
 const HELPER_TASK_STATUS_STALE_AFTER: Duration = Duration::from_secs(10);
@@ -727,9 +728,9 @@ impl ServerHandler for RBXStudioServer {
             instructions: Some(
                 "Prefer using launch_studio_session for high-level launches into start_play or run_server.
 get_studio_mode is for diagnostics and stop-path checks, not the normal launch entrypoint.
-User run_code to query data from Roblox Studio place or to change it
-After calling run_script_in_play_mode, the datamodel status will be reset to stop mode.
-Prefer using start_stop_play tool instead run_script_in_play_mode, Only used run_script_in_play_mode to run one time unit test code on server datamodel.
+Use run_code to query or edit the Roblox Studio place while Studio is in stop/edit mode.
+Use run_script_in_play_mode only for a one-shot unit-test style script that starts from stop/edit mode and automatically returns to stop mode.
+If Studio control reports a previous test is still pending after its settle wait, stop once with start_stop_play(stop) and inspect Studio logs; do not recover by sending another play+stop loop.
 "
                     .to_string(),
             ),
@@ -941,7 +942,9 @@ struct RunScriptInPlayMode {
     task_id: String,
     #[schemars(description = "Code to run")]
     code: String,
-    #[schemars(description = "Timeout in seconds, defaults to 100 seconds")]
+    #[schemars(
+        description = "Timeout in seconds, defaults to 30 seconds and must be <= 90 seconds"
+    )]
     timeout: Option<u32>,
     #[schemars(description = "Mode to run in, must be start_play or run_server")]
     mode: String,
@@ -994,6 +997,15 @@ impl ToolArgumentValues {
             ToolArgumentValues::RunCode(args) => args.diagnostic != Some(true),
             ToolArgumentValues::InsertModel(_) | ToolArgumentValues::RunScriptInPlayMode(_) => true,
             _ => false,
+        }
+    }
+
+    fn helper_request_timeout(&self) -> Duration {
+        match self {
+            ToolArgumentValues::StartStopPlay(_)
+            | ToolArgumentValues::LaunchStudioSession(_)
+            | ToolArgumentValues::RunScriptInPlayMode(_) => HELPER_STUDIO_CONTROL_REQUEST_TIMEOUT,
+            _ => HELPER_REQUEST_TIMEOUT,
         }
     }
 }
@@ -1062,9 +1074,11 @@ impl RBXStudioServer {
     #[tool(
         description = "Run a script in play mode and automatically stop play after script finishes or timeout. Returns the output of the script.
         Result format: { success: boolean, value: string, error: string, logs: { level: string, message: string, ts: number }[], errors: { level: string, message: string, ts: number }[], duration: number, isTimeout: boolean }.
-        - Prefer using start_stop_play tool instead run_script_in_play_mode, Only used run_script_in_play_mode to run one time unit test code on server datamodel.
-        - After calling run_script_in_play_mode, the datamodel status will be reset to stop mode.
-        - If It returns `StudioTestService: Previous call to start play session has not been completed`, call start_stop_play tool to stop play mode first then try it again."
+        - Use run_script_in_play_mode only for one-shot unit-test style code that starts from stop/edit mode.
+        - Do not call it while an existing play/run session is active; use launch_studio_session for normal game launches.
+        - timeout defaults to 30 seconds and must be <= 90 seconds.
+        - The Windows plugin may wait briefly for StudioTestService to settle after stop, but it does not issue a hidden stop/play recovery.
+        - If it still reports a pending previous test or a stop timeout, call start_stop_play(stop) once and inspect Studio logs; do not recover by sending another play+stop loop."
     )]
     async fn run_script_in_play_mode(
         &self,
@@ -1400,6 +1414,7 @@ impl RBXStudioServer {
             })?;
         let (command, id) = ToolArguments::new(normalized_args);
         let tool_name = command.tool_name();
+        let helper_request_timeout = command.args.helper_request_timeout();
         if command.args.requires_studio_stop_snapshot() {
             let hub_status_client = { self.state.lock().await.hub_status_client.clone() };
             require_stop_mode_snapshot(hub_status_client, &requested_task_id, tool_name).await?;
@@ -1447,7 +1462,7 @@ impl RBXStudioServer {
             .send(())
             .map_err(|e| ErrorData::internal_error(format!("Unable to trigger send {e}"), None))?;
         let result = rx.recv();
-        let result = match tokio::time::timeout(HELPER_REQUEST_TIMEOUT, result).await {
+        let result = match tokio::time::timeout(helper_request_timeout, result).await {
             Ok(Some(result)) => result,
             Ok(None) => return Err(ErrorData::internal_error("Couldn't receive response", None)),
             Err(_) => {
@@ -1455,7 +1470,10 @@ impl RBXStudioServer {
                 remove_request_tracking(&mut state, id);
                 abort_uploads_for_request(&uploads, id);
                 return Err(ErrorData::internal_error(
-                    format!("Timed out waiting for {tool_name} response from Studio helper"),
+                    format!(
+                        "Timed out waiting {}ms for {tool_name} response from Studio helper",
+                        helper_request_timeout.as_millis()
+                    ),
                     None,
                 ));
             }
@@ -1736,6 +1754,39 @@ mod tests {
             diagnostic: None,
         })
         .requires_studio_stop_snapshot());
+    }
+
+    #[test]
+    fn studio_control_tools_use_extended_helper_timeout() {
+        let run_code_timeout = ToolArgumentValues::RunCode(RunCode {
+            task_id: "t_test".to_owned(),
+            command: "print('ok')".to_owned(),
+            diagnostic: Some(true),
+        })
+        .helper_request_timeout();
+        let launch_timeout = ToolArgumentValues::LaunchStudioSession(LaunchStudioSession {
+            task_id: "t_test".to_owned(),
+            mode: "start_play".to_owned(),
+        })
+        .helper_request_timeout();
+        let stop_timeout = ToolArgumentValues::StartStopPlay(StartStopPlay {
+            task_id: "t_test".to_owned(),
+            mode: "stop".to_owned(),
+        })
+        .helper_request_timeout();
+        let run_script_timeout = ToolArgumentValues::RunScriptInPlayMode(RunScriptInPlayMode {
+            task_id: "t_test".to_owned(),
+            code: "print('ok')".to_owned(),
+            timeout: Some(30),
+            mode: "start_play".to_owned(),
+        })
+        .helper_request_timeout();
+
+        assert_eq!(run_code_timeout, HELPER_REQUEST_TIMEOUT);
+        assert_eq!(launch_timeout, HELPER_STUDIO_CONTROL_REQUEST_TIMEOUT);
+        assert_eq!(stop_timeout, HELPER_STUDIO_CONTROL_REQUEST_TIMEOUT);
+        assert_eq!(run_script_timeout, HELPER_STUDIO_CONTROL_REQUEST_TIMEOUT);
+        assert!(launch_timeout > run_code_timeout);
     }
 
     #[test]
@@ -2641,7 +2692,9 @@ pub async fn proxy_handler(
     Json(command): Json<ToolArguments>,
 ) -> Result<impl IntoResponse> {
     let id = command.id.ok_or_eyre("Got proxy command with no id")?;
-    tracing::info!(%id, tool = command.tool_name(), "proxy received tool request");
+    let tool_name = command.tool_name();
+    let helper_request_timeout = command.args.helper_request_timeout();
+    tracing::info!(%id, tool = tool_name, "proxy received tool request");
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (trigger, uploads) = {
         let mut state = state.lock().await;
@@ -2650,17 +2703,25 @@ pub async fn proxy_handler(
         (state.trigger.clone(), Arc::clone(&state.uploads))
     };
     trigger.send(()).ok();
-    let result = match tokio::time::timeout(HELPER_REQUEST_TIMEOUT, rx.recv()).await {
+    let result = match tokio::time::timeout(helper_request_timeout, rx.recv()).await {
         Ok(Some(result)) => result,
         Ok(None) => return Err(eyre!("Couldn't receive response").into()),
         Err(_) => {
             let mut state = state.lock().await;
             remove_request_tracking(&mut state, id);
             abort_uploads_for_request(&uploads, id);
-            tracing::warn!(%id, "proxy timed out waiting for helper response");
+            tracing::warn!(
+                %id,
+                tool = tool_name,
+                timeout_ms = helper_request_timeout.as_millis(),
+                "proxy timed out waiting for helper response"
+            );
             return Ok(Json(RunCommandResponse {
                 success: false,
-                response: "Timed out waiting for Studio helper response".to_owned(),
+                response: format!(
+                    "Timed out waiting {}ms for {tool_name} response from Studio helper",
+                    helper_request_timeout.as_millis()
+                ),
                 id,
             }));
         }

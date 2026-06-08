@@ -297,8 +297,12 @@ local function getStudioMode(): Types.StartStopPlayMode
 end
 
 local function isPreviousTestStillInProgress(errorMessage: string): boolean
-	return string.find(errorMessage, "previous", 1, true) ~= nil
-		and string.find(errorMessage, "still in progress", 1, true) ~= nil
+	local lowered = string.lower(errorMessage)
+	return string.find(lowered, "previous", 1, true) ~= nil
+		and (
+			string.find(lowered, "still in progress", 1, true) ~= nil
+			or string.find(lowered, "has not been completed", 1, true) ~= nil
+		)
 end
 
 local function startAsyncCall(executor: () -> any): AsyncCallState
@@ -473,13 +477,12 @@ local function startPlayMode(successMessage: string): string?
 	end
 
 	local deadline = os.clock() + START_TIMEOUT_SECONDS
-	local attempt = 0
 	local lastCommandId = 0
+	local lastRetryReason: string? = nil
 
-	while os.clock() < deadline do
+	for attempt = 1, 2 do
 		local commandId = StudioModeTracker.beginStart("start_play")
 		lastCommandId = commandId
-		attempt += 1
 		local baseline = captureLogBaseline()
 		installSessionControlScript("start_play")
 		logTransitionStage("start_play", "requested", string.format("command_id=%d attempt=%d", commandId, attempt))
@@ -492,9 +495,14 @@ local function startPlayMode(successMessage: string): string?
 			return successMessage
 		end
 
+		lastRetryReason = tostring(retryReason)
+		if attempt >= 2 then
+			break
+		end
+
 		logTransitionStage(
 			"start_play",
-			"retry_wait",
+			"single_retry_stop_before_start",
 			string.format("command_id=%d attempt=%d error=%s", commandId, attempt, tostring(retryReason))
 		)
 		stop(true)
@@ -503,10 +511,11 @@ local function startPlayMode(successMessage: string): string?
 
 	local snapshotAfterTimeout = StudioModeTracker.getSnapshot()
 	local errorMessage = string.format(
-		"Timed out waiting for Studio to accept start_play. mode=%s active_session_id=%d pending_start_id=%d",
+		"Studio did not accept start_play after one stop/retry. mode=%s active_session_id=%d pending_start_id=%d last_error=%s. Call start_stop_play(stop) once and inspect Studio logs before retrying.",
 		snapshotAfterTimeout.mode,
 		snapshotAfterTimeout.activeSessionId,
-		snapshotAfterTimeout.pendingStartId
+		snapshotAfterTimeout.pendingStartId,
+		tostring(lastRetryReason)
 	)
 	StudioModeTracker.recordTransitionError(lastCommandId, errorMessage)
 	error(errorMessage)
