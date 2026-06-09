@@ -116,6 +116,8 @@ pub struct StatusResponse {
     official_ready: bool,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
+    studio_control_state: Option<String>,
+    studio_transition_phase: Option<String>,
     official_mcp_adapter_state: String,
     official_mcp_adapter_age_ms: Option<u128>,
     official_mcp_adapter_last_error: Option<String>,
@@ -174,6 +176,10 @@ struct HubHelperActiveTaskPayload {
     #[serde(default)]
     studio_mode_age_ms: Option<u128>,
     #[serde(default)]
+    studio_control_state: Option<String>,
+    #[serde(default)]
+    studio_transition_phase: Option<String>,
+    #[serde(default)]
     official_mcp_adapter_state: Option<String>,
     #[serde(default)]
     official_mcp_adapter_age_ms: Option<u128>,
@@ -194,6 +200,8 @@ struct HubTaskRuntimeSnapshot {
     remote_state: Option<String>,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
+    studio_control_state: Option<String>,
+    studio_transition_phase: Option<String>,
     official_mcp_adapter_state: Option<String>,
     official_mcp_adapter_age_ms: Option<u128>,
     official_mcp_adapter_last_error: Option<String>,
@@ -367,6 +375,12 @@ fn snapshot_from_hub_status_payload(
         studio_mode_age_ms: active_task_match
             .as_ref()
             .and_then(|active_task| active_task.studio_mode_age_ms),
+        studio_control_state: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.studio_control_state.clone()),
+        studio_transition_phase: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.studio_transition_phase.clone()),
         official_mcp_adapter_state: active_task_match
             .as_ref()
             .and_then(|active_task| active_task.official_mcp_adapter_state.clone()),
@@ -622,6 +636,8 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
     let mut hub_snapshot_error = None;
     let mut studio_mode = None;
     let mut studio_mode_age_ms = None;
+    let mut studio_control_state = None;
+    let mut studio_transition_phase = None;
     let mut official_mcp_adapter_state = "hub_unconfigured".to_owned();
     let mut official_mcp_adapter_age_ms = None;
     let mut official_mcp_adapter_last_error = None;
@@ -643,6 +659,8 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
                 official_ready = snapshot.official_ready();
                 studio_mode = snapshot.studio_mode;
                 studio_mode_age_ms = snapshot.studio_mode_age_ms;
+                studio_control_state = snapshot.studio_control_state;
+                studio_transition_phase = snapshot.studio_transition_phase;
                 official_mcp_adapter_state = snapshot
                     .official_mcp_adapter_state
                     .unwrap_or_else(|| "not_started".to_owned());
@@ -680,11 +698,57 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
         official_ready,
         studio_mode,
         studio_mode_age_ms,
+        studio_control_state,
+        studio_transition_phase,
         official_mcp_adapter_state,
         official_mcp_adapter_age_ms,
         official_mcp_adapter_last_error,
         helper_last_message_age_ms,
     })
+}
+
+pub async fn debug_state_handler(State(state): State<PackedState>) -> Json<serde_json::Value> {
+    let state = state.lock().await;
+    let active_helper = state.active_helper.as_ref().map(|helper| {
+        serde_json::json!({
+            "connection_id": helper.connection_id.to_string(),
+            "place_id": helper.place_id,
+            "task_id": helper.task_id,
+            "capabilities": helper.capabilities,
+            "last_message_age_ms": helper.last_message_at.elapsed().as_millis(),
+            "task_status": helper.task_status,
+        })
+    });
+    let queued_requests = state
+        .process_queue
+        .iter()
+        .map(|request| {
+            serde_json::json!({
+                "id": request.id.map(|id| id.to_string()),
+                "tool": request.tool_name(),
+                "task_id": request.args.task_id(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut pending_request_ids = state
+        .output_map
+        .keys()
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>();
+    pending_request_ids.sort();
+    Json(serde_json::json!({
+        "ok": true,
+        "service": "rbx-studio-mcp",
+        "workspace": state.workspace.to_string_lossy(),
+        "task_id": state.task_id,
+        "public_base_url": state.public_base_url,
+        "hub_base_url": state.hub_status_client.as_ref().map(|client| client.base_url().to_owned()),
+        "queued_request_count": state.process_queue.len(),
+        "pending_response_count": state.output_map.len(),
+        "queued_requests": queued_requests,
+        "pending_request_ids": pending_request_ids,
+        "active_helper": active_helper,
+    }))
 }
 
 impl ToolArguments {
@@ -1679,6 +1743,8 @@ mod tests {
                     remote_state: "connected".to_owned(),
                     studio_mode: Some("stop".to_owned()),
                     studio_mode_age_ms: Some(4),
+                    studio_control_state: Some("none".to_owned()),
+                    studio_transition_phase: Some("idle".to_owned()),
                     official_mcp_adapter_state: Some("ready".to_owned()),
                     official_mcp_adapter_age_ms: Some(5),
                     official_mcp_adapter_last_error: None,
@@ -1689,6 +1755,8 @@ mod tests {
         assert_eq!(snapshot.helper_id.as_deref(), Some("h_test"));
         assert_eq!(snapshot.remote_state.as_deref(), Some("connected"));
         assert_eq!(snapshot.studio_mode.as_deref(), Some("stop"));
+        assert_eq!(snapshot.studio_control_state.as_deref(), Some("none"));
+        assert_eq!(snapshot.studio_transition_phase.as_deref(), Some("idle"));
         assert_eq!(
             snapshot.official_mcp_adapter_state.as_deref(),
             Some("ready")
@@ -1727,6 +1795,8 @@ mod tests {
                     remote_state: "connected".to_owned(),
                     studio_mode: Some("stop".to_owned()),
                     studio_mode_age_ms: Some(4),
+                    studio_control_state: Some("none".to_owned()),
+                    studio_transition_phase: Some("idle".to_owned()),
                     official_mcp_adapter_state: Some("ready".to_owned()),
                     official_mcp_adapter_age_ms: Some(5),
                     official_mcp_adapter_last_error: None,
@@ -1735,6 +1805,97 @@ mod tests {
         };
         let snapshot = snapshot_from_hub_status_payload(payload, "t_test").unwrap();
         assert!(!snapshot.task_services_ready());
+        assert!(!snapshot.launch_ready());
+        assert!(!snapshot.edit_ready());
+        assert!(!snapshot.official_ready());
+    }
+
+    #[test]
+    fn hub_snapshot_in_play_keeps_launch_ready_but_blocks_edit_and_official_tools() {
+        let payload = HubStatusPayload {
+            ok: true,
+            tasks: vec![HubTaskPayload {
+                task_id: "t_test".to_owned(),
+                claimed_by_helper_id: Some("h_test".to_owned()),
+                released: false,
+                service_state: "ready".to_owned(),
+                accepting_launches: true,
+                services: HashMap::from([
+                    ("rojo".to_owned(), "healthy".to_owned()),
+                    ("mcp".to_owned(), "healthy".to_owned()),
+                    ("runtime_log".to_owned(), "healthy".to_owned()),
+                    ("rojo_public".to_owned(), "healthy".to_owned()),
+                    ("mcp_public".to_owned(), "healthy".to_owned()),
+                    ("runtime_log_public".to_owned(), "healthy".to_owned()),
+                ]),
+            }],
+            helpers: vec![HubHelperPayload {
+                helper_id: "h_test".to_owned(),
+                blocked: false,
+                last_seen_age_ms: Some(3),
+                active_tasks: vec![HubHelperActiveTaskPayload {
+                    task_id: "t_test".to_owned(),
+                    remote_state: "connected".to_owned(),
+                    studio_mode: Some("start_play".to_owned()),
+                    studio_mode_age_ms: Some(4),
+                    studio_control_state: Some("ready".to_owned()),
+                    studio_transition_phase: Some("running".to_owned()),
+                    official_mcp_adapter_state: Some("blocked_by_studio_mode".to_owned()),
+                    official_mcp_adapter_age_ms: Some(5),
+                    official_mcp_adapter_last_error: None,
+                }],
+            }],
+        };
+        let snapshot = snapshot_from_hub_status_payload(payload, "t_test").unwrap();
+
+        assert!(snapshot.task_services_ready());
+        assert!(snapshot.launch_ready());
+        assert!(!snapshot.edit_ready());
+        assert!(!snapshot.official_ready());
+        assert_eq!(snapshot.studio_mode.as_deref(), Some("start_play"));
+        assert_eq!(snapshot.studio_control_state.as_deref(), Some("ready"));
+        assert_eq!(snapshot.studio_transition_phase.as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn hub_snapshot_stale_helper_blocks_all_ready_states() {
+        let payload = HubStatusPayload {
+            ok: true,
+            tasks: vec![HubTaskPayload {
+                task_id: "t_test".to_owned(),
+                claimed_by_helper_id: Some("h_test".to_owned()),
+                released: false,
+                service_state: "ready".to_owned(),
+                accepting_launches: true,
+                services: HashMap::from([
+                    ("rojo".to_owned(), "healthy".to_owned()),
+                    ("mcp".to_owned(), "healthy".to_owned()),
+                    ("runtime_log".to_owned(), "healthy".to_owned()),
+                    ("rojo_public".to_owned(), "healthy".to_owned()),
+                    ("mcp_public".to_owned(), "healthy".to_owned()),
+                    ("runtime_log_public".to_owned(), "healthy".to_owned()),
+                ]),
+            }],
+            helpers: vec![HubHelperPayload {
+                helper_id: "h_test".to_owned(),
+                blocked: false,
+                last_seen_age_ms: Some(HELPER_TASK_STATUS_STALE_AFTER.as_millis() + 1),
+                active_tasks: vec![HubHelperActiveTaskPayload {
+                    task_id: "t_test".to_owned(),
+                    remote_state: "connected".to_owned(),
+                    studio_mode: Some("stop".to_owned()),
+                    studio_mode_age_ms: Some(4),
+                    studio_control_state: Some("none".to_owned()),
+                    studio_transition_phase: Some("idle".to_owned()),
+                    official_mcp_adapter_state: Some("ready".to_owned()),
+                    official_mcp_adapter_age_ms: Some(5),
+                    official_mcp_adapter_last_error: None,
+                }],
+            }],
+        };
+        let snapshot = snapshot_from_hub_status_payload(payload, "t_test").unwrap();
+
+        assert!(snapshot.task_services_ready());
         assert!(!snapshot.launch_ready());
         assert!(!snapshot.edit_ready());
         assert!(!snapshot.official_ready());

@@ -286,6 +286,7 @@ async fn main() -> Result<()> {
             .route("/response", post(response_handler))
             .route("/proxy", post(proxy_handler))
             .route("/status", get(status_handler))
+            .route("/v1/debug/state", get(debug_state_handler))
             .with_state(server_state_clone);
         tracing::info!(
             "Studio plugin bridge HTTP server listening on 127.0.0.1:{}",
@@ -349,6 +350,7 @@ async fn main() -> Result<()> {
             .route("/response", post(response_handler))
             .route("/proxy", post(proxy_handler))
             .route("/status", get(status_handler))
+            .route("/v1/debug/state", get(debug_state_handler))
             .route(HELPER_WS_PATH, get(helper_ws_handler))
             .nest_service("/mcp", streamable_http_service)
             .with_state(Arc::clone(&server_state))

@@ -119,8 +119,29 @@ end
 
 local helperBaseUrl = %s
 local instanceId = %s
+local mode = %s
 local afterId = %d
 local pollIntervalSeconds = 0.25
+local heartbeatIntervalSeconds = 0.5
+local lastHeartbeatAt = 0
+
+local function sendControlHeartbeat()
+	if os.clock() - lastHeartbeatAt < heartbeatIntervalSeconds then
+		return
+	end
+	lastHeartbeatAt = os.clock()
+	HttpService:RequestAsync({
+		Url = helperBaseUrl .. "/v1/mcp/plugin/control-heartbeat",
+		Method = "POST",
+		Headers = {
+			["Content-Type"] = "application/json",
+		},
+		Body = HttpService:JSONEncode({
+			instance_id = instanceId,
+			mode = mode,
+		}),
+	})
+end
 
 local function pollStopRequest()
 	local url = string.format("%%s/v1/mcp/plugin/stop-request?instance_id=%%s&after_id=%%d", helperBaseUrl, instanceId, afterId)
@@ -140,7 +161,9 @@ local function pollStopRequest()
 	return payload
 end
 
+pcall(sendControlHeartbeat)
 while true do
+	pcall(sendControlHeartbeat)
 	local payload = pollStopRequest()
 	if payload ~= nil then
 		local stopRequestId = tonumber(payload.stop_request_id) or afterId
@@ -164,6 +187,7 @@ end
 ]],
 		luaStringLiteral(helperUrl),
 		luaStringLiteral(instanceId),
+		luaStringLiteral(targetMode),
 		afterId
 	)
 
@@ -354,7 +378,7 @@ local function stop(force: boolean?): string?
 	ConsoleOutput.outputMessage = ""
 	local currentMode = getStudioMode()
 	local snapshot = StudioModeTracker.getSnapshot()
-	if force ~= true and currentMode == "stop" and snapshot.activeSessionId == 0 then
+	if force ~= true and currentMode == "stop" then
 		StudioModeTracker.markStopped()
 		removeSessionControlScript()
 		if snapshot.pendingStartId > 0 then
@@ -420,12 +444,12 @@ local function stop(force: boolean?): string?
 	return "Stopped"
 end
 
-local function waitForStartPlayLogOrRetry(
+local function waitForStartPlayLog(
 	baseline: LogBaseline,
 	commandId: number,
 	startCall: AsyncCallState,
 	deadline: number
-): (boolean, string?)
+)
 	local lastLogError: string? = nil
 	while os.clock() < deadline do
 		local success, matchedLine = pcall(function()
@@ -446,7 +470,17 @@ local function waitForStartPlayLogOrRetry(
 		if startCall.done and startCall.success == false then
 			local errorMessage = tostring(startCall.errorMessage)
 			if isPreviousTestStillInProgress(errorMessage) then
-				return false, errorMessage
+				removeSessionControlScript()
+				StudioModeTracker.recordTransitionError(commandId, errorMessage)
+				error(
+					"StudioTestService still has a previous test in progress; start_play was not retried. "
+						.. "Call start_stop_play(stop) once and inspect Studio logs before retrying. "
+						.. "Original error: "
+						.. errorMessage
+				)
+			end
+			if getStudioMode() == "stop" then
+				removeSessionControlScript()
 			end
 			StudioModeTracker.recordTransitionError(commandId, errorMessage)
 			error(errorMessage)
@@ -476,49 +510,16 @@ local function startPlayMode(successMessage: string): string?
 		stop(false)
 	end
 
-	local deadline = os.clock() + START_TIMEOUT_SECONDS
-	local lastCommandId = 0
-	local lastRetryReason: string? = nil
+	local commandId = StudioModeTracker.beginStart("start_play")
+	local baseline = captureLogBaseline()
+	installSessionControlScript("start_play")
+	logTransitionStage("start_play", "requested", string.format("command_id=%d", commandId))
+	local startCall = startAsyncCall(function()
+		return StudioTestService:ExecutePlayModeAsync({})
+	end)
 
-	for attempt = 1, 2 do
-		local commandId = StudioModeTracker.beginStart("start_play")
-		lastCommandId = commandId
-		local baseline = captureLogBaseline()
-		installSessionControlScript("start_play")
-		logTransitionStage("start_play", "requested", string.format("command_id=%d attempt=%d", commandId, attempt))
-		local startCall = startAsyncCall(function()
-			return StudioTestService:ExecutePlayModeAsync({})
-		end)
-
-		local observed, retryReason = waitForStartPlayLogOrRetry(baseline, commandId, startCall, deadline)
-		if observed then
-			return successMessage
-		end
-
-		lastRetryReason = tostring(retryReason)
-		if attempt >= 2 then
-			break
-		end
-
-		logTransitionStage(
-			"start_play",
-			"single_retry_stop_before_start",
-			string.format("command_id=%d attempt=%d error=%s", commandId, attempt, tostring(retryReason))
-		)
-		stop(true)
-		task.wait(POLL_INTERVAL_SECONDS)
-	end
-
-	local snapshotAfterTimeout = StudioModeTracker.getSnapshot()
-	local errorMessage = string.format(
-		"Studio did not accept start_play after one stop/retry. mode=%s active_session_id=%d pending_start_id=%d last_error=%s. Call start_stop_play(stop) once and inspect Studio logs before retrying.",
-		snapshotAfterTimeout.mode,
-		snapshotAfterTimeout.activeSessionId,
-		snapshotAfterTimeout.pendingStartId,
-		tostring(lastRetryReason)
-	)
-	StudioModeTracker.recordTransitionError(lastCommandId, errorMessage)
-	error(errorMessage)
+	waitForStartPlayLog(baseline, commandId, startCall, os.clock() + START_TIMEOUT_SECONDS)
+	return successMessage
 end
 
 local function startRunServerMode(executor: () -> any, successMessage: string): string?
@@ -619,4 +620,5 @@ return {
 	getStudioMode = getStudioMode,
 	handleLaunchStudioSession = handleLaunchStudioSession,
 	handleStartStopPlay = handleStartStopPlay,
+	installSessionControlScript = installSessionControlScript,
 }

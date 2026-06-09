@@ -33,7 +33,11 @@ pub struct HelperTaskStatusSnapshot {
     #[serde(rename = "studio_mode", alias = "studioMode")]
     pub studio_mode: Option<String>,
     #[serde(rename = "studio_mode_age_ms", alias = "studioModeAgeMs")]
-    pub studio_mode_age_ms: Option<u128>,
+    pub studio_mode_age_ms: Option<u64>,
+    #[serde(rename = "studio_control_state", alias = "studioControlState")]
+    pub studio_control_state: Option<String>,
+    #[serde(rename = "studio_transition_phase", alias = "studioTransitionPhase")]
+    pub studio_transition_phase: Option<String>,
     #[serde(
         rename = "official_mcp_adapter_state",
         alias = "officialMcpAdapterState"
@@ -43,7 +47,7 @@ pub struct HelperTaskStatusSnapshot {
         rename = "official_mcp_adapter_age_ms",
         alias = "officialMcpAdapterAgeMs"
     )]
-    pub official_mcp_adapter_age_ms: Option<u128>,
+    pub official_mcp_adapter_age_ms: Option<u64>,
     #[serde(
         rename = "official_mcp_adapter_last_error",
         alias = "officialMcpAdapterLastError"
@@ -306,6 +310,8 @@ mod tests {
                 task_id: "tf2a83d456a".to_owned(),
                 studio_mode: Some("stop".to_owned()),
                 studio_mode_age_ms: Some(42),
+                studio_control_state: Some("none".to_owned()),
+                studio_transition_phase: Some("idle".to_owned()),
                 official_mcp_adapter_state: Some("ready".to_owned()),
                 official_mcp_adapter_age_ms: Some(7),
                 official_mcp_adapter_last_error: None,
@@ -319,12 +325,45 @@ mod tests {
         assert_eq!(encoded["plugin_instance_count"], 2);
         assert_eq!(encoded["task_status"]["task_id"], "tf2a83d456a");
         assert_eq!(encoded["task_status"]["studio_mode"], "stop");
+        assert_eq!(encoded["task_status"]["studio_control_state"], "none");
+        assert_eq!(encoded["task_status"]["studio_transition_phase"], "idle");
         assert_eq!(
             encoded["task_status"]["official_mcp_adapter_state"],
             "ready"
         );
         assert!(encoded.get("helperId").is_none());
         assert!(encoded.get("taskId").is_none());
+    }
+
+    #[test]
+    fn helper_to_server_heartbeat_decodes_task_status_age_fields() {
+        let payload = r#"{
+            "type": "heartbeat",
+            "helper_id": "h_test",
+            "place_id": "93795519121520",
+            "task_id": "tf2a83d456a",
+            "plugin_instance_count": 1,
+            "task_status": {
+                "task_id": "tf2a83d456a",
+                "studio_mode": "stop",
+                "studio_mode_age_ms": 12,
+                "studio_control_state": "none",
+                "studio_transition_phase": "idle",
+                "official_mcp_adapter_state": "ready",
+                "official_mcp_adapter_age_ms": 34,
+                "official_mcp_adapter_last_error": null
+            }
+        }"#;
+        let decoded: HelperToServerMessage =
+            serde_json::from_str(payload).expect("helper heartbeat task_status should decode");
+        match decoded {
+            HelperToServerMessage::Heartbeat { task_status, .. } => {
+                let status = task_status.expect("task_status should be present");
+                assert_eq!(status.studio_mode_age_ms, Some(12));
+                assert_eq!(status.official_mcp_adapter_age_ms, Some(34));
+            }
+            other => panic!("expected heartbeat, got {other:?}"),
+        }
     }
 
     #[test]

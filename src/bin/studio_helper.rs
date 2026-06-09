@@ -77,6 +77,8 @@ const DEFAULT_HELPER_PORT: u16 = 44750;
 const LOCAL_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const PLUGIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const PLUGIN_STUDIO_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(150);
+const STUDIO_CONTROL_HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(2);
+const ROBLOX_PLACE_UNIVERSE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 const OFFICIAL_MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(1800);
 const OFFICIAL_STORE_IMAGE_MAX_DECODED_BYTES: usize = 20 * 1024 * 1024;
 const OFFICIAL_STORE_IMAGE_MAX_BASE64_CHARS: usize =
@@ -134,6 +136,7 @@ struct HelperConfig {
     studio_path: Option<PathBuf>,
     skip_claim_studio_launch: bool,
     client: reqwest::Client,
+    hub_heartbeat_notify: Arc<Notify>,
 }
 
 #[derive(Clone)]
@@ -149,6 +152,9 @@ struct PluginInstance {
     studio_pid: Option<u32>,
     studio_mode: Option<String>,
     studio_mode_observed_at: Option<Instant>,
+    studio_control_state: String,
+    studio_transition_phase: String,
+    studio_control_observed_at: Option<Instant>,
     stop_request_id: u64,
     last_seen_at: Instant,
     queue: VecDeque<Value>,
@@ -367,6 +373,12 @@ struct PluginStatusUpdateRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct PluginControlHeartbeatRequest {
+    instance_id: String,
+    mode: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct PluginStopRequestPayload {
     instance_id: String,
 }
@@ -431,6 +443,8 @@ struct ClaimedTaskStatus {
     remote_last_server_message_age_ms: Option<u128>,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
+    studio_control_state: String,
+    studio_transition_phase: String,
     official_mcp_adapter_state: String,
     official_mcp_adapter_age_ms: Option<u128>,
     official_mcp_adapter_last_error: Option<String>,
@@ -503,6 +517,8 @@ struct HelperHeartbeatTaskStatus {
     remote_last_server_message_age_ms: Option<u128>,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
+    studio_control_state: String,
+    studio_transition_phase: String,
     official_mcp_adapter_state: String,
     official_mcp_adapter_age_ms: Option<u128>,
     official_mcp_adapter_last_error: Option<String>,
@@ -525,6 +541,12 @@ struct ClaimTaskHubResponse {
     claimed: bool,
     helper_id: String,
     task: Option<ClaimedTaskHubPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RobloxPlaceUniverseResponse {
+    #[serde(rename = "universeId")]
+    universe_id: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -554,6 +576,8 @@ struct HelperInstanceStatus {
     studio_pid: Option<u32>,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
+    studio_control_state: String,
+    studio_transition_phase: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1046,10 +1070,9 @@ fn launch_studio_for_claim(
 ) -> Result<LaunchProcessRecord> {
     let studio_path = resolve_studio_path(helper)?;
     let mut command = std::process::Command::new(&studio_path);
-    command.arg("-task").arg("EditPlace");
-    command.arg("-placeId").arg(&task.place_id);
-    if let Some(universe_id) = task.universe_id.as_deref() {
-        command.arg("-universeId").arg(universe_id);
+    let launch_args = studio_launch_args_for_claim(task)?;
+    for arg in &launch_args {
+        command.arg(arg);
     }
     if let Some(parent) = studio_path.parent() {
         command.current_dir(parent);
@@ -1087,6 +1110,7 @@ fn launch_studio_for_claim(
         universe_id = task.universe_id.as_deref(),
         studio_pid,
         studio_path = %studio_path.display(),
+        studio_args = ?launch_args,
         "launched Roblox Studio for claimed task"
     );
     Ok(LaunchProcessRecord {
@@ -1098,6 +1122,75 @@ fn launch_studio_for_claim(
         kill_on_close_job: Some(kill_on_close_job),
         child: Some(child),
     })
+}
+
+fn studio_launch_args_for_claim(task: &ClaimedTask) -> Result<Vec<String>> {
+    let universe_id = task.universe_id.as_deref().ok_or_else(|| {
+        eyre!(
+            "cannot launch Studio for placeId {} without universeId",
+            task.place_id
+        )
+    })?;
+    Ok(vec![
+        "-task".to_owned(),
+        "EditPlace".to_owned(),
+        "-placeId".to_owned(),
+        task.place_id.clone(),
+        "-universeId".to_owned(),
+        universe_id.to_owned(),
+    ])
+}
+
+async fn ensure_claimed_task_universe_id(
+    helper: &HelperConfig,
+    task: &mut ClaimedTask,
+) -> Result<()> {
+    if task
+        .universe_id
+        .as_deref()
+        .is_some_and(|value| !trim(value).is_empty())
+    {
+        return Ok(());
+    }
+    let universe_id = resolve_universe_id_for_place(helper, &task.place_id).await?;
+    tracing::info!(
+        task_id = task.task_id.as_str(),
+        place_id = task.place_id.as_str(),
+        universe_id = universe_id.as_str(),
+        "resolved universeId for Studio launch"
+    );
+    task.universe_id = Some(universe_id);
+    Ok(())
+}
+
+async fn resolve_universe_id_for_place(helper: &HelperConfig, place_id: &str) -> Result<String> {
+    let place_id = sanitize_place_id(place_id)?;
+    let url = format!("https://apis.roblox.com/universes/v1/places/{place_id}/universe");
+    let response = tokio::time::timeout(
+        ROBLOX_PLACE_UNIVERSE_LOOKUP_TIMEOUT,
+        helper.client.get(&url).send(),
+    )
+    .await
+    .wrap_err_with(|| {
+        format!(
+            "timed out resolving universeId for placeId {place_id} after {}s",
+            ROBLOX_PLACE_UNIVERSE_LOOKUP_TIMEOUT.as_secs()
+        )
+    })?
+    .wrap_err_with(|| format!("failed to resolve universeId for placeId {place_id}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(eyre!(
+            "failed to resolve universeId for placeId {place_id}: HTTP {status}: {}",
+            summarize_error(&body)
+        ));
+    }
+    let payload = response
+        .json::<RobloxPlaceUniverseResponse>()
+        .await
+        .wrap_err_with(|| format!("failed to parse universeId response for placeId {place_id}"))?;
+    Ok(payload.universe_id.to_string())
 }
 
 fn sanitize_place_id(value: &str) -> Result<String> {
@@ -2051,6 +2144,8 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
             studio_mode_age_ms: instance
                 .studio_mode_observed_at
                 .map(|value| value.elapsed().as_millis()),
+            studio_control_state: effective_studio_control_state(instance),
+            studio_transition_phase: effective_studio_transition_phase(instance),
         })
         .collect();
     instances.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
@@ -2060,7 +2155,7 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
         .map(|task| {
             let connection_key = task_connection_key(&task.task_id);
             let remote_connection = state.remote_connections.get(&connection_key);
-            let (studio_mode, studio_mode_age_ms) =
+            let (studio_mode, studio_mode_age_ms, studio_control_state, studio_transition_phase) =
                 task_studio_mode_snapshot(&state, &task.task_id);
             let (
                 official_mcp_adapter_state,
@@ -2111,6 +2206,8 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
                 }),
                 studio_mode,
                 studio_mode_age_ms,
+                studio_control_state,
+                studio_transition_phase,
                 official_mcp_adapter_state,
                 official_mcp_adapter_age_ms,
                 official_mcp_adapter_last_error,
@@ -2236,6 +2333,71 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
         place_statuses,
         last_remote_errors: state.last_remote_errors.clone(),
     })
+}
+
+async fn helper_debug_task_handler(
+    State(app): State<AppState>,
+    AxumPath(task_id): AxumPath<String>,
+) -> Result<Response, HelperError> {
+    let mut state = app.state.lock().await;
+    cleanup_stale_instances(&mut state);
+    reconcile_launch_processes(&mut state);
+    sync_remote_connections(&app, &mut state);
+    let Some(task) = state.claimed_tasks.get(&task_id) else {
+        return Ok((StatusCode::NOT_FOUND, "task not claimed by helper").into_response());
+    };
+    let connection_key = task_connection_key(&task.task_id);
+    let remote_connection = state.remote_connections.get(&connection_key);
+    let launch_process = state.launch_processes.get(&task.task_id);
+    let instances = state
+        .instances
+        .iter()
+        .filter(|(_, instance)| instance.task_id.as_deref() == Some(task_id.as_str()))
+        .map(|(instance_id, instance)| {
+            serde_json::json!({
+                "instance_id": instance_id,
+                "place_id": instance.place_id,
+                "task_id": instance.task_id,
+                "remote_base_url": instance.remote_base_url,
+                "studio_pid": instance.studio_pid,
+                "studio_mode": instance.studio_mode,
+                "studio_mode_age_ms": instance.studio_mode_observed_at.map(|value| value.elapsed().as_millis()),
+                "studio_control_state": effective_studio_control_state(instance),
+                "studio_transition_phase": effective_studio_transition_phase(instance),
+            })
+        })
+        .collect::<Vec<_>>();
+    let task_status = helper_task_status_snapshot(&state, &task.task_id);
+    let payload = serde_json::json!({
+        "ok": true,
+        "task_id": task.task_id,
+        "claimed_task": {
+            "task_id": task.task_id,
+            "place_id": task.place_id,
+            "universe_id": task.universe_id,
+            "mcp_base_url": task.mcp_base_url,
+            "rojo_base_url": task.rojo_base_url,
+            "runtime_log_base_url": task.runtime_log_base_url,
+            "claimed_age_ms": task.claimed_at.elapsed().as_millis(),
+        },
+        "launch_process": launch_process.map(|launch| serde_json::json!({
+            "task_id": launch.task_id,
+            "place_id": launch.place_id,
+            "universe_id": launch.universe_id,
+            "studio_pid": launch.studio_pid,
+            "launched_by_helper": launch.launched_by_helper,
+        })),
+        "remote_connection": remote_connection.map(|connection| serde_json::json!({
+            "state": remote_connection_state_name(Some(connection)),
+            "connection_id": connection.connection_id,
+            "last_ready_age_ms": connection.last_ready_at.map(|value| value.elapsed().as_millis()),
+            "last_server_message_age_ms": connection.last_server_message_at.map(|value| value.elapsed().as_millis()),
+            "last_error": state.last_remote_errors.get(&connection_key),
+        })),
+        "instances": instances,
+        "task_status": task_status,
+    });
+    Ok(Json(payload).into_response())
 }
 
 async fn rojo_config_handler(
@@ -2606,6 +2768,9 @@ async fn mcp_register_handler(
     let remote_base_url = claimed_task.mcp_base_url.clone();
     {
         let mut state = app.state.lock().await;
+        let studio_mode = normalize_studio_mode(payload.studio_mode.as_deref());
+        let (studio_control_state, studio_transition_phase, studio_control_observed_at) =
+            initial_control_state_for_mode(studio_mode.as_deref());
         state.instances.insert(
             instance_id.clone(),
             PluginInstance {
@@ -2613,9 +2778,12 @@ async fn mcp_register_handler(
                 task_id: Some(claimed_task.task_id.clone()),
                 remote_base_url: remote_base_url.clone(),
                 studio_pid,
-                studio_mode: normalize_studio_mode(payload.studio_mode.as_deref()),
+                studio_mode,
                 studio_mode_observed_at: normalize_studio_mode(payload.studio_mode.as_deref())
                     .map(|_| Instant::now()),
+                studio_control_state,
+                studio_transition_phase,
+                studio_control_observed_at,
                 stop_request_id: 0,
                 last_seen_at: Instant::now(),
                 queue: VecDeque::new(),
@@ -2674,27 +2842,105 @@ async fn mcp_unregister_handler(
 async fn mcp_plugin_stop_request_handler(
     State(app): State<AppState>,
     Json(payload): Json<PluginStopRequestPayload>,
-) -> Result<Json<PluginStopRequestResponse>, HelperError> {
+) -> Result<Response, HelperError> {
     let mut state = app.state.lock().await;
-    let Some(instance) = state.instances.get_mut(&payload.instance_id) else {
-        return Err(HelperError(eyre!(
-            "plugin instance expired: {}",
-            payload.instance_id
-        )));
+    let (place_id, task_id, stop_request_id) = {
+        let Some(instance) = state.instances.get_mut(&payload.instance_id) else {
+            return Err(HelperError(eyre!(
+                "plugin instance expired: {}",
+                payload.instance_id
+            )));
+        };
+        if let Some(reason) = stop_request_rejection_reason(instance) {
+            let control_state = effective_studio_control_state(instance);
+            instance.studio_control_state = control_state.clone();
+            instance.studio_transition_phase = "error".to_owned();
+            instance.last_seen_at = Instant::now();
+            tracing::warn!(
+                instance_id = payload.instance_id,
+                place_id = instance.place_id,
+                task_id = ?instance.task_id,
+                studio_mode = ?instance.studio_mode,
+                studio_control_state = control_state,
+                "rejected MCP plugin stop request without fresh control heartbeat"
+            );
+            return Ok((StatusCode::CONFLICT, reason).into_response());
+        }
+        instance.stop_request_id = instance.stop_request_id.saturating_add(1);
+        instance.studio_transition_phase = "stopping".to_owned();
+        instance.last_seen_at = Instant::now();
+        (
+            instance.place_id.clone(),
+            instance.task_id.clone(),
+            instance.stop_request_id,
+        )
     };
-    instance.stop_request_id = instance.stop_request_id.saturating_add(1);
-    instance.last_seen_at = Instant::now();
+    if let Some(task_id) = task_id.as_deref() {
+        queue_task_status_updates(&state, &app.helper, task_id);
+    }
     tracing::info!(
         instance_id = payload.instance_id,
-        place_id = instance.place_id,
-        task_id = ?instance.task_id,
-        stop_request_id = instance.stop_request_id,
+        place_id,
+        task_id = ?task_id,
+        stop_request_id,
         "recorded MCP plugin stop request"
     );
     Ok(Json(PluginStopRequestResponse {
         stop_requested: true,
-        stop_request_id: instance.stop_request_id,
-    }))
+        stop_request_id,
+    })
+    .into_response())
+}
+
+async fn mcp_plugin_control_heartbeat_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<PluginControlHeartbeatRequest>,
+) -> Result<Response, HelperError> {
+    let Some(mode) = normalize_studio_mode(Some(payload.mode.as_str())) else {
+        return Ok((StatusCode::BAD_REQUEST, "invalid studio mode").into_response());
+    };
+    if !studio_mode_is_running(Some(mode.as_str())) {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            "control heartbeat requires a running mode",
+        )
+            .into_response());
+    }
+    let mut state = app.state.lock().await;
+    let (place_id, task_id, should_push_status) = {
+        let Some(instance) = state.instances.get_mut(&payload.instance_id) else {
+            return Ok((StatusCode::GONE, "instance expired").into_response());
+        };
+        let previous_mode = instance.studio_mode.clone();
+        let previous_control_state = effective_studio_control_state(instance);
+        let previous_transition_phase = effective_studio_transition_phase(instance);
+        instance.studio_mode = Some(mode.clone());
+        instance.studio_mode_observed_at = Some(Instant::now());
+        instance.studio_control_state = "ready".to_owned();
+        instance.studio_transition_phase = "running".to_owned();
+        instance.studio_control_observed_at = Some(Instant::now());
+        instance.last_seen_at = Instant::now();
+        (
+            instance.place_id.clone(),
+            instance.task_id.clone(),
+            previous_mode.as_deref() != Some(mode.as_str())
+                || previous_control_state != "ready"
+                || previous_transition_phase != "running",
+        )
+    };
+    if should_push_status {
+        if let Some(task_id) = task_id.as_deref() {
+            queue_task_status_updates(&state, &app.helper, task_id);
+        }
+    }
+    tracing::debug!(
+        instance_id = payload.instance_id,
+        place_id,
+        task_id = ?task_id,
+        studio_mode = mode,
+        "accepted MCP plugin control heartbeat"
+    );
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn mcp_plugin_stop_request_status_handler(
@@ -2770,6 +3016,13 @@ async fn mcp_plugin_status_update_handler(
         );
         return Ok((StatusCode::GONE, "instance expired or studio_mode invalid").into_response());
     }
+    let task_id = state
+        .instances
+        .get(&payload.instance_id)
+        .and_then(|instance| instance.task_id.clone());
+    if let Some(task_id) = task_id {
+        queue_task_status_updates(&state, &app.helper, &task_id);
+    }
     if let Some(instance) = state.instances.get(&payload.instance_id) {
         tracing::debug!(
             instance_id = payload.instance_id,
@@ -2805,6 +3058,11 @@ async fn mcp_plugin_response_handler(
                     payload.studio_mode.as_deref(),
                 );
                 if let Some(instance) = state.instances.get(instance_id) {
+                    if updated {
+                        if let Some(task_id) = instance.task_id.clone() {
+                            queue_task_status_updates(&state, &app.helper, &task_id);
+                        }
+                    }
                     tracing::info!(
                         instance_id,
                         place_id = instance.place_id,
@@ -2892,6 +3150,87 @@ fn normalize_studio_mode(value: Option<&str>) -> Option<String> {
     }
 }
 
+fn studio_mode_is_running(mode: Option<&str>) -> bool {
+    matches!(mode, Some("start_play") | Some("run_server"))
+}
+
+fn instance_has_fresh_control(instance: &PluginInstance) -> bool {
+    instance.studio_control_state == "ready"
+        && instance
+            .studio_control_observed_at
+            .map(|observed_at| observed_at.elapsed() <= STUDIO_CONTROL_HEARTBEAT_STALE_AFTER)
+            .unwrap_or(false)
+}
+
+fn effective_studio_control_state(instance: &PluginInstance) -> String {
+    if !studio_mode_is_running(instance.studio_mode.as_deref()) {
+        return "none".to_owned();
+    }
+    if instance_has_fresh_control(instance) {
+        "ready".to_owned()
+    } else {
+        "lost".to_owned()
+    }
+}
+
+fn effective_studio_transition_phase(instance: &PluginInstance) -> String {
+    match instance.studio_mode.as_deref() {
+        Some("stop") => "idle".to_owned(),
+        Some("start_play") | Some("run_server") => {
+            if instance_has_fresh_control(instance) {
+                "running".to_owned()
+            } else {
+                instance.studio_transition_phase.clone()
+            }
+        }
+        _ => instance.studio_transition_phase.clone(),
+    }
+}
+
+fn stop_request_rejection_reason(instance: &PluginInstance) -> Option<&'static str> {
+    if studio_mode_is_running(instance.studio_mode.as_deref())
+        && effective_studio_control_state(instance) != "ready"
+    {
+        Some("uncontrolled_play_session: Studio is in play mode but helper has no fresh control heartbeat")
+    } else {
+        None
+    }
+}
+
+fn settle_instance_control_state(instance: &mut PluginInstance, mode: &str) {
+    match mode {
+        "stop" => {
+            instance.studio_control_state = "none".to_owned();
+            instance.studio_transition_phase = "idle".to_owned();
+            instance.studio_control_observed_at = None;
+        }
+        "start_play" | "run_server" => {
+            if instance_has_fresh_control(instance) {
+                instance.studio_control_state = "ready".to_owned();
+                instance.studio_transition_phase = "running".to_owned();
+            } else {
+                instance.studio_control_state = "lost".to_owned();
+                if instance.studio_transition_phase == "idle" {
+                    instance.studio_transition_phase = "starting".to_owned();
+                }
+            }
+        }
+        _ => {
+            instance.studio_control_state = "lost".to_owned();
+            instance.studio_transition_phase = "error".to_owned();
+            instance.studio_control_observed_at = None;
+        }
+    }
+}
+
+fn initial_control_state_for_mode(mode: Option<&str>) -> (String, String, Option<Instant>) {
+    match mode {
+        None | Some("stop") => ("none".to_owned(), "idle".to_owned(), None),
+        Some("start_play") | Some("run_server") => ("lost".to_owned(), "starting".to_owned(), None),
+        _ => ("lost".to_owned(), "error".to_owned(), None),
+    }
+}
+
 fn update_instance_studio_mode(
     state: &mut HelperState,
     instance_id: &str,
@@ -2905,11 +3244,16 @@ fn update_instance_studio_mode(
     };
     instance.studio_mode = Some(mode);
     instance.studio_mode_observed_at = Some(Instant::now());
+    let mode = instance.studio_mode.clone().unwrap_or_default();
+    settle_instance_control_state(instance, &mode);
     instance.last_seen_at = Instant::now();
     true
 }
 
-fn task_studio_mode_snapshot(state: &HelperState, task_id: &str) -> (Option<String>, Option<u128>) {
+fn task_studio_mode_snapshot(
+    state: &HelperState,
+    task_id: &str,
+) -> (Option<String>, Option<u128>, String, String) {
     state
         .instances
         .values()
@@ -2919,11 +3263,15 @@ fn task_studio_mode_snapshot(state: &HelperState, task_id: &str) -> (Option<Stri
             Some((
                 instance.studio_mode.clone(),
                 observed_at.elapsed().as_millis(),
+                effective_studio_control_state(instance),
+                effective_studio_transition_phase(instance),
             ))
         })
-        .min_by_key(|(_, age)| *age)
-        .and_then(|(mode, age)| mode.map(|mode| (Some(mode), Some(age))))
-        .unwrap_or((None, None))
+        .min_by_key(|(_, age, _, _)| *age)
+        .and_then(|(mode, age, control_state, transition_phase)| {
+            mode.map(|mode| (Some(mode), Some(age), control_state, transition_phase))
+        })
+        .unwrap_or((None, None, "none".to_owned(), "idle".to_owned()))
 }
 
 fn task_official_adapter_snapshot(
@@ -2950,18 +3298,65 @@ fn task_official_adapter_snapshot(
     )
 }
 
+fn ws_age_ms(value: Option<u128>) -> Option<u64> {
+    value.map(|age| age.min(u64::MAX as u128) as u64)
+}
+
 fn helper_task_status_snapshot(state: &HelperState, task_id: &str) -> HelperTaskStatusSnapshot {
-    let (studio_mode, studio_mode_age_ms) = task_studio_mode_snapshot(state, task_id);
+    let (studio_mode, studio_mode_age_ms, studio_control_state, studio_transition_phase) =
+        task_studio_mode_snapshot(state, task_id);
     let (official_state, official_age_ms, official_last_error) =
         task_official_adapter_snapshot(state, task_id, studio_mode.as_deref());
     HelperTaskStatusSnapshot {
         task_id: task_id.to_owned(),
         studio_mode,
-        studio_mode_age_ms,
+        studio_mode_age_ms: ws_age_ms(studio_mode_age_ms),
+        studio_control_state: Some(studio_control_state),
+        studio_transition_phase: Some(studio_transition_phase),
         official_mcp_adapter_state: Some(official_state),
-        official_mcp_adapter_age_ms: official_age_ms,
+        official_mcp_adapter_age_ms: ws_age_ms(official_age_ms),
         official_mcp_adapter_last_error: official_last_error,
     }
+}
+
+fn queue_remote_task_status_heartbeat(
+    state: &HelperState,
+    helper: &HelperConfig,
+    task_id: &str,
+) -> bool {
+    let Some(task) = state.claimed_tasks.get(task_id) else {
+        return false;
+    };
+    let connection_key = task_connection_key(&task.task_id);
+    let Some(connection) = state.remote_connections.get(&connection_key) else {
+        return false;
+    };
+    let plugin_instance_count = state
+        .instances
+        .values()
+        .filter(|instance| instance.task_id.as_deref() == Some(task_id))
+        .count();
+    let task_status = Some(helper_task_status_snapshot(state, task_id));
+    let message = HelperToServerMessage::Heartbeat {
+        helper_id: helper.helper_id.clone(),
+        place_id: task.place_id.clone(),
+        task_id: Some(task.task_id.clone()),
+        plugin_instance_count,
+        task_status,
+    };
+    let Ok(encoded) = encode_remote_message(&message) else {
+        return false;
+    };
+    connection
+        .sender
+        .send(RemoteOutgoingFrame::Text(encoded))
+        .is_ok()
+}
+
+fn queue_task_status_updates(state: &HelperState, helper: &HelperConfig, task_id: &str) -> bool {
+    let queued_remote = queue_remote_task_status_heartbeat(state, helper, task_id);
+    helper.hub_heartbeat_notify.notify_one();
+    queued_remote
 }
 
 fn remote_connection_state_name(
@@ -2984,7 +3379,8 @@ fn heartbeat_task_statuses(state: &HelperState) -> Vec<HelperHeartbeatTaskStatus
         .map(|task| {
             let connection_key = task_connection_key(&task.task_id);
             let remote_connection = state.remote_connections.get(&connection_key);
-            let (studio_mode, studio_mode_age_ms) = task_studio_mode_snapshot(state, &task.task_id);
+            let (studio_mode, studio_mode_age_ms, studio_control_state, studio_transition_phase) =
+                task_studio_mode_snapshot(state, &task.task_id);
             let (
                 official_mcp_adapter_state,
                 official_mcp_adapter_age_ms,
@@ -3008,6 +3404,8 @@ fn heartbeat_task_statuses(state: &HelperState) -> Vec<HelperHeartbeatTaskStatus
                 }),
                 studio_mode,
                 studio_mode_age_ms,
+                studio_control_state,
+                studio_transition_phase,
                 official_mcp_adapter_state,
                 official_mcp_adapter_age_ms,
                 official_mcp_adapter_last_error,
@@ -3390,7 +3788,10 @@ async fn remote_ws_loop(
 async fn hub_maintenance_loop(app: AppState, mut registered: bool) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = app.helper.hub_heartbeat_notify.notified() => {}
+        }
         if !registered {
             match hub_register_helper(&app.helper).await {
                 Ok(_) => {
@@ -3485,7 +3886,7 @@ async fn hub_maintenance_loop(app: AppState, mut registered: bool) {
                             Some("hub claimed task missing mcp_base_url".to_owned());
                         continue;
                     };
-                    let claimed_task = ClaimedTask {
+                    let mut claimed_task = ClaimedTask {
                         task_id: task.task_id.clone(),
                         place_id: task.place_id,
                         universe_id: task.universe_id.or(task.game_id),
@@ -3503,6 +3904,14 @@ async fn hub_maintenance_loop(app: AppState, mut registered: bool) {
                             );
                             None
                         } else {
+                            if let Err(error) =
+                                ensure_claimed_task_universe_id(&app.helper, &mut claimed_task)
+                                    .await
+                            {
+                                let mut state = app.state.lock().await;
+                                state.hub_last_error = Some(summarize_error(&error.to_string()));
+                                continue;
+                            }
                             #[cfg(target_os = "windows")]
                             {
                                 match launch_studio_for_claim(&app.helper, &claimed_task) {
@@ -3888,6 +4297,8 @@ async fn run_remote_ws_session(
                     plugin_instance_count,
                     studio_mode = ?task_status.as_ref().and_then(|status| status.studio_mode.clone()),
                     studio_mode_age_ms = ?task_status.as_ref().and_then(|status| status.studio_mode_age_ms),
+                    studio_control_state = ?task_status.as_ref().and_then(|status| status.studio_control_state.clone()),
+                    studio_transition_phase = ?task_status.as_ref().and_then(|status| status.studio_transition_phase.clone()),
                     official_mcp_adapter_state = ?task_status.as_ref().and_then(|status| status.official_mcp_adapter_state.clone()),
                     official_mcp_adapter_age_ms = ?task_status.as_ref().and_then(|status| status.official_mcp_adapter_age_ms),
                     idle_from_server_ms = last_server_message_at.elapsed().as_millis(),
@@ -5622,6 +6033,7 @@ async fn main() -> Result<()> {
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
             .build()?,
+        hub_heartbeat_notify: Arc::new(Notify::new()),
     };
     let token_source = helper.bearer_token_source.lock().await.clone();
     tracing::info!(
@@ -5696,6 +6108,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/status", get(helper_status))
+        .route("/v1/debug/tasks/{task_id}", get(helper_debug_task_handler))
         .route("/v1/rojo/config", get(rojo_config_handler))
         .route(
             "/rojo-forward/{place_id}/task/{task_id}",
@@ -5729,6 +6142,10 @@ async fn main() -> Result<()> {
             "/v1/mcp/plugin/status",
             post(mcp_plugin_status_update_handler),
         )
+        .route(
+            "/v1/mcp/plugin/control-heartbeat",
+            post(mcp_plugin_control_heartbeat_handler),
+        )
         .route("/v1/mcp/plugin/response", post(mcp_plugin_response_handler))
         .route("/v1/helper/screenshot", post(screenshot_debug_handler))
         .route(
@@ -5760,6 +6177,9 @@ mod tests {
             studio_pid: Some(123),
             studio_mode: Some("stop".to_owned()),
             studio_mode_observed_at: Some(Instant::now()),
+            studio_control_state: "none".to_owned(),
+            studio_transition_phase: "idle".to_owned(),
+            studio_control_observed_at: None,
             stop_request_id: 0,
             last_seen_at: Instant::now() - Duration::from_millis(age_ms),
             queue: VecDeque::new(),
@@ -5779,6 +6199,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn studio_launch_args_include_place_and_universe_ids() {
+        let task = test_claimed_task("task-a", "134795435066737");
+
+        let args = studio_launch_args_for_claim(&task).unwrap();
+
+        assert_eq!(
+            args,
+            vec![
+                "-task",
+                "EditPlace",
+                "-placeId",
+                "134795435066737",
+                "-universeId",
+                "999"
+            ]
+        );
+    }
+
+    #[test]
+    fn studio_launch_args_reject_missing_universe_id() {
+        let mut task = test_claimed_task("task-a", "134795435066737");
+        task.universe_id = None;
+
+        let error = studio_launch_args_for_claim(&task).unwrap_err().to_string();
+
+        assert!(error.contains("without universeId"));
+    }
+
     fn empty_helper_state() -> HelperState {
         HelperState {
             instances: HashMap::new(),
@@ -5791,6 +6240,27 @@ mod tests {
             last_remote_errors: HashMap::new(),
             hub_last_error: None,
             hub_last_ready_at: None,
+        }
+    }
+
+    fn test_app_state() -> AppState {
+        AppState {
+            helper: HelperConfig {
+                port: DEFAULT_HELPER_PORT,
+                helper_id: "h_test".to_owned(),
+                capacity: 1,
+                user_name: "local-test".to_owned(),
+                bearer_token: Arc::new(Mutex::new("test-token".to_owned())),
+                bearer_token_source: Arc::new(Mutex::new("test".to_owned())),
+                bearer_token_candidates: Arc::new(Vec::new()),
+                domain_suffix: DEFAULT_DOMAIN_SUFFIX.to_owned(),
+                hub_base_url: Some("http://127.0.0.1:1".to_owned()),
+                studio_path: None,
+                skip_claim_studio_launch: true,
+                client: reqwest::Client::new(),
+                hub_heartbeat_notify: Arc::new(Notify::new()),
+            },
+            state: Arc::new(Mutex::new(empty_helper_state())),
         }
     }
 
@@ -5897,6 +6367,324 @@ mod tests {
             PLUGIN_STUDIO_CONTROL_REQUEST_TIMEOUT
         );
         assert!(PLUGIN_STUDIO_CONTROL_REQUEST_TIMEOUT > PLUGIN_REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn stop_request_rejects_running_instance_without_fresh_control_heartbeat() {
+        let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+        instance.studio_mode = Some("start_play".to_owned());
+        instance.studio_control_state = "lost".to_owned();
+        instance.studio_transition_phase = "running".to_owned();
+        instance.studio_control_observed_at = None;
+
+        let reason = stop_request_rejection_reason(&instance).unwrap();
+
+        assert!(reason.contains("uncontrolled_play_session"));
+    }
+
+    #[test]
+    fn stop_request_accepts_running_instance_with_fresh_control_heartbeat() {
+        let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+        instance.studio_mode = Some("start_play".to_owned());
+        instance.studio_control_state = "ready".to_owned();
+        instance.studio_transition_phase = "running".to_owned();
+        instance.studio_control_observed_at = Some(Instant::now());
+
+        assert!(stop_request_rejection_reason(&instance).is_none());
+    }
+
+    #[test]
+    fn stop_request_accepts_stopped_instance_without_control_heartbeat() {
+        let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+        instance.studio_mode = Some("stop".to_owned());
+        instance.studio_control_state = "none".to_owned();
+        instance.studio_control_observed_at = None;
+
+        assert!(stop_request_rejection_reason(&instance).is_none());
+    }
+
+    #[test]
+    fn initial_control_state_is_idle_without_reported_mode() {
+        let (control_state, transition_phase, observed_at) = initial_control_state_for_mode(None);
+
+        assert_eq!(control_state, "none");
+        assert_eq!(transition_phase, "idle");
+        assert!(observed_at.is_none());
+    }
+
+    #[test]
+    fn task_studio_mode_snapshot_reports_ready_while_control_heartbeat_is_fresh() {
+        let mut state = empty_helper_state();
+        let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+        instance.studio_mode = Some("start_play".to_owned());
+        instance.studio_mode_observed_at = Some(Instant::now());
+        instance.studio_control_state = "ready".to_owned();
+        instance.studio_transition_phase = "running".to_owned();
+        instance.studio_control_observed_at = Some(Instant::now());
+        state.instances.insert("instance-a".to_owned(), instance);
+
+        let (mode, _age_ms, control_state, transition_phase) =
+            task_studio_mode_snapshot(&state, "task-a");
+
+        assert_eq!(mode.as_deref(), Some("start_play"));
+        assert_eq!(control_state, "ready");
+        assert_eq!(transition_phase, "running");
+    }
+
+    #[test]
+    fn task_studio_mode_snapshot_reports_lost_after_control_heartbeat_expires() {
+        let mut state = empty_helper_state();
+        let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+        instance.studio_mode = Some("start_play".to_owned());
+        instance.studio_mode_observed_at = Some(Instant::now());
+        instance.studio_control_state = "ready".to_owned();
+        instance.studio_transition_phase = "running".to_owned();
+        instance.studio_control_observed_at =
+            Some(Instant::now() - STUDIO_CONTROL_HEARTBEAT_STALE_AFTER - Duration::from_millis(1));
+        state.instances.insert("instance-a".to_owned(), instance);
+
+        let (mode, _age_ms, control_state, transition_phase) =
+            task_studio_mode_snapshot(&state, "task-a");
+
+        assert_eq!(mode.as_deref(), Some("start_play"));
+        assert_eq!(control_state, "lost");
+        assert_eq!(transition_phase, "running");
+    }
+
+    #[test]
+    fn status_update_to_stop_clears_control_state() {
+        let mut state = empty_helper_state();
+        let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+        instance.studio_mode = Some("start_play".to_owned());
+        instance.studio_control_state = "ready".to_owned();
+        instance.studio_transition_phase = "running".to_owned();
+        instance.studio_control_observed_at = Some(Instant::now());
+        state.instances.insert("instance-a".to_owned(), instance);
+
+        assert!(update_instance_studio_mode(
+            &mut state,
+            "instance-a",
+            Some("stop")
+        ));
+        let instance = state.instances.get("instance-a").unwrap();
+
+        assert_eq!(instance.studio_mode.as_deref(), Some("stop"));
+        assert_eq!(instance.studio_control_state, "none");
+        assert_eq!(instance.studio_transition_phase, "idle");
+        assert!(instance.studio_control_observed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn control_heartbeat_rejects_invalid_or_stopped_modes_without_mutating_instance() {
+        let app = test_app_state();
+        {
+            let mut state = app.state.lock().await;
+            state.instances.insert(
+                "instance-a".to_owned(),
+                test_instance("93795519121520", Some("task-a"), 0),
+            );
+        }
+
+        let invalid = mcp_plugin_control_heartbeat_handler(
+            State(app.clone()),
+            Json(PluginControlHeartbeatRequest {
+                instance_id: "instance-a".to_owned(),
+                mode: "bogus".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+        let stopped = mcp_plugin_control_heartbeat_handler(
+            State(app.clone()),
+            Json(PluginControlHeartbeatRequest {
+                instance_id: "instance-a".to_owned(),
+                mode: "stop".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stopped.status(), StatusCode::BAD_REQUEST);
+
+        let state = app.state.lock().await;
+        let instance = state.instances.get("instance-a").unwrap();
+        assert_eq!(instance.studio_mode.as_deref(), Some("stop"));
+        assert_eq!(instance.studio_control_state, "none");
+        assert_eq!(instance.studio_transition_phase, "idle");
+        assert!(instance.studio_control_observed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn control_heartbeat_restores_lost_running_instance_and_stop_moves_to_stopping() {
+        let app = test_app_state();
+        {
+            let mut state = app.state.lock().await;
+            let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+            instance.studio_mode = Some("start_play".to_owned());
+            instance.studio_mode_observed_at = Some(Instant::now());
+            instance.studio_control_state = "ready".to_owned();
+            instance.studio_transition_phase = "running".to_owned();
+            instance.studio_control_observed_at = Some(
+                Instant::now() - STUDIO_CONTROL_HEARTBEAT_STALE_AFTER - Duration::from_millis(1),
+            );
+            state.instances.insert("instance-a".to_owned(), instance);
+        }
+
+        let stale_stop = mcp_plugin_stop_request_handler(
+            State(app.clone()),
+            Json(PluginStopRequestPayload {
+                instance_id: "instance-a".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stale_stop.status(), StatusCode::CONFLICT);
+        {
+            let state = app.state.lock().await;
+            let instance = state.instances.get("instance-a").unwrap();
+            assert_eq!(effective_studio_control_state(instance), "lost");
+            assert_eq!(instance.studio_transition_phase, "error");
+            assert_eq!(instance.stop_request_id, 0);
+        }
+
+        let heartbeat = mcp_plugin_control_heartbeat_handler(
+            State(app.clone()),
+            Json(PluginControlHeartbeatRequest {
+                instance_id: "instance-a".to_owned(),
+                mode: "start_play".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(heartbeat.status(), StatusCode::NO_CONTENT);
+        {
+            let state = app.state.lock().await;
+            let instance = state.instances.get("instance-a").unwrap();
+            assert_eq!(effective_studio_control_state(instance), "ready");
+            assert_eq!(effective_studio_transition_phase(instance), "running");
+        }
+
+        let accepted_stop = mcp_plugin_stop_request_handler(
+            State(app.clone()),
+            Json(PluginStopRequestPayload {
+                instance_id: "instance-a".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(accepted_stop.status(), StatusCode::OK);
+        {
+            let state = app.state.lock().await;
+            let instance = state.instances.get("instance-a").unwrap();
+            assert_eq!(instance.stop_request_id, 1);
+            assert_eq!(instance.studio_transition_phase, "stopping");
+        }
+
+        {
+            let mut state = app.state.lock().await;
+            assert!(update_instance_studio_mode(
+                &mut state,
+                "instance-a",
+                Some("stop"),
+            ));
+        }
+        let state = app.state.lock().await;
+        let instance = state.instances.get("instance-a").unwrap();
+        assert_eq!(instance.studio_mode.as_deref(), Some("stop"));
+        assert_eq!(instance.studio_control_state, "none");
+        assert_eq!(instance.studio_transition_phase, "idle");
+    }
+
+    #[tokio::test]
+    async fn stop_request_status_returns_gone_for_expired_instance() {
+        let response = mcp_plugin_stop_request_status_handler(
+            State(test_app_state()),
+            Query(PluginStopRequestQuery {
+                instance_id: "missing".to_owned(),
+                after_id: Some(0),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn immediate_task_status_update_queues_remote_snapshot_and_hub_notify() {
+        let mut state = empty_helper_state();
+        state.claimed_tasks.insert(
+            "task-a".to_owned(),
+            test_claimed_task("task-a", "93795519121520"),
+        );
+        let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+        instance.studio_mode = Some("start_play".to_owned());
+        instance.studio_control_state = "ready".to_owned();
+        instance.studio_transition_phase = "running".to_owned();
+        instance.studio_control_observed_at = Some(Instant::now());
+        state.instances.insert("instance-a".to_owned(), instance);
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (stop_tx, _stop_rx) = watch::channel(false);
+        state.remote_connections.insert(
+            task_connection_key("task-a").to_owned(),
+            RemoteConnectionHandle {
+                worker_id: Uuid::new_v4(),
+                stop_tx,
+                sender,
+                remote_base_url: "http://127.0.0.1:44880".to_owned(),
+                place_id: "93795519121520".to_owned(),
+                task_id: Some("task-a".to_owned()),
+                connection_state: RemoteConnectionState::Connected,
+                state_changed_at: Instant::now(),
+                retrying_since: None,
+                consecutive_failures: 0,
+                connection_id: Some("connection-a".to_owned()),
+                last_ready_at: Some(Instant::now()),
+                last_server_message_at: Some(Instant::now()),
+            },
+        );
+        let app = test_app_state();
+
+        assert!(queue_task_status_updates(&state, &app.helper, "task-a"));
+        let frame = receiver
+            .try_recv()
+            .expect("heartbeat frame should be queued");
+        let RemoteOutgoingFrame::Text(encoded) = frame else {
+            panic!("expected text heartbeat frame");
+        };
+        let payload: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(payload["type"], "heartbeat");
+        assert_eq!(payload["task_id"], "task-a");
+        assert_eq!(payload["plugin_instance_count"], 1);
+        assert_eq!(payload["task_status"]["studio_mode"], "start_play");
+        assert_eq!(payload["task_status"]["studio_control_state"], "ready");
+        assert_eq!(payload["task_status"]["studio_transition_phase"], "running");
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            app.helper.hub_heartbeat_notify.notified(),
+        )
+        .await
+        .expect("hub heartbeat notify should be queued");
+    }
+
+    #[tokio::test]
+    async fn task_status_update_notifies_hub_without_remote_connection() {
+        let mut state = empty_helper_state();
+        state.claimed_tasks.insert(
+            "task-a".to_owned(),
+            test_claimed_task("task-a", "93795519121520"),
+        );
+        let app = test_app_state();
+
+        assert!(!queue_task_status_updates(&state, &app.helper, "task-a"));
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            app.helper.hub_heartbeat_notify.notified(),
+        )
+        .await
+        .expect("hub heartbeat notify should not depend on server websocket");
     }
 
     fn test_remote_connection_handle(
