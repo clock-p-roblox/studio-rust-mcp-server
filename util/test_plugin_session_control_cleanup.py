@@ -26,6 +26,24 @@ class PluginSessionControlCleanupTests(unittest.TestCase):
         self.assertNotIn("one stop/retry", session_control)
         self.assertIn("start_play was not retried", session_control)
 
+    def test_start_play_waits_for_helper_control_ready(self) -> None:
+        session_control = (REPO / "plugin/src/Utils/StudioSessionControl.luau").read_text(encoding="utf-8")
+
+        start_play_start = session_control.index("local function startPlayMode")
+        start_play_end = session_control.index("local function startRunServerMode", start_play_start)
+        start_play_function = session_control[start_play_start:start_play_end]
+
+        self.assertIn("waitForStartPlayLog", start_play_function)
+        self.assertIn("waitForHelperControlReady", start_play_function)
+        self.assertLess(
+            start_play_function.index("waitForStartPlayLog"),
+            start_play_function.index("waitForHelperControlReady"),
+            "start_play must first observe Studio entering play, then wait for helper-owned control heartbeat",
+        )
+        self.assertIn('lastModeSource == "play_control"', session_control)
+        self.assertIn('lastControlState == "ready"', session_control)
+        self.assertIn('lastTransitionPhase == "running"', session_control)
+
 
 if __name__ == "__main__":
     unittest.main()

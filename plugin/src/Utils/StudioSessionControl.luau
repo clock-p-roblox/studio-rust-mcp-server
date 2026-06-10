@@ -52,11 +52,13 @@ local lastModeInferencePath: string? = nil
 local lastModeInferenceLineNumber = 0
 local currentHelperBaseUrl: string? = nil
 local currentInstanceId: string? = nil
+local currentTaskId: string? = nil
 local lastHelperStopRequestId = 0
 
-local function configureHelperContext(helperUrl: string?, instanceId: string?)
+local function configureHelperContext(helperUrl: string?, instanceId: string?, taskId: string?)
 	currentHelperBaseUrl = helperUrl
 	currentInstanceId = instanceId
+	currentTaskId = taskId
 end
 
 local function logTransitionStage(mode: Types.StartStopPlayMode, stage: string, detail: string?)
@@ -84,6 +86,34 @@ end
 
 local function activeHelperBaseUrl(): string
 	return currentHelperBaseUrl or helperBaseUrl()
+end
+
+local function requestHelperStatus()
+	local response = HttpService:RequestAsync({
+		Url = activeHelperBaseUrl() .. "/status",
+		Method = "GET",
+	})
+	if not response.Success then
+		error(string.format("Windows helper status failed with HTTP %d: %s", response.StatusCode, response.Body))
+	end
+	return HttpService:JSONDecode(response.Body)
+end
+
+local function findCurrentHelperInstance(statusPayload: any): any
+	if currentInstanceId == nil or currentInstanceId == "" then
+		return nil
+	end
+	if type(statusPayload) ~= "table" or type(statusPayload.instances) ~= "table" then
+		return nil
+	end
+	for _, instance in statusPayload.instances do
+		if type(instance) == "table" and tostring(instance.instance_id) == currentInstanceId then
+			if currentTaskId == nil or currentTaskId == "" or tostring(instance.task_id) == currentTaskId then
+				return instance
+			end
+		end
+	end
+	return nil
 end
 
 local function sendHelperStudioModeStatus(mode: Types.StartStopPlayMode)
@@ -550,6 +580,66 @@ local function waitForStartPlayLog(
 	error(errorMessage)
 end
 
+local function waitForHelperControlReady(targetMode: Types.TestMode, commandId: number, deadline: number)
+	local lastHelperError: string? = nil
+	local lastMode: string? = nil
+	local lastModeSource: string? = nil
+	local lastControlState: string? = nil
+	local lastTransitionPhase: string? = nil
+
+	logTransitionStage(targetMode, "waiting_for_play_control", string.format("command_id=%d", commandId))
+	while os.clock() < deadline do
+		local success, statusPayload = pcall(requestHelperStatus)
+		if success then
+			local instance = findCurrentHelperInstance(statusPayload)
+			if type(instance) == "table" then
+				lastHelperError = nil
+				lastMode = tostring(instance.studio_mode)
+				lastModeSource = tostring(instance.studio_mode_source)
+				lastControlState = tostring(instance.studio_control_state)
+				lastTransitionPhase = tostring(instance.studio_transition_phase)
+				if
+					lastMode == targetMode
+					and lastModeSource == "play_control"
+					and lastControlState == "ready"
+					and lastTransitionPhase == "running"
+				then
+					logTransitionStage(
+						targetMode,
+						"control_ready",
+						string.format(
+							"command_id=%d source=%s control_state=%s transition_phase=%s",
+							commandId,
+							lastModeSource,
+							lastControlState,
+							lastTransitionPhase
+						)
+					)
+					return
+				end
+			else
+				lastHelperError = "helper_status_missing_current_instance"
+			end
+		else
+			lastHelperError = tostring(statusPayload)
+		end
+		task.wait(POLL_INTERVAL_SECONDS)
+	end
+
+	local errorMessage = string.format(
+		"Timed out waiting for helper control heartbeat. mode=%s command_id=%d helper_mode=%s helper_mode_source=%s helper_control_state=%s helper_transition_phase=%s last_helper_error=%s",
+		targetMode,
+		commandId,
+		tostring(lastMode),
+		tostring(lastModeSource),
+		tostring(lastControlState),
+		tostring(lastTransitionPhase),
+		tostring(lastHelperError)
+	)
+	StudioModeTracker.recordTransitionError(commandId, errorMessage)
+	error(errorMessage)
+end
+
 local function startPlayMode(successMessage: string): string?
 	ConsoleOutput.outputMessage = ""
 	local currentMode = getStudioMode()
@@ -567,7 +657,9 @@ local function startPlayMode(successMessage: string): string?
 		return StudioTestService:ExecutePlayModeAsync({})
 	end)
 
-	waitForStartPlayLog(baseline, commandId, startCall, os.clock() + START_TIMEOUT_SECONDS)
+	local deadline = os.clock() + START_TIMEOUT_SECONDS
+	waitForStartPlayLog(baseline, commandId, startCall, deadline)
+	waitForHelperControlReady("start_play", commandId, deadline)
 	return successMessage
 end
 

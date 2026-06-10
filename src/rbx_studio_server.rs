@@ -529,6 +529,67 @@ async fn require_stop_mode_snapshot(
     }
 }
 
+fn studio_mode_is_running(mode: Option<&str>) -> bool {
+    matches!(mode, Some("start_play") | Some("run_server"))
+}
+
+fn studio_transition_is_stopping(phase: Option<&str>) -> bool {
+    matches!(
+        phase,
+        Some(
+            "stopping_requested"
+                | "stopping_acknowledged"
+                | "waiting_for_stop_log"
+                | "waiting_for_edit_runtime"
+        )
+    )
+}
+
+fn require_studio_control_snapshot(
+    snapshot: &HubTaskRuntimeSnapshot,
+    action: &str,
+) -> Result<(), ErrorData> {
+    let Some(mode) = snapshot.studio_mode.as_deref() else {
+        return Ok(());
+    };
+    if !studio_mode_is_running(Some(mode)) {
+        return Ok(());
+    }
+
+    ensure_reported_age_fresh(action, "studio_mode", snapshot.studio_mode_age_ms)?;
+    let transition_phase = snapshot
+        .studio_transition_phase
+        .as_deref()
+        .unwrap_or("unknown");
+    if studio_transition_is_stopping(Some(transition_phase)) {
+        return Err(ErrorData::internal_error(
+            format!(
+                "{action} failed fast: studio_stop_in_progress current_mode={mode} transition_phase={transition_phase}"
+            ),
+            None,
+        ));
+    }
+
+    let control_state = snapshot
+        .studio_control_state
+        .as_deref()
+        .unwrap_or("unknown");
+    if control_state != "ready" {
+        let last_error = snapshot
+            .studio_control_last_error
+            .as_deref()
+            .unwrap_or("none");
+        return Err(ErrorData::internal_error(
+            format!(
+                "{action} failed fast: uncontrolled_play_session current_mode={mode} studio_control_state={control_state} transition_phase={transition_phase} last_error={last_error}"
+            ),
+            None,
+        ));
+    }
+
+    Ok(())
+}
+
 async fn require_official_adapter_ready_snapshot(
     hub_client: Option<HubStatusClient>,
     task_id: &str,
@@ -1117,6 +1178,16 @@ impl ToolArgumentValues {
         }
     }
 
+    fn requires_studio_control_snapshot(&self) -> bool {
+        match self {
+            ToolArgumentValues::StartStopPlay(args) => {
+                args.mode == "start_play" || args.mode == "run_server"
+            }
+            ToolArgumentValues::LaunchStudioSession(_) => true,
+            _ => false,
+        }
+    }
+
     fn helper_request_timeout(&self) -> Duration {
         match self {
             ToolArgumentValues::StartStopPlay(_)
@@ -1536,6 +1607,13 @@ impl RBXStudioServer {
             let hub_status_client = { self.state.lock().await.hub_status_client.clone() };
             require_stop_mode_snapshot(hub_status_client, &requested_task_id, tool_name).await?;
         }
+        if command.args.requires_studio_control_snapshot() {
+            let hub_status_client = { self.state.lock().await.hub_status_client.clone() };
+            let snapshot =
+                fetch_hub_snapshot_for_gate(hub_status_client, &requested_task_id, tool_name)
+                    .await?;
+            require_studio_control_snapshot(&snapshot, tool_name)?;
+        }
         let (tx, mut rx) = mpsc::unbounded_channel::<Result<String>>();
         let (trigger, uploads, queued_requests, pending_responses) = {
             let mut state = self.state.lock().await;
@@ -1925,6 +2003,62 @@ mod tests {
         assert_eq!(snapshot.studio_transition_phase.as_deref(), Some("running"));
     }
 
+    fn running_studio_snapshot(
+        control_state: &str,
+        transition_phase: &str,
+    ) -> HubTaskRuntimeSnapshot {
+        HubTaskRuntimeSnapshot {
+            claimed_by_helper_id: Some("h_test".to_owned()),
+            helper_id: Some("h_test".to_owned()),
+            helper_blocked: false,
+            helper_last_seen_age_ms: Some(3),
+            task_released: false,
+            task_service_state: "ready".to_owned(),
+            task_accepting_launches: true,
+            task_services_healthy: true,
+            remote_state: Some("connected".to_owned()),
+            studio_mode: Some("start_play".to_owned()),
+            studio_mode_age_ms: Some(4),
+            studio_mode_source: Some("play_control".to_owned()),
+            studio_control_state: Some(control_state.to_owned()),
+            studio_transition_phase: Some(transition_phase.to_owned()),
+            studio_transition_age_ms: None,
+            edit_runtime_state: Some("stale".to_owned()),
+            edit_runtime_age_ms: Some(20_000),
+            studio_control_last_error: None,
+            official_mcp_adapter_state: Some("blocked_by_studio_mode".to_owned()),
+            official_mcp_adapter_age_ms: Some(5),
+            official_mcp_adapter_last_error: None,
+        }
+    }
+
+    #[test]
+    fn studio_control_preflight_allows_controlled_running_session() {
+        let snapshot = running_studio_snapshot("ready", "running");
+        require_studio_control_snapshot(&snapshot, "launch_studio_session")
+            .expect("controlled running session should be stoppable/relaunchable");
+    }
+
+    #[test]
+    fn studio_control_preflight_rejects_uncontrolled_running_session() {
+        let snapshot = running_studio_snapshot("lost", "error");
+        let error = require_studio_control_snapshot(&snapshot, "launch_studio_session")
+            .expect_err("lost running session must fail before dispatch");
+
+        assert!(error.to_string().contains("uncontrolled_play_session"));
+        assert!(error.to_string().contains("studio_control_state=lost"));
+    }
+
+    #[test]
+    fn studio_control_preflight_rejects_stop_in_progress() {
+        let snapshot = running_studio_snapshot("stopping", "waiting_for_edit_runtime");
+        let error = require_studio_control_snapshot(&snapshot, "start_stop_play")
+            .expect_err("stopping session must wait for stop/idle");
+
+        assert!(error.to_string().contains("studio_stop_in_progress"));
+        assert!(error.to_string().contains("waiting_for_edit_runtime"));
+    }
+
     #[test]
     fn hub_snapshot_stale_helper_blocks_all_ready_states() {
         let payload = HubStatusPayload {
@@ -2021,6 +2155,27 @@ mod tests {
         assert_eq!(stop_timeout, HELPER_STUDIO_CONTROL_REQUEST_TIMEOUT);
         assert_eq!(run_script_timeout, HELPER_STUDIO_CONTROL_REQUEST_TIMEOUT);
         assert!(launch_timeout > run_code_timeout);
+    }
+
+    #[test]
+    fn only_starting_control_tools_require_hub_control_preflight() {
+        assert!(!ToolArgumentValues::StartStopPlay(StartStopPlay {
+            task_id: "t_test".to_owned(),
+            mode: "stop".to_owned(),
+        })
+        .requires_studio_control_snapshot());
+        assert!(ToolArgumentValues::StartStopPlay(StartStopPlay {
+            task_id: "t_test".to_owned(),
+            mode: "start_play".to_owned(),
+        })
+        .requires_studio_control_snapshot());
+        assert!(
+            ToolArgumentValues::LaunchStudioSession(LaunchStudioSession {
+                task_id: "t_test".to_owned(),
+                mode: "start_play".to_owned(),
+            })
+            .requires_studio_control_snapshot()
+        );
     }
 
     #[test]

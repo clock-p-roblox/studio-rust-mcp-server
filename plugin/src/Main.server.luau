@@ -864,7 +864,7 @@ local function unregisterCurrentInstance()
 	currentHelperBaseUrl = nil
 	currentRemoteBaseUrl = nil
 	currentTaskId = nil
-	StudioSessionControl.configureHelperContext(nil, nil)
+	StudioSessionControl.configureHelperContext(nil, nil, nil)
 end
 
 local function stopStatusPolling()
@@ -1172,7 +1172,7 @@ local function connectToHelper(helperPort: string)
 	local taskId = if type(registration.task_id) == "string" and registration.task_id ~= ""
 		then registration.task_id
 		else nil
-	StudioSessionControl.configureHelperContext(baseUrl, instanceId)
+	StudioSessionControl.configureHelperContext(baseUrl, instanceId, taskId)
 	logPluginEvent("plugin_register_response", {
 		instance_id = instanceId,
 		task_id = taskId,
@@ -1230,7 +1230,7 @@ local function connectToHelper(helperPort: string)
 			currentHelperBaseUrl = nil
 			currentRemoteBaseUrl = nil
 			currentTaskId = nil
-			StudioSessionControl.configureHelperContext(nil, nil)
+			StudioSessionControl.configureHelperContext(nil, nil, nil)
 			resetStatusSections("Stopped polling the local helper on port " .. helperPort .. ".")
 		end
 	end)
