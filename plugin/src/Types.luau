@@ -19,19 +19,12 @@ export type LaunchStudioSessionArgs = {
 	mode: TestMode,
 }
 
-export type RunScriptInPlayModeArgs = {
-	code: string,
-	timeout: number?,
-	mode: TestMode,
-}
-
 export type ToolArgs =
 	{}
 	| { InsertModel: InsertModelArgs }
 	| { RunCode: RunCodeArgs }
 	| { StartStopPlay: StartStopPlayArgs }
 	| { LaunchStudioSession: LaunchStudioSessionArgs }
-	| { RunScriptInPlayMode: RunScriptInPlayModeArgs }
 
 export type ToolFunction = (ToolArgs) -> string?
 

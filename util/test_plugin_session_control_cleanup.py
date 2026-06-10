@@ -9,15 +9,15 @@ REPO = Path(__file__).resolve().parents[1]
 
 
 class PluginSessionControlCleanupTests(unittest.TestCase):
-    def test_run_script_does_not_install_persistent_session_control_script(self) -> None:
-        run_script = (REPO / "plugin/src/Tools/RunScriptInPlayMode.luau").read_text(encoding="utf-8")
+    def test_run_script_in_play_mode_tool_is_removed(self) -> None:
+        dispatcher = (REPO / "plugin/src/Utils/ToolDispatcher.luau").read_text(encoding="utf-8")
+        types = (REPO / "plugin/src/Types.luau").read_text(encoding="utf-8")
+        server = (REPO / "src/rbx_studio_server.rs").read_text(encoding="utf-8")
 
-        self.assertNotIn(
-            "StudioSessionControl.installSessionControlScript(args.mode)",
-            run_script,
-            "RunScriptInPlayMode is one-shot StudioTestService execution; it must not install persistent session control",
-        )
-        self.assertIn("removeTestScript()", run_script)
+        self.assertFalse((REPO / "plugin/src/Tools/RunScriptInPlayMode.luau").exists())
+        self.assertNotIn("RunScriptInPlayMode", dispatcher)
+        self.assertNotIn("RunScriptInPlayMode", types)
+        self.assertNotIn("run_script_in_play_mode", server)
 
     def test_start_play_does_not_hide_stop_retry_for_previous_test(self) -> None:
         session_control = (REPO / "plugin/src/Utils/StudioSessionControl.luau").read_text(encoding="utf-8")

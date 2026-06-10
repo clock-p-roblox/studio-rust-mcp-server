@@ -162,12 +162,10 @@ local function installSessionControlScript(targetMode: Types.StartStopPlayMode)
 	removeSessionControlScript()
 	local helperUrl = activeHelperBaseUrl()
 	local instanceId = currentInstanceId
-	local afterId = lastHelperStopRequestId
 	local source = string.format(
 		[[
 local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
-local StudioTestService = game:GetService("StudioTestService")
 
 if not RunService:IsServer() then
 	return
@@ -176,7 +174,6 @@ end
 local helperBaseUrl = %s
 local instanceId = %s
 local mode = %s
-local afterId = %d
 local pollIntervalSeconds = 0.25
 local heartbeatIntervalSeconds = 0.5
 local lastHeartbeatAt = 0
@@ -199,76 +196,22 @@ local function sendControlHeartbeat()
 	})
 end
 
-local function pollStopRequest()
-	local url = string.format("%%s/v1/mcp/plugin/stop-request?instance_id=%%s&after_id=%%d", helperBaseUrl, instanceId, afterId)
-	local response = HttpService:RequestAsync({
-		Url = url,
-		Method = "GET",
-	})
-	if not response.Success then
-		return nil
-	end
-	local ok, payload = pcall(function()
-		return HttpService:JSONDecode(response.Body)
-	end)
-	if not ok or type(payload) ~= "table" then
-		return nil
-	end
-	return payload
-end
-
-local function sendStopAck(stopRequestId)
-	HttpService:RequestAsync({
-		Url = helperBaseUrl .. "/v1/mcp/plugin/stop-ack",
-		Method = "POST",
-		Headers = {
-			["Content-Type"] = "application/json",
-		},
-		Body = HttpService:JSONEncode({
-			instance_id = instanceId,
-			stop_request_id = stopRequestId,
-		}),
-	})
-end
-
 pcall(sendControlHeartbeat)
 while true do
 	pcall(sendControlHeartbeat)
-	local payload = pollStopRequest()
-	if payload ~= nil then
-		local stopRequestId = tonumber(payload.stop_request_id) or afterId
-		if payload.stop_requested == true and stopRequestId > afterId then
-			pcall(function()
-				sendStopAck(stopRequestId)
-			end)
-			print(string.format("[MCP Plugin] session_control_stop stop_request_id=%%d", stopRequestId))
-			local ok, errorMessage = pcall(function()
-				StudioTestService:EndTest({
-					stopped_by = "mcp_session_control",
-					stop_request_id = stopRequestId,
-				})
-			end)
-			if not ok then
-				print(string.format("[MCP Plugin] session_control_stop_ignored stop_request_id=%%d error=%%s", stopRequestId, tostring(errorMessage)))
-			end
-			return
-		end
-		afterId = math.max(afterId, stopRequestId)
-	end
 	task.wait(pollIntervalSeconds)
 end
 ]],
 		luaStringLiteral(helperUrl),
 		luaStringLiteral(instanceId),
-		luaStringLiteral(targetMode),
-		afterId
+		luaStringLiteral(targetMode)
 	)
 
 	local controlScript = Instance.new("Script")
 	controlScript.Name = SESSION_CONTROL_SCRIPT_NAME
 	controlScript.Source = source
 	controlScript.Parent = ServerScriptService
-	logTransitionStage(targetMode, "control_script_installed", string.format("instance_id=%s after_id=%d", instanceId, afterId))
+	logTransitionStage(targetMode, "control_script_installed", string.format("instance_id=%s", instanceId))
 end
 
 local function requestStudioLog(startLine: number, lineCount: number)
@@ -503,6 +446,17 @@ local function stop(force: boolean?): string?
 				.. tostring(helperStopSignalError or "missing_instance_id")
 		)
 	end
+	local endTestOk, endTestError = pcall(function()
+		StudioTestService:EndTest({
+			stopped_by = "mcp_edit_plugin",
+			stop_request_id = stopRequestId,
+		})
+	end)
+	if not endTestOk then
+		logTransitionStage("stop", "end_test_failed", tostring(endTestError))
+		error("Unable to stop the running Studio session through StudioTestService: " .. tostring(endTestError))
+	end
+	logTransitionStage("stop", "end_test_requested", string.format("stop_request_id=%d", stopRequestId))
 	logTransitionStage(
 		"stop",
 		"requested",
@@ -587,7 +541,7 @@ local function waitForHelperControlReady(targetMode: Types.TestMode, commandId: 
 	local lastControlState: string? = nil
 	local lastTransitionPhase: string? = nil
 
-	logTransitionStage(targetMode, "waiting_for_play_control", string.format("command_id=%d", commandId))
+	logTransitionStage(targetMode, "helper_control_wait", string.format("command_id=%d", commandId))
 	while os.clock() < deadline do
 		local success, statusPayload = pcall(requestHelperStatus)
 		if success then
@@ -693,17 +647,11 @@ local function handleStartStopPlay(startStopPlayArgs: Types.StartStopPlayArgs): 
 		error("Missing mode in StartStopPlay")
 	end
 
-	if startStopPlayArgs.mode == "start_play" then
-		return startPlayMode("Started play")
-	elseif startStopPlayArgs.mode == "stop" then
+	if startStopPlayArgs.mode == "stop" then
 		return stop(false)
-	elseif startStopPlayArgs.mode == "run_server" then
-		return startRunServerMode(function()
-			return StudioTestService:ExecuteRunModeAsync({})
-		end, "Ran server")
 	end
 
-	error("Invalid mode in StartStopPlay, must be start_play, stop, or run_server")
+	error("Invalid mode in StartStopPlay; start_stop_play only supports stop. Use LaunchStudioSession to enter start_play or run_server.")
 end
 
 local function buildLaunchMessage(requestedMode: Types.TestMode, restartApplied: boolean): string

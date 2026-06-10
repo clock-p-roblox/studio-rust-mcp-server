@@ -389,19 +389,6 @@ struct PluginStopRequestPayload {
     instance_id: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct PluginStopAckPayload {
-    instance_id: String,
-    stop_request_id: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct PluginStopRequestQuery {
-    instance_id: String,
-    #[serde(default)]
-    after_id: Option<u64>,
-}
-
 #[derive(Debug, Serialize)]
 struct PluginStopRequestResponse {
     stop_requested: bool,
@@ -1819,12 +1806,7 @@ fn extract_tool_name_and_args(command: &Value) -> Result<(String, Value)> {
 fn is_studio_control_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "LaunchStudioSession"
-            | "StartStopPlay"
-            | "RunScriptInPlayMode"
-            | "launch_studio_session"
-            | "start_stop_play"
-            | "run_script_in_play_mode"
+        "LaunchStudioSession" | "StartStopPlay" | "launch_studio_session" | "start_stop_play"
     )
 }
 
@@ -2918,7 +2900,7 @@ async fn mcp_plugin_stop_request_handler(
                 task_id = ?instance.task_id,
                 studio_mode = ?instance.studio_mode,
                 studio_control_state = control_state,
-                "rejected MCP plugin stop request without fresh control heartbeat"
+                "rejected MCP plugin stop request"
             );
             return Ok((StatusCode::CONFLICT, reason).into_response());
         }
@@ -2948,42 +2930,6 @@ async fn mcp_plugin_stop_request_handler(
         stop_request_id,
     })
     .into_response())
-}
-
-async fn mcp_plugin_stop_ack_handler(
-    State(app): State<AppState>,
-    Json(payload): Json<PluginStopAckPayload>,
-) -> Result<Response, HelperError> {
-    let mut state = app.state.lock().await;
-    let task_id = {
-        let Some(instance) = state.instances.get_mut(&payload.instance_id) else {
-            return Ok((StatusCode::GONE, "instance expired").into_response());
-        };
-        if payload.stop_request_id == 0 || payload.stop_request_id != instance.stop_request_id {
-            tracing::warn!(
-                instance_id = payload.instance_id,
-                stop_request_id = payload.stop_request_id,
-                current_stop_request_id = instance.stop_request_id,
-                "rejected stale MCP plugin stop ack"
-            );
-            return Ok((StatusCode::CONFLICT, "stale stop ack").into_response());
-        }
-        instance.studio_control_state = "stopping".to_owned();
-        set_studio_transition_phase(instance, "stopping_acknowledged");
-        instance.studio_control_last_error = None;
-        instance.last_seen_at = Instant::now();
-        instance.task_id.clone()
-    };
-    if let Some(task_id) = task_id.as_deref() {
-        queue_task_status_updates(&state, &app.helper, task_id);
-    }
-    tracing::info!(
-        instance_id = payload.instance_id,
-        stop_request_id = payload.stop_request_id,
-        task_id = ?task_id,
-        "accepted MCP plugin stop ack"
-    );
-    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn mcp_plugin_control_heartbeat_handler(
@@ -3041,23 +2987,6 @@ async fn mcp_plugin_control_heartbeat_handler(
         "accepted MCP plugin control heartbeat"
     );
     Ok(StatusCode::NO_CONTENT.into_response())
-}
-
-async fn mcp_plugin_stop_request_status_handler(
-    State(app): State<AppState>,
-    Query(query): Query<PluginStopRequestQuery>,
-) -> Result<Response, HelperError> {
-    let mut state = app.state.lock().await;
-    let Some(instance) = state.instances.get_mut(&query.instance_id) else {
-        return Ok((StatusCode::GONE, "instance expired").into_response());
-    };
-    instance.last_seen_at = Instant::now();
-    let after_id = query.after_id.unwrap_or(0);
-    Ok(Json(PluginStopRequestResponse {
-        stop_requested: instance.stop_request_id > after_id,
-        stop_request_id: instance.stop_request_id,
-    })
-    .into_response())
 }
 
 async fn mcp_plugin_request_handler(
@@ -3270,13 +3199,7 @@ struct StudioTaskStatusSnapshot {
 }
 
 fn is_stopping_transition_phase(phase: &str) -> bool {
-    matches!(
-        phase,
-        "stopping_requested"
-            | "stopping_acknowledged"
-            | "waiting_for_stop_log"
-            | "waiting_for_edit_runtime"
-    )
+    phase == "stopping_requested"
 }
 
 fn set_studio_transition_phase(instance: &mut PluginInstance, phase: &str) {
@@ -3317,11 +3240,6 @@ fn effective_studio_transition_phase(instance: &PluginInstance) -> String {
         Some("stop") => "idle".to_owned(),
         Some("start_play") | Some("run_server") => {
             if is_stopping_transition_phase(&instance.studio_transition_phase) {
-                if instance.studio_transition_phase == "stopping_acknowledged"
-                    && !instance_has_fresh_control(instance)
-                {
-                    return "waiting_for_edit_runtime".to_owned();
-                }
                 return instance.studio_transition_phase.clone();
             }
             if instance_has_fresh_control(instance) {
@@ -3341,9 +3259,6 @@ fn stop_request_rejection_reason(instance: &PluginInstance) -> Option<&'static s
     let transition_phase = effective_studio_transition_phase(instance);
     if is_stopping_transition_phase(&transition_phase) {
         return Some("studio_stop_in_progress: Studio stop is already in progress; wait for helper status to return stop/idle before issuing another control command");
-    }
-    if effective_studio_control_state(instance) != "ready" {
-        return Some("uncontrolled_play_session: Studio is in play mode but helper has no fresh control heartbeat");
     }
     None
 }
@@ -6378,9 +6293,8 @@ async fn main() -> Result<()> {
         .route("/v1/mcp/plugin/request", get(mcp_plugin_request_handler))
         .route(
             "/v1/mcp/plugin/stop-request",
-            get(mcp_plugin_stop_request_status_handler).post(mcp_plugin_stop_request_handler),
+            post(mcp_plugin_stop_request_handler),
         )
-        .route("/v1/mcp/plugin/stop-ack", post(mcp_plugin_stop_ack_handler))
         .route(
             "/v1/mcp/plugin/status",
             post(mcp_plugin_status_update_handler),
@@ -6610,24 +6524,18 @@ mod tests {
             plugin_request_timeout_for_tool("StartStopPlay"),
             PLUGIN_STUDIO_CONTROL_REQUEST_TIMEOUT
         );
-        assert_eq!(
-            plugin_request_timeout_for_tool("RunScriptInPlayMode"),
-            PLUGIN_STUDIO_CONTROL_REQUEST_TIMEOUT
-        );
         assert!(PLUGIN_STUDIO_CONTROL_REQUEST_TIMEOUT > PLUGIN_REQUEST_TIMEOUT);
     }
 
     #[test]
-    fn stop_request_rejects_running_instance_without_fresh_control_heartbeat() {
+    fn stop_request_accepts_running_instance_without_fresh_control_heartbeat() {
         let mut instance = test_instance("93795519121520", Some("task-a"), 0);
         instance.studio_mode = Some("start_play".to_owned());
         instance.studio_control_state = "lost".to_owned();
         instance.studio_transition_phase = "running".to_owned();
         instance.studio_control_observed_at = None;
 
-        let reason = stop_request_rejection_reason(&instance).unwrap();
-
-        assert!(reason.contains("uncontrolled_play_session"));
+        assert!(stop_request_rejection_reason(&instance).is_none());
     }
 
     #[test]
@@ -6803,7 +6711,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_heartbeat_restores_lost_running_instance_and_stop_moves_to_stopping() {
+    async fn stop_request_accepts_lost_running_instance_and_control_heartbeat_restores_running() {
         let app = test_app_state();
         {
             let mut state = app.state.lock().await;
@@ -6818,7 +6726,7 @@ mod tests {
             state.instances.insert("instance-a".to_owned(), instance);
         }
 
-        let stale_stop = mcp_plugin_stop_request_handler(
+        let accepted_lost_stop = mcp_plugin_stop_request_handler(
             State(app.clone()),
             Json(PluginStopRequestPayload {
                 instance_id: "instance-a".to_owned(),
@@ -6826,13 +6734,32 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(stale_stop.status(), StatusCode::CONFLICT);
+        assert_eq!(accepted_lost_stop.status(), StatusCode::OK);
         {
             let state = app.state.lock().await;
             let instance = state.instances.get("instance-a").unwrap();
-            assert_eq!(effective_studio_control_state(instance), "lost");
-            assert_eq!(instance.studio_transition_phase, "error");
-            assert_eq!(instance.stop_request_id, 0);
+            assert_eq!(instance.stop_request_id, 1);
+            assert_eq!(instance.studio_control_state, "stopping");
+            assert_eq!(instance.studio_transition_phase, "stopping_requested");
+        }
+
+        let duplicate_stop = mcp_plugin_stop_request_handler(
+            State(app.clone()),
+            Json(PluginStopRequestPayload {
+                instance_id: "instance-a".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(duplicate_stop.status(), StatusCode::CONFLICT);
+        {
+            let mut state = app.state.lock().await;
+            let instance = state.instances.get_mut("instance-a").unwrap();
+            instance.studio_transition_phase = "running".to_owned();
+            instance.studio_control_state = "lost".to_owned();
+            instance.studio_control_observed_at = Some(
+                Instant::now() - STUDIO_CONTROL_HEARTBEAT_STALE_AFTER - Duration::from_millis(1),
+            );
         }
 
         let heartbeat = mcp_plugin_control_heartbeat_handler(
@@ -6864,38 +6791,15 @@ mod tests {
         {
             let state = app.state.lock().await;
             let instance = state.instances.get("instance-a").unwrap();
-            assert_eq!(instance.stop_request_id, 1);
+            assert_eq!(instance.stop_request_id, 2);
             assert_eq!(instance.studio_control_state, "stopping");
             assert_eq!(instance.studio_transition_phase, "stopping_requested");
         }
 
-        let stop_ack = mcp_plugin_stop_ack_handler(
-            State(app.clone()),
-            Json(PluginStopAckPayload {
-                instance_id: "instance-a".to_owned(),
-                stop_request_id: 1,
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(stop_ack.status(), StatusCode::NO_CONTENT);
-        {
-            let mut state = app.state.lock().await;
-            let instance = state.instances.get_mut("instance-a").unwrap();
-            assert_eq!(instance.studio_transition_phase, "stopping_acknowledged");
-            instance.studio_control_observed_at = Some(
-                Instant::now() - STUDIO_CONTROL_HEARTBEAT_STALE_AFTER - Duration::from_millis(1),
-            );
-            assert_eq!(
-                effective_studio_transition_phase(instance),
-                "waiting_for_edit_runtime"
-            );
-            assert_eq!(effective_studio_control_state(instance), "stopping");
-        }
         {
             let state = app.state.lock().await;
             let snapshot = task_studio_mode_snapshot(&state, "task-a");
-            assert_eq!(snapshot.studio_transition_phase, "waiting_for_edit_runtime");
+            assert_eq!(snapshot.studio_transition_phase, "stopping_requested");
             assert_eq!(snapshot.studio_control_state, "stopping");
         }
 
@@ -6913,21 +6817,6 @@ mod tests {
         assert_eq!(instance.studio_mode.as_deref(), Some("stop"));
         assert_eq!(instance.studio_control_state, "none");
         assert_eq!(instance.studio_transition_phase, "idle");
-    }
-
-    #[tokio::test]
-    async fn stop_request_status_returns_gone_for_expired_instance() {
-        let response = mcp_plugin_stop_request_status_handler(
-            State(test_app_state()),
-            Query(PluginStopRequestQuery {
-                instance_id: "missing".to_owned(),
-                after_id: Some(0),
-            }),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(response.status(), StatusCode::GONE);
     }
 
     #[tokio::test]

@@ -418,17 +418,6 @@ def main() -> int:
         )
         repeat_triplet = wait_triplet(task_id, "stop", "none", "idle")
 
-        one_shot_result = call_tool(
-            client,
-            "run_script_in_play_mode",
-            {
-                "task_id": task_id,
-                "mode": "start_play",
-                "timeout": 10,
-                "code": 'print("[MCP] one-shot cleanup probe")',
-            },
-        )
-        one_shot_triplet = wait_triplet(task_id, "stop", "none", "idle")
         cleanup_check = call_tool(
             client,
             "run_code",
@@ -448,8 +437,6 @@ def main() -> int:
             json.dumps(
                 {
                     "task_id": task_id,
-                    "one_shot_result": one_shot_result,
-                    "one_shot_triplet": one_shot_triplet,
                     "cleanup_check": cleanup_check,
                     "start_elapsed_ms": start_elapsed_ms,
                     "stop_elapsed_ms": stop_elapsed_ms,

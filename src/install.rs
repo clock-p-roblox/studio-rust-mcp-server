@@ -31,7 +31,6 @@ Tools included:
 - get_console_output
 - launch_studio_session
 - start_stop_play
-- run_script_in_play_mode
 - get_studio_mode
 
 Plugin integration:

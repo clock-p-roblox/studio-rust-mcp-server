@@ -16,9 +16,8 @@ The current clock-p shape is:
 - **run_code** - Runs a command in Roblox Studio and returns printed output.
 - **insert_model** - Inserts a model from the Roblox marketplace.
 - **get_console_output** - Gets Studio console output.
-- **launch_studio_session** - Launches Studio into start_play or run_server through helper.
-- **start_stop_play** - Starts or stops play mode.
-- **run_script_in_play_mode** - Runs a one-time script in play mode.
+- **launch_studio_session** - The only tool that launches Studio into start_play or run_server through helper.
+- **start_stop_play** - Stops the current play/run session.
 - **get_studio_mode** - Gets the current Studio mode.
 - **take_screenshot** - Captures the active Studio window through helper.
 

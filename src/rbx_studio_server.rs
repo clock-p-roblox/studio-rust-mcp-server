@@ -534,15 +534,7 @@ fn studio_mode_is_running(mode: Option<&str>) -> bool {
 }
 
 fn studio_transition_is_stopping(phase: Option<&str>) -> bool {
-    matches!(
-        phase,
-        Some(
-            "stopping_requested"
-                | "stopping_acknowledged"
-                | "waiting_for_stop_log"
-                | "waiting_for_edit_runtime"
-        )
-    )
+    matches!(phase, Some("stopping_requested"))
 }
 
 fn require_studio_control_snapshot(
@@ -565,23 +557,6 @@ fn require_studio_control_snapshot(
         return Err(ErrorData::internal_error(
             format!(
                 "{action} failed fast: studio_stop_in_progress current_mode={mode} transition_phase={transition_phase}"
-            ),
-            None,
-        ));
-    }
-
-    let control_state = snapshot
-        .studio_control_state
-        .as_deref()
-        .unwrap_or("unknown");
-    if control_state != "ready" {
-        let last_error = snapshot
-            .studio_control_last_error
-            .as_deref()
-            .unwrap_or("none");
-        return Err(ErrorData::internal_error(
-            format!(
-                "{action} failed fast: uncontrolled_play_session current_mode={mode} studio_control_state={control_state} transition_phase={transition_phase} last_error={last_error}"
             ),
             None,
         ));
@@ -905,10 +880,10 @@ impl ServerHandler for RBXStudioServer {
                 "Prefer using launch_studio_session for high-level launches into start_play or run_server.
 get_studio_mode is for diagnostics and stop-path checks, not the normal launch entrypoint.
 Use run_code to query or edit the Roblox Studio place while Studio is in stop/edit mode.
-Use run_script_in_play_mode only for a one-shot unit-test style script that starts from stop/edit mode and automatically returns to stop mode.
+Only launch_studio_session may enter start_play or run_server. start_stop_play is stop-only.
 If Studio control reports a previous test is still pending after its settle wait, stop once with start_stop_play(stop) and inspect Studio logs; do not recover by sending another play+stop loop.
-If status reports studio_transition_phase=waiting_for_edit_runtime, wait for stop/idle instead of issuing another play or stop command.
-If status or a tool error reports uncontrolled_play_session, do not retry launch automatically; the current Studio play session was not started with a fresh helper control heartbeat.
+If status reports studio_transition_phase=stopping_requested, wait for stop/idle instead of issuing another play or stop command.
+If status reports an uncontrolled play session, stop it with start_stop_play(stop) before launching again.
 "
                     .to_string(),
             ),
@@ -1095,7 +1070,7 @@ struct StartStopPlay {
     )]
     task_id: String,
     #[schemars(
-        description = "Mode to start or stop, must be start_play, stop, or run_server. Don't use run_server unless you are sure no client/player is needed."
+        description = "Only stop is allowed. Use launch_studio_session to enter start_play or run_server."
     )]
     mode: String,
 }
@@ -1113,29 +1088,12 @@ struct LaunchStudioSession {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
-struct RunScriptInPlayMode {
-    #[schemars(
-        description = "Required clock-p task_id used to route this call to the matching Studio plugin instance."
-    )]
-    task_id: String,
-    #[schemars(description = "Code to run")]
-    code: String,
-    #[schemars(
-        description = "Timeout in seconds, defaults to 30 seconds and must be <= 90 seconds"
-    )]
-    timeout: Option<u32>,
-    #[schemars(description = "Mode to run in, must be start_play or run_server")]
-    mode: String,
-}
-
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
 enum ToolArgumentValues {
     RunCode(RunCode),
     InsertModel(InsertModel),
     GetConsoleOutput(GetConsoleOutput),
     StartStopPlay(StartStopPlay),
     LaunchStudioSession(LaunchStudioSession),
-    RunScriptInPlayMode(RunScriptInPlayMode),
     GetStudioMode(GetStudioMode),
     TakeScreenshot(TakeScreenshot),
     ReadStudioLog(ReadStudioLog),
@@ -1149,7 +1107,6 @@ impl ToolArgumentValues {
             ToolArgumentValues::GetConsoleOutput(_) => "get_console_output",
             ToolArgumentValues::StartStopPlay(_) => "start_stop_play",
             ToolArgumentValues::LaunchStudioSession(_) => "launch_studio_session",
-            ToolArgumentValues::RunScriptInPlayMode(_) => "run_script_in_play_mode",
             ToolArgumentValues::GetStudioMode(_) => "get_studio_mode",
             ToolArgumentValues::TakeScreenshot(_) => "take_screenshot",
             ToolArgumentValues::ReadStudioLog(_) => "read_studio_log",
@@ -1163,26 +1120,34 @@ impl ToolArgumentValues {
             ToolArgumentValues::GetConsoleOutput(args) => &args.task_id,
             ToolArgumentValues::StartStopPlay(args) => &args.task_id,
             ToolArgumentValues::LaunchStudioSession(args) => &args.task_id,
-            ToolArgumentValues::RunScriptInPlayMode(args) => &args.task_id,
             ToolArgumentValues::GetStudioMode(args) => &args.task_id,
             ToolArgumentValues::TakeScreenshot(args) => &args.task_id,
             ToolArgumentValues::ReadStudioLog(args) => &args.task_id,
         }
     }
 
+    fn validate(&self) -> Result<(), ErrorData> {
+        match self {
+            ToolArgumentValues::StartStopPlay(args) if args.mode != "stop" => {
+                Err(ErrorData::invalid_params(
+                    "start_stop_play is stop-only. Use launch_studio_session to enter start_play or run_server.",
+                    None,
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn requires_studio_stop_snapshot(&self) -> bool {
         match self {
             ToolArgumentValues::RunCode(args) => args.diagnostic != Some(true),
-            ToolArgumentValues::InsertModel(_) | ToolArgumentValues::RunScriptInPlayMode(_) => true,
+            ToolArgumentValues::InsertModel(_) => true,
             _ => false,
         }
     }
 
     fn requires_studio_control_snapshot(&self) -> bool {
         match self {
-            ToolArgumentValues::StartStopPlay(args) => {
-                args.mode == "start_play" || args.mode == "run_server"
-            }
             ToolArgumentValues::LaunchStudioSession(_) => true,
             _ => false,
         }
@@ -1190,9 +1155,9 @@ impl ToolArgumentValues {
 
     fn helper_request_timeout(&self) -> Duration {
         match self {
-            ToolArgumentValues::StartStopPlay(_)
-            | ToolArgumentValues::LaunchStudioSession(_)
-            | ToolArgumentValues::RunScriptInPlayMode(_) => HELPER_STUDIO_CONTROL_REQUEST_TIMEOUT,
+            ToolArgumentValues::StartStopPlay(_) | ToolArgumentValues::LaunchStudioSession(_) => {
+                HELPER_STUDIO_CONTROL_REQUEST_TIMEOUT
+            }
             _ => HELPER_REQUEST_TIMEOUT,
         }
     }
@@ -1238,7 +1203,7 @@ impl RBXStudioServer {
     }
 
     #[tool(
-        description = "Start or stop play mode or run the server, Don't enter run_server mode unless you are sure no client/player is needed."
+        description = "Stop the current Roblox Studio play/run session. This tool never starts Studio."
     )]
     async fn start_stop_play(
         &self,
@@ -1249,30 +1214,13 @@ impl RBXStudioServer {
     }
 
     #[tool(
-        description = "Launch Roblox Studio into start_play or run_server. This is the high-level launch entrypoint for controlled sessions: if a controlled Studio session is already running, Windows will stop it and relaunch into the requested mode. If the current play session has no fresh helper control heartbeat, it returns uncontrolled_play_session instead of guessing a recovery. Returns a JSON object with requested_mode, restart_applied, previous_mode, final_mode, actions, and message."
+        description = "Launch Roblox Studio into start_play or run_server. This is the only MCP tool that may enter play/run. If Studio is already running, Windows stops it first and then launches the requested mode. Returns a JSON object with requested_mode, restart_applied, previous_mode, final_mode, actions, and message."
     )]
     async fn launch_studio_session(
         &self,
         Parameters(args): Parameters<LaunchStudioSession>,
     ) -> Result<CallToolResult, ErrorData> {
         self.generic_tool_run(ToolArgumentValues::LaunchStudioSession(args))
-            .await
-    }
-
-    #[tool(
-        description = "Run a script in play mode and automatically stop play after script finishes or timeout. Returns the output of the script.
-        Result format: { success: boolean, value: string, error: string, logs: { level: string, message: string, ts: number }[], errors: { level: string, message: string, ts: number }[], duration: number, isTimeout: boolean }.
-        - Use run_script_in_play_mode only for one-shot unit-test style code that starts from stop/edit mode.
-        - Do not call it while an existing play/run session is active; use launch_studio_session for normal game launches.
-        - timeout defaults to 30 seconds and must be <= 90 seconds.
-        - The Windows plugin may wait briefly for StudioTestService to settle after stop, but it does not issue a hidden stop/play recovery.
-        - If it still reports a pending previous test or a stop timeout, call start_stop_play(stop) once and inspect Studio logs; do not recover by sending another play+stop loop."
-    )]
-    async fn run_script_in_play_mode(
-        &self,
-        Parameters(args): Parameters<RunScriptInPlayMode>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.generic_tool_run(ToolArgumentValues::RunScriptInPlayMode(args))
             .await
     }
 
@@ -1593,6 +1541,7 @@ impl RBXStudioServer {
                 )
             })?
         };
+        normalized_args.validate()?;
         let requested_task_id =
             sanitize_identifier("task_id", normalized_args.task_id()).map_err(|error| {
                 ErrorData::internal_error(
@@ -2040,23 +1989,20 @@ mod tests {
     }
 
     #[test]
-    fn studio_control_preflight_rejects_uncontrolled_running_session() {
+    fn studio_control_preflight_allows_uncontrolled_running_session() {
         let snapshot = running_studio_snapshot("lost", "error");
-        let error = require_studio_control_snapshot(&snapshot, "launch_studio_session")
-            .expect_err("lost running session must fail before dispatch");
-
-        assert!(error.to_string().contains("uncontrolled_play_session"));
-        assert!(error.to_string().contains("studio_control_state=lost"));
+        require_studio_control_snapshot(&snapshot, "launch_studio_session")
+            .expect("launch should dispatch so Windows can stop the running Studio session first");
     }
 
     #[test]
     fn studio_control_preflight_rejects_stop_in_progress() {
-        let snapshot = running_studio_snapshot("stopping", "waiting_for_edit_runtime");
+        let snapshot = running_studio_snapshot("stopping", "stopping_requested");
         let error = require_studio_control_snapshot(&snapshot, "start_stop_play")
             .expect_err("stopping session must wait for stop/idle");
 
         assert!(error.to_string().contains("studio_stop_in_progress"));
-        assert!(error.to_string().contains("waiting_for_edit_runtime"));
+        assert!(error.to_string().contains("stopping_requested"));
     }
 
     #[test]
@@ -2142,29 +2088,20 @@ mod tests {
             mode: "stop".to_owned(),
         })
         .helper_request_timeout();
-        let run_script_timeout = ToolArgumentValues::RunScriptInPlayMode(RunScriptInPlayMode {
-            task_id: "t_test".to_owned(),
-            code: "print('ok')".to_owned(),
-            timeout: Some(30),
-            mode: "start_play".to_owned(),
-        })
-        .helper_request_timeout();
-
         assert_eq!(run_code_timeout, HELPER_REQUEST_TIMEOUT);
         assert_eq!(launch_timeout, HELPER_STUDIO_CONTROL_REQUEST_TIMEOUT);
         assert_eq!(stop_timeout, HELPER_STUDIO_CONTROL_REQUEST_TIMEOUT);
-        assert_eq!(run_script_timeout, HELPER_STUDIO_CONTROL_REQUEST_TIMEOUT);
         assert!(launch_timeout > run_code_timeout);
     }
 
     #[test]
-    fn only_starting_control_tools_require_hub_control_preflight() {
+    fn only_launch_requires_hub_control_preflight() {
         assert!(!ToolArgumentValues::StartStopPlay(StartStopPlay {
             task_id: "t_test".to_owned(),
             mode: "stop".to_owned(),
         })
         .requires_studio_control_snapshot());
-        assert!(ToolArgumentValues::StartStopPlay(StartStopPlay {
+        assert!(!ToolArgumentValues::StartStopPlay(StartStopPlay {
             task_id: "t_test".to_owned(),
             mode: "start_play".to_owned(),
         })
@@ -2176,6 +2113,25 @@ mod tests {
             })
             .requires_studio_control_snapshot()
         );
+    }
+
+    #[test]
+    fn start_stop_play_validates_as_stop_only() {
+        ToolArgumentValues::StartStopPlay(StartStopPlay {
+            task_id: "t_test".to_owned(),
+            mode: "stop".to_owned(),
+        })
+        .validate()
+        .expect("stop remains valid");
+
+        let error = ToolArgumentValues::StartStopPlay(StartStopPlay {
+            task_id: "t_test".to_owned(),
+            mode: "start_play".to_owned(),
+        })
+        .validate()
+        .expect_err("start_stop_play must not start Studio");
+
+        assert!(error.to_string().contains("stop-only"));
     }
 
     #[test]

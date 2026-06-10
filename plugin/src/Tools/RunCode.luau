@@ -3,6 +3,23 @@ local Types = require(Main.Types)
 
 local HttpService = game:GetService("HttpService")
 
+local FORBIDDEN_STUDIO_CONTROL_TOKENS = {
+	"StudioTestService",
+	"ExecutePlayModeAsync",
+	"ExecuteRunModeAsync",
+	"EndTest",
+}
+
+local function assertNoStudioControlApi(command: string)
+	for _, token in FORBIDDEN_STUDIO_CONTROL_TOKENS do
+		if string.find(command, token, 1, true) ~= nil then
+			error(
+				"RunCode cannot call Studio play/stop control APIs. Use LaunchStudioSession to enter play/run and StartStopPlay(stop) to stop."
+			)
+		end
+	end
+end
+
 local function runCodeWithOutput(command: string): string
 	local output = ""
 
@@ -121,6 +138,7 @@ local function handleRunCode(runCodeArgs: Types.RunCodeArgs): string?
 	if type(runCodeArgs.command) ~= "string" then
 		error("Missing command in RunCode")
 	end
+	assertNoStudioControlApi(runCodeArgs.command)
 
 	return runCodeWithOutput(runCodeArgs.command)
 end

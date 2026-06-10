@@ -56,8 +56,27 @@ class StudioStopTimeoutContractTests(unittest.TestCase):
         self.assertIn("waitForStopLog(baseline, STOP_TIMEOUT_SECONDS)", stop_function)
         self.assertIn("Timed out waiting for Studio stop log", plugin)
         self.assertIn('/v1/mcp/plugin/stop-request', stop_function)
+        self.assertIn("StudioTestService:EndTest", stop_function)
         self.assertNotIn("ExecutePlayModeAsync", stop_function)
         self.assertNotIn("ExecuteRunModeAsync", stop_function)
+
+    def test_play_control_script_is_heartbeat_only(self) -> None:
+        plugin = read(PLUGIN_SESSION_CONTROL)
+        install_start = plugin.index("local function installSessionControlScript")
+        install_end = plugin.index("local function requestStudioLog", install_start)
+        install_function = plugin[install_start:install_end]
+
+        self.assertIn("/v1/mcp/plugin/control-heartbeat", install_function)
+        self.assertNotIn("/v1/mcp/plugin/stop-request", install_function)
+        self.assertNotIn("/v1/mcp/plugin/stop-ack", install_function)
+        self.assertNotIn("StudioTestService:EndTest", install_function)
+
+    def test_legacy_play_runtime_stop_paths_are_removed(self) -> None:
+        helper = read(HELPER)
+        self.assertFalse((REPO / "plugin/src/Utils/GameStopUtil.luau").exists())
+        self.assertNotIn("/v1/mcp/plugin/stop-ack", helper)
+        self.assertNotIn("mcp_plugin_stop_ack_handler", helper)
+        self.assertNotIn("stopping_acknowledged", helper)
 
 
 if __name__ == "__main__":
