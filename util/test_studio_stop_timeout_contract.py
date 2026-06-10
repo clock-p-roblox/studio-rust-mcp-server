@@ -47,29 +47,31 @@ class StudioStopTimeoutContractTests(unittest.TestCase):
         self.assertGreater(helper_plugin_timeout, plugin_stop_timeout)
         self.assertGreater(server_helper_timeout, helper_plugin_timeout)
 
-    def test_stop_timeout_is_reported_without_hidden_retry(self) -> None:
+    def test_edit_runtime_stop_does_not_directly_stop_play_runtime(self) -> None:
         plugin = read(PLUGIN_SESSION_CONTROL)
         stop_function_start = plugin.index("local function stop(")
         stop_function_end = plugin.index("local function waitForStartPlayLog", stop_function_start)
         stop_function = plugin[stop_function_start:stop_function_end]
 
-        self.assertIn("waitForStopLog(baseline, STOP_TIMEOUT_SECONDS)", stop_function)
-        self.assertIn("Timed out waiting for Studio stop log", plugin)
-        self.assertIn('/v1/mcp/plugin/stop-request', stop_function)
-        self.assertIn("StudioTestService:EndTest", stop_function)
+        self.assertNotIn("waitForStopLog(baseline, STOP_TIMEOUT_SECONDS)", stop_function)
+        self.assertNotIn('/v1/mcp/plugin/stop-request', stop_function)
+        self.assertNotIn("StudioTestService:EndTest", stop_function)
         self.assertNotIn("ExecutePlayModeAsync", stop_function)
         self.assertNotIn("ExecuteRunModeAsync", stop_function)
 
-    def test_play_control_script_is_heartbeat_only(self) -> None:
+    def test_play_control_script_polls_stop_intent_and_stops_in_runtime(self) -> None:
         plugin = read(PLUGIN_SESSION_CONTROL)
         install_start = plugin.index("local function installSessionControlScript")
         install_end = plugin.index("local function requestStudioLog", install_start)
         install_function = plugin[install_start:install_end]
 
         self.assertIn("/v1/mcp/plugin/control-heartbeat", install_function)
-        self.assertNotIn("/v1/mcp/plugin/stop-request", install_function)
+        self.assertIn("/v1/mcp/plugin/stop-request", install_function)
+        self.assertIn("StudioTestService:EndTest", install_function)
+        self.assertIn('stopped_by = "mcp_session_control"', install_function)
         self.assertNotIn("/v1/mcp/plugin/stop-ack", install_function)
-        self.assertNotIn("StudioTestService:EndTest", install_function)
+        self.assertNotIn("ExecutePlayModeAsync", install_function)
+        self.assertNotIn("ExecuteRunModeAsync", install_function)
 
     def test_legacy_play_runtime_stop_paths_are_removed(self) -> None:
         helper = read(HELPER)

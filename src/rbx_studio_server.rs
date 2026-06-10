@@ -561,6 +561,18 @@ fn require_studio_control_snapshot(
             None,
         ));
     }
+    if snapshot.studio_control_state.as_deref() != Some("ready") {
+        return Err(ErrorData::internal_error(
+            format!(
+                "{action} failed fast: uncontrolled_play_session current_mode={mode} studio_control_state={} transition_phase={transition_phase}",
+                snapshot
+                    .studio_control_state
+                    .as_deref()
+                    .unwrap_or("unknown")
+            ),
+            None,
+        ));
+    }
 
     Ok(())
 }
@@ -883,7 +895,7 @@ Use run_code to query or edit the Roblox Studio place while Studio is in stop/ed
 Only launch_studio_session may enter start_play or run_server. start_stop_play is stop-only.
 If Studio control reports a previous test is still pending after its settle wait, stop once with start_stop_play(stop) and inspect Studio logs; do not recover by sending another play+stop loop.
 If status reports studio_transition_phase=stopping_requested, wait for stop/idle instead of issuing another play or stop command.
-If status reports an uncontrolled play session, stop it with start_stop_play(stop) before launching again.
+If status reports an uncontrolled play session, do not issue start_stop_play(stop); restore fresh runtime control or rebuild the session before launching again.
 "
                     .to_string(),
             ),
@@ -1148,7 +1160,9 @@ impl ToolArgumentValues {
 
     fn requires_studio_control_snapshot(&self) -> bool {
         match self {
-            ToolArgumentValues::LaunchStudioSession(_) => true,
+            ToolArgumentValues::LaunchStudioSession(_) | ToolArgumentValues::StartStopPlay(_) => {
+                true
+            }
             _ => false,
         }
     }
@@ -1989,10 +2003,13 @@ mod tests {
     }
 
     #[test]
-    fn studio_control_preflight_allows_uncontrolled_running_session() {
+    fn studio_control_preflight_rejects_uncontrolled_running_session() {
         let snapshot = running_studio_snapshot("lost", "error");
-        require_studio_control_snapshot(&snapshot, "launch_studio_session")
-            .expect("launch should dispatch so Windows can stop the running Studio session first");
+        let error = require_studio_control_snapshot(&snapshot, "launch_studio_session")
+            .expect_err("uncontrolled running session cannot be stopped or relaunched safely");
+
+        assert!(error.to_string().contains("uncontrolled_play_session"));
+        assert!(error.to_string().contains("studio_control_state=lost"));
     }
 
     #[test]
@@ -2095,13 +2112,13 @@ mod tests {
     }
 
     #[test]
-    fn only_launch_requires_hub_control_preflight() {
-        assert!(!ToolArgumentValues::StartStopPlay(StartStopPlay {
+    fn studio_control_tools_require_hub_control_preflight() {
+        assert!(ToolArgumentValues::StartStopPlay(StartStopPlay {
             task_id: "t_test".to_owned(),
             mode: "stop".to_owned(),
         })
         .requires_studio_control_snapshot());
-        assert!(!ToolArgumentValues::StartStopPlay(StartStopPlay {
+        assert!(ToolArgumentValues::StartStopPlay(StartStopPlay {
             task_id: "t_test".to_owned(),
             mode: "start_play".to_owned(),
         })

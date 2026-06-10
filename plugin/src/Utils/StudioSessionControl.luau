@@ -153,12 +153,27 @@ local function luaStringLiteral(value: string): string
 	return HttpService:JSONEncode(value)
 end
 
+local function ensureHttpEnabledForSessionControl(targetMode: Types.StartStopPlayMode)
+	local enabled = false
+	pcall(function()
+		enabled = HttpService.HttpEnabled
+	end)
+	if enabled ~= true then
+		logTransitionStage(targetMode, "http_disabled")
+		error(
+			"Studio session control requires HttpService HTTP requests to be enabled for the experience. "
+				.. "Studio plugins and Rojo cannot enable this setting at launch time; enable HTTP in Game Settings before launching."
+		)
+	end
+end
+
 local function installSessionControlScript(targetMode: Types.StartStopPlayMode)
 	if currentInstanceId == nil or currentInstanceId == "" then
 		logTransitionStage(targetMode, "control_script_skipped", "reason=missing_instance_id")
 		return
 	end
 
+	ensureHttpEnabledForSessionControl(targetMode)
 	removeSessionControlScript()
 	local helperUrl = activeHelperBaseUrl()
 	local instanceId = currentInstanceId
@@ -166,24 +181,44 @@ local function installSessionControlScript(targetMode: Types.StartStopPlayMode)
 		[[
 local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
+local StudioTestService = game:GetService("StudioTestService")
 
-if not RunService:IsServer() then
+if not RunService:IsStudio() or not RunService:IsServer() then
+	return
+end
+
+local httpEnabled = false
+pcall(function()
+	httpEnabled = HttpService.HttpEnabled
+end)
+if httpEnabled ~= true then
+	print("[MCP Plugin] runtime_session_control_disabled reason=http_disabled")
 	return
 end
 
 local helperBaseUrl = %s
 local instanceId = %s
-local mode = %s
+local targetMode = %s
 local pollIntervalSeconds = 0.25
 local heartbeatIntervalSeconds = 0.5
 local lastHeartbeatAt = 0
+local lastStopRequestId = 0
+
+local function inferRuntimeMode()
+	local ok, isRunMode = pcall(function()
+		return RunService:IsRunMode()
+	end)
+	if ok and isRunMode == true then
+		return "run_server"
+	end
+	return targetMode
+end
 
 local function sendControlHeartbeat()
 	if os.clock() - lastHeartbeatAt < heartbeatIntervalSeconds then
 		return
 	end
-	lastHeartbeatAt = os.clock()
-	HttpService:RequestAsync({
+	local response = HttpService:RequestAsync({
 		Url = helperBaseUrl .. "/v1/mcp/plugin/control-heartbeat",
 		Method = "POST",
 		Headers = {
@@ -191,14 +226,50 @@ local function sendControlHeartbeat()
 		},
 		Body = HttpService:JSONEncode({
 			instance_id = instanceId,
-			mode = mode,
+			mode = inferRuntimeMode(),
 		}),
 	})
+	if not response.Success then
+		error(string.format("HTTP %%d: %%s", response.StatusCode, response.Body))
+	end
+	lastHeartbeatAt = os.clock()
+end
+
+local function pollStopRequest()
+	local url = string.format(
+		"%%s/v1/mcp/plugin/stop-request?instance_id=%%s&after_id=%%d",
+		helperBaseUrl,
+		HttpService:UrlEncode(instanceId),
+		lastStopRequestId
+	)
+	local response = HttpService:RequestAsync({
+		Url = url,
+		Method = "GET",
+	})
+	if not response.Success then
+		error(string.format("HTTP %%d: %%s", response.StatusCode, response.Body))
+	end
+	local payload = HttpService:JSONDecode(response.Body)
+	local stopRequestId = tonumber(payload.stop_request_id) or 0
+	if payload.stop_requested == true and stopRequestId > lastStopRequestId then
+		local ok, err = pcall(function()
+			StudioTestService:EndTest({
+				stopped_by = "mcp_session_control",
+				stop_request_id = stopRequestId,
+			})
+		end)
+		if ok then
+			lastStopRequestId = stopRequestId
+		else
+			print(string.format("[MCP Plugin] runtime_stop_actuator_failed stop_request_id=%%d error=%%s", stopRequestId, tostring(err)))
+		end
+	end
 end
 
 pcall(sendControlHeartbeat)
 while true do
 	pcall(sendControlHeartbeat)
+	pcall(pollStopRequest)
 	task.wait(pollIntervalSeconds)
 end
 ]],
@@ -409,72 +480,15 @@ local function stop(force: boolean?): string?
 		return "Stopped"
 	end
 
-	local baseline = captureLogBaseline()
-	local stopRequestId = 0
-	local helperStopSignaled = false
-	local helperStopSignalError: string? = nil
-	if currentInstanceId ~= nil and currentInstanceId ~= "" then
-		local signalOk, signalResult = pcall(function()
-			local response = HttpService:RequestAsync({
-				Url = activeHelperBaseUrl() .. "/v1/mcp/plugin/stop-request",
-				Method = "POST",
-				Headers = {
-					["Content-Type"] = "application/json",
-				},
-				Body = HttpService:JSONEncode({
-					instance_id = currentInstanceId,
-				}),
-			})
-			if not response.Success then
-				error(string.format("HTTP %d: %s", response.StatusCode, response.Body))
-			end
-			return HttpService:JSONDecode(response.Body)
-		end)
-		if signalOk and type(signalResult) == "table" then
-			lastHelperStopRequestId = math.max(lastHelperStopRequestId, tonumber(signalResult.stop_request_id) or 0)
-			stopRequestId = lastHelperStopRequestId
-			helperStopSignaled = true
-			logTransitionStage("stop", "helper_stop_signaled", string.format("stop_request_id=%d", lastHelperStopRequestId))
-		else
-			helperStopSignalError = tostring(signalResult)
-			logTransitionStage("stop", "helper_stop_signal_failed", tostring(signalResult))
-		end
-	end
-	if not helperStopSignaled then
-		error(
-			"Unable to signal the running Studio session to stop through the helper: "
-				.. tostring(helperStopSignalError or "missing_instance_id")
-		)
-	end
-	local endTestOk, endTestError = pcall(function()
-		StudioTestService:EndTest({
-			stopped_by = "mcp_edit_plugin",
-			stop_request_id = stopRequestId,
-		})
-	end)
-	if not endTestOk then
-		logTransitionStage("stop", "end_test_failed", tostring(endTestError))
-		error("Unable to stop the running Studio session through StudioTestService: " .. tostring(endTestError))
-	end
-	logTransitionStage("stop", "end_test_requested", string.format("stop_request_id=%d", stopRequestId))
 	logTransitionStage(
 		"stop",
-		"requested",
-		string.format(
-			"current_mode=%s stop_request_id=%d force=%s",
-			currentMode,
-			stopRequestId,
-			tostring(force == true)
-		)
+		"rejected_edit_runtime_stop",
+		string.format("current_mode=%s pending_start_id=%d force=%s", currentMode, snapshot.pendingStartId, tostring(force == true))
 	)
-
-	local matchedLine = waitForStopLog(baseline, STOP_TIMEOUT_SECONDS)
-
-	StudioModeTracker.markStopped()
-	removeSessionControlScript()
-	sendHelperStudioModeStatus("stop")
-	logTransitionStage("stop", "observed", string.format("matched_line=%s", matchedLine))
-	return "Stopped"
+	error(
+		"Cannot stop a running Studio session from the edit plugin runtime. "
+			.. "Use the helper-controlled start_stop_play(stop) path so the play/run server runtime actuator can stop the session."
+	)
 end
 
 local function waitForStartPlayLog(
@@ -599,8 +613,12 @@ local function startPlayMode(successMessage: string): string?
 	local currentMode = getStudioMode()
 	local snapshot = StudioModeTracker.getSnapshot()
 	if currentMode ~= "stop" or snapshot.pendingStartId ~= 0 then
-		logTransitionStage("start_play", "stop_before_start", string.format("current_mode=%s", currentMode))
-		stop(false)
+		logTransitionStage(
+			"start_play",
+			"rejected_running_session",
+			string.format("current_mode=%s pending_start_id=%d", currentMode, snapshot.pendingStartId)
+		)
+		error("Cannot start play while Studio is already running; helper control must stop the current session before launch.")
 	end
 
 	local commandId = StudioModeTracker.beginStart("start_play")
@@ -622,8 +640,12 @@ local function startRunServerMode(executor: () -> any, successMessage: string): 
 	local currentMode = getStudioMode()
 	local snapshot = StudioModeTracker.getSnapshot()
 	if currentMode ~= "stop" or snapshot.pendingStartId ~= 0 then
-		logTransitionStage("run_server", "stop_before_start", string.format("current_mode=%s", currentMode))
-		stop(false)
+		logTransitionStage(
+			"run_server",
+			"rejected_running_session",
+			string.format("current_mode=%s pending_start_id=%d", currentMode, snapshot.pendingStartId)
+		)
+		error("Cannot run server while Studio is already running; helper control must stop the current session before launch.")
 	end
 
 	local commandId = StudioModeTracker.beginStart("run_server")
@@ -676,8 +698,12 @@ local function handleLaunchStudioSession(launchStudioSessionArgs: Types.LaunchSt
 	local actions = {}
 
 	if restartApplied then
-		table.insert(actions, "stop")
-		stop(false)
+		logTransitionStage(
+			requestedMode,
+			"rejected_restart_without_helper_stop",
+			string.format("previous_mode=%s pending_start_id=%d", previousMode, previousSnapshot.pendingStartId)
+		)
+		error("LaunchStudioSession requires helper-controlled stop before relaunch when Studio is already running.")
 	end
 
 	table.insert(actions, requestedMode)
