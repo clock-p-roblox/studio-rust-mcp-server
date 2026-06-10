@@ -34,10 +34,20 @@ pub struct HelperTaskStatusSnapshot {
     pub studio_mode: Option<String>,
     #[serde(rename = "studio_mode_age_ms", alias = "studioModeAgeMs")]
     pub studio_mode_age_ms: Option<u64>,
+    #[serde(rename = "studio_mode_source", alias = "studioModeSource")]
+    pub studio_mode_source: Option<String>,
     #[serde(rename = "studio_control_state", alias = "studioControlState")]
     pub studio_control_state: Option<String>,
     #[serde(rename = "studio_transition_phase", alias = "studioTransitionPhase")]
     pub studio_transition_phase: Option<String>,
+    #[serde(rename = "studio_transition_age_ms", alias = "studioTransitionAgeMs")]
+    pub studio_transition_age_ms: Option<u64>,
+    #[serde(rename = "edit_runtime_state", alias = "editRuntimeState")]
+    pub edit_runtime_state: Option<String>,
+    #[serde(rename = "edit_runtime_age_ms", alias = "editRuntimeAgeMs")]
+    pub edit_runtime_age_ms: Option<u64>,
+    #[serde(rename = "studio_control_last_error", alias = "studioControlLastError")]
+    pub studio_control_last_error: Option<String>,
     #[serde(
         rename = "official_mcp_adapter_state",
         alias = "officialMcpAdapterState"
@@ -310,8 +320,13 @@ mod tests {
                 task_id: "tf2a83d456a".to_owned(),
                 studio_mode: Some("stop".to_owned()),
                 studio_mode_age_ms: Some(42),
+                studio_mode_source: Some("edit_plugin".to_owned()),
                 studio_control_state: Some("none".to_owned()),
                 studio_transition_phase: Some("idle".to_owned()),
+                studio_transition_age_ms: None,
+                edit_runtime_state: Some("ready".to_owned()),
+                edit_runtime_age_ms: Some(3),
+                studio_control_last_error: None,
                 official_mcp_adapter_state: Some("ready".to_owned()),
                 official_mcp_adapter_age_ms: Some(7),
                 official_mcp_adapter_last_error: None,
@@ -325,8 +340,10 @@ mod tests {
         assert_eq!(encoded["plugin_instance_count"], 2);
         assert_eq!(encoded["task_status"]["task_id"], "tf2a83d456a");
         assert_eq!(encoded["task_status"]["studio_mode"], "stop");
+        assert_eq!(encoded["task_status"]["studio_mode_source"], "edit_plugin");
         assert_eq!(encoded["task_status"]["studio_control_state"], "none");
         assert_eq!(encoded["task_status"]["studio_transition_phase"], "idle");
+        assert_eq!(encoded["task_status"]["edit_runtime_state"], "ready");
         assert_eq!(
             encoded["task_status"]["official_mcp_adapter_state"],
             "ready"
@@ -347,8 +364,13 @@ mod tests {
                 "task_id": "tf2a83d456a",
                 "studio_mode": "stop",
                 "studio_mode_age_ms": 12,
+                "studio_mode_source": "edit_plugin",
                 "studio_control_state": "none",
                 "studio_transition_phase": "idle",
+                "studio_transition_age_ms": 4,
+                "edit_runtime_state": "ready",
+                "edit_runtime_age_ms": 5,
+                "studio_control_last_error": null,
                 "official_mcp_adapter_state": "ready",
                 "official_mcp_adapter_age_ms": 34,
                 "official_mcp_adapter_last_error": null
@@ -360,6 +382,10 @@ mod tests {
             HelperToServerMessage::Heartbeat { task_status, .. } => {
                 let status = task_status.expect("task_status should be present");
                 assert_eq!(status.studio_mode_age_ms, Some(12));
+                assert_eq!(status.studio_mode_source.as_deref(), Some("edit_plugin"));
+                assert_eq!(status.studio_transition_age_ms, Some(4));
+                assert_eq!(status.edit_runtime_state.as_deref(), Some("ready"));
+                assert_eq!(status.edit_runtime_age_ms, Some(5));
                 assert_eq!(status.official_mcp_adapter_age_ms, Some(34));
             }
             other => panic!("expected heartbeat, got {other:?}"),

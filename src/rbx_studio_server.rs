@@ -116,8 +116,13 @@ pub struct StatusResponse {
     official_ready: bool,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
+    studio_mode_source: Option<String>,
     studio_control_state: Option<String>,
     studio_transition_phase: Option<String>,
+    studio_transition_age_ms: Option<u128>,
+    edit_runtime_state: Option<String>,
+    edit_runtime_age_ms: Option<u128>,
+    studio_control_last_error: Option<String>,
     official_mcp_adapter_state: String,
     official_mcp_adapter_age_ms: Option<u128>,
     official_mcp_adapter_last_error: Option<String>,
@@ -176,9 +181,19 @@ struct HubHelperActiveTaskPayload {
     #[serde(default)]
     studio_mode_age_ms: Option<u128>,
     #[serde(default)]
+    studio_mode_source: Option<String>,
+    #[serde(default)]
     studio_control_state: Option<String>,
     #[serde(default)]
     studio_transition_phase: Option<String>,
+    #[serde(default)]
+    studio_transition_age_ms: Option<u128>,
+    #[serde(default)]
+    edit_runtime_state: Option<String>,
+    #[serde(default)]
+    edit_runtime_age_ms: Option<u128>,
+    #[serde(default)]
+    studio_control_last_error: Option<String>,
     #[serde(default)]
     official_mcp_adapter_state: Option<String>,
     #[serde(default)]
@@ -200,8 +215,13 @@ struct HubTaskRuntimeSnapshot {
     remote_state: Option<String>,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
+    studio_mode_source: Option<String>,
     studio_control_state: Option<String>,
     studio_transition_phase: Option<String>,
+    studio_transition_age_ms: Option<u128>,
+    edit_runtime_state: Option<String>,
+    edit_runtime_age_ms: Option<u128>,
+    studio_control_last_error: Option<String>,
     official_mcp_adapter_state: Option<String>,
     official_mcp_adapter_age_ms: Option<u128>,
     official_mcp_adapter_last_error: Option<String>,
@@ -242,6 +262,7 @@ impl HubTaskRuntimeSnapshot {
         self.launch_ready()
             && self.studio_snapshot_fresh()
             && self.studio_mode.as_deref() == Some("stop")
+            && self.edit_runtime_state.as_deref() == Some("ready")
     }
 
     fn official_ready(&self) -> bool {
@@ -375,12 +396,27 @@ fn snapshot_from_hub_status_payload(
         studio_mode_age_ms: active_task_match
             .as_ref()
             .and_then(|active_task| active_task.studio_mode_age_ms),
+        studio_mode_source: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.studio_mode_source.clone()),
         studio_control_state: active_task_match
             .as_ref()
             .and_then(|active_task| active_task.studio_control_state.clone()),
         studio_transition_phase: active_task_match
             .as_ref()
             .and_then(|active_task| active_task.studio_transition_phase.clone()),
+        studio_transition_age_ms: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.studio_transition_age_ms),
+        edit_runtime_state: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.edit_runtime_state.clone()),
+        edit_runtime_age_ms: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.edit_runtime_age_ms),
+        studio_control_last_error: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.studio_control_last_error.clone()),
         official_mcp_adapter_state: active_task_match
             .as_ref()
             .and_then(|active_task| active_task.official_mcp_adapter_state.clone()),
@@ -636,8 +672,13 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
     let mut hub_snapshot_error = None;
     let mut studio_mode = None;
     let mut studio_mode_age_ms = None;
+    let mut studio_mode_source = None;
     let mut studio_control_state = None;
     let mut studio_transition_phase = None;
+    let mut studio_transition_age_ms = None;
+    let mut edit_runtime_state = None;
+    let mut edit_runtime_age_ms = None;
+    let mut studio_control_last_error = None;
     let mut official_mcp_adapter_state = "hub_unconfigured".to_owned();
     let mut official_mcp_adapter_age_ms = None;
     let mut official_mcp_adapter_last_error = None;
@@ -659,8 +700,13 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
                 official_ready = snapshot.official_ready();
                 studio_mode = snapshot.studio_mode;
                 studio_mode_age_ms = snapshot.studio_mode_age_ms;
+                studio_mode_source = snapshot.studio_mode_source;
                 studio_control_state = snapshot.studio_control_state;
                 studio_transition_phase = snapshot.studio_transition_phase;
+                studio_transition_age_ms = snapshot.studio_transition_age_ms;
+                edit_runtime_state = snapshot.edit_runtime_state;
+                edit_runtime_age_ms = snapshot.edit_runtime_age_ms;
+                studio_control_last_error = snapshot.studio_control_last_error;
                 official_mcp_adapter_state = snapshot
                     .official_mcp_adapter_state
                     .unwrap_or_else(|| "not_started".to_owned());
@@ -698,8 +744,13 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
         official_ready,
         studio_mode,
         studio_mode_age_ms,
+        studio_mode_source,
         studio_control_state,
         studio_transition_phase,
+        studio_transition_age_ms,
+        edit_runtime_state,
+        edit_runtime_age_ms,
+        studio_control_last_error,
         official_mcp_adapter_state,
         official_mcp_adapter_age_ms,
         official_mcp_adapter_last_error,
@@ -795,6 +846,8 @@ get_studio_mode is for diagnostics and stop-path checks, not the normal launch e
 Use run_code to query or edit the Roblox Studio place while Studio is in stop/edit mode.
 Use run_script_in_play_mode only for a one-shot unit-test style script that starts from stop/edit mode and automatically returns to stop mode.
 If Studio control reports a previous test is still pending after its settle wait, stop once with start_stop_play(stop) and inspect Studio logs; do not recover by sending another play+stop loop.
+If status reports studio_transition_phase=waiting_for_edit_runtime, wait for stop/idle instead of issuing another play or stop command.
+If status or a tool error reports uncontrolled_play_session, do not retry launch automatically; the current Studio play session was not started with a fresh helper control heartbeat.
 "
                     .to_string(),
             ),
@@ -1125,7 +1178,7 @@ impl RBXStudioServer {
     }
 
     #[tool(
-        description = "Launch Roblox Studio into start_play or run_server. This is the high-level launch entrypoint: if Studio is already running, or a previous start is still pending, Windows will stop the existing session and relaunch into the requested mode. Returns a JSON object with requested_mode, restart_applied, previous_mode, final_mode, actions, and message."
+        description = "Launch Roblox Studio into start_play or run_server. This is the high-level launch entrypoint for controlled sessions: if a controlled Studio session is already running, Windows will stop it and relaunch into the requested mode. If the current play session has no fresh helper control heartbeat, it returns uncontrolled_play_session instead of guessing a recovery. Returns a JSON object with requested_mode, restart_applied, previous_mode, final_mode, actions, and message."
     )]
     async fn launch_studio_session(
         &self,
@@ -1743,8 +1796,13 @@ mod tests {
                     remote_state: "connected".to_owned(),
                     studio_mode: Some("stop".to_owned()),
                     studio_mode_age_ms: Some(4),
+                    studio_mode_source: Some("edit_plugin".to_owned()),
                     studio_control_state: Some("none".to_owned()),
                     studio_transition_phase: Some("idle".to_owned()),
+                    studio_transition_age_ms: None,
+                    edit_runtime_state: Some("ready".to_owned()),
+                    edit_runtime_age_ms: Some(2),
+                    studio_control_last_error: None,
                     official_mcp_adapter_state: Some("ready".to_owned()),
                     official_mcp_adapter_age_ms: Some(5),
                     official_mcp_adapter_last_error: None,
@@ -1795,8 +1853,13 @@ mod tests {
                     remote_state: "connected".to_owned(),
                     studio_mode: Some("stop".to_owned()),
                     studio_mode_age_ms: Some(4),
+                    studio_mode_source: Some("edit_plugin".to_owned()),
                     studio_control_state: Some("none".to_owned()),
                     studio_transition_phase: Some("idle".to_owned()),
+                    studio_transition_age_ms: None,
+                    edit_runtime_state: Some("ready".to_owned()),
+                    edit_runtime_age_ms: Some(2),
+                    studio_control_last_error: None,
                     official_mcp_adapter_state: Some("ready".to_owned()),
                     official_mcp_adapter_age_ms: Some(5),
                     official_mcp_adapter_last_error: None,
@@ -1838,8 +1901,13 @@ mod tests {
                     remote_state: "connected".to_owned(),
                     studio_mode: Some("start_play".to_owned()),
                     studio_mode_age_ms: Some(4),
+                    studio_mode_source: Some("play_control".to_owned()),
                     studio_control_state: Some("ready".to_owned()),
                     studio_transition_phase: Some("running".to_owned()),
+                    studio_transition_age_ms: None,
+                    edit_runtime_state: Some("stale".to_owned()),
+                    edit_runtime_age_ms: Some(20_000),
+                    studio_control_last_error: None,
                     official_mcp_adapter_state: Some("blocked_by_studio_mode".to_owned()),
                     official_mcp_adapter_age_ms: Some(5),
                     official_mcp_adapter_last_error: None,
@@ -1885,8 +1953,13 @@ mod tests {
                     remote_state: "connected".to_owned(),
                     studio_mode: Some("stop".to_owned()),
                     studio_mode_age_ms: Some(4),
+                    studio_mode_source: Some("edit_plugin".to_owned()),
                     studio_control_state: Some("none".to_owned()),
                     studio_transition_phase: Some("idle".to_owned()),
+                    studio_transition_age_ms: None,
+                    edit_runtime_state: Some("ready".to_owned()),
+                    edit_runtime_age_ms: Some(2),
+                    studio_control_last_error: None,
                     official_mcp_adapter_state: Some("ready".to_owned()),
                     official_mcp_adapter_age_ms: Some(5),
                     official_mcp_adapter_last_error: None,

@@ -86,6 +86,32 @@ local function activeHelperBaseUrl(): string
 	return currentHelperBaseUrl or helperBaseUrl()
 end
 
+local function sendHelperStudioModeStatus(mode: Types.StartStopPlayMode)
+	if currentInstanceId == nil or currentInstanceId == "" then
+		return
+	end
+
+	local ok, errorMessage = pcall(function()
+		local response = HttpService:RequestAsync({
+			Url = activeHelperBaseUrl() .. "/v1/mcp/plugin/status",
+			Method = "POST",
+			Headers = {
+				["Content-Type"] = "application/json",
+			},
+			Body = HttpService:JSONEncode({
+				instance_id = currentInstanceId,
+				studio_mode = mode,
+			}),
+		})
+		if not response.Success then
+			error(string.format("HTTP %d: %s", response.StatusCode, response.Body))
+		end
+	end)
+	if not ok then
+		logTransitionStage(mode, "status_update_failed", tostring(errorMessage))
+	end
+end
+
 local function removeSessionControlScript()
 	local existing = ServerScriptService:FindFirstChild(SESSION_CONTROL_SCRIPT_NAME)
 	if existing then
@@ -161,6 +187,20 @@ local function pollStopRequest()
 	return payload
 end
 
+local function sendStopAck(stopRequestId)
+	HttpService:RequestAsync({
+		Url = helperBaseUrl .. "/v1/mcp/plugin/stop-ack",
+		Method = "POST",
+		Headers = {
+			["Content-Type"] = "application/json",
+		},
+		Body = HttpService:JSONEncode({
+			instance_id = instanceId,
+			stop_request_id = stopRequestId,
+		}),
+	})
+end
+
 pcall(sendControlHeartbeat)
 while true do
 	pcall(sendControlHeartbeat)
@@ -168,6 +208,9 @@ while true do
 	if payload ~= nil then
 		local stopRequestId = tonumber(payload.stop_request_id) or afterId
 		if payload.stop_requested == true and stopRequestId > afterId then
+			pcall(function()
+				sendStopAck(stopRequestId)
+			end)
 			print(string.format("[MCP Plugin] session_control_stop stop_request_id=%%d", stopRequestId))
 			local ok, errorMessage = pcall(function()
 				StudioTestService:EndTest({
@@ -396,6 +439,7 @@ local function stop(force: boolean?): string?
 	local baseline = captureLogBaseline()
 	local stopRequestId = 0
 	local helperStopSignaled = false
+	local helperStopSignalError: string? = nil
 	if currentInstanceId ~= nil and currentInstanceId ~= "" then
 		local signalOk, signalResult = pcall(function()
 			local response = HttpService:RequestAsync({
@@ -419,11 +463,15 @@ local function stop(force: boolean?): string?
 			helperStopSignaled = true
 			logTransitionStage("stop", "helper_stop_signaled", string.format("stop_request_id=%d", lastHelperStopRequestId))
 		else
+			helperStopSignalError = tostring(signalResult)
 			logTransitionStage("stop", "helper_stop_signal_failed", tostring(signalResult))
 		end
 	end
 	if not helperStopSignaled then
-		error("Unable to signal the running Studio session to stop through the helper")
+		error(
+			"Unable to signal the running Studio session to stop through the helper: "
+				.. tostring(helperStopSignalError or "missing_instance_id")
+		)
 	end
 	logTransitionStage(
 		"stop",
@@ -440,6 +488,7 @@ local function stop(force: boolean?): string?
 
 	StudioModeTracker.markStopped()
 	removeSessionControlScript()
+	sendHelperStudioModeStatus("stop")
 	logTransitionStage("stop", "observed", string.format("matched_line=%s", matchedLine))
 	return "Stopped"
 end

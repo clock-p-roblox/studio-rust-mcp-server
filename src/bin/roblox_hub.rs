@@ -112,8 +112,13 @@ struct HelperActiveTaskRecord {
     remote_last_server_message_age_ms: Option<u128>,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
+    studio_mode_source: Option<String>,
     studio_control_state: Option<String>,
     studio_transition_phase: Option<String>,
+    studio_transition_age_ms: Option<u128>,
+    edit_runtime_state: Option<String>,
+    edit_runtime_age_ms: Option<u128>,
+    studio_control_last_error: Option<String>,
     official_mcp_adapter_state: Option<String>,
     official_mcp_adapter_age_ms: Option<u128>,
     official_mcp_adapter_last_error: Option<String>,
@@ -316,9 +321,19 @@ struct HelperActiveTaskHeartbeat {
     #[serde(default)]
     studio_mode_age_ms: Option<u128>,
     #[serde(default)]
+    studio_mode_source: Option<String>,
+    #[serde(default)]
     studio_control_state: Option<String>,
     #[serde(default)]
     studio_transition_phase: Option<String>,
+    #[serde(default)]
+    studio_transition_age_ms: Option<u128>,
+    #[serde(default)]
+    edit_runtime_state: Option<String>,
+    #[serde(default)]
+    edit_runtime_age_ms: Option<u128>,
+    #[serde(default)]
+    studio_control_last_error: Option<String>,
     #[serde(default)]
     official_mcp_adapter_state: Option<String>,
     #[serde(default)]
@@ -412,8 +427,13 @@ struct HelperActiveTaskPayload {
     remote_last_server_message_age_ms: Option<u128>,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
+    studio_mode_source: Option<String>,
     studio_control_state: Option<String>,
     studio_transition_phase: Option<String>,
+    studio_transition_age_ms: Option<u128>,
+    edit_runtime_state: Option<String>,
+    edit_runtime_age_ms: Option<u128>,
+    studio_control_last_error: Option<String>,
     official_mcp_adapter_state: Option<String>,
     official_mcp_adapter_age_ms: Option<u128>,
     official_mcp_adapter_last_error: Option<String>,
@@ -885,8 +905,15 @@ fn helper_status_payload(helper: &HelperRecord, blocked: bool) -> HelperStatusPa
                     remote_last_server_message_age_ms: task.remote_last_server_message_age_ms,
                     studio_mode: task.studio_mode.clone(),
                     studio_mode_age_ms: task.studio_mode_age_ms.map(|age| age + age_delta),
+                    studio_mode_source: task.studio_mode_source.clone(),
                     studio_control_state: task.studio_control_state.clone(),
                     studio_transition_phase: task.studio_transition_phase.clone(),
+                    studio_transition_age_ms: task
+                        .studio_transition_age_ms
+                        .map(|age| age + age_delta),
+                    edit_runtime_state: task.edit_runtime_state.clone(),
+                    edit_runtime_age_ms: task.edit_runtime_age_ms.map(|age| age + age_delta),
+                    studio_control_last_error: task.studio_control_last_error.clone(),
                     official_mcp_adapter_state: task.official_mcp_adapter_state.clone(),
                     official_mcp_adapter_age_ms: task
                         .official_mcp_adapter_age_ms
@@ -903,8 +930,13 @@ fn helper_status_payload(helper: &HelperRecord, blocked: bool) -> HelperStatusPa
                     remote_last_server_message_age_ms: None,
                     studio_mode: None,
                     studio_mode_age_ms: None,
+                    studio_mode_source: None,
                     studio_control_state: None,
                     studio_transition_phase: None,
+                    studio_transition_age_ms: None,
+                    edit_runtime_state: None,
+                    edit_runtime_age_ms: None,
+                    studio_control_last_error: None,
                     official_mcp_adapter_state: None,
                     official_mcp_adapter_age_ms: None,
                     official_mcp_adapter_last_error: None,
@@ -1665,8 +1697,13 @@ async fn helper_heartbeat_handler(
                 remote_last_server_message_age_ms: active_task.remote_last_server_message_age_ms,
                 studio_mode: active_task.studio_mode,
                 studio_mode_age_ms: active_task.studio_mode_age_ms,
+                studio_mode_source: active_task.studio_mode_source,
                 studio_control_state: active_task.studio_control_state,
                 studio_transition_phase: active_task.studio_transition_phase,
+                studio_transition_age_ms: active_task.studio_transition_age_ms,
+                edit_runtime_state: active_task.edit_runtime_state,
+                edit_runtime_age_ms: active_task.edit_runtime_age_ms,
+                studio_control_last_error: active_task.studio_control_last_error,
                 official_mcp_adapter_state: active_task.official_mcp_adapter_state,
                 official_mcp_adapter_age_ms: active_task.official_mcp_adapter_age_ms,
                 official_mcp_adapter_last_error: active_task.official_mcp_adapter_last_error,
@@ -2067,8 +2104,13 @@ mod tests {
                     remote_last_server_message_age_ms: None,
                     studio_mode: Some("start_play".to_owned()),
                     studio_mode_age_ms: Some(15),
+                    studio_mode_source: Some("play_control".to_owned()),
                     studio_control_state: Some("ready".to_owned()),
                     studio_transition_phase: Some("running".to_owned()),
+                    studio_transition_age_ms: None,
+                    edit_runtime_state: Some("stale".to_owned()),
+                    edit_runtime_age_ms: Some(20_000),
+                    studio_control_last_error: None,
                     official_mcp_adapter_state: Some("blocked_by_studio_mode".to_owned()),
                     official_mcp_adapter_age_ms: Some(15),
                     official_mcp_adapter_last_error: None,

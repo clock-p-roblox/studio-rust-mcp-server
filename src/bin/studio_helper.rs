@@ -78,6 +78,7 @@ const LOCAL_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const PLUGIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const PLUGIN_STUDIO_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(150);
 const STUDIO_CONTROL_HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(2);
+const EDIT_RUNTIME_STALE_AFTER: Duration = Duration::from_secs(5);
 const ROBLOX_PLACE_UNIVERSE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 const OFFICIAL_MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(1800);
 const OFFICIAL_STORE_IMAGE_MAX_DECODED_BYTES: usize = 20 * 1024 * 1024;
@@ -152,9 +153,13 @@ struct PluginInstance {
     studio_pid: Option<u32>,
     studio_mode: Option<String>,
     studio_mode_observed_at: Option<Instant>,
+    studio_mode_source: String,
     studio_control_state: String,
     studio_transition_phase: String,
+    studio_transition_started_at: Option<Instant>,
     studio_control_observed_at: Option<Instant>,
+    edit_runtime_observed_at: Option<Instant>,
+    studio_control_last_error: Option<String>,
     stop_request_id: u64,
     last_seen_at: Instant,
     queue: VecDeque<Value>,
@@ -178,6 +183,7 @@ struct HelperState {
     official_adapter_states: HashMap<String, OfficialAdapterStateRecord>,
     last_remote_errors: HashMap<String, String>,
     hub_last_error: Option<String>,
+    hub_last_claim_error: Option<String>,
     hub_last_ready_at: Option<Instant>,
 }
 
@@ -384,6 +390,12 @@ struct PluginStopRequestPayload {
 }
 
 #[derive(Debug, Deserialize)]
+struct PluginStopAckPayload {
+    instance_id: String,
+    stop_request_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
 struct PluginStopRequestQuery {
     instance_id: String,
     #[serde(default)]
@@ -414,6 +426,7 @@ struct HelperStatusResponse {
     capacity: usize,
     hub_base_url: Option<String>,
     hub_last_error: Option<String>,
+    hub_last_claim_error: Option<String>,
     hub_last_ready_age_ms: Option<u128>,
     active_instances: usize,
     claimed_task_count: usize,
@@ -443,8 +456,13 @@ struct ClaimedTaskStatus {
     remote_last_server_message_age_ms: Option<u128>,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
+    studio_mode_source: String,
     studio_control_state: String,
     studio_transition_phase: String,
+    studio_transition_age_ms: Option<u128>,
+    edit_runtime_state: String,
+    edit_runtime_age_ms: Option<u128>,
+    studio_control_last_error: Option<String>,
     official_mcp_adapter_state: String,
     official_mcp_adapter_age_ms: Option<u128>,
     official_mcp_adapter_last_error: Option<String>,
@@ -517,8 +535,13 @@ struct HelperHeartbeatTaskStatus {
     remote_last_server_message_age_ms: Option<u128>,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
+    studio_mode_source: String,
     studio_control_state: String,
     studio_transition_phase: String,
+    studio_transition_age_ms: Option<u128>,
+    edit_runtime_state: String,
+    edit_runtime_age_ms: Option<u128>,
+    studio_control_last_error: Option<String>,
     official_mcp_adapter_state: String,
     official_mcp_adapter_age_ms: Option<u128>,
     official_mcp_adapter_last_error: Option<String>,
@@ -576,8 +599,13 @@ struct HelperInstanceStatus {
     studio_pid: Option<u32>,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
+    studio_mode_source: String,
     studio_control_state: String,
     studio_transition_phase: String,
+    studio_transition_age_ms: Option<u128>,
+    edit_runtime_state: String,
+    edit_runtime_age_ms: Option<u128>,
+    studio_control_last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2144,8 +2172,17 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
             studio_mode_age_ms: instance
                 .studio_mode_observed_at
                 .map(|value| value.elapsed().as_millis()),
+            studio_mode_source: instance.studio_mode_source.clone(),
             studio_control_state: effective_studio_control_state(instance),
             studio_transition_phase: effective_studio_transition_phase(instance),
+            studio_transition_age_ms: instance
+                .studio_transition_started_at
+                .map(|value| value.elapsed().as_millis()),
+            edit_runtime_state: edit_runtime_state(instance),
+            edit_runtime_age_ms: instance
+                .edit_runtime_observed_at
+                .map(|value| value.elapsed().as_millis()),
+            studio_control_last_error: instance.studio_control_last_error.clone(),
         })
         .collect();
     instances.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
@@ -2155,13 +2192,16 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
         .map(|task| {
             let connection_key = task_connection_key(&task.task_id);
             let remote_connection = state.remote_connections.get(&connection_key);
-            let (studio_mode, studio_mode_age_ms, studio_control_state, studio_transition_phase) =
-                task_studio_mode_snapshot(&state, &task.task_id);
+            let studio_snapshot = task_studio_mode_snapshot(&state, &task.task_id);
             let (
                 official_mcp_adapter_state,
                 official_mcp_adapter_age_ms,
                 official_mcp_adapter_last_error,
-            ) = task_official_adapter_snapshot(&state, &task.task_id, studio_mode.as_deref());
+            ) = task_official_adapter_snapshot(
+                &state,
+                &task.task_id,
+                studio_snapshot.studio_mode.as_deref(),
+            );
             let launch_process = state.launch_processes.get(&task.task_id);
             let studio_pid = launch_process.map(|launch| launch.studio_pid).or_else(|| {
                 state
@@ -2204,10 +2244,15 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
                         .last_server_message_at
                         .map(|value| value.elapsed().as_millis())
                 }),
-                studio_mode,
-                studio_mode_age_ms,
-                studio_control_state,
-                studio_transition_phase,
+                studio_mode: studio_snapshot.studio_mode,
+                studio_mode_age_ms: studio_snapshot.studio_mode_age_ms,
+                studio_mode_source: studio_snapshot.studio_mode_source,
+                studio_control_state: studio_snapshot.studio_control_state,
+                studio_transition_phase: studio_snapshot.studio_transition_phase,
+                studio_transition_age_ms: studio_snapshot.studio_transition_age_ms,
+                edit_runtime_state: studio_snapshot.edit_runtime_state,
+                edit_runtime_age_ms: studio_snapshot.edit_runtime_age_ms,
+                studio_control_last_error: studio_snapshot.studio_control_last_error,
                 official_mcp_adapter_state,
                 official_mcp_adapter_age_ms,
                 official_mcp_adapter_last_error,
@@ -2321,6 +2366,7 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
         capacity: app.helper.capacity,
         hub_base_url: app.helper.hub_base_url.clone(),
         hub_last_error: state.hub_last_error.clone(),
+        hub_last_claim_error: state.hub_last_claim_error.clone(),
         hub_last_ready_age_ms: state
             .hub_last_ready_at
             .map(|value| value.elapsed().as_millis()),
@@ -2362,8 +2408,13 @@ async fn helper_debug_task_handler(
                 "studio_pid": instance.studio_pid,
                 "studio_mode": instance.studio_mode,
                 "studio_mode_age_ms": instance.studio_mode_observed_at.map(|value| value.elapsed().as_millis()),
+                "studio_mode_source": instance.studio_mode_source,
                 "studio_control_state": effective_studio_control_state(instance),
                 "studio_transition_phase": effective_studio_transition_phase(instance),
+                "studio_transition_age_ms": instance.studio_transition_started_at.map(|value| value.elapsed().as_millis()),
+                "edit_runtime_state": edit_runtime_state(instance),
+                "edit_runtime_age_ms": instance.edit_runtime_observed_at.map(|value| value.elapsed().as_millis()),
+                "studio_control_last_error": instance.studio_control_last_error,
             })
         })
         .collect::<Vec<_>>();
@@ -2781,9 +2832,13 @@ async fn mcp_register_handler(
                 studio_mode,
                 studio_mode_observed_at: normalize_studio_mode(payload.studio_mode.as_deref())
                     .map(|_| Instant::now()),
+                studio_mode_source: "edit_plugin".to_owned(),
                 studio_control_state,
                 studio_transition_phase,
+                studio_transition_started_at: None,
                 studio_control_observed_at,
+                edit_runtime_observed_at: Some(Instant::now()),
+                studio_control_last_error: None,
                 stop_request_id: 0,
                 last_seen_at: Instant::now(),
                 queue: VecDeque::new(),
@@ -2854,7 +2909,8 @@ async fn mcp_plugin_stop_request_handler(
         if let Some(reason) = stop_request_rejection_reason(instance) {
             let control_state = effective_studio_control_state(instance);
             instance.studio_control_state = control_state.clone();
-            instance.studio_transition_phase = "error".to_owned();
+            set_studio_transition_phase(instance, "error");
+            instance.studio_control_last_error = Some(reason.to_owned());
             instance.last_seen_at = Instant::now();
             tracing::warn!(
                 instance_id = payload.instance_id,
@@ -2867,7 +2923,9 @@ async fn mcp_plugin_stop_request_handler(
             return Ok((StatusCode::CONFLICT, reason).into_response());
         }
         instance.stop_request_id = instance.stop_request_id.saturating_add(1);
-        instance.studio_transition_phase = "stopping".to_owned();
+        instance.studio_control_state = "stopping".to_owned();
+        set_studio_transition_phase(instance, "stopping_requested");
+        instance.studio_control_last_error = None;
         instance.last_seen_at = Instant::now();
         (
             instance.place_id.clone(),
@@ -2890,6 +2948,42 @@ async fn mcp_plugin_stop_request_handler(
         stop_request_id,
     })
     .into_response())
+}
+
+async fn mcp_plugin_stop_ack_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<PluginStopAckPayload>,
+) -> Result<Response, HelperError> {
+    let mut state = app.state.lock().await;
+    let task_id = {
+        let Some(instance) = state.instances.get_mut(&payload.instance_id) else {
+            return Ok((StatusCode::GONE, "instance expired").into_response());
+        };
+        if payload.stop_request_id == 0 || payload.stop_request_id != instance.stop_request_id {
+            tracing::warn!(
+                instance_id = payload.instance_id,
+                stop_request_id = payload.stop_request_id,
+                current_stop_request_id = instance.stop_request_id,
+                "rejected stale MCP plugin stop ack"
+            );
+            return Ok((StatusCode::CONFLICT, "stale stop ack").into_response());
+        }
+        instance.studio_control_state = "stopping".to_owned();
+        set_studio_transition_phase(instance, "stopping_acknowledged");
+        instance.studio_control_last_error = None;
+        instance.last_seen_at = Instant::now();
+        instance.task_id.clone()
+    };
+    if let Some(task_id) = task_id.as_deref() {
+        queue_task_status_updates(&state, &app.helper, task_id);
+    }
+    tracing::info!(
+        instance_id = payload.instance_id,
+        stop_request_id = payload.stop_request_id,
+        task_id = ?task_id,
+        "accepted MCP plugin stop ack"
+    );
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn mcp_plugin_control_heartbeat_handler(
@@ -2916,9 +3010,15 @@ async fn mcp_plugin_control_heartbeat_handler(
         let previous_transition_phase = effective_studio_transition_phase(instance);
         instance.studio_mode = Some(mode.clone());
         instance.studio_mode_observed_at = Some(Instant::now());
-        instance.studio_control_state = "ready".to_owned();
-        instance.studio_transition_phase = "running".to_owned();
+        instance.studio_mode_source = "play_control".to_owned();
         instance.studio_control_observed_at = Some(Instant::now());
+        if is_stopping_transition_phase(&instance.studio_transition_phase) {
+            instance.studio_control_state = "stopping".to_owned();
+        } else {
+            instance.studio_control_state = "ready".to_owned();
+            set_studio_transition_phase(instance, "running");
+        }
+        instance.studio_control_last_error = None;
         instance.last_seen_at = Instant::now();
         (
             instance.place_id.clone(),
@@ -3007,6 +3107,7 @@ async fn mcp_plugin_status_update_handler(
         &mut state,
         &payload.instance_id,
         payload.studio_mode.as_deref(),
+        "edit_plugin",
     );
     if !updated {
         tracing::warn!(
@@ -3056,6 +3157,7 @@ async fn mcp_plugin_response_handler(
                     &mut state,
                     instance_id,
                     payload.studio_mode.as_deref(),
+                    "edit_plugin",
                 );
                 if let Some(instance) = state.instances.get(instance_id) {
                     if updated {
@@ -3154,6 +3256,40 @@ fn studio_mode_is_running(mode: Option<&str>) -> bool {
     matches!(mode, Some("start_play") | Some("run_server"))
 }
 
+#[derive(Clone, Debug)]
+struct StudioTaskStatusSnapshot {
+    studio_mode: Option<String>,
+    studio_mode_age_ms: Option<u128>,
+    studio_mode_source: String,
+    studio_control_state: String,
+    studio_transition_phase: String,
+    studio_transition_age_ms: Option<u128>,
+    edit_runtime_state: String,
+    edit_runtime_age_ms: Option<u128>,
+    studio_control_last_error: Option<String>,
+}
+
+fn is_stopping_transition_phase(phase: &str) -> bool {
+    matches!(
+        phase,
+        "stopping_requested"
+            | "stopping_acknowledged"
+            | "waiting_for_stop_log"
+            | "waiting_for_edit_runtime"
+    )
+}
+
+fn set_studio_transition_phase(instance: &mut PluginInstance, phase: &str) {
+    if instance.studio_transition_phase != phase {
+        instance.studio_transition_started_at = if phase == "idle" || phase == "running" {
+            None
+        } else {
+            Some(Instant::now())
+        };
+    }
+    instance.studio_transition_phase = phase.to_owned();
+}
+
 fn instance_has_fresh_control(instance: &PluginInstance) -> bool {
     instance.studio_control_state == "ready"
         && instance
@@ -3166,6 +3302,9 @@ fn effective_studio_control_state(instance: &PluginInstance) -> String {
     if !studio_mode_is_running(instance.studio_mode.as_deref()) {
         return "none".to_owned();
     }
+    if is_stopping_transition_phase(&effective_studio_transition_phase(instance)) {
+        return "stopping".to_owned();
+    }
     if instance_has_fresh_control(instance) {
         "ready".to_owned()
     } else {
@@ -3177,6 +3316,14 @@ fn effective_studio_transition_phase(instance: &PluginInstance) -> String {
     match instance.studio_mode.as_deref() {
         Some("stop") => "idle".to_owned(),
         Some("start_play") | Some("run_server") => {
+            if is_stopping_transition_phase(&instance.studio_transition_phase) {
+                if instance.studio_transition_phase == "stopping_acknowledged"
+                    && !instance_has_fresh_control(instance)
+                {
+                    return "waiting_for_edit_runtime".to_owned();
+                }
+                return instance.studio_transition_phase.clone();
+            }
             if instance_has_fresh_control(instance) {
                 "running".to_owned()
             } else {
@@ -3188,36 +3335,43 @@ fn effective_studio_transition_phase(instance: &PluginInstance) -> String {
 }
 
 fn stop_request_rejection_reason(instance: &PluginInstance) -> Option<&'static str> {
-    if studio_mode_is_running(instance.studio_mode.as_deref())
-        && effective_studio_control_state(instance) != "ready"
-    {
-        Some("uncontrolled_play_session: Studio is in play mode but helper has no fresh control heartbeat")
-    } else {
-        None
+    if !studio_mode_is_running(instance.studio_mode.as_deref()) {
+        return None;
     }
+    let transition_phase = effective_studio_transition_phase(instance);
+    if is_stopping_transition_phase(&transition_phase) {
+        return Some("studio_stop_in_progress: Studio stop is already in progress; wait for helper status to return stop/idle before issuing another control command");
+    }
+    if effective_studio_control_state(instance) != "ready" {
+        return Some("uncontrolled_play_session: Studio is in play mode but helper has no fresh control heartbeat");
+    }
+    None
 }
 
 fn settle_instance_control_state(instance: &mut PluginInstance, mode: &str) {
     match mode {
         "stop" => {
             instance.studio_control_state = "none".to_owned();
-            instance.studio_transition_phase = "idle".to_owned();
+            set_studio_transition_phase(instance, "idle");
             instance.studio_control_observed_at = None;
+            instance.studio_control_last_error = None;
         }
         "start_play" | "run_server" => {
-            if instance_has_fresh_control(instance) {
+            if is_stopping_transition_phase(&instance.studio_transition_phase) {
+                instance.studio_control_state = "stopping".to_owned();
+            } else if instance_has_fresh_control(instance) {
                 instance.studio_control_state = "ready".to_owned();
-                instance.studio_transition_phase = "running".to_owned();
+                set_studio_transition_phase(instance, "running");
             } else {
                 instance.studio_control_state = "lost".to_owned();
                 if instance.studio_transition_phase == "idle" {
-                    instance.studio_transition_phase = "starting".to_owned();
+                    set_studio_transition_phase(instance, "starting");
                 }
             }
         }
         _ => {
             instance.studio_control_state = "lost".to_owned();
-            instance.studio_transition_phase = "error".to_owned();
+            set_studio_transition_phase(instance, "error");
             instance.studio_control_observed_at = None;
         }
     }
@@ -3231,10 +3385,25 @@ fn initial_control_state_for_mode(mode: Option<&str>) -> (String, String, Option
     }
 }
 
+fn edit_runtime_state(instance: &PluginInstance) -> String {
+    if studio_mode_is_running(instance.studio_mode.as_deref()) {
+        return "stale".to_owned();
+    }
+    let Some(observed_at) = instance.edit_runtime_observed_at else {
+        return "missing".to_owned();
+    };
+    if observed_at.elapsed() <= EDIT_RUNTIME_STALE_AFTER {
+        "ready".to_owned()
+    } else {
+        "stale".to_owned()
+    }
+}
+
 fn update_instance_studio_mode(
     state: &mut HelperState,
     instance_id: &str,
     studio_mode: Option<&str>,
+    source: &str,
 ) -> bool {
     let Some(mode) = normalize_studio_mode(studio_mode) else {
         return false;
@@ -3242,18 +3411,26 @@ fn update_instance_studio_mode(
     let Some(instance) = state.instances.get_mut(instance_id) else {
         return false;
     };
-    instance.studio_mode = Some(mode);
-    instance.studio_mode_observed_at = Some(Instant::now());
-    let mode = instance.studio_mode.clone().unwrap_or_default();
-    settle_instance_control_state(instance, &mode);
+    let preserve_play_control_source = source == "edit_plugin"
+        && studio_mode_is_running(Some(mode.as_str()))
+        && instance.studio_mode.as_deref() == Some(mode.as_str())
+        && instance.studio_mode_source == "play_control"
+        && instance_has_fresh_control(instance);
+    if !preserve_play_control_source {
+        instance.studio_mode = Some(mode.clone());
+        instance.studio_mode_observed_at = Some(Instant::now());
+        instance.studio_mode_source = source.to_owned();
+    }
+    if source == "edit_plugin" && mode == "stop" {
+        instance.edit_runtime_observed_at = Some(Instant::now());
+    }
+    let current_mode = instance.studio_mode.clone().unwrap_or_default();
+    settle_instance_control_state(instance, &current_mode);
     instance.last_seen_at = Instant::now();
     true
 }
 
-fn task_studio_mode_snapshot(
-    state: &HelperState,
-    task_id: &str,
-) -> (Option<String>, Option<u128>, String, String) {
+fn task_studio_mode_snapshot(state: &HelperState, task_id: &str) -> StudioTaskStatusSnapshot {
     state
         .instances
         .values()
@@ -3263,15 +3440,56 @@ fn task_studio_mode_snapshot(
             Some((
                 instance.studio_mode.clone(),
                 observed_at.elapsed().as_millis(),
+                instance.studio_mode_source.clone(),
                 effective_studio_control_state(instance),
                 effective_studio_transition_phase(instance),
+                instance
+                    .studio_transition_started_at
+                    .map(|value| value.elapsed().as_millis()),
+                edit_runtime_state(instance),
+                instance
+                    .edit_runtime_observed_at
+                    .map(|value| value.elapsed().as_millis()),
+                instance.studio_control_last_error.clone(),
             ))
         })
-        .min_by_key(|(_, age, _, _)| *age)
-        .and_then(|(mode, age, control_state, transition_phase)| {
-            mode.map(|mode| (Some(mode), Some(age), control_state, transition_phase))
+        .min_by_key(|(_, age, _, _, _, _, _, _, _)| *age)
+        .and_then(
+            |(
+                mode,
+                age,
+                mode_source,
+                control_state,
+                transition_phase,
+                transition_age_ms,
+                edit_runtime_state,
+                edit_runtime_age_ms,
+                control_last_error,
+            )| {
+                mode.map(|mode| StudioTaskStatusSnapshot {
+                    studio_mode: Some(mode),
+                    studio_mode_age_ms: Some(age),
+                    studio_mode_source: mode_source,
+                    studio_control_state: control_state,
+                    studio_transition_phase: transition_phase,
+                    studio_transition_age_ms: transition_age_ms,
+                    edit_runtime_state,
+                    edit_runtime_age_ms,
+                    studio_control_last_error: control_last_error,
+                })
+            },
+        )
+        .unwrap_or(StudioTaskStatusSnapshot {
+            studio_mode: None,
+            studio_mode_age_ms: None,
+            studio_mode_source: "none".to_owned(),
+            studio_control_state: "none".to_owned(),
+            studio_transition_phase: "idle".to_owned(),
+            studio_transition_age_ms: None,
+            edit_runtime_state: "missing".to_owned(),
+            edit_runtime_age_ms: None,
+            studio_control_last_error: None,
         })
-        .unwrap_or((None, None, "none".to_owned(), "idle".to_owned()))
 }
 
 fn task_official_adapter_snapshot(
@@ -3303,16 +3521,20 @@ fn ws_age_ms(value: Option<u128>) -> Option<u64> {
 }
 
 fn helper_task_status_snapshot(state: &HelperState, task_id: &str) -> HelperTaskStatusSnapshot {
-    let (studio_mode, studio_mode_age_ms, studio_control_state, studio_transition_phase) =
-        task_studio_mode_snapshot(state, task_id);
+    let studio_snapshot = task_studio_mode_snapshot(state, task_id);
     let (official_state, official_age_ms, official_last_error) =
-        task_official_adapter_snapshot(state, task_id, studio_mode.as_deref());
+        task_official_adapter_snapshot(state, task_id, studio_snapshot.studio_mode.as_deref());
     HelperTaskStatusSnapshot {
         task_id: task_id.to_owned(),
-        studio_mode,
-        studio_mode_age_ms: ws_age_ms(studio_mode_age_ms),
-        studio_control_state: Some(studio_control_state),
-        studio_transition_phase: Some(studio_transition_phase),
+        studio_mode: studio_snapshot.studio_mode,
+        studio_mode_age_ms: ws_age_ms(studio_snapshot.studio_mode_age_ms),
+        studio_mode_source: Some(studio_snapshot.studio_mode_source),
+        studio_control_state: Some(studio_snapshot.studio_control_state),
+        studio_transition_phase: Some(studio_snapshot.studio_transition_phase),
+        studio_transition_age_ms: ws_age_ms(studio_snapshot.studio_transition_age_ms),
+        edit_runtime_state: Some(studio_snapshot.edit_runtime_state),
+        edit_runtime_age_ms: ws_age_ms(studio_snapshot.edit_runtime_age_ms),
+        studio_control_last_error: studio_snapshot.studio_control_last_error,
         official_mcp_adapter_state: Some(official_state),
         official_mcp_adapter_age_ms: ws_age_ms(official_age_ms),
         official_mcp_adapter_last_error: official_last_error,
@@ -3379,13 +3601,16 @@ fn heartbeat_task_statuses(state: &HelperState) -> Vec<HelperHeartbeatTaskStatus
         .map(|task| {
             let connection_key = task_connection_key(&task.task_id);
             let remote_connection = state.remote_connections.get(&connection_key);
-            let (studio_mode, studio_mode_age_ms, studio_control_state, studio_transition_phase) =
-                task_studio_mode_snapshot(state, &task.task_id);
+            let studio_snapshot = task_studio_mode_snapshot(state, &task.task_id);
             let (
                 official_mcp_adapter_state,
                 official_mcp_adapter_age_ms,
                 official_mcp_adapter_last_error,
-            ) = task_official_adapter_snapshot(state, &task.task_id, studio_mode.as_deref());
+            ) = task_official_adapter_snapshot(
+                state,
+                &task.task_id,
+                studio_snapshot.studio_mode.as_deref(),
+            );
             HelperHeartbeatTaskStatus {
                 task_id: task.task_id.clone(),
                 remote_state: remote_connection_state_name(remote_connection).to_owned(),
@@ -3402,10 +3627,15 @@ fn heartbeat_task_statuses(state: &HelperState) -> Vec<HelperHeartbeatTaskStatus
                         .last_server_message_at
                         .map(|value| value.elapsed().as_millis())
                 }),
-                studio_mode,
-                studio_mode_age_ms,
-                studio_control_state,
-                studio_transition_phase,
+                studio_mode: studio_snapshot.studio_mode,
+                studio_mode_age_ms: studio_snapshot.studio_mode_age_ms,
+                studio_mode_source: studio_snapshot.studio_mode_source,
+                studio_control_state: studio_snapshot.studio_control_state,
+                studio_transition_phase: studio_snapshot.studio_transition_phase,
+                studio_transition_age_ms: studio_snapshot.studio_transition_age_ms,
+                edit_runtime_state: studio_snapshot.edit_runtime_state,
+                edit_runtime_age_ms: studio_snapshot.edit_runtime_age_ms,
+                studio_control_last_error: studio_snapshot.studio_control_last_error,
                 official_mcp_adapter_state,
                 official_mcp_adapter_age_ms,
                 official_mcp_adapter_last_error,
@@ -3798,6 +4028,7 @@ async fn hub_maintenance_loop(app: AppState, mut registered: bool) {
                     registered = true;
                     let mut state = app.state.lock().await;
                     state.hub_last_error = None;
+                    state.hub_last_claim_error = None;
                     state.hub_last_ready_at = Some(Instant::now());
                 }
                 Err(RegisterHelperError::HelperIdConflict(message)) => {
@@ -3879,6 +4110,12 @@ async fn hub_maintenance_loop(app: AppState, mut registered: bool) {
         }
         match hub_claim_task(&app.helper).await {
             Ok(response) => {
+                {
+                    let mut state = app.state.lock().await;
+                    state.hub_last_error = None;
+                    state.hub_last_claim_error = None;
+                    state.hub_last_ready_at = Some(Instant::now());
+                }
                 if let Some(task) = response.task {
                     let Some(mcp_base_url) = task.routes.mcp_base_url else {
                         let mut state = app.state.lock().await;
@@ -3944,8 +4181,12 @@ async fn hub_maintenance_loop(app: AppState, mut registered: bool) {
                 }
             }
             Err(error) => {
+                let claim_error = summarize_error(&error.to_string());
                 let mut state = app.state.lock().await;
-                state.hub_last_error = Some(summarize_error(&error.to_string()));
+                state.hub_last_claim_error = Some(claim_error.clone());
+                if state.claimed_tasks.is_empty() {
+                    state.hub_last_error = Some(claim_error);
+                }
             }
         }
     }
@@ -6083,6 +6324,7 @@ async fn main() -> Result<()> {
         official_adapter_states: HashMap::new(),
         last_remote_errors: HashMap::new(),
         hub_last_error: initial_hub_error,
+        hub_last_claim_error: None,
         hub_last_ready_at: initial_hub_registration.as_ref().map(|_| Instant::now()),
     }));
 
@@ -6138,6 +6380,7 @@ async fn main() -> Result<()> {
             "/v1/mcp/plugin/stop-request",
             get(mcp_plugin_stop_request_status_handler).post(mcp_plugin_stop_request_handler),
         )
+        .route("/v1/mcp/plugin/stop-ack", post(mcp_plugin_stop_ack_handler))
         .route(
             "/v1/mcp/plugin/status",
             post(mcp_plugin_status_update_handler),
@@ -6177,9 +6420,13 @@ mod tests {
             studio_pid: Some(123),
             studio_mode: Some("stop".to_owned()),
             studio_mode_observed_at: Some(Instant::now()),
+            studio_mode_source: "edit_plugin".to_owned(),
             studio_control_state: "none".to_owned(),
             studio_transition_phase: "idle".to_owned(),
+            studio_transition_started_at: None,
             studio_control_observed_at: None,
+            edit_runtime_observed_at: Some(Instant::now()),
+            studio_control_last_error: None,
             stop_request_id: 0,
             last_seen_at: Instant::now() - Duration::from_millis(age_ms),
             queue: VecDeque::new(),
@@ -6239,6 +6486,7 @@ mod tests {
             official_adapter_states: HashMap::new(),
             last_remote_errors: HashMap::new(),
             hub_last_error: None,
+            hub_last_claim_error: None,
             hub_last_ready_at: None,
         }
     }
@@ -6386,6 +6634,7 @@ mod tests {
     fn stop_request_accepts_running_instance_with_fresh_control_heartbeat() {
         let mut instance = test_instance("93795519121520", Some("task-a"), 0);
         instance.studio_mode = Some("start_play".to_owned());
+        instance.studio_mode_source = "play_control".to_owned();
         instance.studio_control_state = "ready".to_owned();
         instance.studio_transition_phase = "running".to_owned();
         instance.studio_control_observed_at = Some(Instant::now());
@@ -6423,12 +6672,11 @@ mod tests {
         instance.studio_control_observed_at = Some(Instant::now());
         state.instances.insert("instance-a".to_owned(), instance);
 
-        let (mode, _age_ms, control_state, transition_phase) =
-            task_studio_mode_snapshot(&state, "task-a");
+        let snapshot = task_studio_mode_snapshot(&state, "task-a");
 
-        assert_eq!(mode.as_deref(), Some("start_play"));
-        assert_eq!(control_state, "ready");
-        assert_eq!(transition_phase, "running");
+        assert_eq!(snapshot.studio_mode.as_deref(), Some("start_play"));
+        assert_eq!(snapshot.studio_control_state, "ready");
+        assert_eq!(snapshot.studio_transition_phase, "running");
     }
 
     #[test]
@@ -6443,12 +6691,11 @@ mod tests {
             Some(Instant::now() - STUDIO_CONTROL_HEARTBEAT_STALE_AFTER - Duration::from_millis(1));
         state.instances.insert("instance-a".to_owned(), instance);
 
-        let (mode, _age_ms, control_state, transition_phase) =
-            task_studio_mode_snapshot(&state, "task-a");
+        let snapshot = task_studio_mode_snapshot(&state, "task-a");
 
-        assert_eq!(mode.as_deref(), Some("start_play"));
-        assert_eq!(control_state, "lost");
-        assert_eq!(transition_phase, "running");
+        assert_eq!(snapshot.studio_mode.as_deref(), Some("start_play"));
+        assert_eq!(snapshot.studio_control_state, "lost");
+        assert_eq!(snapshot.studio_transition_phase, "running");
     }
 
     #[test]
@@ -6464,14 +6711,54 @@ mod tests {
         assert!(update_instance_studio_mode(
             &mut state,
             "instance-a",
-            Some("stop")
+            Some("stop"),
+            "edit_plugin",
         ));
         let instance = state.instances.get("instance-a").unwrap();
 
         assert_eq!(instance.studio_mode.as_deref(), Some("stop"));
+        assert_eq!(instance.studio_mode_source, "edit_plugin");
         assert_eq!(instance.studio_control_state, "none");
         assert_eq!(instance.studio_transition_phase, "idle");
         assert!(instance.studio_control_observed_at.is_none());
+        assert!(instance.edit_runtime_observed_at.is_some());
+    }
+
+    #[test]
+    fn edit_runtime_state_is_stale_while_studio_is_running() {
+        let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+        instance.studio_mode = Some("start_play".to_owned());
+        instance.studio_mode_source = "play_control".to_owned();
+        instance.edit_runtime_observed_at = Some(Instant::now());
+
+        assert_eq!(edit_runtime_state(&instance), "stale");
+    }
+
+    #[test]
+    fn edit_plugin_running_status_does_not_override_fresh_play_control_source() {
+        let mut state = empty_helper_state();
+        let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+        instance.studio_mode = Some("start_play".to_owned());
+        instance.studio_mode_source = "play_control".to_owned();
+        instance.studio_control_state = "ready".to_owned();
+        instance.studio_transition_phase = "running".to_owned();
+        instance.studio_control_observed_at = Some(Instant::now());
+        instance.edit_runtime_observed_at = Some(Instant::now());
+        state.instances.insert("instance-a".to_owned(), instance);
+
+        assert!(update_instance_studio_mode(
+            &mut state,
+            "instance-a",
+            Some("start_play"),
+            "edit_plugin",
+        ));
+        let instance = state.instances.get("instance-a").unwrap();
+
+        assert_eq!(instance.studio_mode.as_deref(), Some("start_play"));
+        assert_eq!(instance.studio_mode_source, "play_control");
+        assert_eq!(instance.studio_control_state, "ready");
+        assert_eq!(instance.studio_transition_phase, "running");
+        assert_eq!(edit_runtime_state(instance), "stale");
     }
 
     #[tokio::test]
@@ -6578,7 +6865,38 @@ mod tests {
             let state = app.state.lock().await;
             let instance = state.instances.get("instance-a").unwrap();
             assert_eq!(instance.stop_request_id, 1);
-            assert_eq!(instance.studio_transition_phase, "stopping");
+            assert_eq!(instance.studio_control_state, "stopping");
+            assert_eq!(instance.studio_transition_phase, "stopping_requested");
+        }
+
+        let stop_ack = mcp_plugin_stop_ack_handler(
+            State(app.clone()),
+            Json(PluginStopAckPayload {
+                instance_id: "instance-a".to_owned(),
+                stop_request_id: 1,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stop_ack.status(), StatusCode::NO_CONTENT);
+        {
+            let mut state = app.state.lock().await;
+            let instance = state.instances.get_mut("instance-a").unwrap();
+            assert_eq!(instance.studio_transition_phase, "stopping_acknowledged");
+            instance.studio_control_observed_at = Some(
+                Instant::now() - STUDIO_CONTROL_HEARTBEAT_STALE_AFTER - Duration::from_millis(1),
+            );
+            assert_eq!(
+                effective_studio_transition_phase(instance),
+                "waiting_for_edit_runtime"
+            );
+            assert_eq!(effective_studio_control_state(instance), "stopping");
+        }
+        {
+            let state = app.state.lock().await;
+            let snapshot = task_studio_mode_snapshot(&state, "task-a");
+            assert_eq!(snapshot.studio_transition_phase, "waiting_for_edit_runtime");
+            assert_eq!(snapshot.studio_control_state, "stopping");
         }
 
         {
@@ -6587,6 +6905,7 @@ mod tests {
                 &mut state,
                 "instance-a",
                 Some("stop"),
+                "edit_plugin",
             ));
         }
         let state = app.state.lock().await;
@@ -6620,6 +6939,7 @@ mod tests {
         );
         let mut instance = test_instance("93795519121520", Some("task-a"), 0);
         instance.studio_mode = Some("start_play".to_owned());
+        instance.studio_mode_source = "play_control".to_owned();
         instance.studio_control_state = "ready".to_owned();
         instance.studio_transition_phase = "running".to_owned();
         instance.studio_control_observed_at = Some(Instant::now());
@@ -6659,8 +6979,10 @@ mod tests {
         assert_eq!(payload["task_id"], "task-a");
         assert_eq!(payload["plugin_instance_count"], 1);
         assert_eq!(payload["task_status"]["studio_mode"], "start_play");
+        assert_eq!(payload["task_status"]["studio_mode_source"], "play_control");
         assert_eq!(payload["task_status"]["studio_control_state"], "ready");
         assert_eq!(payload["task_status"]["studio_transition_phase"], "running");
+        assert_eq!(payload["task_status"]["edit_runtime_state"], "stale");
         tokio::time::timeout(
             Duration::from_millis(50),
             app.helper.hub_heartbeat_notify.notified(),
