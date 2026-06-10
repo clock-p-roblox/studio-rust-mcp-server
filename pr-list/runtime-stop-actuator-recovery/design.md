@@ -81,6 +81,32 @@ EndTest: can only be called from the server DataModel of a running Studio play s
 
 如果 helper 没有看到 fresh control heartbeat，说明当前 running session 没有可用 actuator。此时 stop 必须失败为 `uncontrolled_play_session`。
 
+### HttpService / HTTP enabled 前置
+
+`MCPStudioSessionControl` 依赖 play/run server DataModel 内的 `HttpService:RequestAsync` 访问 helper 私有接口。因此它只有在 Studio play/run runtime 允许 HTTP 请求时才可用。
+
+硬规则：
+
+- actuator 只有在成功向 helper 上报 fresh `control-heartbeat` 后，才算可接管当前 play/run session。
+- 如果 `HttpService:RequestAsync` 不可用、HTTP requests 未启用、请求 helper 失败或 JSON 解析失败，actuator 不得伪造 heartbeat，也不得让 helper 进入 `ready/running`。
+- helper 没有 fresh heartbeat 时，`POST stop-request` 必须返回 `uncontrolled_play_session`，不得递增 `stop_request_id`。
+- edit 插件可以把 HTTP/actuator 初始化失败写入诊断日志，但不能把它当作已安装且可控的 actuator。
+- 实机测试必须覆盖 HTTP 不可用或 helper 请求失败时的语义：状态应保持 lost/uncontrolled，stop fail fast，不能进入永久 `stopping_requested`。
+
+该前置不改变对外入口：LLM / bridge 仍只能走 `start_stop_play(stop)` / `stop-game.py`，不能直接调用 helper 私有 HTTP 口。
+
+### 预安装脚本非污染生命周期
+
+`MCPStudioSessionControl` 是平台临时控制脚本，不是用户工程资产。预安装到 `ServerScriptService` 时必须满足非污染规则：
+
+- 使用唯一固定名称 `MCPStudioSessionControl`，只管理平台自己创建的同名脚本；如果存在非平台同名对象，必须明确失败或先安全隔离，不能覆盖用户资产。
+- 脚本内容必须带平台标记，例如 attribute / 注释签名，用于判断对象是否由插件创建。
+- helper URL、`instance_id`、`task_id` 或脚本版本变化时，edit 插件只能替换带平台标记的旧脚本。
+- Studio 退出插件、helper 断开、task release、插件 unload 或回到不再需要 actuator 的状态时，应尽力清理平台脚本；清理失败只能作为诊断错误，不得假装 stop 成功。
+- 该脚本必须包含 `RunService:IsStudio()` / server runtime guard，避免发布后在真实线上 server 中执行 helper 请求。
+- 文档和安装提示不得要求用户手工创建、保存或发布该脚本；它也不得出现在 clockp MCP `tools/list`、插件 dispatcher 或 LLM 操作入口里。
+- 与 Rojo / syncback 的交互必须按“平台临时对象”处理：不能要求用户把它纳入工程源文件，也不能让它成为发布内容或代码评审里的业务文件。
+
 ## 协议边界
 
 ### POST `/v1/mcp/plugin/stop-request`
@@ -216,6 +242,9 @@ stopping_requested / stopping
 - `StudioSessionControl.stop()` 不包含 `StudioTestService:EndTest`。
 - `installSessionControlScript()` 生成的 server script 包含内部 stop actuator。
 - 生成的 server script 不包含启动 API：`ExecutePlayModeAsync` / `ExecuteRunModeAsync`。
+- 生成的 server script 包含 Studio/server guard，且 helper HTTP 失败时不会上报 ready heartbeat。
+- edit 插件只替换带平台标记的 `MCPStudioSessionControl`，不得覆盖用户同名对象。
+- plugin unload / helper disconnect / task release 路径会尽力清理平台预安装脚本。
 - helper 只在 fresh heartbeat 下接受 stop POST。
 - helper GET stop-request 只在 `stopping_requested` 下返回 active stop。
 - helper 不暴露 `/stop-ack`。
@@ -262,4 +291,3 @@ stopping_requested / stopping
 - [x] 明确 `EndTest` 只能在 play/run server runtime 内执行。
 - [x] 明确手动 Play 的 stop 依赖预安装 actuator 和 fresh heartbeat。
 - [x] 明确没有 heartbeat 时返回 `uncontrolled_play_session`，不创建 stop request。
-
