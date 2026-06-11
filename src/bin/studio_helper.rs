@@ -77,6 +77,7 @@ const DEFAULT_HELPER_PORT: u16 = 44750;
 const LOCAL_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const PLUGIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const PLUGIN_STUDIO_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(150);
+const RUNTIME_LOG_FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 const STUDIO_CONTROL_HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(2);
 const EDIT_RUNTIME_STALE_AFTER: Duration = Duration::from_secs(5);
 const ROBLOX_PLACE_UNIVERSE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -235,6 +236,15 @@ struct PendingLaunchTermination {
 
 fn runtime_screenshot_upload_url_for_base_url(base_url: &str) -> String {
     format!("{}/v1/runtime-screenshots", base_url.trim_end_matches('/'))
+}
+
+fn runtime_log_upload_url_for_base_url(base_url: &str) -> String {
+    format!("{}/v1/runtime-logs", base_url.trim_end_matches('/'))
+}
+
+#[cfg(test)]
+fn runtime_log_forward_url(helper_port: u16, place_id: &str, task_id: &str) -> String {
+    format!("http://127.0.0.1:{helper_port}/runtime-log-forward/{place_id}/task/{task_id}/v1/runtime-logs")
 }
 
 #[derive(Clone)]
@@ -1850,6 +1860,99 @@ async fn post_runtime_screenshot(
     Err(eyre!("runtime screenshot upload could not complete"))
 }
 
+async fn post_runtime_log_forward(
+    helper: &HelperConfig,
+    upload_url: &str,
+    body: Bytes,
+) -> Result<(StatusCode, Bytes)> {
+    let current_token = helper.bearer_token.lock().await.clone();
+    let current_source = helper.bearer_token_source.lock().await.clone();
+    let mut attempts = vec![ResolvedToken {
+        value: current_token.clone(),
+        source: current_source,
+    }];
+    for candidate in helper.bearer_token_candidates.iter() {
+        if candidate.value != current_token {
+            attempts.push(candidate.clone());
+        }
+    }
+
+    let mut saw_unauthorized = false;
+    let mut last_error = None;
+    for candidate in attempts {
+        let client = if saw_unauthorized {
+            reqwest::Client::new()
+        } else {
+            helper.client.clone()
+        };
+        match client
+            .post(upload_url)
+            .timeout(RUNTIME_LOG_FORWARD_TIMEOUT)
+            .header(AUTHORIZATION, format!("Bearer {}", candidate.value))
+            .header(CONTENT_TYPE, "application/json; charset=utf-8")
+            .body(body.clone())
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let status = response.status();
+                if status == StatusCode::UNAUTHORIZED {
+                    saw_unauthorized = true;
+                    if let Err(error) = response.bytes().await {
+                        last_error = Some(format!(
+                            "failed to drain unauthorized runtime log response body: {error}"
+                        ));
+                    }
+                    tracing::warn!(
+                        source = candidate.source,
+                        "runtime log forward was unauthorized; trying next token candidate"
+                    );
+                    continue;
+                }
+                let response_body = response.bytes().await?;
+                if !status.is_success() {
+                    return Err(eyre!(
+                        "runtime log forward upstream returned {status}: {}",
+                        summarize_error(&String::from_utf8_lossy(&response_body))
+                    ));
+                }
+
+                if candidate.value != current_token {
+                    *helper.bearer_token.lock().await = candidate.value.clone();
+                    *helper.bearer_token_source.lock().await = candidate.source.clone();
+                    tracing::warn!(
+                        source = candidate.source,
+                        "helper switched bearer token after runtime log forward unauthorized"
+                    );
+                }
+                let axum_status =
+                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                return Ok((axum_status, response_body));
+            }
+            Err(error) => {
+                last_error = Some(error.to_string());
+            }
+        }
+    }
+
+    if saw_unauthorized {
+        if let Some(error) = last_error {
+            return Err(eyre!(
+                "runtime log forward saw unauthorized response and then could not complete: {error}"
+            ));
+        }
+        return Err(eyre!(
+            "runtime log forward returned unauthorized for all token candidates"
+        ));
+    }
+    Err(eyre!(
+        "runtime log forward could not complete{}",
+        last_error
+            .map(|error| format!(": {error}"))
+            .unwrap_or_default()
+    ))
+}
+
 fn extract_command_id(command: &Value) -> Result<String> {
     command
         .get("id")
@@ -3355,6 +3458,112 @@ async fn runtime_screenshot_handler(
 ) -> Result<Json<RuntimeScreenshotResponse>, HelperError> {
     let response = upload_runtime_screenshot(app, payload).await?;
     Ok(Json(response))
+}
+
+async fn runtime_log_forward_handler(
+    State(app): State<AppState>,
+    AxumPath((raw_place_id, raw_task_id)): AxumPath<(String, String)>,
+    body: Bytes,
+) -> Response {
+    let place_id = match sanitize_place_id(&raw_place_id) {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    let task_id = match sanitize_identifier("task_id", &raw_task_id) {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    let payload: Value = match serde_json::from_slice(&body) {
+        Ok(Value::Object(value)) => Value::Object(value),
+        Ok(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "runtime log payload must be a JSON object",
+            )
+                .into_response()
+        }
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("runtime log payload is not valid JSON: {error}"),
+            )
+                .into_response();
+        }
+    };
+    let session_id = payload
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>")
+        .to_owned();
+    let runtime_id = payload
+        .get("runtime_id")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>")
+        .to_owned();
+
+    let target_url = {
+        let state = app.state.lock().await;
+        let Some(task) = state.claimed_tasks.get(&task_id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("runtime_log_task_not_claimed: {task_id}"),
+            )
+                .into_response();
+        };
+        if task.place_id != place_id {
+            return (
+                StatusCode::CONFLICT,
+                format!(
+                    "runtime_log_place_task_mismatch: task_id={task_id} expected_place_id={} got_place_id={place_id}",
+                    task.place_id
+                ),
+            )
+                .into_response();
+        }
+        let Some(base_url) = task.runtime_log_base_url.as_deref() else {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("claimed_task_missing_runtime_log_base_url: {task_id}"),
+            )
+                .into_response();
+        };
+        runtime_log_upload_url_for_base_url(base_url)
+    };
+
+    match post_runtime_log_forward(&app.helper, &target_url, body).await {
+        Ok((status, response_body)) => {
+            tracing::debug!(
+                place_id,
+                task_id,
+                session_id,
+                runtime_id,
+                status = status.as_u16(),
+                bytes = response_body.len(),
+                "forwarded runtime log upload through helper"
+            );
+            (
+                status,
+                [(CONTENT_TYPE, "application/json; charset=utf-8")],
+                response_body,
+            )
+                .into_response()
+        }
+        Err(error) => {
+            tracing::warn!(
+                place_id,
+                task_id,
+                session_id,
+                runtime_id,
+                error = summarize_error(&error.to_string()),
+                "runtime log forward failed"
+            );
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("runtime_log_forward_failed: {error}"),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn read_studio_log_debug_handler(
@@ -6960,6 +7169,10 @@ async fn main() -> Result<()> {
             "/rojo-forward/{place_id}/task/{task_id}/{*path}",
             any(rojo_forward_task_path_handler),
         )
+        .route(
+            "/runtime-log-forward/{place_id}/task/{task_id}/v1/runtime-logs",
+            post(runtime_log_forward_handler),
+        )
         .route("/rojo-forward/{place_id}", any(rojo_forward_root_handler))
         .route(
             "/rojo-forward/{place_id}/api/socket/{cursor}",
@@ -7118,6 +7331,106 @@ mod tests {
             },
             state: Arc::new(Mutex::new(empty_helper_state())),
         }
+    }
+
+    #[derive(Clone)]
+    struct RuntimeLogForwardTestUpstream {
+        statuses: Arc<Mutex<Vec<StatusCode>>>,
+        requests: Arc<Mutex<Vec<(Option<String>, Value)>>>,
+        success_auth: Option<String>,
+    }
+
+    async fn runtime_log_forward_test_upstream_handler(
+        State(upstream): State<RuntimeLogForwardTestUpstream>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response {
+        let auth = headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let payload = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+        upstream.requests.lock().await.push((auth.clone(), payload));
+        let status = if let Some(success_auth) = upstream.success_auth.as_deref() {
+            if auth.as_deref() == Some(success_auth) {
+                StatusCode::OK
+            } else {
+                StatusCode::UNAUTHORIZED
+            }
+        } else {
+            let mut statuses = upstream.statuses.lock().await;
+            if statuses.is_empty() {
+                StatusCode::OK
+            } else {
+                statuses.remove(0)
+            }
+        };
+        if status.is_success() {
+            (
+                status,
+                [(CONTENT_TYPE, "application/json; charset=utf-8")],
+                r#"{"ok":true}"#,
+            )
+                .into_response()
+        } else {
+            (status, "upstream failure").into_response()
+        }
+    }
+
+    async fn spawn_runtime_log_forward_test_upstream(
+        statuses: Vec<StatusCode>,
+    ) -> (
+        String,
+        RuntimeLogForwardTestUpstream,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let upstream = RuntimeLogForwardTestUpstream {
+            statuses: Arc::new(Mutex::new(statuses)),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            success_auth: None,
+        };
+        let app = Router::new()
+            .route(
+                "/v1/runtime-logs",
+                post(runtime_log_forward_test_upstream_handler),
+            )
+            .with_state(upstream.clone());
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), upstream, handle)
+    }
+
+    async fn spawn_runtime_log_forward_auth_test_upstream(
+        success_auth: &str,
+    ) -> (
+        String,
+        RuntimeLogForwardTestUpstream,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let upstream = RuntimeLogForwardTestUpstream {
+            statuses: Arc::new(Mutex::new(Vec::new())),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            success_auth: Some(success_auth.to_owned()),
+        };
+        let app = Router::new()
+            .route(
+                "/v1/runtime-logs",
+                post(runtime_log_forward_test_upstream_handler),
+            )
+            .with_state(upstream.clone());
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), upstream, handle)
     }
 
     #[test]
@@ -7859,6 +8172,173 @@ mod tests {
             rojo_forward_base_url(44750, "93795519121520", "tff2f06bc6a"),
             "http://127.0.0.1:44750/rojo-forward/93795519121520/task/tff2f06bc6a"
         );
+    }
+
+    #[test]
+    fn runtime_log_forward_url_uses_single_helper_port_and_task_path() {
+        assert_eq!(
+            runtime_log_forward_url(44750, "93795519121520", "tff2f06bc6a"),
+            "http://127.0.0.1:44750/runtime-log-forward/93795519121520/task/tff2f06bc6a/v1/runtime-logs"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_log_forward_uses_claimed_task_target() {
+        let (base_url, upstream, handle) =
+            spawn_runtime_log_forward_test_upstream(vec![StatusCode::OK]).await;
+        let app = test_app_state();
+        {
+            let mut state = app.state.lock().await;
+            let mut task = test_claimed_task("task-a", "93795519121520");
+            task.runtime_log_base_url = Some(base_url);
+            state.claimed_tasks.insert("task-a".to_owned(), task);
+        }
+        let body = Bytes::from(
+            serde_json::json!({
+                "session_id": "sess_demo",
+                "runtime_id": "server",
+                "place_id": "93795519121520",
+                "logs": []
+            })
+            .to_string(),
+        );
+
+        let response = runtime_log_forward_handler(
+            State(app),
+            AxumPath(("93795519121520".to_owned(), "task-a".to_owned())),
+            body,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = upstream.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0.as_deref(), Some("Bearer test-token"));
+        assert_eq!(requests[0].1["session_id"], "sess_demo");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn runtime_log_forward_rejects_unclaimed_task() {
+        let app = test_app_state();
+        let body = Bytes::from(
+            serde_json::json!({
+                "session_id": "sess_demo",
+                "runtime_id": "server",
+                "logs": []
+            })
+            .to_string(),
+        );
+
+        let response = runtime_log_forward_handler(
+            State(app),
+            AxumPath(("93795519121520".to_owned(), "missing-task".to_owned())),
+            body,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn runtime_log_forward_rejects_place_task_mismatch() {
+        let app = test_app_state();
+        {
+            let mut state = app.state.lock().await;
+            state.claimed_tasks.insert(
+                "task-a".to_owned(),
+                test_claimed_task("task-a", "93795519121520"),
+            );
+        }
+        let body = Bytes::from(
+            serde_json::json!({
+                "session_id": "sess_demo",
+                "runtime_id": "server",
+                "logs": []
+            })
+            .to_string(),
+        );
+
+        let response = runtime_log_forward_handler(
+            State(app),
+            AxumPath(("134795435066737".to_owned(), "task-a".to_owned())),
+            body,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn runtime_log_forward_retries_next_token_after_unauthorized() {
+        let (base_url, upstream, handle) =
+            spawn_runtime_log_forward_auth_test_upstream("Bearer good-token").await;
+        let app = AppState {
+            helper: HelperConfig {
+                port: DEFAULT_HELPER_PORT,
+                helper_id: "h_test".to_owned(),
+                capacity: 1,
+                user_name: "local-test".to_owned(),
+                bearer_token: Arc::new(Mutex::new("bad-token".to_owned())),
+                bearer_token_source: Arc::new(Mutex::new("bad".to_owned())),
+                bearer_token_candidates: Arc::new(vec![
+                    ResolvedToken {
+                        value: "bad-token".to_owned(),
+                        source: "bad".to_owned(),
+                    },
+                    ResolvedToken {
+                        value: "good-token".to_owned(),
+                        source: "good".to_owned(),
+                    },
+                ]),
+                domain_suffix: DEFAULT_DOMAIN_SUFFIX.to_owned(),
+                hub_base_url: Some("http://127.0.0.1:1".to_owned()),
+                studio_path: None,
+                skip_claim_studio_launch: true,
+                client: reqwest::Client::new(),
+                hub_heartbeat_notify: Arc::new(Notify::new()),
+            },
+            state: Arc::new(Mutex::new(empty_helper_state())),
+        };
+        {
+            let mut state = app.state.lock().await;
+            let mut task = test_claimed_task("task-a", "93795519121520");
+            task.runtime_log_base_url = Some(base_url);
+            state.claimed_tasks.insert("task-a".to_owned(), task);
+        }
+        let body = Bytes::from(
+            serde_json::json!({
+                "session_id": "sess_demo",
+                "runtime_id": "server",
+                "logs": []
+            })
+            .to_string(),
+        );
+
+        let response = runtime_log_forward_handler(
+            State(app.clone()),
+            AxumPath(("93795519121520".to_owned(), "task-a".to_owned())),
+            body,
+        )
+        .await;
+
+        let status = response.status();
+        let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let requests = upstream.requests.lock().await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "response body: {}; requests: {:?}",
+            String::from_utf8_lossy(&response_body),
+            *requests
+        );
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].0.as_deref(), Some("Bearer bad-token"));
+        assert_eq!(requests[1].0.as_deref(), Some("Bearer good-token"));
+        assert_eq!(&*app.helper.bearer_token.lock().await, "good-token");
+        handle.abort();
     }
 
     #[test]
