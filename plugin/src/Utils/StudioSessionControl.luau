@@ -235,6 +235,8 @@ local function sendControlHeartbeat()
 	lastHeartbeatAt = os.clock()
 end
 
+local executeStopRequest
+
 local function pollStopRequest()
 	local url = string.format(
 		"%%s/v1/mcp/plugin/stop-request?instance_id=%%s&after_id=%%d",
@@ -252,17 +254,44 @@ local function pollStopRequest()
 	local payload = HttpService:JSONDecode(response.Body)
 	local stopRequestId = tonumber(payload.stop_request_id) or 0
 	if payload.stop_requested == true and stopRequestId > lastStopRequestId then
-		local ok, err = pcall(function()
-			StudioTestService:EndTest({
-				stopped_by = "mcp_session_control",
-				stop_request_id = stopRequestId,
-			})
-		end)
-		if ok then
-			lastStopRequestId = stopRequestId
-		else
-			print(string.format("[MCP Plugin] runtime_stop_actuator_failed stop_request_id=%%d error=%%s", stopRequestId, tostring(err)))
-		end
+		executeStopRequest(stopRequestId)
+	end
+end
+
+local function reportStopRequestAck(stopRequestId, stage, errorMessage)
+	local body = {
+		instance_id = instanceId,
+		stop_request_id = stopRequestId,
+		stage = stage,
+	}
+	if errorMessage ~= nil then
+		body.error = tostring(errorMessage)
+	end
+	local response = HttpService:RequestAsync({
+		Url = helperBaseUrl .. "/v1/mcp/plugin/stop-request/ack",
+		Method = "POST",
+		Headers = {
+			["Content-Type"] = "application/json",
+		},
+		Body = HttpService:JSONEncode(body),
+	})
+	if not response.Success then
+		error(string.format("HTTP %%d: %%s", response.StatusCode, response.Body))
+	end
+end
+
+executeStopRequest = function(stopRequestId)
+	lastStopRequestId = stopRequestId
+	pcall(reportStopRequestAck, stopRequestId, "end_test_requested", nil)
+	local ok, err = pcall(function()
+		StudioTestService:EndTest({
+			stopped_by = "mcp_session_control",
+			stop_request_id = stopRequestId,
+		})
+	end)
+	if not ok then
+		pcall(reportStopRequestAck, stopRequestId, "end_test_failed", tostring(err))
+		print(string.format("[MCP Plugin] runtime_stop_actuator_failed stop_request_id=%%d error=%%s", stopRequestId, tostring(err)))
 	end
 end
 

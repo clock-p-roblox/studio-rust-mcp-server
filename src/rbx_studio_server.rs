@@ -123,6 +123,17 @@ pub struct StatusResponse {
     edit_runtime_state: Option<String>,
     edit_runtime_age_ms: Option<u128>,
     studio_control_last_error: Option<String>,
+    last_stop_request_id: u64,
+    last_stop_request_age_ms: Option<u128>,
+    last_stop_request_source: Option<String>,
+    last_stop_request_error: Option<String>,
+    stop_intent_recorded: bool,
+    stop_request_available: bool,
+    stop_request_consumed: bool,
+    end_test_requested: bool,
+    runtime_actuator_last_poll_id: u64,
+    runtime_actuator_last_poll_age_ms: Option<u128>,
+    runtime_actuator_last_error: Option<String>,
     official_mcp_adapter_state: String,
     official_mcp_adapter_age_ms: Option<u128>,
     official_mcp_adapter_last_error: Option<String>,
@@ -195,6 +206,28 @@ struct HubHelperActiveTaskPayload {
     #[serde(default)]
     studio_control_last_error: Option<String>,
     #[serde(default)]
+    last_stop_request_id: u64,
+    #[serde(default)]
+    last_stop_request_age_ms: Option<u128>,
+    #[serde(default)]
+    last_stop_request_source: Option<String>,
+    #[serde(default)]
+    last_stop_request_error: Option<String>,
+    #[serde(default)]
+    stop_intent_recorded: bool,
+    #[serde(default)]
+    stop_request_available: bool,
+    #[serde(default)]
+    stop_request_consumed: bool,
+    #[serde(default)]
+    end_test_requested: bool,
+    #[serde(default)]
+    runtime_actuator_last_poll_id: u64,
+    #[serde(default)]
+    runtime_actuator_last_poll_age_ms: Option<u128>,
+    #[serde(default)]
+    runtime_actuator_last_error: Option<String>,
+    #[serde(default)]
     official_mcp_adapter_state: Option<String>,
     #[serde(default)]
     official_mcp_adapter_age_ms: Option<u128>,
@@ -222,6 +255,17 @@ struct HubTaskRuntimeSnapshot {
     edit_runtime_state: Option<String>,
     edit_runtime_age_ms: Option<u128>,
     studio_control_last_error: Option<String>,
+    last_stop_request_id: u64,
+    last_stop_request_age_ms: Option<u128>,
+    last_stop_request_source: Option<String>,
+    last_stop_request_error: Option<String>,
+    stop_intent_recorded: bool,
+    stop_request_available: bool,
+    stop_request_consumed: bool,
+    end_test_requested: bool,
+    runtime_actuator_last_poll_id: u64,
+    runtime_actuator_last_poll_age_ms: Option<u128>,
+    runtime_actuator_last_error: Option<String>,
     official_mcp_adapter_state: Option<String>,
     official_mcp_adapter_age_ms: Option<u128>,
     official_mcp_adapter_last_error: Option<String>,
@@ -417,6 +461,45 @@ fn snapshot_from_hub_status_payload(
         studio_control_last_error: active_task_match
             .as_ref()
             .and_then(|active_task| active_task.studio_control_last_error.clone()),
+        last_stop_request_id: active_task_match
+            .as_ref()
+            .map(|active_task| active_task.last_stop_request_id)
+            .unwrap_or(0),
+        last_stop_request_age_ms: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.last_stop_request_age_ms),
+        last_stop_request_source: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.last_stop_request_source.clone()),
+        last_stop_request_error: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.last_stop_request_error.clone()),
+        stop_intent_recorded: active_task_match
+            .as_ref()
+            .map(|active_task| active_task.stop_intent_recorded)
+            .unwrap_or(false),
+        stop_request_available: active_task_match
+            .as_ref()
+            .map(|active_task| active_task.stop_request_available)
+            .unwrap_or(false),
+        stop_request_consumed: active_task_match
+            .as_ref()
+            .map(|active_task| active_task.stop_request_consumed)
+            .unwrap_or(false),
+        end_test_requested: active_task_match
+            .as_ref()
+            .map(|active_task| active_task.end_test_requested)
+            .unwrap_or(false),
+        runtime_actuator_last_poll_id: active_task_match
+            .as_ref()
+            .map(|active_task| active_task.runtime_actuator_last_poll_id)
+            .unwrap_or(0),
+        runtime_actuator_last_poll_age_ms: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.runtime_actuator_last_poll_age_ms),
+        runtime_actuator_last_error: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.runtime_actuator_last_error.clone()),
         official_mcp_adapter_state: active_task_match
             .as_ref()
             .and_then(|active_task| active_task.official_mcp_adapter_state.clone()),
@@ -727,6 +810,17 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
     let mut edit_runtime_state = None;
     let mut edit_runtime_age_ms = None;
     let mut studio_control_last_error = None;
+    let mut last_stop_request_id = 0;
+    let mut last_stop_request_age_ms = None;
+    let mut last_stop_request_source = None;
+    let mut last_stop_request_error = None;
+    let mut stop_intent_recorded = false;
+    let mut stop_request_available = false;
+    let mut stop_request_consumed = false;
+    let mut end_test_requested = false;
+    let mut runtime_actuator_last_poll_id = 0;
+    let mut runtime_actuator_last_poll_age_ms = None;
+    let mut runtime_actuator_last_error = None;
     let mut official_mcp_adapter_state = "hub_unconfigured".to_owned();
     let mut official_mcp_adapter_age_ms = None;
     let mut official_mcp_adapter_last_error = None;
@@ -755,6 +849,17 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
                 edit_runtime_state = snapshot.edit_runtime_state;
                 edit_runtime_age_ms = snapshot.edit_runtime_age_ms;
                 studio_control_last_error = snapshot.studio_control_last_error;
+                last_stop_request_id = snapshot.last_stop_request_id;
+                last_stop_request_age_ms = snapshot.last_stop_request_age_ms;
+                last_stop_request_source = snapshot.last_stop_request_source;
+                last_stop_request_error = snapshot.last_stop_request_error;
+                stop_intent_recorded = snapshot.stop_intent_recorded;
+                stop_request_available = snapshot.stop_request_available;
+                stop_request_consumed = snapshot.stop_request_consumed;
+                end_test_requested = snapshot.end_test_requested;
+                runtime_actuator_last_poll_id = snapshot.runtime_actuator_last_poll_id;
+                runtime_actuator_last_poll_age_ms = snapshot.runtime_actuator_last_poll_age_ms;
+                runtime_actuator_last_error = snapshot.runtime_actuator_last_error;
                 official_mcp_adapter_state = snapshot
                     .official_mcp_adapter_state
                     .unwrap_or_else(|| "not_started".to_owned());
@@ -799,6 +904,17 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
         edit_runtime_state,
         edit_runtime_age_ms,
         studio_control_last_error,
+        last_stop_request_id,
+        last_stop_request_age_ms,
+        last_stop_request_source,
+        last_stop_request_error,
+        stop_intent_recorded,
+        stop_request_available,
+        stop_request_consumed,
+        end_test_requested,
+        runtime_actuator_last_poll_id,
+        runtime_actuator_last_poll_age_ms,
+        runtime_actuator_last_error,
         official_mcp_adapter_state,
         official_mcp_adapter_age_ms,
         official_mcp_adapter_last_error,
@@ -1844,6 +1960,17 @@ mod tests {
                     edit_runtime_state: Some("ready".to_owned()),
                     edit_runtime_age_ms: Some(2),
                     studio_control_last_error: None,
+                    last_stop_request_id: 17,
+                    last_stop_request_age_ms: Some(80),
+                    last_stop_request_source: Some("start_stop_play".to_owned()),
+                    last_stop_request_error: None,
+                    stop_intent_recorded: true,
+                    stop_request_available: true,
+                    stop_request_consumed: false,
+                    end_test_requested: false,
+                    runtime_actuator_last_poll_id: 0,
+                    runtime_actuator_last_poll_age_ms: None,
+                    runtime_actuator_last_error: None,
                     official_mcp_adapter_state: Some("ready".to_owned()),
                     official_mcp_adapter_age_ms: Some(5),
                     official_mcp_adapter_last_error: None,
@@ -1860,6 +1987,15 @@ mod tests {
             snapshot.official_mcp_adapter_state.as_deref(),
             Some("ready")
         );
+        assert_eq!(snapshot.last_stop_request_id, 17);
+        assert_eq!(snapshot.last_stop_request_age_ms, Some(80));
+        assert_eq!(
+            snapshot.last_stop_request_source.as_deref(),
+            Some("start_stop_play")
+        );
+        assert!(snapshot.stop_intent_recorded);
+        assert!(snapshot.stop_request_available);
+        assert!(!snapshot.stop_request_consumed);
         assert!(snapshot.task_services_ready());
         assert!(snapshot.launch_ready());
         assert!(snapshot.edit_ready());
@@ -1901,6 +2037,17 @@ mod tests {
                     edit_runtime_state: Some("ready".to_owned()),
                     edit_runtime_age_ms: Some(2),
                     studio_control_last_error: None,
+                    last_stop_request_id: 0,
+                    last_stop_request_age_ms: None,
+                    last_stop_request_source: None,
+                    last_stop_request_error: None,
+                    stop_intent_recorded: false,
+                    stop_request_available: false,
+                    stop_request_consumed: false,
+                    end_test_requested: false,
+                    runtime_actuator_last_poll_id: 0,
+                    runtime_actuator_last_poll_age_ms: None,
+                    runtime_actuator_last_error: None,
                     official_mcp_adapter_state: Some("ready".to_owned()),
                     official_mcp_adapter_age_ms: Some(5),
                     official_mcp_adapter_last_error: None,
@@ -1949,6 +2096,17 @@ mod tests {
                     edit_runtime_state: Some("stale".to_owned()),
                     edit_runtime_age_ms: Some(20_000),
                     studio_control_last_error: None,
+                    last_stop_request_id: 0,
+                    last_stop_request_age_ms: None,
+                    last_stop_request_source: None,
+                    last_stop_request_error: None,
+                    stop_intent_recorded: false,
+                    stop_request_available: false,
+                    stop_request_consumed: false,
+                    end_test_requested: false,
+                    runtime_actuator_last_poll_id: 0,
+                    runtime_actuator_last_poll_age_ms: None,
+                    runtime_actuator_last_error: None,
                     official_mcp_adapter_state: Some("blocked_by_studio_mode".to_owned()),
                     official_mcp_adapter_age_ms: Some(5),
                     official_mcp_adapter_last_error: None,
@@ -1989,6 +2147,17 @@ mod tests {
             edit_runtime_state: Some("stale".to_owned()),
             edit_runtime_age_ms: Some(20_000),
             studio_control_last_error: None,
+            last_stop_request_id: 0,
+            last_stop_request_age_ms: None,
+            last_stop_request_source: None,
+            last_stop_request_error: None,
+            stop_intent_recorded: false,
+            stop_request_available: false,
+            stop_request_consumed: false,
+            end_test_requested: false,
+            runtime_actuator_last_poll_id: 0,
+            runtime_actuator_last_poll_age_ms: None,
+            runtime_actuator_last_error: None,
             official_mcp_adapter_state: Some("blocked_by_studio_mode".to_owned()),
             official_mcp_adapter_age_ms: Some(5),
             official_mcp_adapter_last_error: None,
@@ -2057,6 +2226,17 @@ mod tests {
                     edit_runtime_state: Some("ready".to_owned()),
                     edit_runtime_age_ms: Some(2),
                     studio_control_last_error: None,
+                    last_stop_request_id: 0,
+                    last_stop_request_age_ms: None,
+                    last_stop_request_source: None,
+                    last_stop_request_error: None,
+                    stop_intent_recorded: false,
+                    stop_request_available: false,
+                    stop_request_consumed: false,
+                    end_test_requested: false,
+                    runtime_actuator_last_poll_id: 0,
+                    runtime_actuator_last_poll_age_ms: None,
+                    runtime_actuator_last_error: None,
                     official_mcp_adapter_state: Some("ready".to_owned()),
                     official_mcp_adapter_age_ms: Some(5),
                     official_mcp_adapter_last_error: None,

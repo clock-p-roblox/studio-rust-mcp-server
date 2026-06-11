@@ -48,6 +48,60 @@ pub struct HelperTaskStatusSnapshot {
     pub edit_runtime_age_ms: Option<u64>,
     #[serde(rename = "studio_control_last_error", alias = "studioControlLastError")]
     pub studio_control_last_error: Option<String>,
+    #[serde(default, rename = "last_stop_request_id", alias = "lastStopRequestId")]
+    pub last_stop_request_id: u64,
+    #[serde(
+        default,
+        rename = "last_stop_request_age_ms",
+        alias = "lastStopRequestAgeMs"
+    )]
+    pub last_stop_request_age_ms: Option<u64>,
+    #[serde(
+        default,
+        rename = "last_stop_request_source",
+        alias = "lastStopRequestSource"
+    )]
+    pub last_stop_request_source: Option<String>,
+    #[serde(
+        default,
+        rename = "last_stop_request_error",
+        alias = "lastStopRequestError"
+    )]
+    pub last_stop_request_error: Option<String>,
+    #[serde(default, rename = "stop_intent_recorded", alias = "stopIntentRecorded")]
+    pub stop_intent_recorded: bool,
+    #[serde(
+        default,
+        rename = "stop_request_available",
+        alias = "stopRequestAvailable"
+    )]
+    pub stop_request_available: bool,
+    #[serde(
+        default,
+        rename = "stop_request_consumed",
+        alias = "stopRequestConsumed"
+    )]
+    pub stop_request_consumed: bool,
+    #[serde(default, rename = "end_test_requested", alias = "endTestRequested")]
+    pub end_test_requested: bool,
+    #[serde(
+        default,
+        rename = "runtime_actuator_last_poll_id",
+        alias = "runtimeActuatorLastPollId"
+    )]
+    pub runtime_actuator_last_poll_id: u64,
+    #[serde(
+        default,
+        rename = "runtime_actuator_last_poll_age_ms",
+        alias = "runtimeActuatorLastPollAgeMs"
+    )]
+    pub runtime_actuator_last_poll_age_ms: Option<u64>,
+    #[serde(
+        default,
+        rename = "runtime_actuator_last_error",
+        alias = "runtimeActuatorLastError"
+    )]
+    pub runtime_actuator_last_error: Option<String>,
     #[serde(
         rename = "official_mcp_adapter_state",
         alias = "officialMcpAdapterState"
@@ -327,6 +381,17 @@ mod tests {
                 edit_runtime_state: Some("ready".to_owned()),
                 edit_runtime_age_ms: Some(3),
                 studio_control_last_error: None,
+                last_stop_request_id: 9,
+                last_stop_request_age_ms: Some(100),
+                last_stop_request_source: Some("start_stop_play".to_owned()),
+                last_stop_request_error: None,
+                stop_intent_recorded: true,
+                stop_request_available: true,
+                stop_request_consumed: false,
+                end_test_requested: false,
+                runtime_actuator_last_poll_id: 0,
+                runtime_actuator_last_poll_age_ms: None,
+                runtime_actuator_last_error: None,
                 official_mcp_adapter_state: Some("ready".to_owned()),
                 official_mcp_adapter_age_ms: Some(7),
                 official_mcp_adapter_last_error: None,
@@ -344,6 +409,14 @@ mod tests {
         assert_eq!(encoded["task_status"]["studio_control_state"], "none");
         assert_eq!(encoded["task_status"]["studio_transition_phase"], "idle");
         assert_eq!(encoded["task_status"]["edit_runtime_state"], "ready");
+        assert_eq!(encoded["task_status"]["last_stop_request_id"], 9);
+        assert_eq!(
+            encoded["task_status"]["last_stop_request_source"],
+            "start_stop_play"
+        );
+        assert_eq!(encoded["task_status"]["stop_intent_recorded"], true);
+        assert_eq!(encoded["task_status"]["stop_request_available"], true);
+        assert_eq!(encoded["task_status"]["runtime_actuator_last_poll_id"], 0);
         assert_eq!(
             encoded["task_status"]["official_mcp_adapter_state"],
             "ready"
@@ -386,6 +459,9 @@ mod tests {
                 assert_eq!(status.studio_transition_age_ms, Some(4));
                 assert_eq!(status.edit_runtime_state.as_deref(), Some("ready"));
                 assert_eq!(status.edit_runtime_age_ms, Some(5));
+                assert_eq!(status.last_stop_request_id, 0);
+                assert!(!status.stop_intent_recorded);
+                assert_eq!(status.runtime_actuator_last_poll_id, 0);
                 assert_eq!(status.official_mcp_adapter_age_ms, Some(34));
             }
             other => panic!("expected heartbeat, got {other:?}"),

@@ -67,8 +67,19 @@ class StudioStopTimeoutContractTests(unittest.TestCase):
 
         self.assertIn("/v1/mcp/plugin/control-heartbeat", install_function)
         self.assertIn("/v1/mcp/plugin/stop-request", install_function)
+        self.assertIn("/v1/mcp/plugin/stop-request/ack", install_function)
         self.assertIn("StudioTestService:EndTest", install_function)
         self.assertIn('stopped_by = "mcp_session_control"', install_function)
+        self.assertLess(
+            install_function.index("lastStopRequestId = stopRequestId"),
+            install_function.index("StudioTestService:EndTest"),
+            "a stop request must be consumed before EndTest so failures do not retry the same request forever",
+        )
+        self.assertLess(
+            install_function.index('pcall(reportStopRequestAck, stopRequestId, "end_test_requested", nil)'),
+            install_function.index("StudioTestService:EndTest"),
+        )
+        self.assertIn('"end_test_failed"', install_function)
         self.assertNotIn("/v1/mcp/plugin/stop-ack", install_function)
         self.assertNotIn("ExecutePlayModeAsync", install_function)
         self.assertNotIn("ExecuteRunModeAsync", install_function)
