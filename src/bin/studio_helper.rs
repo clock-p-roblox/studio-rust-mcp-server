@@ -402,6 +402,15 @@ struct PluginStopRequestResponse {
     stop_request_id: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct PluginStopResultPayload {
+    instance_id: String,
+    stop_request_id: u64,
+    phase: String,
+    #[serde(default)]
+    error: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct PluginResponsePayload {
     instance_id: Option<String>,
@@ -414,6 +423,11 @@ struct PluginResponsePayload {
 
 #[derive(Debug, Deserialize)]
 struct StartStopPlayCommandArgs {
+    mode: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LaunchStudioSessionCommandArgs {
     mode: String,
 }
 
@@ -2938,12 +2952,86 @@ async fn mcp_plugin_stop_request_poll_handler(
     let after_id = query.after_id.unwrap_or(0);
     let stop_request_id = instance.stop_request_id;
     let stop_requested = stop_request_id > after_id
-        && is_stopping_transition_phase(&effective_studio_transition_phase(instance));
+        && is_stop_request_deliverable_phase(&effective_studio_transition_phase(instance));
     Ok(Json(PluginStopRequestResponse {
         stop_requested,
         stop_request_id,
     })
     .into_response())
+}
+
+async fn mcp_plugin_stop_result_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<PluginStopResultPayload>,
+) -> Result<Response, HelperError> {
+    let mut state = app.state.lock().await;
+    let (place_id, task_id, should_push_status) = {
+        let Some(instance) = state.instances.get_mut(&payload.instance_id) else {
+            return Ok((StatusCode::GONE, "instance expired").into_response());
+        };
+        if instance.stop_request_id != payload.stop_request_id {
+            tracing::warn!(
+                instance_id = payload.instance_id,
+                stop_request_id = payload.stop_request_id,
+                current_stop_request_id = instance.stop_request_id,
+                phase = payload.phase,
+                "ignored stale MCP plugin stop result"
+            );
+            return Ok(StatusCode::NO_CONTENT.into_response());
+        }
+        if !is_stopping_transition_phase(&instance.studio_transition_phase) {
+            tracing::warn!(
+                instance_id = payload.instance_id,
+                stop_request_id = payload.stop_request_id,
+                phase = payload.phase,
+                current_phase = instance.studio_transition_phase,
+                "ignored MCP plugin stop result outside stopping phase"
+            );
+            return Ok(StatusCode::NO_CONTENT.into_response());
+        }
+
+        let previous_phase = instance.studio_transition_phase.clone();
+        match payload.phase.as_str() {
+            "observed" => {
+                instance.studio_control_state = "stopping".to_owned();
+                set_studio_transition_phase(instance, "stopping_observed");
+                instance.studio_control_last_error = None;
+            }
+            "failed" => {
+                let message =
+                    format!(
+                    "runtime_stop_failed: play runtime failed to execute stop_request_id={}: {}",
+                    payload.stop_request_id,
+                    payload.error.as_deref().unwrap_or("unknown runtime stop failure")
+                );
+                instance.studio_control_state = "lost".to_owned();
+                set_studio_transition_phase(instance, "error");
+                instance.studio_control_observed_at = None;
+                instance.studio_control_last_error = Some(message);
+            }
+            _ => return Ok((StatusCode::BAD_REQUEST, "invalid stop result phase").into_response()),
+        }
+        instance.last_seen_at = Instant::now();
+        (
+            instance.place_id.clone(),
+            instance.task_id.clone(),
+            previous_phase != instance.studio_transition_phase,
+        )
+    };
+    if should_push_status {
+        if let Some(task_id) = task_id.as_deref() {
+            queue_task_status_updates(&state, &app.helper, task_id);
+        }
+    }
+    tracing::info!(
+        instance_id = payload.instance_id,
+        place_id,
+        task_id = ?task_id,
+        stop_request_id = payload.stop_request_id,
+        phase = payload.phase,
+        "accepted MCP plugin stop result"
+    );
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn mcp_plugin_control_heartbeat_handler(
@@ -2972,13 +3060,15 @@ async fn mcp_plugin_control_heartbeat_handler(
         instance.studio_mode_observed_at = Some(Instant::now());
         instance.studio_mode_source = "play_control".to_owned();
         instance.studio_control_observed_at = Some(Instant::now());
-        if is_stopping_transition_phase(&instance.studio_transition_phase) {
+        if is_error_transition_phase(&instance.studio_transition_phase) {
+            instance.studio_control_state = "lost".to_owned();
+        } else if is_stopping_transition_phase(&instance.studio_transition_phase) {
             instance.studio_control_state = "stopping".to_owned();
         } else {
             instance.studio_control_state = "ready".to_owned();
             set_studio_transition_phase(instance, "running");
+            instance.studio_control_last_error = None;
         }
-        instance.studio_control_last_error = None;
         instance.last_seen_at = Instant::now();
         (
             instance.place_id.clone(),
@@ -3220,11 +3310,19 @@ struct RecordedStopRequest {
 
 enum StopRequestRecordError {
     MissingInstance,
-    Rejected(&'static str),
+    Rejected(String),
 }
 
 fn is_stopping_transition_phase(phase: &str) -> bool {
+    phase == "stopping_requested" || phase == "stopping_observed"
+}
+
+fn is_stop_request_deliverable_phase(phase: &str) -> bool {
     phase == "stopping_requested"
+}
+
+fn is_error_transition_phase(phase: &str) -> bool {
+    phase == "error"
 }
 
 fn set_studio_transition_phase(instance: &mut PluginInstance, phase: &str) {
@@ -3250,6 +3348,9 @@ fn effective_studio_control_state(instance: &PluginInstance) -> String {
     if !studio_mode_is_running(instance.studio_mode.as_deref()) {
         return "none".to_owned();
     }
+    if is_error_transition_phase(&effective_studio_transition_phase(instance)) {
+        return "lost".to_owned();
+    }
     if is_stopping_transition_phase(&effective_studio_transition_phase(instance)) {
         return "stopping".to_owned();
     }
@@ -3264,6 +3365,9 @@ fn effective_studio_transition_phase(instance: &PluginInstance) -> String {
     match instance.studio_mode.as_deref() {
         Some("stop") => "idle".to_owned(),
         Some("start_play") | Some("run_server") => {
+            if is_error_transition_phase(&instance.studio_transition_phase) {
+                return instance.studio_transition_phase.clone();
+            }
             if is_stopping_transition_phase(&instance.studio_transition_phase) {
                 return instance.studio_transition_phase.clone();
             }
@@ -3277,16 +3381,21 @@ fn effective_studio_transition_phase(instance: &PluginInstance) -> String {
     }
 }
 
-fn stop_request_rejection_reason(instance: &PluginInstance) -> Option<&'static str> {
+fn stop_request_rejection_reason(instance: &PluginInstance) -> Option<String> {
     if !studio_mode_is_running(instance.studio_mode.as_deref()) {
-        return Some("studio_not_running: Studio is not currently in start_play or run_server; stop is a no-op");
+        return Some("studio_not_running: Studio is not currently in start_play or run_server; stop is a no-op".to_owned());
     }
     let transition_phase = effective_studio_transition_phase(instance);
+    if is_error_transition_phase(&transition_phase) {
+        return Some(instance.studio_control_last_error.clone().unwrap_or_else(|| {
+            "studio_stop_failed: previous Studio stop request failed; manually return Studio to stop before relaunching".to_owned()
+        }));
+    }
     if is_stopping_transition_phase(&transition_phase) {
-        return Some("stopping_requested: Studio stop is already in progress; wait for helper status to return stop/idle before issuing another control command");
+        return Some("stopping_requested: Studio stop is already in progress; wait for helper status to return stop/idle before issuing another control command".to_owned());
     }
     if !instance_has_fresh_control(instance) {
-        return Some("uncontrolled_play_session: no fresh server runtime control heartbeat; refusing to request stop because the play/run runtime may not be running the stop actuator");
+        return Some("uncontrolled_play_session: no fresh server runtime control heartbeat; refusing to request stop because the play/run runtime may not be running the stop actuator".to_owned());
     }
     None
 }
@@ -3345,7 +3454,9 @@ fn settle_instance_control_state(instance: &mut PluginInstance, mode: &str) {
             instance.studio_control_last_error = None;
         }
         "start_play" | "run_server" => {
-            if is_stopping_transition_phase(&instance.studio_transition_phase) {
+            if is_error_transition_phase(&instance.studio_transition_phase) {
+                instance.studio_control_state = "lost".to_owned();
+            } else if is_stopping_transition_phase(&instance.studio_transition_phase) {
                 instance.studio_control_state = "stopping".to_owned();
             } else if instance_has_fresh_control(instance) {
                 instance.studio_control_state = "ready".to_owned();
@@ -4003,6 +4114,23 @@ async fn remote_ws_loop(
     );
 }
 
+fn mark_hub_reachable(state: &mut HelperState) {
+    state.hub_last_error = None;
+    state.hub_last_ready_at = Some(Instant::now());
+}
+
+fn mark_hub_claim_ok(state: &mut HelperState) {
+    mark_hub_reachable(state);
+    state.hub_last_claim_error = None;
+}
+
+fn record_hub_claim_error(state: &mut HelperState, claim_error: String) {
+    state.hub_last_claim_error = Some(claim_error.clone());
+    if state.claimed_tasks.is_empty() {
+        state.hub_last_error = Some(claim_error);
+    }
+}
+
 async fn hub_maintenance_loop(app: AppState, mut registered: bool) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     loop {
@@ -4015,9 +4143,7 @@ async fn hub_maintenance_loop(app: AppState, mut registered: bool) {
                 Ok(_) => {
                     registered = true;
                     let mut state = app.state.lock().await;
-                    state.hub_last_error = None;
-                    state.hub_last_claim_error = None;
-                    state.hub_last_ready_at = Some(Instant::now());
+                    mark_hub_reachable(&mut state);
                 }
                 Err(RegisterHelperError::HelperIdConflict(message)) => {
                     let mut state = app.state.lock().await;
@@ -4050,8 +4176,7 @@ async fn hub_maintenance_loop(app: AppState, mut registered: bool) {
                     let mut state = app.state.lock().await;
                     let mut pending_terminations = Vec::new();
                     if response.ok {
-                        state.hub_last_error = None;
-                        state.hub_last_ready_at = Some(Instant::now());
+                        mark_hub_reachable(&mut state);
                     } else {
                         state.hub_last_error = Some("hub rejected helper heartbeat".to_owned());
                         state.hub_last_ready_at = None;
@@ -4094,15 +4219,15 @@ async fn hub_maintenance_loop(app: AppState, mut registered: bool) {
             state.claimed_tasks.len() < app.helper.capacity
         };
         if !should_claim {
+            let mut state = app.state.lock().await;
+            state.hub_last_claim_error = None;
             continue;
         }
         match hub_claim_task(&app.helper).await {
             Ok(response) => {
                 {
                     let mut state = app.state.lock().await;
-                    state.hub_last_error = None;
-                    state.hub_last_claim_error = None;
-                    state.hub_last_ready_at = Some(Instant::now());
+                    mark_hub_claim_ok(&mut state);
                 }
                 if let Some(task) = response.task {
                     let Some(mcp_base_url) = task.routes.mcp_base_url else {
@@ -4163,18 +4288,14 @@ async fn hub_maintenance_loop(app: AppState, mut registered: bool) {
                             .launch_processes
                             .insert(launch_record.task_id.clone(), launch_record);
                     }
-                    state.hub_last_error = None;
-                    state.hub_last_ready_at = Some(Instant::now());
+                    mark_hub_claim_ok(&mut state);
                     sync_remote_connections(&app, &mut state);
                 }
             }
             Err(error) => {
                 let claim_error = summarize_error(&error.to_string());
                 let mut state = app.state.lock().await;
-                state.hub_last_claim_error = Some(claim_error.clone());
-                if state.claimed_tasks.is_empty() {
-                    state.hub_last_error = Some(claim_error);
-                }
+                record_hub_claim_error(&mut state, claim_error);
             }
         }
     }
@@ -5695,11 +5816,29 @@ async fn handle_remote_command(
             handle_helper_start_stop_play(app, place_id, task_id, payload).await
         }
         "LaunchStudioSession" | "launch_studio_session" => {
-            stop_running_session_before_launch_if_needed(app.clone(), place_id, task_id).await?;
-            forward_to_plugin(app, place_id, task_id, command).await
+            let args: LaunchStudioSessionCommandArgs = serde_json::from_value(payload)?;
+            validate_launch_studio_session_mode(&args.mode)?;
+            let stopped_previous_mode =
+                stop_running_session_before_launch_if_needed(app.clone(), place_id, task_id)
+                    .await?;
+            let response = forward_to_plugin(app, place_id, task_id, command).await?;
+            Ok(merge_launch_response_with_helper_restart(
+                response,
+                stopped_previous_mode.as_deref(),
+                &args.mode,
+            ))
         }
         _ => forward_to_plugin(app, place_id, task_id, command).await,
     }
+}
+
+fn validate_launch_studio_session_mode(mode: &str) -> Result<()> {
+    if mode == "start_play" || mode == "run_server" {
+        return Ok(());
+    }
+    Err(eyre!(
+        "Invalid mode in LaunchStudioSession, must be start_play or run_server"
+    ))
 }
 
 async fn handle_helper_start_stop_play(
@@ -5737,7 +5876,7 @@ async fn handle_helper_start_stop_play(
                 return Err(eyre!("selected helper instance disappeared"));
             }
             Err(StopRequestRecordError::Rejected(reason)) => {
-                return Err(eyre!(reason));
+                return Err(eyre!("{reason}"));
             }
         };
         if let Some(task_id) = recorded.task_id.as_deref() {
@@ -5764,7 +5903,7 @@ async fn stop_running_session_before_launch_if_needed(
     app: AppState,
     place_id: &str,
     task_id: Option<&str>,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let wait_for_stop = {
         let mut state = app.state.lock().await;
         cleanup_stale_instances(&mut state);
@@ -5772,7 +5911,7 @@ async fn stop_running_session_before_launch_if_needed(
         let Some(selected_instance_id) =
             select_instance_for_route(place_id, task_id, &state.instances)
         else {
-            return Ok(());
+            return Ok(None);
         };
         ensure_studio_control_slot_available(&state, &selected_instance_id, "LaunchStudioSession")?;
         let instance = state
@@ -5780,13 +5919,15 @@ async fn stop_running_session_before_launch_if_needed(
             .get(&selected_instance_id)
             .ok_or_else(|| eyre!("selected helper instance disappeared"))?;
         if !studio_mode_is_running(instance.studio_mode.as_deref()) {
-            return Ok(());
+            return Ok(None);
         }
+        let previous_mode = instance.studio_mode.clone();
         if is_stopping_transition_phase(&effective_studio_transition_phase(instance)) {
             Some((
                 selected_instance_id,
                 instance.task_id.clone(),
                 instance.stop_request_id,
+                previous_mode,
             ))
         } else {
             let recorded = match record_stop_request_for_instance(&mut state, &selected_instance_id)
@@ -5796,7 +5937,7 @@ async fn stop_running_session_before_launch_if_needed(
                     return Err(eyre!("selected helper instance disappeared"));
                 }
                 Err(StopRequestRecordError::Rejected(reason)) => {
-                    return Err(eyre!(reason));
+                    return Err(eyre!("{reason}"));
                 }
             };
             if let Some(task_id) = recorded.task_id.as_deref() {
@@ -5806,11 +5947,12 @@ async fn stop_running_session_before_launch_if_needed(
                 selected_instance_id,
                 recorded.task_id.clone(),
                 recorded.stop_request_id,
+                previous_mode,
             ))
         }
     };
 
-    if let Some((instance_id, task_id_to_queue, stop_request_id)) = wait_for_stop {
+    if let Some((instance_id, task_id_to_queue, stop_request_id, previous_mode)) = wait_for_stop {
         wait_for_helper_observed_stop(
             app,
             &instance_id,
@@ -5818,8 +5960,44 @@ async fn stop_running_session_before_launch_if_needed(
             stop_request_id,
         )
         .await?;
+        return Ok(previous_mode);
     }
-    Ok(())
+    Ok(None)
+}
+
+fn merge_launch_response_with_helper_restart(
+    response: String,
+    stopped_previous_mode: Option<&str>,
+    requested_mode: &str,
+) -> String {
+    let Some(previous_mode) = stopped_previous_mode else {
+        return response;
+    };
+    let Ok(mut value) = serde_json::from_str::<Value>(&response) else {
+        return response;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return response;
+    };
+    object.insert("restart_applied".to_owned(), Value::Bool(true));
+    object.insert(
+        "previous_mode".to_owned(),
+        Value::String(previous_mode.to_owned()),
+    );
+    object.insert(
+        "message".to_owned(),
+        Value::String(format!(
+            "Stopped the previous Studio session and launched {requested_mode}."
+        )),
+    );
+    object.insert(
+        "actions".to_owned(),
+        Value::Array(vec![
+            Value::String("stop".to_owned()),
+            Value::String(requested_mode.to_owned()),
+        ]),
+    );
+    serde_json::to_string(&value).unwrap_or(response)
 }
 
 async fn wait_for_helper_observed_stop(
@@ -5831,7 +6009,7 @@ async fn wait_for_helper_observed_stop(
     let deadline = Instant::now() + PLUGIN_STUDIO_CONTROL_REQUEST_TIMEOUT;
 
     loop {
-        let (last_mode, last_phase, last_edit_state, observed_stopped) = {
+        let (last_mode, last_phase, last_edit_state, last_error, observed_stopped) = {
             let state = app.state.lock().await;
             let instance = state.instances.get(instance_id).ok_or_else(|| {
                 eyre!("Studio plugin instance disappeared while waiting for stop")
@@ -5839,14 +6017,29 @@ async fn wait_for_helper_observed_stop(
             let last_mode = instance.studio_mode.clone();
             let last_phase = effective_studio_transition_phase(instance);
             let last_edit_state = edit_runtime_state(instance);
+            let last_error = instance.studio_control_last_error.clone();
             let observed_stopped = instance.stop_request_id >= stop_request_id
                 && instance.studio_mode.as_deref() == Some("stop")
                 && last_phase == "idle"
                 && last_edit_state == "ready";
-            (last_mode, last_phase, last_edit_state, observed_stopped)
+            (
+                last_mode,
+                last_phase,
+                last_edit_state,
+                last_error,
+                observed_stopped,
+            )
         };
         if observed_stopped {
             return Ok(());
+        }
+        if last_phase == "error" {
+            let message = last_error.unwrap_or_else(|| {
+                format!(
+                    "studio_stop_failed: stop_request_id={stop_request_id} failed while waiting for Studio to return to stop/idle"
+                )
+            });
+            return Err(eyre!("{message}"));
         }
 
         if Instant::now() >= deadline {
@@ -5869,7 +6062,7 @@ async fn wait_for_helper_observed_stop(
                     queue_task_status_updates(&state, &app.helper, task_id);
                 }
             }
-            return Err(eyre!(message));
+            return Err(eyre!("{message}"));
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -6549,6 +6742,10 @@ async fn main() -> Result<()> {
             get(mcp_plugin_stop_request_poll_handler).post(mcp_plugin_stop_request_handler),
         )
         .route(
+            "/v1/mcp/plugin/stop-result",
+            post(mcp_plugin_stop_result_handler),
+        )
+        .route(
             "/v1/mcp/plugin/status",
             post(mcp_plugin_status_update_handler),
         )
@@ -6640,6 +6837,50 @@ mod tests {
         let error = studio_launch_args_for_claim(&task).unwrap_err().to_string();
 
         assert!(error.contains("without universeId"));
+    }
+
+    #[test]
+    fn hub_reachable_keeps_claim_error_until_claim_result() {
+        let mut state = empty_helper_state();
+        state.hub_last_error = Some("heartbeat failed".to_owned());
+        state.hub_last_claim_error = Some("claim failed".to_owned());
+        state.hub_last_ready_at = None;
+
+        mark_hub_reachable(&mut state);
+
+        assert!(state.hub_last_error.is_none());
+        assert_eq!(state.hub_last_claim_error.as_deref(), Some("claim failed"));
+        assert!(state.hub_last_ready_at.is_some());
+
+        mark_hub_claim_ok(&mut state);
+
+        assert!(state.hub_last_claim_error.is_none());
+        assert!(state.hub_last_ready_at.is_some());
+    }
+
+    #[test]
+    fn record_hub_claim_error_keeps_active_task_health_separate() {
+        let mut idle_state = empty_helper_state();
+        record_hub_claim_error(&mut idle_state, "claim failed".to_owned());
+
+        assert_eq!(idle_state.hub_last_error.as_deref(), Some("claim failed"));
+        assert_eq!(
+            idle_state.hub_last_claim_error.as_deref(),
+            Some("claim failed")
+        );
+
+        let mut active_state = empty_helper_state();
+        active_state.claimed_tasks.insert(
+            "task-a".to_owned(),
+            test_claimed_task("task-a", "134795435066737"),
+        );
+        record_hub_claim_error(&mut active_state, "claim failed".to_owned());
+
+        assert!(active_state.hub_last_error.is_none());
+        assert_eq!(
+            active_state.hub_last_claim_error.as_deref(),
+            Some("claim failed")
+        );
     }
 
     fn empty_helper_state() -> HelperState {
@@ -6764,6 +7005,48 @@ mod tests {
     }
 
     #[test]
+    fn helper_launch_response_preserves_plain_launch_and_marks_helper_restart() {
+        let plain = serde_json::json!({
+            "message": "Launched Studio session in start_play.",
+            "actions": ["start_play"],
+            "requested_mode": "start_play",
+            "restart_applied": false,
+            "previous_mode": "stop",
+            "final_mode": "start_play"
+        })
+        .to_string();
+
+        assert_eq!(
+            merge_launch_response_with_helper_restart(plain.clone(), None, "start_play"),
+            plain
+        );
+
+        let merged =
+            merge_launch_response_with_helper_restart(plain, Some("start_play"), "start_play");
+        let value: Value = serde_json::from_str(&merged).unwrap();
+
+        assert_eq!(value["restart_applied"], Value::Bool(true));
+        assert_eq!(
+            value["previous_mode"],
+            Value::String("start_play".to_owned())
+        );
+        assert_eq!(
+            value["actions"],
+            Value::Array(vec![
+                Value::String("stop".to_owned()),
+                Value::String("start_play".to_owned())
+            ])
+        );
+        assert_eq!(
+            value["message"],
+            Value::String(
+                "Stopped the previous Studio session and launched start_play.".to_owned()
+            )
+        );
+        assert_eq!(value["final_mode"], Value::String("start_play".to_owned()));
+    }
+
+    #[test]
     fn studio_control_tools_use_extended_plugin_timeout() {
         assert_eq!(
             plugin_request_timeout_for_tool("RunCode"),
@@ -6789,7 +7072,7 @@ mod tests {
         instance.studio_control_observed_at = None;
 
         assert_eq!(
-            stop_request_rejection_reason(&instance),
+            stop_request_rejection_reason(&instance).as_deref(),
             Some("uncontrolled_play_session: no fresh server runtime control heartbeat; refusing to request stop because the play/run runtime may not be running the stop actuator")
         );
     }
@@ -6814,7 +7097,7 @@ mod tests {
         instance.studio_control_observed_at = None;
 
         assert_eq!(
-            stop_request_rejection_reason(&instance),
+            stop_request_rejection_reason(&instance).as_deref(),
             Some("studio_not_running: Studio is not currently in start_play or run_server; stop is a no-op")
         );
     }
@@ -6970,6 +7253,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_launch_mode_rejects_before_stop_request() {
+        let app = test_app_state();
+        {
+            let mut state = app.state.lock().await;
+            let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+            instance.studio_mode = Some("start_play".to_owned());
+            instance.studio_mode_source = "play_control".to_owned();
+            instance.studio_control_state = "ready".to_owned();
+            instance.studio_transition_phase = "running".to_owned();
+            instance.studio_control_observed_at = Some(Instant::now());
+            state.instances.insert("instance-a".to_owned(), instance);
+        }
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let command = serde_json::json!({
+            "id": "request-a",
+            "args": {
+                "LaunchStudioSession": {
+                    "mode": "bogus"
+                }
+            }
+        });
+
+        let error = handle_remote_command(
+            app.clone(),
+            "93795519121520",
+            Some("task-a"),
+            command,
+            sender,
+            Arc::new(Mutex::new(HashMap::new())),
+            "request-a".to_owned(),
+        )
+        .await
+        .expect_err("invalid launch mode must reject before stopping Studio");
+
+        assert!(error
+            .to_string()
+            .contains("must be start_play or run_server"));
+        let state = app.state.lock().await;
+        let instance = state.instances.get("instance-a").unwrap();
+        assert_eq!(instance.stop_request_id, 0);
+        assert_eq!(instance.studio_control_state, "ready");
+        assert_eq!(instance.studio_transition_phase, "running");
+    }
+
+    #[tokio::test]
     async fn stop_request_requires_fresh_runtime_control_and_runtime_poll_consumes_request() {
         let app = test_app_state();
         {
@@ -7096,6 +7424,102 @@ mod tests {
         assert_eq!(instance.studio_mode.as_deref(), Some("stop"));
         assert_eq!(instance.studio_control_state, "none");
         assert_eq!(instance.studio_transition_phase, "idle");
+    }
+
+    #[tokio::test]
+    async fn runtime_stop_result_acknowledges_and_fails_active_stop_request() {
+        let app = test_app_state();
+        {
+            let mut state = app.state.lock().await;
+            let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+            instance.studio_mode = Some("start_play".to_owned());
+            instance.studio_mode_source = "play_control".to_owned();
+            instance.studio_mode_observed_at = Some(Instant::now());
+            instance.studio_control_state = "stopping".to_owned();
+            instance.studio_transition_phase = "stopping_requested".to_owned();
+            instance.studio_control_observed_at = Some(Instant::now());
+            instance.stop_request_id = 2;
+            state.instances.insert("instance-a".to_owned(), instance);
+        }
+
+        let observed = mcp_plugin_stop_result_handler(
+            State(app.clone()),
+            Json(PluginStopResultPayload {
+                instance_id: "instance-a".to_owned(),
+                stop_request_id: 2,
+                phase: "observed".to_owned(),
+                error: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(observed.status(), StatusCode::NO_CONTENT);
+        {
+            let state = app.state.lock().await;
+            let instance = state.instances.get("instance-a").unwrap();
+            assert_eq!(instance.studio_control_state, "stopping");
+            assert_eq!(instance.studio_transition_phase, "stopping_observed");
+            assert!(instance.studio_control_last_error.is_none());
+        }
+
+        let poll_after_observed = mcp_plugin_stop_request_poll_handler(
+            State(app.clone()),
+            Query(PluginStopRequestQuery {
+                instance_id: "instance-a".to_owned(),
+                after_id: Some(0),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(poll_after_observed.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(poll_after_observed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: PluginStopRequestResponse = serde_json::from_slice(&body).unwrap();
+        assert!(!payload.stop_requested);
+        assert_eq!(payload.stop_request_id, 2);
+
+        let failed = mcp_plugin_stop_result_handler(
+            State(app.clone()),
+            Json(PluginStopResultPayload {
+                instance_id: "instance-a".to_owned(),
+                stop_request_id: 2,
+                phase: "failed".to_owned(),
+                error: Some("EndTest: can only be called once".to_owned()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed.status(), StatusCode::NO_CONTENT);
+        {
+            let state = app.state.lock().await;
+            let instance = state.instances.get("instance-a").unwrap();
+            assert_eq!(effective_studio_control_state(instance), "lost");
+            assert_eq!(effective_studio_transition_phase(instance), "error");
+            assert!(instance
+                .studio_control_last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("EndTest: can only be called once"));
+        }
+
+        let heartbeat_after_failure = mcp_plugin_control_heartbeat_handler(
+            State(app.clone()),
+            Json(PluginControlHeartbeatRequest {
+                instance_id: "instance-a".to_owned(),
+                mode: "start_play".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(heartbeat_after_failure.status(), StatusCode::NO_CONTENT);
+        let state = app.state.lock().await;
+        let instance = state.instances.get("instance-a").unwrap();
+        assert_eq!(effective_studio_control_state(instance), "lost");
+        assert_eq!(effective_studio_transition_phase(instance), "error");
+        assert!(stop_request_rejection_reason(instance)
+            .unwrap()
+            .contains("EndTest: can only be called once"));
     }
 
     #[test]

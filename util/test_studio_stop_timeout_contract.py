@@ -67,6 +67,9 @@ class StudioStopTimeoutContractTests(unittest.TestCase):
 
         self.assertIn("/v1/mcp/plugin/control-heartbeat", install_function)
         self.assertIn("/v1/mcp/plugin/stop-request", install_function)
+        self.assertIn("/v1/mcp/plugin/stop-result", install_function)
+        self.assertIn('postStopResult(stopRequestId, "observed"', install_function)
+        self.assertIn('postStopResult(stopRequestId, "failed"', install_function)
         self.assertIn("StudioTestService:EndTest", install_function)
         self.assertIn('stopped_by = "mcp_session_control"', install_function)
         self.assertNotIn("/v1/mcp/plugin/stop-ack", install_function)
@@ -79,6 +82,8 @@ class StudioStopTimeoutContractTests(unittest.TestCase):
         self.assertNotIn("/v1/mcp/plugin/stop-ack", helper)
         self.assertNotIn("mcp_plugin_stop_ack_handler", helper)
         self.assertNotIn("stopping_acknowledged", helper)
+        self.assertIn("/v1/mcp/plugin/stop-result", helper)
+        self.assertIn("stopping_observed", helper)
 
 
 if __name__ == "__main__":

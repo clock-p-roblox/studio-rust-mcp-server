@@ -534,7 +534,7 @@ fn studio_mode_is_running(mode: Option<&str>) -> bool {
 }
 
 fn studio_transition_is_stopping(phase: Option<&str>) -> bool {
-    matches!(phase, Some("stopping_requested"))
+    matches!(phase, Some("stopping_requested" | "stopping_observed"))
 }
 
 fn require_studio_control_snapshot(
@@ -894,7 +894,7 @@ get_studio_mode is for diagnostics and stop-path checks, not the normal launch e
 Use run_code to query or edit the Roblox Studio place while Studio is in stop/edit mode.
 Only launch_studio_session may enter start_play or run_server. start_stop_play is stop-only.
 If Studio control reports a previous test is still pending after its settle wait, stop once with start_stop_play(stop) and inspect Studio logs; do not recover by sending another play+stop loop.
-If status reports studio_transition_phase=stopping_requested, wait for stop/idle instead of issuing another play or stop command.
+If status reports studio_transition_phase=stopping_requested or stopping_observed, wait for stop/idle instead of issuing another play or stop command.
 If status reports an uncontrolled play session, do not issue start_stop_play(stop); restore fresh runtime control or rebuild the session before launching again.
 "
                     .to_string(),
@@ -2020,6 +2020,16 @@ mod tests {
 
         assert!(error.to_string().contains("studio_stop_in_progress"));
         assert!(error.to_string().contains("stopping_requested"));
+
+        let observed_snapshot = running_studio_snapshot("stopping", "stopping_observed");
+        let observed_error =
+            require_studio_control_snapshot(&observed_snapshot, "launch_studio_session")
+                .expect_err("observed stopping session must wait for stop/idle");
+
+        assert!(observed_error
+            .to_string()
+            .contains("studio_stop_in_progress"));
+        assert!(observed_error.to_string().contains("stopping_observed"));
     }
 
     #[test]

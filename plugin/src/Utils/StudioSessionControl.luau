@@ -204,6 +204,28 @@ local heartbeatIntervalSeconds = 0.5
 local lastHeartbeatAt = 0
 local lastStopRequestId = 0
 
+local function postStopResult(stopRequestId, phase, errorMessage)
+	local body = {
+		instance_id = instanceId,
+		stop_request_id = stopRequestId,
+		phase = phase,
+	}
+	if errorMessage ~= nil then
+		body.error = tostring(errorMessage)
+	end
+	local response = HttpService:RequestAsync({
+		Url = helperBaseUrl .. "/v1/mcp/plugin/stop-result",
+		Method = "POST",
+		Headers = {
+			["Content-Type"] = "application/json",
+		},
+		Body = HttpService:JSONEncode(body),
+	})
+	if not response.Success then
+		error(string.format("HTTP %%d: %%s", response.StatusCode, response.Body))
+	end
+end
+
 local function inferRuntimeMode()
 	local ok, isRunMode = pcall(function()
 		return RunService:IsRunMode()
@@ -252,16 +274,21 @@ local function pollStopRequest()
 	local payload = HttpService:JSONDecode(response.Body)
 	local stopRequestId = tonumber(payload.stop_request_id) or 0
 	if payload.stop_requested == true and stopRequestId > lastStopRequestId then
+		lastStopRequestId = stopRequestId
+		pcall(function()
+			postStopResult(stopRequestId, "observed", nil)
+		end)
 		local ok, err = pcall(function()
 			StudioTestService:EndTest({
 				stopped_by = "mcp_session_control",
 				stop_request_id = stopRequestId,
 			})
 		end)
-		if ok then
-			lastStopRequestId = stopRequestId
-		else
+		if not ok then
 			print(string.format("[MCP Plugin] runtime_stop_actuator_failed stop_request_id=%%d error=%%s", stopRequestId, tostring(err)))
+			pcall(function()
+				postStopResult(stopRequestId, "failed", tostring(err))
+			end)
 		end
 	end
 end
