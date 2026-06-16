@@ -1151,14 +1151,18 @@ end
 local function connectToHelper(helperPort: string)
 	local baseUrl = helperBaseUrl(helperPort)
 	local initialStudioMode = currentStudioMode()
+	local studioLogMarker = "clockp-studio-log-marker:" .. HttpService:GenerateGUID(false)
+	print(LOG_PREFIX, "studio_log_marker marker=" .. studioLogMarker)
 	local registrationPayload = {
 		place_id = tostring(game.PlaceId),
+		studio_log_marker = studioLogMarker,
 		studio_mode = initialStudioMode,
 	}
 	logPluginEvent("plugin_register_request", {
 		helper_port = helperPort,
 		base_url = baseUrl,
 		place_id = tostring(game.PlaceId),
+		studio_log_marker = studioLogMarker,
 		studio_mode = initialStudioMode,
 	})
 	local registration = requestJson(baseUrl, "POST", "/v1/mcp/register", registrationPayload)

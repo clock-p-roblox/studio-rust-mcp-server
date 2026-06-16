@@ -48,6 +48,22 @@ pub struct HelperTaskStatusSnapshot {
     pub edit_runtime_age_ms: Option<u64>,
     #[serde(rename = "studio_control_last_error", alias = "studioControlLastError")]
     pub studio_control_last_error: Option<String>,
+    #[serde(default, rename = "studio_log_bound", alias = "studioLogBound")]
+    pub studio_log_bound: bool,
+    #[serde(default, rename = "studio_log_path", alias = "studioLogPath")]
+    pub studio_log_path: Option<String>,
+    #[serde(
+        default,
+        rename = "studio_log_bound_age_ms",
+        alias = "studioLogBoundAgeMs"
+    )]
+    pub studio_log_bound_age_ms: Option<u64>,
+    #[serde(
+        default,
+        rename = "studio_log_last_error",
+        alias = "studioLogLastError"
+    )]
+    pub studio_log_last_error: Option<String>,
     #[serde(default, rename = "last_stop_request_id", alias = "lastStopRequestId")]
     pub last_stop_request_id: u64,
     #[serde(
@@ -381,6 +397,10 @@ mod tests {
                 edit_runtime_state: Some("ready".to_owned()),
                 edit_runtime_age_ms: Some(3),
                 studio_control_last_error: None,
+                studio_log_bound: true,
+                studio_log_path: Some("C:\\Roblox\\logs\\Studio.log".to_owned()),
+                studio_log_bound_age_ms: Some(5),
+                studio_log_last_error: None,
                 last_stop_request_id: 9,
                 last_stop_request_age_ms: Some(100),
                 last_stop_request_source: Some("start_stop_play".to_owned()),

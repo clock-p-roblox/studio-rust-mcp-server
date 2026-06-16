@@ -152,6 +152,10 @@ struct PluginInstance {
     task_id: Option<String>,
     remote_base_url: String,
     studio_pid: Option<u32>,
+    studio_log_marker: Option<String>,
+    studio_log_path: Option<PathBuf>,
+    studio_log_bound_at: Option<Instant>,
+    studio_log_last_error: Option<String>,
     studio_mode: Option<String>,
     studio_mode_observed_at: Option<Instant>,
     studio_mode_source: String,
@@ -369,6 +373,8 @@ struct RegisterPluginRequest {
     place_id: String,
     task_id: Option<String>,
     #[serde(default)]
+    studio_log_marker: Option<String>,
+    #[serde(default)]
     studio_mode: Option<String>,
 }
 
@@ -490,6 +496,10 @@ struct ClaimedTaskStatus {
     edit_runtime_state: String,
     edit_runtime_age_ms: Option<u128>,
     studio_control_last_error: Option<String>,
+    studio_log_bound: bool,
+    studio_log_path: Option<String>,
+    studio_log_bound_age_ms: Option<u128>,
+    studio_log_last_error: Option<String>,
     last_stop_request_id: u64,
     last_stop_request_age_ms: Option<u128>,
     last_stop_request_source: Option<String>,
@@ -580,6 +590,10 @@ struct HelperHeartbeatTaskStatus {
     edit_runtime_state: String,
     edit_runtime_age_ms: Option<u128>,
     studio_control_last_error: Option<String>,
+    studio_log_bound: bool,
+    studio_log_path: Option<String>,
+    studio_log_bound_age_ms: Option<u128>,
+    studio_log_last_error: Option<String>,
     last_stop_request_id: u64,
     last_stop_request_age_ms: Option<u128>,
     last_stop_request_source: Option<String>,
@@ -655,6 +669,10 @@ struct HelperInstanceStatus {
     edit_runtime_state: String,
     edit_runtime_age_ms: Option<u128>,
     studio_control_last_error: Option<String>,
+    studio_log_bound: bool,
+    studio_log_path: Option<String>,
+    studio_log_bound_age_ms: Option<u128>,
+    studio_log_last_error: Option<String>,
     last_stop_request_id: u64,
     last_stop_request_age_ms: Option<u128>,
     last_stop_request_source: Option<String>,
@@ -818,16 +836,25 @@ struct CapturedScreenshot {
 #[derive(Debug, Deserialize, Clone)]
 struct ReadStudioLogArgs {
     #[serde(default)]
+    instance_id: Option<String>,
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default)]
     start_line: Option<i64>,
     #[serde(default)]
     line_count: Option<usize>,
     #[serde(default)]
     regex: Option<String>,
+    #[serde(default)]
+    latest: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct ReadStudioLogResponse {
     path: String,
+    instance_id: Option<String>,
+    task_id: Option<String>,
+    bound: bool,
     total_lines: usize,
     range: [usize; 2],
     lines: Vec<String>,
@@ -2316,12 +2343,17 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
         .iter()
         .map(|(instance_id, instance)| {
             let stop_snapshot = instance_stop_request_snapshot(instance);
+            let studio_log_snapshot = instance_studio_log_snapshot(instance);
             HelperInstanceStatus {
                 instance_id: instance_id.clone(),
                 place_id: instance.place_id.clone(),
                 task_id: instance.task_id.clone(),
                 remote_base_url: instance.remote_base_url.clone(),
                 studio_pid: instance.studio_pid,
+                studio_log_bound: studio_log_snapshot.studio_log_bound,
+                studio_log_path: studio_log_snapshot.studio_log_path,
+                studio_log_bound_age_ms: studio_log_snapshot.studio_log_bound_age_ms,
+                studio_log_last_error: studio_log_snapshot.studio_log_last_error,
                 studio_mode: instance.studio_mode.clone(),
                 studio_mode_age_ms: instance
                     .studio_mode_observed_at
@@ -2369,6 +2401,7 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
                 studio_snapshot.studio_mode.as_deref(),
             );
             let launch_process = state.launch_processes.get(&task.task_id);
+            let studio_log_snapshot = task_studio_log_snapshot(&state, &task.task_id);
             let studio_pid = launch_process.map(|launch| launch.studio_pid).or_else(|| {
                 state
                     .instances
@@ -2419,6 +2452,10 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
                 edit_runtime_state: studio_snapshot.edit_runtime_state,
                 edit_runtime_age_ms: studio_snapshot.edit_runtime_age_ms,
                 studio_control_last_error: studio_snapshot.studio_control_last_error,
+                studio_log_bound: studio_log_snapshot.studio_log_bound,
+                studio_log_path: studio_log_snapshot.studio_log_path,
+                studio_log_bound_age_ms: studio_log_snapshot.studio_log_bound_age_ms,
+                studio_log_last_error: studio_log_snapshot.studio_log_last_error,
                 last_stop_request_id: studio_snapshot.last_stop_request_id,
                 last_stop_request_age_ms: studio_snapshot.last_stop_request_age_ms,
                 last_stop_request_source: studio_snapshot.last_stop_request_source,
@@ -3019,6 +3056,14 @@ async fn mcp_register_handler(
                 task_id: Some(claimed_task.task_id.clone()),
                 remote_base_url: remote_base_url.clone(),
                 studio_pid,
+                studio_log_marker: payload
+                    .studio_log_marker
+                    .as_ref()
+                    .map(|value| trim(value))
+                    .filter(|value| !value.is_empty()),
+                studio_log_path: None,
+                studio_log_bound_at: None,
+                studio_log_last_error: None,
                 studio_mode,
                 studio_mode_observed_at: normalize_studio_mode(payload.studio_mode.as_deref())
                     .map(|_| Instant::now()),
@@ -3055,6 +3100,7 @@ async fn mcp_register_handler(
         place_id,
         task_id = claimed_task.task_id,
         studio_pid,
+        studio_log_marker = payload.studio_log_marker.as_deref(),
         remote_base_url,
         studio_mode = ?payload.studio_mode,
         "registered MCP plugin instance with helper"
@@ -3567,9 +3613,10 @@ async fn runtime_log_forward_handler(
 }
 
 async fn read_studio_log_debug_handler(
+    State(app): State<AppState>,
     Query(query): Query<ReadStudioLogArgs>,
 ) -> Result<Json<ReadStudioLogResponse>, HelperError> {
-    Ok(Json(read_studio_log(query)?))
+    Ok(Json(read_studio_log_for_app(&app, query).await?))
 }
 
 fn task_connection_key(task_id: &str) -> String {
@@ -3627,6 +3674,14 @@ struct StudioTaskStatusSnapshot {
     runtime_actuator_last_poll_id: u64,
     runtime_actuator_last_poll_age_ms: Option<u128>,
     runtime_actuator_last_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct StudioLogStatusSnapshot {
+    studio_log_bound: bool,
+    studio_log_path: Option<String>,
+    studio_log_bound_age_ms: Option<u128>,
+    studio_log_last_error: Option<String>,
 }
 
 struct RecordedStopRequest {
@@ -4025,6 +4080,39 @@ fn task_studio_mode_snapshot(state: &HelperState, task_id: &str) -> StudioTaskSt
         })
 }
 
+fn instance_studio_log_snapshot(instance: &PluginInstance) -> StudioLogStatusSnapshot {
+    StudioLogStatusSnapshot {
+        studio_log_bound: instance.studio_log_path.is_some(),
+        studio_log_path: instance
+            .studio_log_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        studio_log_bound_age_ms: instance
+            .studio_log_bound_at
+            .map(|value| value.elapsed().as_millis()),
+        studio_log_last_error: instance.studio_log_last_error.clone(),
+    }
+}
+
+fn empty_studio_log_snapshot() -> StudioLogStatusSnapshot {
+    StudioLogStatusSnapshot {
+        studio_log_bound: false,
+        studio_log_path: None,
+        studio_log_bound_age_ms: None,
+        studio_log_last_error: None,
+    }
+}
+
+fn task_studio_log_snapshot(state: &HelperState, task_id: &str) -> StudioLogStatusSnapshot {
+    state
+        .instances
+        .values()
+        .filter(|instance| instance.task_id.as_deref() == Some(task_id))
+        .max_by_key(|instance| instance.last_seen_at)
+        .map(instance_studio_log_snapshot)
+        .unwrap_or_else(empty_studio_log_snapshot)
+}
+
 fn task_official_adapter_snapshot(
     state: &HelperState,
     task_id: &str,
@@ -4055,6 +4143,7 @@ fn ws_age_ms(value: Option<u128>) -> Option<u64> {
 
 fn helper_task_status_snapshot(state: &HelperState, task_id: &str) -> HelperTaskStatusSnapshot {
     let studio_snapshot = task_studio_mode_snapshot(state, task_id);
+    let studio_log_snapshot = task_studio_log_snapshot(state, task_id);
     let (official_state, official_age_ms, official_last_error) =
         task_official_adapter_snapshot(state, task_id, studio_snapshot.studio_mode.as_deref());
     HelperTaskStatusSnapshot {
@@ -4068,6 +4157,10 @@ fn helper_task_status_snapshot(state: &HelperState, task_id: &str) -> HelperTask
         edit_runtime_state: Some(studio_snapshot.edit_runtime_state),
         edit_runtime_age_ms: ws_age_ms(studio_snapshot.edit_runtime_age_ms),
         studio_control_last_error: studio_snapshot.studio_control_last_error,
+        studio_log_bound: studio_log_snapshot.studio_log_bound,
+        studio_log_path: studio_log_snapshot.studio_log_path,
+        studio_log_bound_age_ms: ws_age_ms(studio_log_snapshot.studio_log_bound_age_ms),
+        studio_log_last_error: studio_log_snapshot.studio_log_last_error,
         last_stop_request_id: studio_snapshot.last_stop_request_id,
         last_stop_request_age_ms: ws_age_ms(studio_snapshot.last_stop_request_age_ms),
         last_stop_request_source: studio_snapshot.last_stop_request_source,
@@ -4148,6 +4241,7 @@ fn heartbeat_task_statuses(state: &HelperState) -> Vec<HelperHeartbeatTaskStatus
             let connection_key = task_connection_key(&task.task_id);
             let remote_connection = state.remote_connections.get(&connection_key);
             let studio_snapshot = task_studio_mode_snapshot(state, &task.task_id);
+            let studio_log_snapshot = task_studio_log_snapshot(state, &task.task_id);
             let (
                 official_mcp_adapter_state,
                 official_mcp_adapter_age_ms,
@@ -4182,6 +4276,10 @@ fn heartbeat_task_statuses(state: &HelperState) -> Vec<HelperHeartbeatTaskStatus
                 edit_runtime_state: studio_snapshot.edit_runtime_state,
                 edit_runtime_age_ms: studio_snapshot.edit_runtime_age_ms,
                 studio_control_last_error: studio_snapshot.studio_control_last_error,
+                studio_log_bound: studio_log_snapshot.studio_log_bound,
+                studio_log_path: studio_log_snapshot.studio_log_path,
+                studio_log_bound_age_ms: studio_log_snapshot.studio_log_bound_age_ms,
+                studio_log_last_error: studio_log_snapshot.studio_log_last_error,
                 last_stop_request_id: studio_snapshot.last_stop_request_id,
                 last_stop_request_age_ms: studio_snapshot.last_stop_request_age_ms,
                 last_stop_request_source: studio_snapshot.last_stop_request_source,
@@ -6258,8 +6356,13 @@ async fn handle_remote_command(
             .await
         }
         "ReadStudioLog" | "read_studio_log" => {
-            let args: ReadStudioLogArgs = serde_json::from_value(payload)?;
-            Ok(serde_json::to_string(&read_studio_log(args)?)?)
+            let mut args: ReadStudioLogArgs = serde_json::from_value(payload)?;
+            if args.task_id.is_none() {
+                args.task_id = task_id.map(ToOwned::to_owned);
+            }
+            Ok(serde_json::to_string(
+                &read_studio_log_for_app(&app, args).await?,
+            )?)
         }
         "StartStopPlay" | "start_stop_play" => {
             handle_helper_start_stop_play(app, place_id, task_id, payload).await
@@ -6894,51 +6997,209 @@ async fn upload_runtime_screenshot(
     })
 }
 
-fn read_studio_log(args: ReadStudioLogArgs) -> Result<ReadStudioLogResponse> {
+async fn read_studio_log_for_app(
+    app: &AppState,
+    args: ReadStudioLogArgs,
+) -> Result<ReadStudioLogResponse> {
     #[cfg(target_os = "windows")]
     {
-        let local_app_data = env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .ok_or_else(|| eyre!("LOCALAPPDATA is not set"))?;
-        let logs_dir = local_app_data.join("Roblox").join("logs");
-        let (log_path, content) = read_latest_studio_log(&logs_dir)?;
-        let mut all_lines: Vec<String> = content.lines().map(ToOwned::to_owned).collect();
-        if let Some(pattern) = args.regex.as_ref() {
-            let regex = Regex::new(pattern)?;
-            all_lines.retain(|line| regex.is_match(line));
+        let logs_dir = roblox_logs_dir()?;
+        if args.latest {
+            let (log_path, content) = read_latest_studio_log(&logs_dir)?;
+            return read_studio_log_content(&args, &log_path, content, None, None, false);
         }
-        let total_lines = all_lines.len();
-        let count = args.line_count.unwrap_or(total_lines.max(1)).max(1);
-        let mut start_line = args.start_line.unwrap_or(1);
-        if start_line < 0 {
-            start_line = (total_lines as i64 + start_line + 1).max(1);
-        }
-        let start = start_line.clamp(1, total_lines.max(1) as i64) as usize;
-        let end = if total_lines == 0 {
-            0
-        } else {
-            (start + count - 1).min(total_lines)
+
+        let (instance_id, task_id, log_path) = {
+            let mut state = app.state.lock().await;
+            cleanup_stale_instances(&mut state);
+            let instance_id = select_instance_id_for_studio_log(&state, &args)?;
+            let instance = state
+                .instances
+                .get_mut(&instance_id)
+                .ok_or_else(|| eyre!("selected Studio plugin instance disappeared"))?;
+            let log_path =
+                bind_studio_log_path_for_instance(instance, &logs_dir).wrap_err_with(|| {
+                    format!("failed to bind Studio log for instance {instance_id}")
+                })?;
+            (instance_id, instance.task_id.clone(), log_path)
         };
-        let lines = if total_lines == 0 || end == 0 {
-            Vec::new()
-        } else {
-            all_lines[(start - 1)..end].to_vec()
-        };
-        tracing::debug!(path = %log_path.display(), total_lines, returned_lines = lines.len(), "read Studio log from helper");
-        return Ok(ReadStudioLogResponse {
-            path: log_path.display().to_string(),
-            total_lines,
-            range: [if total_lines == 0 { 0 } else { start }, end],
-            lines,
-        });
+        let content = fs::read(&log_path)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .wrap_err_with(|| format!("failed to read bound Studio log {}", log_path.display()))?;
+        return read_studio_log_content(
+            &args,
+            &log_path,
+            content,
+            Some(instance_id),
+            task_id,
+            true,
+        );
     }
 
     #[cfg(not(target_os = "windows"))]
     {
         let _ = args;
+        let _ = app;
         Err(eyre!(
             "read_studio_log is only available on Windows helper builds"
         ))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn roblox_logs_dir() -> Result<PathBuf> {
+    let local_app_data = env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .ok_or_else(|| eyre!("LOCALAPPDATA is not set"))?;
+    Ok(local_app_data.join("Roblox").join("logs"))
+}
+
+#[cfg(target_os = "windows")]
+fn read_studio_log_content(
+    args: &ReadStudioLogArgs,
+    log_path: &Path,
+    content: String,
+    instance_id: Option<String>,
+    task_id: Option<String>,
+    bound: bool,
+) -> Result<ReadStudioLogResponse> {
+    let mut all_lines: Vec<String> = content.lines().map(ToOwned::to_owned).collect();
+    if let Some(pattern) = args.regex.as_ref() {
+        let regex = Regex::new(pattern)?;
+        all_lines.retain(|line| regex.is_match(line));
+    }
+    let total_lines = all_lines.len();
+    let count = args.line_count.unwrap_or(total_lines.max(1)).max(1);
+    let mut start_line = args.start_line.unwrap_or(1);
+    if start_line < 0 {
+        start_line = (total_lines as i64 + start_line + 1).max(1);
+    }
+    let start = start_line.clamp(1, total_lines.max(1) as i64) as usize;
+    let end = if total_lines == 0 {
+        0
+    } else {
+        (start + count - 1).min(total_lines)
+    };
+    let lines = if total_lines == 0 || end == 0 {
+        Vec::new()
+    } else {
+        all_lines[(start - 1)..end].to_vec()
+    };
+    tracing::debug!(
+        path = %log_path.display(),
+        instance_id = ?instance_id,
+        task_id = ?task_id,
+        bound,
+        total_lines,
+        returned_lines = lines.len(),
+        "read Studio log from helper"
+    );
+    Ok(ReadStudioLogResponse {
+        path: log_path.display().to_string(),
+        instance_id,
+        task_id,
+        bound,
+        total_lines,
+        range: [if total_lines == 0 { 0 } else { start }, end],
+        lines,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn select_instance_id_for_studio_log(
+    state: &HelperState,
+    args: &ReadStudioLogArgs,
+) -> Result<String> {
+    let requested_instance_id =
+        maybe_sanitize_identifier("instance_id", args.instance_id.as_deref())?;
+    let requested_task_id = maybe_sanitize_identifier("task_id", args.task_id.as_deref())?;
+
+    if let Some(instance_id) = requested_instance_id {
+        let instance = state.instances.get(&instance_id).ok_or_else(|| {
+            eyre!("read_studio_log instance_id {instance_id} is not registered with helper")
+        })?;
+        if let Some(task_id) = requested_task_id.as_deref() {
+            if instance.task_id.as_deref() != Some(task_id) {
+                return Err(eyre!(
+                    "read_studio_log instance_id {instance_id} belongs to task_id {:?}, not {task_id}",
+                    instance.task_id
+                ));
+            }
+        }
+        return Ok(instance_id);
+    }
+
+    if let Some(task_id) = requested_task_id {
+        return state
+            .instances
+            .iter()
+            .filter(|(_, instance)| instance.task_id.as_deref() == Some(task_id.as_str()))
+            .max_by_key(|(_, instance)| instance.last_seen_at)
+            .map(|(instance_id, _)| instance_id.clone())
+            .ok_or_else(|| {
+                eyre!(
+                    "read_studio_log found no active Studio plugin instance for task_id {task_id}"
+                )
+            });
+    }
+
+    Err(eyre!(
+        "read_studio_log requires instance_id or task_id; pass latest=true only for manual diagnostics"
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn bind_studio_log_path_for_instance(
+    instance: &mut PluginInstance,
+    logs_dir: &Path,
+) -> Result<PathBuf> {
+    if let Some(path) = instance.studio_log_path.as_ref() {
+        if path.is_file() {
+            return Ok(path.clone());
+        }
+        instance.studio_log_path = None;
+        instance.studio_log_bound_at = None;
+    }
+
+    let marker = instance.studio_log_marker.as_deref().ok_or_else(|| {
+        eyre!("studio_log_marker_missing: plugin registered without a log marker")
+    })?;
+    match find_studio_log_by_marker(logs_dir, marker) {
+        Ok(path) => {
+            instance.studio_log_path = Some(path.clone());
+            instance.studio_log_bound_at = Some(Instant::now());
+            instance.studio_log_last_error = None;
+            Ok(path)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            instance.studio_log_last_error = Some(message);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn find_studio_log_by_marker(logs_dir: &Path, marker: &str) -> Result<PathBuf> {
+    let candidates = list_candidate_log_files(logs_dir)?;
+    let mut matches = Vec::new();
+    for path in candidates {
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        let content = String::from_utf8_lossy(&bytes);
+        if content.contains(marker) {
+            matches.push(path);
+        }
+    }
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Err(eyre!(
+            "studio_log_not_bound: no Studio log contains marker {marker}"
+        )),
+        _ => Err(eyre!(
+            "studio_log_ambiguous: multiple Studio logs contain marker {marker}"
+        )),
     }
 }
 
@@ -7230,6 +7491,10 @@ mod tests {
             task_id: task_id.map(ToOwned::to_owned),
             remote_base_url: "https://example.com".to_owned(),
             studio_pid: Some(123),
+            studio_log_marker: Some("clockp-studio-log-marker:test".to_owned()),
+            studio_log_path: None,
+            studio_log_bound_at: None,
+            studio_log_last_error: None,
             studio_mode: Some("stop".to_owned()),
             studio_mode_observed_at: Some(Instant::now()),
             studio_mode_source: "edit_plugin".to_owned(),
@@ -7253,6 +7518,117 @@ mod tests {
             queue: VecDeque::new(),
             notify: Arc::new(Notify::new()),
         }
+    }
+
+    fn temp_studio_logs_dir(test_name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "clockp-studio-helper-{test_name}-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).expect("test log dir should be created");
+        dir
+    }
+
+    #[test]
+    fn select_studio_log_instance_requires_instance_or_task() {
+        let state = empty_helper_state();
+        let args = ReadStudioLogArgs {
+            instance_id: None,
+            task_id: None,
+            start_line: None,
+            line_count: None,
+            regex: None,
+            latest: false,
+        };
+
+        let error = select_instance_id_for_studio_log(&state, &args)
+            .expect_err("unscoped log reads must fail");
+
+        assert!(error
+            .to_string()
+            .contains("requires instance_id or task_id"));
+    }
+
+    #[test]
+    fn select_studio_log_instance_rejects_task_mismatch() {
+        let mut state = empty_helper_state();
+        state.instances.insert(
+            "instance-a".to_owned(),
+            test_instance("93795519121520", Some("task-a"), 0),
+        );
+        let args = ReadStudioLogArgs {
+            instance_id: Some("instance-a".to_owned()),
+            task_id: Some("task-b".to_owned()),
+            start_line: None,
+            line_count: None,
+            regex: None,
+            latest: false,
+        };
+
+        let error = select_instance_id_for_studio_log(&state, &args)
+            .expect_err("mismatched task should fail");
+
+        assert!(error.to_string().contains("not task-b"));
+    }
+
+    #[test]
+    fn bind_studio_log_path_uses_unique_marker() {
+        let logs_dir = temp_studio_logs_dir("bind-unique-marker");
+        let marker = "clockp-studio-log-marker:unique-bind-test";
+        let expected_path = logs_dir.join("0.724.0_test_Studio_ABCD_last.log");
+        fs::write(
+            &expected_path,
+            format!("before\n[MCP Plugin] studio_log_marker marker={marker}\nafter\n"),
+        )
+        .expect("test Studio log should be written");
+        fs::write(
+            logs_dir.join("0.724.0_other_Studio_EFGH_last.log"),
+            "before\nafter\n",
+        )
+        .expect("other Studio log should be written");
+        let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+        instance.studio_log_marker = Some(marker.to_owned());
+
+        let bound_path = bind_studio_log_path_for_instance(&mut instance, &logs_dir)
+            .expect("marker should bind exactly one log");
+        let snapshot = instance_studio_log_snapshot(&instance);
+
+        assert_eq!(bound_path, expected_path);
+        assert!(snapshot.studio_log_bound);
+        assert_eq!(
+            snapshot.studio_log_path,
+            Some(expected_path.display().to_string())
+        );
+        assert!(snapshot.studio_log_last_error.is_none());
+    }
+
+    #[test]
+    fn bind_studio_log_path_rejects_ambiguous_marker() {
+        let logs_dir = temp_studio_logs_dir("bind-ambiguous-marker");
+        let marker = "clockp-studio-log-marker:ambiguous-bind-test";
+        fs::write(
+            logs_dir.join("0.724.0_test_Studio_ABCD_last.log"),
+            format!("[MCP Plugin] studio_log_marker marker={marker}\n"),
+        )
+        .expect("first test Studio log should be written");
+        fs::write(
+            logs_dir.join("0.724.0_test_Studio_EFGH_last.log"),
+            format!("[MCP Plugin] studio_log_marker marker={marker}\n"),
+        )
+        .expect("second test Studio log should be written");
+        let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+        instance.studio_log_marker = Some(marker.to_owned());
+
+        let error = bind_studio_log_path_for_instance(&mut instance, &logs_dir)
+            .expect_err("ambiguous marker should fail");
+
+        assert!(error.to_string().contains("studio_log_ambiguous"));
+        assert!(instance.studio_log_path.is_none());
+        assert!(instance
+            .studio_log_last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("studio_log_ambiguous"));
     }
 
     fn test_claimed_task(task_id: &str, place_id: &str) -> ClaimedTask {

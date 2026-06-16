@@ -1376,7 +1376,9 @@ impl RBXStudioServer {
             .await
     }
 
-    #[tool(description = "Read the latest Roblox Studio desktop log through the Windows helper.")]
+    #[tool(
+        description = "Read the task-bound Roblox Studio desktop log through the Windows helper."
+    )]
     async fn read_studio_log(
         &self,
         Parameters(args): Parameters<ReadStudioLog>,

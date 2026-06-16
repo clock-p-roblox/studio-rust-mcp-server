@@ -315,8 +315,17 @@ end
 end
 
 local function requestStudioLog(startLine: number, lineCount: number)
-	local url =
-		string.format("%s/v1/helper/studio-log?start_line=%d&line_count=%d", activeHelperBaseUrl(), startLine, lineCount)
+	local query = {
+		string.format("start_line=%d", startLine),
+		string.format("line_count=%d", lineCount),
+	}
+	if currentInstanceId ~= nil and currentInstanceId ~= "" then
+		table.insert(query, "instance_id=" .. HttpService:UrlEncode(currentInstanceId))
+	end
+	if currentTaskId ~= nil and currentTaskId ~= "" then
+		table.insert(query, "task_id=" .. HttpService:UrlEncode(currentTaskId))
+	end
+	local url = string.format("%s/v1/helper/studio-log?%s", activeHelperBaseUrl(), table.concat(query, "&"))
 	local response = HttpService:RequestAsync({
 		Url = url,
 		Method = "GET",
