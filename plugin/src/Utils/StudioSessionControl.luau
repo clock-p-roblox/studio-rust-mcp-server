@@ -204,6 +204,31 @@ local heartbeatIntervalSeconds = 0.5
 local lastHeartbeatAt = 0
 local lastStopRequestId = 0
 
+local function runtimeStateSummary()
+	local pieces = {}
+	local okStudio, isStudio = pcall(function()
+		return RunService:IsStudio()
+	end)
+	table.insert(pieces, "is_studio=" .. tostring(okStudio and isStudio))
+	local okServer, isServer = pcall(function()
+		return RunService:IsServer()
+	end)
+	table.insert(pieces, "is_server=" .. tostring(okServer and isServer))
+	local okClient, isClient = pcall(function()
+		return RunService:IsClient()
+	end)
+	table.insert(pieces, "is_client=" .. tostring(okClient and isClient))
+	local okRunning, isRunning = pcall(function()
+		return RunService:IsRunning()
+	end)
+	table.insert(pieces, "is_running=" .. tostring(okRunning and isRunning))
+	local okRunMode, isRunMode = pcall(function()
+		return RunService:IsRunMode()
+	end)
+	table.insert(pieces, "is_run_mode=" .. tostring(okRunMode and isRunMode))
+	return table.concat(pieces, ",")
+end
+
 local function postStopResult(stopRequestId, phase, errorMessage)
 	local body = {
 		instance_id = instanceId,
@@ -213,6 +238,12 @@ local function postStopResult(stopRequestId, phase, errorMessage)
 	if errorMessage ~= nil then
 		body.error = tostring(errorMessage)
 	end
+	print(string.format(
+		"[MCP Plugin] runtime_stop_result_http_begin stop_request_id=%%d phase=%%s %%s",
+		stopRequestId,
+		tostring(phase),
+		runtimeStateSummary()
+	))
 	local response = HttpService:RequestAsync({
 		Url = helperBaseUrl .. "/v1/mcp/plugin/stop-result",
 		Method = "POST",
@@ -221,6 +252,15 @@ local function postStopResult(stopRequestId, phase, errorMessage)
 		},
 		Body = HttpService:JSONEncode(body),
 	})
+	print(string.format(
+		"[MCP Plugin] runtime_stop_result_http_end stop_request_id=%%d phase=%%s success=%%s status=%%s body_len=%%d %%s",
+		stopRequestId,
+		tostring(phase),
+		tostring(response.Success),
+		tostring(response.StatusCode),
+		string.len(tostring(response.Body or "")),
+		runtimeStateSummary()
+	))
 	if not response.Success then
 		error(string.format("HTTP %%d: %%s", response.StatusCode, response.Body))
 	end
@@ -274,16 +314,38 @@ local function pollStopRequest()
 	local payload = HttpService:JSONDecode(response.Body)
 	local stopRequestId = tonumber(payload.stop_request_id) or 0
 	if payload.stop_requested == true and stopRequestId > lastStopRequestId then
+		local previousStopRequestId = lastStopRequestId
 		lastStopRequestId = stopRequestId
-		pcall(function()
+		print(string.format(
+			"[MCP Plugin] runtime_stop_request_received stop_request_id=%%d after_id=%%d %%s",
+			stopRequestId,
+			previousStopRequestId,
+			runtimeStateSummary()
+		))
+		local observedPosted, observedPostErr = pcall(function()
 			postStopResult(stopRequestId, "observed", nil)
 		end)
+		print(string.format(
+			"[MCP Plugin] runtime_stop_observed_http_result stop_request_id=%%d success=%%s error=%%s %%s",
+			stopRequestId,
+			tostring(observedPosted),
+			tostring(observedPostErr),
+			runtimeStateSummary()
+		))
+		print(string.format("[MCP Plugin] runtime_stop_call_begin stop_request_id=%%d %%s", stopRequestId, runtimeStateSummary()))
 		local ok, err = pcall(function()
 			StudioTestService:EndTest({
 				stopped_by = "mcp_session_control",
 				stop_request_id = stopRequestId,
 			})
 		end)
+		print(string.format(
+			"[MCP Plugin] runtime_stop_call_end stop_request_id=%%d success=%%s error=%%s %%s",
+			stopRequestId,
+			tostring(ok),
+			tostring(err),
+			runtimeStateSummary()
+		))
 		if not ok then
 			print(string.format("[MCP Plugin] runtime_stop_actuator_failed stop_request_id=%%d error=%%s", stopRequestId, tostring(err)))
 			pcall(function()
