@@ -15,6 +15,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
+use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
@@ -81,6 +82,7 @@ const STUDIO_CONTROL_HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(2);
 const EDIT_RUNTIME_STALE_AFTER: Duration = Duration::from_secs(5);
 const ROBLOX_PLACE_UNIVERSE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 const OFFICIAL_MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(1800);
+const OBSERVABLE_UPSTREAM_SLOW_AFTER: Duration = Duration::from_secs(5);
 const OFFICIAL_STORE_IMAGE_MAX_DECODED_BYTES: usize = 20 * 1024 * 1024;
 const OFFICIAL_STORE_IMAGE_MAX_BASE64_CHARS: usize =
     ((OFFICIAL_STORE_IMAGE_MAX_DECODED_BYTES + 2) / 3) * 4;
@@ -228,6 +230,13 @@ fn runtime_screenshot_upload_url_for_base_url(base_url: &str) -> String {
     format!("{}/v1/runtime-screenshots", base_url.trim_end_matches('/'))
 }
 
+fn runtime_screenshot_helper_upload_url(helper_port: u16, place_id: &str, task_id: &str) -> String {
+    format!(
+        "{}/v1/runtime-screenshots",
+        runtime_log_forward_base_url(helper_port, place_id, task_id)
+    )
+}
+
 #[derive(Clone)]
 struct RemoteTarget {
     connection_key: String,
@@ -359,6 +368,9 @@ struct RegisterPluginResponse {
     place_id: String,
     task_id: Option<String>,
     remote_base_url: String,
+    runtime_log_base_url: Option<String>,
+    runtime_log_remote_base_url: Option<String>,
+    runtime_log_upload_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -459,6 +471,8 @@ struct ClaimedTaskStatus {
     mcp_base_url: String,
     rojo_base_url: Option<String>,
     runtime_log_base_url: Option<String>,
+    runtime_log_remote_base_url: Option<String>,
+    runtime_log_upload_url: Option<String>,
     studio_pid: Option<u32>,
     launched_by_helper: bool,
     claimed_age_ms: u128,
@@ -626,6 +640,10 @@ struct HelperPlaceStatus {
     place_id: String,
     remote_base_url: String,
     task_id: Option<String>,
+    runtime_log_base_url: Option<String>,
+    runtime_log_remote_base_url: Option<String>,
+    runtime_log_upload_url: Option<String>,
+    runtime_screenshot_upload_url: Option<String>,
     registered_instance_count: usize,
     registered_instance_ids: Vec<String>,
     studio_pids: Vec<u32>,
@@ -685,10 +703,14 @@ fn rojo_forward_base_url(helper_port: u16, place_id: &str, task_id: &str) -> Str
     format!("http://127.0.0.1:{helper_port}/rojo-forward/{place_id}/task/{task_id}")
 }
 
-#[cfg(test)]
+fn runtime_log_forward_base_url(helper_port: u16, place_id: &str, task_id: &str) -> String {
+    format!("http://127.0.0.1:{helper_port}/runtime-log-forward/{place_id}/task/{task_id}")
+}
+
 fn runtime_log_forward_upload_url(helper_port: u16, place_id: &str, task_id: &str) -> String {
     format!(
-        "http://127.0.0.1:{helper_port}/runtime-log-forward/{place_id}/task/{task_id}/v1/runtime-logs"
+        "{}/v1/runtime-logs",
+        runtime_log_forward_base_url(helper_port, place_id, task_id)
     )
 }
 
@@ -795,6 +817,32 @@ struct ReadStudioLogResponse {
 
 fn trim(value: &str) -> String {
     value.trim().to_owned()
+}
+
+async fn await_observable_upstream_result<T, F>(
+    operation: &'static str,
+    target: String,
+    future: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    let started_at = Instant::now();
+    let mut future = Box::pin(future);
+    tokio::select! {
+        result = &mut future => result,
+        _ = tokio::time::sleep(OBSERVABLE_UPSTREAM_SLOW_AFTER) => {
+            tracing::warn!(
+                operation,
+                target,
+                threshold_ms = OBSERVABLE_UPSTREAM_SLOW_AFTER.as_millis(),
+                elapsed_ms = started_at.elapsed().as_millis(),
+                result_observable = true,
+                "observable upstream operation still waiting for result"
+            );
+            future.await
+        }
+    }
 }
 
 fn normalize_bearer_token(value: &str) -> Option<String> {
@@ -1585,15 +1633,16 @@ async fn hub_post_json<TRequest: Serialize, TResponse: DeserializeOwned>(
         return Err(eyre!("hub_base_url is not configured"));
     };
     let token = helper.bearer_token.lock().await.clone();
-    let response = helper
-        .client
-        .post(format!("{}{path}", base_url.trim_end_matches('/')))
-        .bearer_auth(token)
-        .json(payload)
-        .send()
+    let url = format!("{}{path}", base_url.trim_end_matches('/'));
+    let request = helper.client.post(&url).bearer_auth(token).json(payload);
+    let (status, body) =
+        await_observable_upstream_result("hub_http", path.to_owned(), async move {
+            let response = request.send().await?;
+            let status = response.status();
+            let body = response.text().await?;
+            Result::<(StatusCode, String)>::Ok((status, body))
+        })
         .await?;
-    let status = response.status();
-    let body = response.text().await?;
     if !status.is_success() {
         return Err(eyre!("hub request {path} failed with {status}: {body}"));
     }
@@ -1631,7 +1680,7 @@ async fn hub_register_helper(
         )));
     };
     let token = helper.bearer_token.lock().await.clone();
-    let response = helper
+    let request = helper
         .client
         .post(format!(
             "{}/v1/helpers/register",
@@ -1644,20 +1693,24 @@ async fn hub_register_helper(
             platform: std::env::consts::OS.to_owned(),
             capacity: helper.capacity,
             labels: vec![std::env::consts::ARCH.to_owned()],
-        })
-        .send()
-        .await
-        .map_err(|error| RegisterHelperError::Other(error.into()))?;
-    let status = response.status();
-    let error_code = response
-        .headers()
-        .get("x-clock-p-hub-error")
-        .and_then(|value| value.to_str().ok())
-        .map(ToOwned::to_owned);
-    let body = response
-        .text()
-        .await
-        .map_err(|error| RegisterHelperError::Other(error.into()))?;
+        });
+    let (status, error_code, body) = await_observable_upstream_result(
+        "hub_http",
+        "/v1/helpers/register".to_owned(),
+        async move {
+            let response = request.send().await?;
+            let status = response.status();
+            let error_code = response
+                .headers()
+                .get("x-clock-p-hub-error")
+                .and_then(|value| value.to_str().ok())
+                .map(ToOwned::to_owned);
+            let body = response.text().await?;
+            Result::<(StatusCode, Option<String>, String)>::Ok((status, error_code, body))
+        },
+    )
+    .await
+    .map_err(|error| RegisterHelperError::Other(error.into()))?;
     if let Some(message) = parse_helper_id_conflict(status, error_code.as_deref(), &body) {
         return Err(RegisterHelperError::HelperIdConflict(message));
     }
@@ -1709,19 +1762,25 @@ fn validate_runtime_screenshot_upload_url(
         return Err(eyre!("upload_url must not be empty"));
     }
 
-    let _ = helper;
-    let expected = select_claimed_task(state, place_id, task_id)?
+    let claimed_task = select_claimed_task(state, place_id, task_id)?;
+    let expected_remote = claimed_task
         .runtime_log_base_url
         .as_deref()
         .map(runtime_screenshot_upload_url_for_base_url)
         .ok_or_else(|| eyre!("claimed task has no runtime_log_base_url"))?;
-    if trimmed != expected {
+    if trimmed == expected_remote {
+        return Ok(expected_remote);
+    }
+
+    let expected_helper =
+        runtime_screenshot_helper_upload_url(helper.port, place_id, &claimed_task.task_id);
+    if trimmed != expected_helper {
         return Err(eyre!(
-            "upload_url must match runtime screenshot sink for placeId {place_id}: {expected}"
+            "upload_url must match runtime screenshot sink for placeId {place_id}: {expected_remote} or {expected_helper}"
         ));
     }
 
-    Ok(expected)
+    Ok(expected_remote)
 }
 
 async fn post_runtime_screenshot(
@@ -1760,9 +1819,18 @@ async fn post_runtime_screenshot(
             request = request.header("X-Screenshot-Tag", tag);
         }
 
-        let response = request.body(png_bytes.to_vec()).send().await?;
-        let status = response.status();
-        let response_body = response.text().await?;
+        let upload_target = format!("{upload_url} source={}", candidate.source);
+        let (status, response_body) = await_observable_upstream_result(
+            "runtime_screenshot_upload",
+            upload_target,
+            async move {
+                let response = request.body(png_bytes.to_vec()).send().await?;
+                let status = response.status();
+                let response_body = response.text().await?;
+                Result::<(StatusCode, String)>::Ok((status, response_body))
+            },
+        )
+        .await?;
         if status == StatusCode::UNAUTHORIZED {
             saw_unauthorized = true;
             tracing::warn!(
@@ -2225,13 +2293,21 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
                     .find(|instance| route_identity_matches(instance, Some(task.task_id.as_str())))
                     .and_then(|instance| instance.studio_pid)
             });
+            let runtime_log_base_url = task.runtime_log_base_url.as_ref().map(|_| {
+                runtime_log_forward_base_url(app.helper.port, &task.place_id, &task.task_id)
+            });
+            let runtime_log_upload_url = task.runtime_log_base_url.as_ref().map(|_| {
+                runtime_log_forward_upload_url(app.helper.port, &task.place_id, &task.task_id)
+            });
             ClaimedTaskStatus {
                 task_id: task.task_id.clone(),
                 place_id: task.place_id.clone(),
                 universe_id: task.universe_id.clone(),
                 mcp_base_url: task.mcp_base_url.clone(),
                 rojo_base_url: task.rojo_base_url.clone(),
-                runtime_log_base_url: task.runtime_log_base_url.clone(),
+                runtime_log_base_url,
+                runtime_log_remote_base_url: task.runtime_log_base_url.clone(),
+                runtime_log_upload_url,
                 studio_pid,
                 launched_by_helper: launch_process
                     .map(|launch| launch.launched_by_helper)
@@ -2338,6 +2414,21 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
         let remote_connection = connection_key
             .as_ref()
             .and_then(|key| state.remote_connections.get(key));
+        let runtime_log_base_url = claimed_task.as_ref().and_then(|task| {
+            task.runtime_log_base_url.as_ref().map(|_| {
+                runtime_log_forward_base_url(app.helper.port, &task.place_id, &task.task_id)
+            })
+        });
+        let runtime_log_upload_url = claimed_task.as_ref().and_then(|task| {
+            task.runtime_log_base_url.as_ref().map(|_| {
+                runtime_log_forward_upload_url(app.helper.port, &task.place_id, &task.task_id)
+            })
+        });
+        let runtime_screenshot_upload_url = claimed_task.as_ref().and_then(|task| {
+            task.runtime_log_base_url.as_ref().map(|_| {
+                runtime_screenshot_helper_upload_url(app.helper.port, &task.place_id, &task.task_id)
+            })
+        });
         place_statuses.push(HelperPlaceStatus {
             remote_base_url: claimed_task
                 .as_ref()
@@ -2345,6 +2436,12 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
                 .unwrap_or_default(),
             place_id: place_id.clone(),
             task_id: claimed_task.as_ref().map(|task| task.task_id.clone()),
+            runtime_log_base_url,
+            runtime_log_remote_base_url: claimed_task
+                .as_ref()
+                .and_then(|task| task.runtime_log_base_url.clone()),
+            runtime_log_upload_url,
+            runtime_screenshot_upload_url,
             registered_instance_count: registered_instance_ids.len(),
             registered_instance_ids,
             studio_pids,
@@ -2434,6 +2531,14 @@ async fn helper_debug_task_handler(
         })
         .collect::<Vec<_>>();
     let task_status = helper_task_status_snapshot(&state, &task.task_id);
+    let runtime_log_base_url = task
+        .runtime_log_base_url
+        .as_ref()
+        .map(|_| runtime_log_forward_base_url(app.helper.port, &task.place_id, &task.task_id));
+    let runtime_log_upload_url = task
+        .runtime_log_base_url
+        .as_ref()
+        .map(|_| runtime_log_forward_upload_url(app.helper.port, &task.place_id, &task.task_id));
     let payload = serde_json::json!({
         "ok": true,
         "task_id": task.task_id,
@@ -2443,7 +2548,9 @@ async fn helper_debug_task_handler(
             "universe_id": task.universe_id,
             "mcp_base_url": task.mcp_base_url,
             "rojo_base_url": task.rojo_base_url,
-            "runtime_log_base_url": task.runtime_log_base_url,
+            "runtime_log_base_url": runtime_log_base_url,
+            "runtime_log_remote_base_url": task.runtime_log_base_url,
+            "runtime_log_upload_url": runtime_log_upload_url,
             "claimed_age_ms": task.claimed_at.elapsed().as_millis(),
         },
         "launch_process": launch_process.map(|launch| serde_json::json!({
@@ -2795,21 +2902,26 @@ async fn rojo_forward_request(
     if !body.is_empty() {
         request = request.body(body.to_vec());
     }
-    let response = request
-        .send()
-        .await
-        .wrap_err_with(|| format!("failed to forward Rojo request to {target_url}"))?;
-    let status =
-        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(ToOwned::to_owned);
-    let bytes = response
-        .bytes()
-        .await
-        .wrap_err("failed to read Rojo forward response body")?;
+    let (status, content_type, bytes) =
+        await_observable_upstream_result("rojo_forward_http", target_path.clone(), async move {
+            let response = request
+                .send()
+                .await
+                .wrap_err_with(|| format!("failed to forward Rojo request to {target_url}"))?;
+            let status =
+                StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(ToOwned::to_owned);
+            let bytes = response
+                .bytes()
+                .await
+                .wrap_err("failed to read Rojo forward response body")?;
+            Result::<(StatusCode, Option<String>, Bytes)>::Ok((status, content_type, bytes))
+        })
+        .await?;
     tracing::debug!(
         place_id,
         task_id,
@@ -2873,21 +2985,28 @@ async fn runtime_log_forward_request(
     if !body.is_empty() {
         request = request.body(body.to_vec());
     }
-    let response = request
-        .send()
-        .await
-        .wrap_err_with(|| format!("failed to forward runtime-log request to {target_url}"))?;
-    let status =
-        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(ToOwned::to_owned);
-    let bytes = response
-        .bytes()
-        .await
-        .wrap_err("failed to read runtime-log forward response body")?;
+    let (status, content_type, bytes) = await_observable_upstream_result(
+        "runtime_log_forward_http",
+        target_path.clone(),
+        async move {
+            let response = request.send().await.wrap_err_with(|| {
+                format!("failed to forward runtime-log request to {target_url}")
+            })?;
+            let status =
+                StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(ToOwned::to_owned);
+            let bytes = response
+                .bytes()
+                .await
+                .wrap_err("failed to read runtime-log forward response body")?;
+            Result::<(StatusCode, Option<String>, Bytes)>::Ok((status, content_type, bytes))
+        },
+    )
+    .await?;
     tracing::debug!(
         place_id,
         task_id,
@@ -2922,6 +3041,13 @@ async fn mcp_register_handler(
             .map_err(HelperError)?
     };
     let remote_base_url = claimed_task.mcp_base_url.clone();
+    let runtime_log_remote_base_url = claimed_task.runtime_log_base_url.clone();
+    let runtime_log_base_url = runtime_log_remote_base_url
+        .as_ref()
+        .map(|_| runtime_log_forward_base_url(app.helper.port, &place_id, &claimed_task.task_id));
+    let runtime_log_upload_url = runtime_log_remote_base_url
+        .as_ref()
+        .map(|_| runtime_log_forward_upload_url(app.helper.port, &place_id, &claimed_task.task_id));
     {
         let mut state = app.state.lock().await;
         let studio_mode = normalize_studio_mode(payload.studio_mode.as_deref());
@@ -2970,6 +3096,9 @@ async fn mcp_register_handler(
         place_id,
         task_id: Some(claimed_task.task_id),
         remote_base_url,
+        runtime_log_base_url,
+        runtime_log_remote_base_url,
+        runtime_log_upload_url,
     }))
 }
 
@@ -4515,6 +4644,10 @@ async fn stream_runtime_screenshot(
         .lock()
         .await
         .insert(upload_id.to_string(), tx);
+    let upload_target = format!(
+        "request_id={request_id} upload_id={upload_id} place_id={place_id} task_id={}",
+        task_id.unwrap_or("")
+    );
 
     if sender
         .send(RemoteOutgoingFrame::Text(encode_remote_message(
@@ -4587,21 +4720,25 @@ async fn stream_runtime_screenshot(
         ));
     }
 
-    let committed = match tokio::time::timeout(Duration::from_secs(30), rx).await {
-        Ok(result) => result??,
-        Err(_) => {
-            upload_waiters.lock().await.remove(&upload_id.to_string());
-            send_artifact_abort_message(
-                &sender,
-                upload_id,
-                &request_id,
-                "timed out waiting for artifact commit acknowledgement",
-            );
-            return Err(eyre!(
-                "timed out waiting for artifact commit acknowledgement"
-            ));
-        }
-    };
+    let committed =
+        await_observable_upstream_result("remote_artifact_upload", upload_target, async {
+            match tokio::time::timeout(Duration::from_secs(30), rx).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    upload_waiters.lock().await.remove(&upload_id.to_string());
+                    send_artifact_abort_message(
+                        &sender,
+                        upload_id,
+                        &request_id,
+                        "timed out waiting for artifact commit acknowledgement",
+                    );
+                    Err(eyre!(
+                        "timed out waiting for artifact commit acknowledgement"
+                    ))
+                }
+            }
+        })
+        .await?;
 
     let response = RuntimeScreenshotResponse {
         session_id: committed.session_id,
@@ -4665,6 +4802,7 @@ async fn run_remote_ws_session(
             }
         }
     });
+    let hello_sent_at = Instant::now();
     if out_tx
         .send(RemoteOutgoingFrame::Text(encode_remote_message(
             &HelperToServerMessage::Hello(HelperHello {
@@ -4711,9 +4849,23 @@ async fn run_remote_ws_session(
     let mut ping = tokio::time::interval(REMOTE_WS_PING_INTERVAL);
     let mut last_pong_at = Instant::now();
     let mut ready_acknowledged = false;
+    let mut hello_slow_logged = false;
+    let mut hello_slow_timer = Box::pin(tokio::time::sleep(OBSERVABLE_UPSTREAM_SLOW_AFTER));
     let mut session_error: Option<Report> = None;
     loop {
         tokio::select! {
+            _ = &mut hello_slow_timer, if !ready_acknowledged && !hello_slow_logged => {
+                hello_slow_logged = true;
+                tracing::warn!(
+                    connection_key,
+                    place_id,
+                    task_id = ?task_id,
+                    threshold_ms = OBSERVABLE_UPSTREAM_SLOW_AFTER.as_millis(),
+                    elapsed_ms = hello_sent_at.elapsed().as_millis(),
+                    result_observable = true,
+                    "helper remote websocket hello still waiting for ready_ack"
+                );
+            }
             changed = stop_rx.changed() => {
                 if changed.is_ok() && *stop_rx.borrow() {
                     stopped_by_request = true;
