@@ -24,7 +24,20 @@ class PluginSessionControlCleanupTests(unittest.TestCase):
 
         self.assertNotIn("single_retry_stop_before_start", session_control)
         self.assertNotIn("one stop/retry", session_control)
-        self.assertIn("start_play was not retried", session_control)
+        self.assertNotIn("Call start_stop_play(stop) once", session_control)
+        self.assertIn("previous_test_in_progress", session_control)
+        self.assertIn("start_play or run_server was not retried", session_control)
+        self.assertIn("Restart Studio before launching again", session_control)
+
+    def test_run_server_uses_previous_test_in_progress_error_code(self) -> None:
+        session_control = (REPO / "plugin/src/Utils/StudioSessionControl.luau").read_text(encoding="utf-8")
+
+        run_server_start = session_control.index("local function startRunServerMode")
+        run_server_end = session_control.index("local function handleStartStopPlay", run_server_start)
+        run_server_function = session_control[run_server_start:run_server_end]
+
+        self.assertIn("isPreviousTestStillInProgress(errorMessage)", run_server_function)
+        self.assertIn("previousTestInProgressError(errorMessage)", run_server_function)
 
     def test_start_play_waits_for_helper_control_ready(self) -> None:
         session_control = (REPO / "plugin/src/Utils/StudioSessionControl.luau").read_text(encoding="utf-8")

@@ -505,6 +505,14 @@ local function isPreviousTestStillInProgress(errorMessage: string): boolean
 		)
 end
 
+local function previousTestInProgressError(errorMessage: string): string
+	return "previous_test_in_progress: StudioTestService still has a previous test in progress; "
+		.. "start_play or run_server was not retried. "
+		.. "Restart Studio before launching again; start_stop_play(stop) is not a recovery path when the helper snapshot is already stop. "
+		.. "Original error: "
+		.. errorMessage
+end
+
 local function startAsyncCall(executor: () -> any): AsyncCallState
 	local state: AsyncCallState = {
 		done = false,
@@ -608,12 +616,7 @@ local function waitForStartPlayLog(
 			if isPreviousTestStillInProgress(errorMessage) then
 				removeSessionControlScript()
 				StudioModeTracker.recordTransitionError(commandId, errorMessage)
-				error(
-					"StudioTestService still has a previous test in progress; start_play was not retried. "
-						.. "Call start_stop_play(stop) once and inspect Studio logs before retrying. "
-						.. "Original error: "
-						.. errorMessage
-				)
+				error(previousTestInProgressError(errorMessage))
 			end
 			if getStudioMode() == "stop" then
 				removeSessionControlScript()
@@ -745,6 +748,10 @@ local function startRunServerMode(executor: () -> any, successMessage: string): 
 	if not success then
 		local errorMessage = tostring(result)
 		StudioModeTracker.recordTransitionError(commandId, errorMessage)
+		if isPreviousTestStillInProgress(errorMessage) then
+			removeSessionControlScript()
+			error(previousTestInProgressError(errorMessage))
+		end
 		error(errorMessage)
 	end
 

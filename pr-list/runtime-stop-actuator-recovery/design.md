@@ -38,6 +38,18 @@ EndTest: can only be called from the server DataModel of a running Studio play s
 
 关键原因：Studio 处于 playing 时，edit 插件运行时可能挂起；把 stop request 交给 edit 插件会在最需要 stop 的时候变成无人消费的请求。
 
+### `previous_test_in_progress` 不是普通 stop
+
+还有一种独立故障：helper / plugin 可见快照已经是 `studio_mode=stop`、`studio_transition_phase=idle`、`edit_runtime_state=ready`，但下一次 `launch_studio_session(start_play|run_server)` 调用 `StudioTestService` 时，Roblox 仍返回 previous test still in progress。
+
+这个状态只允许在 `launch_studio_session` 收到 StudioTestService 的明确 previous-test 错误时确认。它不是新的 `studio_mode`，不是新的 `studio_transition_phase`，也不是 `controlled running` 或 `uncontrolled_play_session`。
+
+对外稳定错误码为 `previous_test_in_progress`。`dirty stop` 只能作为解释性描述，不能作为另一个对外 code。
+
+该场景下不得提示调用 `start_stop_play(stop)` 作为恢复手段：既然 helper 快照已经是 stop，普通 stop 会被视为 no-op；而让 edit 插件直接调用 `StudioTestService:EndTest` 又违反 runtime 边界。安全恢复动作是重启 Studio 后重新 launch。helper 只在本机链路自身异常时才需要处理；这不是 hub 管理动作，也不包含 block-helper、force release 或修改 hub state。
+
+错误返回必须保留原始 StudioTestService 错误和当时 helper snapshot，便于区分真实 previous-test 残留和普通 `mcp_not_ready`。
+
 ## 目标
 
 - 保持对外启动唯一入口：`launch_studio_session`。
@@ -53,6 +65,7 @@ EndTest: can only be called from the server DataModel of a running Studio play s
 - 不恢复 `StartStopPlay(start_play)` 或 `StartStopPlay(run_server)`。
 - 不允许 `run_code` 调 Studio 控制 API。
 - 不恢复隐藏 play/stop retry。
+- 不把 `previous_test_in_progress` 伪装成普通 `mcp_not_ready`、普通 stop 或自动 retry。
 - 不把 helper 私有 HTTP 入口写进 README、skill、bridge 文档或 LLM 可调用入口。
 - 不把 `/v1/mcp/plugin/stop-request` 暴露为对外调试脚本入口。
 - 不恢复简单 `/stop-ack` 作为完成语义；旧 ack 只能证明 runtime 看到了请求，不能证明 stop 成功。
@@ -278,6 +291,7 @@ stopping_requested / stopping
 - `StudioSessionControl.stop()` 不包含 `StudioTestService:EndTest`。
 - `StudioSessionControl.handleStartStopPlay()` 不登记 stop intent，不等待 stop log；playing stop 不依赖 edit 插件 long-poll。
 - MCP server 的 `launch_studio_session` / `start_stop_play(stop)` control preflight 在 running 且非 fresh ready heartbeat 时必须 fail fast 为 `uncontrolled_play_session`。
+- `previous_test_in_progress` 文案必须明确要求重启 Studio，不得建议 `start_stop_play(stop)`。
 - helper / MCP control handler 直接登记 stop intent，并在 fresh heartbeat 缺失时 fail fast。
 - `installSessionControlScript()` 生成的 server script 包含内部 stop actuator。
 - 生成的 server script 不包含启动 API：`ExecutePlayModeAsync` / `ExecuteRunModeAsync`。
@@ -292,6 +306,8 @@ stopping_requested / stopping
 
 - lost/uncontrolled running session 的 stop POST 返回 `uncontrolled_play_session`，且不递增 `stop_request_id`。
 - MCP server control preflight 对 lost/uncontrolled running session 返回 `uncontrolled_play_session`，不把请求继续派发给 helper。
+- bridge 错误映射必须把 StudioTestService previous-test 错误归类为 `previous_test_in_progress` / `restart_studio` / `retryable=false`，并且该判断必须位于普通 `mcp_not_ready` 兜底之前。
+- 普通 MCP / Studio mode 失败不得被误判为 `previous_test_in_progress`。
 - fresh heartbeat running session 的 stop POST 成功进入 `stopping_requested`。
 - duplicate stop 返回 `studio_stop_in_progress`。
 - GET stop-request 在 idle/error/lost 时不重放旧 stop。

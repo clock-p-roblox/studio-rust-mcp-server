@@ -893,7 +893,7 @@ impl ServerHandler for RBXStudioServer {
 get_studio_mode is for diagnostics and stop-path checks, not the normal launch entrypoint.
 Use run_code to query or edit the Roblox Studio place while Studio is in stop/edit mode.
 Only launch_studio_session may enter start_play or run_server. start_stop_play is stop-only.
-If Studio control reports a previous test is still pending after its settle wait, stop once with start_stop_play(stop) and inspect Studio logs; do not recover by sending another play+stop loop.
+If Studio control reports previous_test_in_progress after its settle wait, restart Studio before launching again. Do not call start_stop_play(stop) as recovery when the helper snapshot is already stop, and do not recover by sending another play+stop loop.
 If status reports studio_transition_phase=stopping_requested or stopping_observed, wait for stop/idle instead of issuing another play or stop command.
 If status reports an uncontrolled play session, do not issue start_stop_play(stop); restore fresh runtime control or rebuild the session before launching again.
 "
