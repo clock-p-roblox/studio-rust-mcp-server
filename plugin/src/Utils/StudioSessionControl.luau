@@ -714,10 +714,7 @@ local function handleStartStopPlay(startStopPlayArgs: Types.StartStopPlayArgs): 
 	error("Invalid mode in StartStopPlay; start_stop_play only supports stop. Use LaunchStudioSession to enter start_play or run_server.")
 end
 
-local function buildLaunchMessage(requestedMode: Types.TestMode, restartApplied: boolean): string
-	if restartApplied then
-		return string.format("Stopped the previous Studio session and launched %s.", requestedMode)
-	end
+local function buildLaunchMessage(requestedMode: Types.TestMode): string
 	return string.format("Launched Studio session in %s.", requestedMode)
 end
 
@@ -732,10 +729,9 @@ local function handleLaunchStudioSession(launchStudioSessionArgs: Types.LaunchSt
 	local requestedMode = launchStudioSessionArgs.mode
 	local previousMode = getStudioMode()
 	local previousSnapshot = StudioModeTracker.getSnapshot()
-	local restartApplied = previousMode ~= "stop" or previousSnapshot.pendingStartId ~= 0
 	local actions = {}
 
-	if restartApplied then
+	if previousMode ~= "stop" or previousSnapshot.pendingStartId ~= 0 then
 		logTransitionStage(
 			requestedMode,
 			"rejected_restart_without_helper_stop",
@@ -760,11 +756,9 @@ local function handleLaunchStudioSession(launchStudioSessionArgs: Types.LaunchSt
 
 	return HttpService:JSONEncode({
 		requested_mode = requestedMode,
-		restart_applied = restartApplied,
-		previous_mode = previousMode,
 		final_mode = finalMode,
 		actions = actions,
-		message = buildLaunchMessage(requestedMode, restartApplied),
+		message = buildLaunchMessage(requestedMode),
 	})
 end
 

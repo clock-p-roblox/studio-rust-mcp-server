@@ -451,6 +451,20 @@ struct StartStopPlayCommandArgs {
     mode: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct LaunchStudioSessionCommandArgs {
+    mode: String,
+}
+
+fn validate_launch_studio_session_mode(mode: &str) -> Result<()> {
+    match mode {
+        "start_play" | "run_server" => Ok(()),
+        _ => Err(eyre!(
+            "launch_studio_session only supports start_play or run_server"
+        )),
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct HelperStatusResponse {
     helper_port: u16,
@@ -487,6 +501,8 @@ struct ClaimedTaskStatus {
     remote_last_error: Option<String>,
     remote_last_ready_age_ms: Option<u128>,
     remote_last_server_message_age_ms: Option<u128>,
+    studio_session_state: String,
+    studio_session_state_age_ms: Option<u128>,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
     studio_mode_source: String,
@@ -581,6 +597,8 @@ struct HelperHeartbeatTaskStatus {
     remote_last_error: Option<String>,
     remote_last_ready_age_ms: Option<u128>,
     remote_last_server_message_age_ms: Option<u128>,
+    studio_session_state: String,
+    studio_session_state_age_ms: Option<u128>,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
     studio_mode_source: String,
@@ -660,6 +678,8 @@ struct HelperInstanceStatus {
     task_id: Option<String>,
     remote_base_url: String,
     studio_pid: Option<u32>,
+    studio_session_state: String,
+    studio_session_state_age_ms: Option<u128>,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
     studio_mode_source: String,
@@ -2344,12 +2364,16 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
         .map(|(instance_id, instance)| {
             let stop_snapshot = instance_stop_request_snapshot(instance);
             let studio_log_snapshot = instance_studio_log_snapshot(instance);
+            let (studio_session_state, studio_session_state_age_ms) =
+                instance_studio_session_state(instance);
             HelperInstanceStatus {
                 instance_id: instance_id.clone(),
                 place_id: instance.place_id.clone(),
                 task_id: instance.task_id.clone(),
                 remote_base_url: instance.remote_base_url.clone(),
                 studio_pid: instance.studio_pid,
+                studio_session_state,
+                studio_session_state_age_ms,
                 studio_log_bound: studio_log_snapshot.studio_log_bound,
                 studio_log_path: studio_log_snapshot.studio_log_path,
                 studio_log_bound_age_ms: studio_log_snapshot.studio_log_bound_age_ms,
@@ -2398,7 +2422,7 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
             ) = task_official_adapter_snapshot(
                 &state,
                 &task.task_id,
-                studio_snapshot.studio_mode.as_deref(),
+                &studio_snapshot.studio_session_state,
             );
             let launch_process = state.launch_processes.get(&task.task_id);
             let studio_log_snapshot = task_studio_log_snapshot(&state, &task.task_id);
@@ -2443,6 +2467,8 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
                         .last_server_message_at
                         .map(|value| value.elapsed().as_millis())
                 }),
+                studio_session_state: studio_snapshot.studio_session_state,
+                studio_session_state_age_ms: studio_snapshot.studio_session_state_age_ms,
                 studio_mode: studio_snapshot.studio_mode,
                 studio_mode_age_ms: studio_snapshot.studio_mode_age_ms,
                 studio_mode_source: studio_snapshot.studio_mode_source,
@@ -3654,6 +3680,8 @@ struct StopRequestStatusSnapshot {
 
 #[derive(Clone, Debug)]
 struct StudioTaskStatusSnapshot {
+    studio_session_state: String,
+    studio_session_state_age_ms: Option<u128>,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
     studio_mode_source: String,
@@ -3961,6 +3989,63 @@ fn edit_runtime_state(instance: &PluginInstance) -> String {
     }
 }
 
+fn studio_session_state_rank(state: &str) -> u8 {
+    match state {
+        "stopping" => 0,
+        "play" => 1,
+        "starting_play" => 2,
+        "stop" => 3,
+        "none_response" => 4,
+        "none_connected" => 5,
+        _ => 6,
+    }
+}
+
+fn instance_studio_session_state(instance: &PluginInstance) -> (String, Option<u128>) {
+    let transition_phase = effective_studio_transition_phase(instance);
+    if is_stopping_transition_phase(&transition_phase) {
+        return (
+            "stopping".to_owned(),
+            instance
+                .studio_transition_started_at
+                .map(|value| value.elapsed().as_millis()),
+        );
+    }
+
+    if studio_mode_is_running(instance.studio_mode.as_deref()) {
+        if instance_has_fresh_control(instance) {
+            return (
+                "play".to_owned(),
+                instance
+                    .studio_control_observed_at
+                    .map(|value| value.elapsed().as_millis()),
+            );
+        }
+        return (
+            "starting_play".to_owned(),
+            instance
+                .studio_transition_started_at
+                .or(instance.studio_mode_observed_at)
+                .map(|value| value.elapsed().as_millis()),
+        );
+    }
+
+    if instance.studio_mode.as_deref() == Some("stop") && edit_runtime_state(instance) == "ready" {
+        return (
+            "stop".to_owned(),
+            instance
+                .edit_runtime_observed_at
+                .or(instance.studio_mode_observed_at)
+                .map(|value| value.elapsed().as_millis()),
+        );
+    }
+
+    (
+        "none_response".to_owned(),
+        Some(instance.last_seen_at.elapsed().as_millis()),
+    )
+}
+
 fn update_instance_studio_mode(
     state: &mut HelperState,
     instance_id: &str,
@@ -3997,66 +4082,50 @@ fn task_studio_mode_snapshot(state: &HelperState, task_id: &str) -> StudioTaskSt
         .instances
         .values()
         .filter(|instance| instance.task_id.as_deref() == Some(task_id))
-        .filter_map(|instance| {
-            let observed_at = instance.studio_mode_observed_at?;
+        .map(|instance| {
+            let (studio_session_state, studio_session_state_age_ms) =
+                instance_studio_session_state(instance);
             let stop_snapshot = instance_stop_request_snapshot(instance);
-            Some((
-                instance.studio_mode.clone(),
-                observed_at.elapsed().as_millis(),
-                instance.studio_mode_source.clone(),
-                effective_studio_control_state(instance),
-                effective_studio_transition_phase(instance),
-                instance
+            StudioTaskStatusSnapshot {
+                studio_session_state,
+                studio_session_state_age_ms,
+                studio_mode: instance.studio_mode.clone(),
+                studio_mode_age_ms: instance
+                    .studio_mode_observed_at
+                    .map(|value| value.elapsed().as_millis()),
+                studio_mode_source: instance.studio_mode_source.clone(),
+                studio_control_state: effective_studio_control_state(instance),
+                studio_transition_phase: effective_studio_transition_phase(instance),
+                studio_transition_age_ms: instance
                     .studio_transition_started_at
                     .map(|value| value.elapsed().as_millis()),
-                edit_runtime_state(instance),
-                instance
+                edit_runtime_state: edit_runtime_state(instance),
+                edit_runtime_age_ms: instance
                     .edit_runtime_observed_at
                     .map(|value| value.elapsed().as_millis()),
-                instance.studio_control_last_error.clone(),
-                stop_snapshot,
-            ))
+                studio_control_last_error: instance.studio_control_last_error.clone(),
+                last_stop_request_id: stop_snapshot.last_stop_request_id,
+                last_stop_request_age_ms: stop_snapshot.last_stop_request_age_ms,
+                last_stop_request_source: stop_snapshot.last_stop_request_source,
+                last_stop_request_error: stop_snapshot.last_stop_request_error,
+                stop_intent_recorded: stop_snapshot.stop_intent_recorded,
+                stop_request_available: stop_snapshot.stop_request_available,
+                stop_request_consumed: stop_snapshot.stop_request_consumed,
+                end_test_requested: stop_snapshot.end_test_requested,
+                runtime_actuator_last_poll_id: stop_snapshot.runtime_actuator_last_poll_id,
+                runtime_actuator_last_poll_age_ms: stop_snapshot.runtime_actuator_last_poll_age_ms,
+                runtime_actuator_last_error: stop_snapshot.runtime_actuator_last_error,
+            }
         })
-        .min_by_key(|(_, age, _, _, _, _, _, _, _, _)| *age)
-        .and_then(
-            |(
-                mode,
-                age,
-                mode_source,
-                control_state,
-                transition_phase,
-                transition_age_ms,
-                edit_runtime_state,
-                edit_runtime_age_ms,
-                control_last_error,
-                stop_snapshot,
-            )| {
-                mode.map(|mode| StudioTaskStatusSnapshot {
-                    studio_mode: Some(mode),
-                    studio_mode_age_ms: Some(age),
-                    studio_mode_source: mode_source,
-                    studio_control_state: control_state,
-                    studio_transition_phase: transition_phase,
-                    studio_transition_age_ms: transition_age_ms,
-                    edit_runtime_state,
-                    edit_runtime_age_ms,
-                    studio_control_last_error: control_last_error,
-                    last_stop_request_id: stop_snapshot.last_stop_request_id,
-                    last_stop_request_age_ms: stop_snapshot.last_stop_request_age_ms,
-                    last_stop_request_source: stop_snapshot.last_stop_request_source,
-                    last_stop_request_error: stop_snapshot.last_stop_request_error,
-                    stop_intent_recorded: stop_snapshot.stop_intent_recorded,
-                    stop_request_available: stop_snapshot.stop_request_available,
-                    stop_request_consumed: stop_snapshot.stop_request_consumed,
-                    end_test_requested: stop_snapshot.end_test_requested,
-                    runtime_actuator_last_poll_id: stop_snapshot.runtime_actuator_last_poll_id,
-                    runtime_actuator_last_poll_age_ms: stop_snapshot
-                        .runtime_actuator_last_poll_age_ms,
-                    runtime_actuator_last_error: stop_snapshot.runtime_actuator_last_error,
-                })
-            },
-        )
+        .min_by_key(|snapshot| {
+            (
+                studio_session_state_rank(&snapshot.studio_session_state),
+                snapshot.studio_session_state_age_ms.unwrap_or(u128::MAX),
+            )
+        })
         .unwrap_or(StudioTaskStatusSnapshot {
+            studio_session_state: "none_connected".to_owned(),
+            studio_session_state_age_ms: None,
             studio_mode: None,
             studio_mode_age_ms: None,
             studio_mode_source: "none".to_owned(),
@@ -4116,16 +4185,16 @@ fn task_studio_log_snapshot(state: &HelperState, task_id: &str) -> StudioLogStat
 fn task_official_adapter_snapshot(
     state: &HelperState,
     task_id: &str,
-    studio_mode: Option<&str>,
+    studio_session_state: &str,
 ) -> (String, Option<u128>, Option<String>) {
     let Some(record) = state.official_adapter_states.get(task_id) else {
         return ("not_started".to_owned(), None, None);
     };
     let state_name = if record.state == "ready" {
-        match studio_mode {
-            Some("stop") => "ready".to_owned(),
-            Some(_) => "blocked_by_studio_mode".to_owned(),
-            None => "stale".to_owned(),
+        match studio_session_state {
+            "stop" => "ready".to_owned(),
+            "none_response" | "none_connected" => "stale".to_owned(),
+            _ => "blocked_by_studio_mode".to_owned(),
         }
     } else {
         record.state.clone()
@@ -4145,9 +4214,11 @@ fn helper_task_status_snapshot(state: &HelperState, task_id: &str) -> HelperTask
     let studio_snapshot = task_studio_mode_snapshot(state, task_id);
     let studio_log_snapshot = task_studio_log_snapshot(state, task_id);
     let (official_state, official_age_ms, official_last_error) =
-        task_official_adapter_snapshot(state, task_id, studio_snapshot.studio_mode.as_deref());
+        task_official_adapter_snapshot(state, task_id, &studio_snapshot.studio_session_state);
     HelperTaskStatusSnapshot {
         task_id: task_id.to_owned(),
+        studio_session_state: Some(studio_snapshot.studio_session_state),
+        studio_session_state_age_ms: ws_age_ms(studio_snapshot.studio_session_state_age_ms),
         studio_mode: studio_snapshot.studio_mode,
         studio_mode_age_ms: ws_age_ms(studio_snapshot.studio_mode_age_ms),
         studio_mode_source: Some(studio_snapshot.studio_mode_source),
@@ -4249,7 +4320,7 @@ fn heartbeat_task_statuses(state: &HelperState) -> Vec<HelperHeartbeatTaskStatus
             ) = task_official_adapter_snapshot(
                 state,
                 &task.task_id,
-                studio_snapshot.studio_mode.as_deref(),
+                &studio_snapshot.studio_session_state,
             );
             HelperHeartbeatTaskStatus {
                 task_id: task.task_id.clone(),
@@ -4267,6 +4338,8 @@ fn heartbeat_task_statuses(state: &HelperState) -> Vec<HelperHeartbeatTaskStatus
                         .last_server_message_at
                         .map(|value| value.elapsed().as_millis())
                 }),
+                studio_session_state: studio_snapshot.studio_session_state,
+                studio_session_state_age_ms: studio_snapshot.studio_session_state_age_ms,
                 studio_mode: studio_snapshot.studio_mode,
                 studio_mode_age_ms: studio_snapshot.studio_mode_age_ms,
                 studio_mode_source: studio_snapshot.studio_mode_source,
@@ -6368,7 +6441,8 @@ async fn handle_remote_command(
             handle_helper_start_stop_play(app, place_id, task_id, payload).await
         }
         "LaunchStudioSession" | "launch_studio_session" => {
-            stop_running_session_before_launch_if_needed(app.clone(), place_id, task_id).await?;
+            let args: LaunchStudioSessionCommandArgs = serde_json::from_value(payload)?;
+            validate_launch_studio_session_mode(&args.mode)?;
             forward_to_plugin(app, place_id, task_id, command).await
         }
         _ => forward_to_plugin(app, place_id, task_id, command).await,
@@ -6495,71 +6569,6 @@ async fn handle_helper_start_stop_play(
         None,
     );
     stop_control_success_text("Stopped", diagnostics)
-}
-
-async fn stop_running_session_before_launch_if_needed(
-    app: AppState,
-    place_id: &str,
-    task_id: Option<&str>,
-) -> Result<()> {
-    let wait_for_stop = {
-        let mut state = app.state.lock().await;
-        cleanup_stale_instances(&mut state);
-        sync_remote_connections(&app, &mut state);
-        let Some(selected_instance_id) =
-            select_instance_for_route(place_id, task_id, &state.instances)
-        else {
-            return Ok(());
-        };
-        ensure_studio_control_slot_available(&state, &selected_instance_id, "LaunchStudioSession")?;
-        let instance = state
-            .instances
-            .get(&selected_instance_id)
-            .ok_or_else(|| eyre!("selected helper instance disappeared"))?;
-        if !studio_mode_is_running(instance.studio_mode.as_deref()) {
-            return Ok(());
-        }
-        if is_stopping_transition_phase(&effective_studio_transition_phase(instance)) {
-            Some((
-                selected_instance_id,
-                instance.task_id.clone(),
-                instance.stop_request_id,
-            ))
-        } else {
-            let recorded = match record_stop_request_for_instance(
-                &mut state,
-                &selected_instance_id,
-                "launch_studio_session",
-            ) {
-                Ok(recorded) => recorded,
-                Err(StopRequestRecordError::MissingInstance) => {
-                    return Err(eyre!("selected helper instance disappeared"));
-                }
-                Err(StopRequestRecordError::Rejected(reason)) => {
-                    return Err(eyre!(reason));
-                }
-            };
-            if let Some(task_id) = recorded.task_id.as_deref() {
-                queue_task_status_updates(&state, &app.helper, task_id);
-            }
-            Some((
-                selected_instance_id,
-                recorded.task_id.clone(),
-                recorded.stop_request_id,
-            ))
-        }
-    };
-
-    if let Some((instance_id, task_id_to_queue, stop_request_id)) = wait_for_stop {
-        wait_for_helper_observed_stop(
-            app,
-            &instance_id,
-            task_id_to_queue.as_deref(),
-            stop_request_id,
-        )
-        .await?;
-    }
-    Ok(())
 }
 
 async fn wait_for_helper_observed_stop(

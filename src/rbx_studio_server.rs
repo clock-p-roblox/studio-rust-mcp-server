@@ -111,9 +111,13 @@ pub struct StatusResponse {
     hub_base_url: Option<String>,
     hub_snapshot_error: Option<String>,
     task_services_ready: bool,
+    helper_route_ready: bool,
+    launch_chain_ready: bool,
     launch_ready: bool,
     edit_ready: bool,
     official_ready: bool,
+    studio_session_state: Option<String>,
+    studio_session_state_age_ms: Option<u128>,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
     studio_mode_source: Option<String>,
@@ -188,6 +192,10 @@ struct HubHelperActiveTaskPayload {
     #[serde(default)]
     remote_state: String,
     #[serde(default)]
+    studio_session_state: Option<String>,
+    #[serde(default)]
+    studio_session_state_age_ms: Option<u128>,
+    #[serde(default)]
     studio_mode: Option<String>,
     #[serde(default)]
     studio_mode_age_ms: Option<u128>,
@@ -246,6 +254,8 @@ struct HubTaskRuntimeSnapshot {
     task_accepting_launches: bool,
     task_services_healthy: bool,
     remote_state: Option<String>,
+    studio_session_state: Option<String>,
+    studio_session_state_age_ms: Option<u128>,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
     studio_mode_source: Option<String>,
@@ -290,23 +300,27 @@ impl HubTaskRuntimeSnapshot {
     }
 
     fn studio_snapshot_fresh(&self) -> bool {
-        self.studio_mode_age_ms
+        self.studio_session_state_age_ms
             .map(|age| age <= HELPER_TASK_STATUS_STALE_AFTER.as_millis())
             .unwrap_or(false)
     }
 
+    fn helper_route_ready(&self) -> bool {
+        self.helper_snapshot_fresh() && self.helper_remote_ready() && !self.helper_blocked
+    }
+
+    fn launch_chain_ready(&self) -> bool {
+        self.task_services_ready() && self.helper_route_ready()
+    }
+
     fn launch_ready(&self) -> bool {
-        self.task_services_ready()
-            && self.helper_snapshot_fresh()
-            && self.helper_remote_ready()
-            && !self.helper_blocked
+        self.launch_chain_ready()
     }
 
     fn edit_ready(&self) -> bool {
-        self.launch_ready()
+        self.launch_chain_ready()
             && self.studio_snapshot_fresh()
-            && self.studio_mode.as_deref() == Some("stop")
-            && self.edit_runtime_state.as_deref() == Some("ready")
+            && self.studio_session_state.as_deref() == Some("stop")
     }
 
     fn official_ready(&self) -> bool {
@@ -434,6 +448,12 @@ fn snapshot_from_hub_status_payload(
         remote_state: active_task_match
             .as_ref()
             .map(|active_task| active_task.remote_state.clone()),
+        studio_session_state: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.studio_session_state.clone()),
+        studio_session_state_age_ms: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.studio_session_state_age_ms),
         studio_mode: active_task_match
             .as_ref()
             .and_then(|active_task| active_task.studio_mode.clone()),
@@ -598,66 +618,86 @@ async fn require_stop_mode_snapshot(
     action: &str,
 ) -> Result<HubTaskRuntimeSnapshot, ErrorData> {
     let snapshot = fetch_hub_snapshot_for_gate(hub_client, task_id, action).await?;
-    ensure_reported_age_fresh(action, "studio_mode", snapshot.studio_mode_age_ms)?;
-    match snapshot.studio_mode.as_deref() {
+    ensure_reported_age_fresh(
+        action,
+        "studio_session_state",
+        snapshot.studio_session_state_age_ms,
+    )?;
+    match snapshot.studio_session_state.as_deref() {
         Some("stop") => Ok(snapshot),
-        Some(mode) => Err(ErrorData::internal_error(
-            format!("{action} failed fast: studio_mode_not_stop current_mode={mode}"),
+        Some(state) => Err(ErrorData::internal_error(
+            format!("{action} failed fast: studio_session_state_not_stop current_state={state}"),
             None,
         )),
         None => Err(ErrorData::internal_error(
-            format!("{action} failed fast: studio_mode_unknown"),
+            format!("{action} failed fast: studio_session_state_unknown"),
             None,
         )),
     }
 }
 
-fn studio_mode_is_running(mode: Option<&str>) -> bool {
-    matches!(mode, Some("start_play") | Some("run_server"))
-}
-
-fn studio_transition_is_stopping(phase: Option<&str>) -> bool {
-    matches!(phase, Some("stopping_requested"))
-}
-
-fn require_studio_control_snapshot(
+fn require_launch_studio_session_snapshot(
     snapshot: &HubTaskRuntimeSnapshot,
     action: &str,
 ) -> Result<(), ErrorData> {
-    let Some(mode) = snapshot.studio_mode.as_deref() else {
-        return Ok(());
-    };
-    if !studio_mode_is_running(Some(mode)) {
-        return Ok(());
-    }
-
-    ensure_reported_age_fresh(action, "studio_mode", snapshot.studio_mode_age_ms)?;
-    let transition_phase = snapshot
-        .studio_transition_phase
-        .as_deref()
-        .unwrap_or("unknown");
-    if studio_transition_is_stopping(Some(transition_phase)) {
-        return Err(ErrorData::internal_error(
-            format!(
-                "{action} failed fast: studio_stop_in_progress current_mode={mode} transition_phase={transition_phase}"
-            ),
+    ensure_reported_age_fresh(
+        action,
+        "studio_session_state",
+        snapshot.studio_session_state_age_ms,
+    )?;
+    match snapshot.studio_session_state.as_deref() {
+        Some("stop") => Ok(()),
+        Some("play") => Err(ErrorData::internal_error(
+            format!("{action} failed fast: studio_already_playing"),
             None,
-        ));
-    }
-    if snapshot.studio_control_state.as_deref() != Some("ready") {
-        return Err(ErrorData::internal_error(
-            format!(
-                "{action} failed fast: uncontrolled_play_session current_mode={mode} studio_control_state={} transition_phase={transition_phase}",
-                snapshot
-                    .studio_control_state
-                    .as_deref()
-                    .unwrap_or("unknown")
-            ),
+        )),
+        Some("starting_play") => Err(ErrorData::internal_error(
+            format!("{action} failed fast: launch_already_in_progress"),
             None,
-        ));
+        )),
+        Some("stopping") => Err(ErrorData::internal_error(
+            format!("{action} failed fast: studio_stop_in_progress"),
+            None,
+        )),
+        Some(state) => Err(ErrorData::internal_error(
+            format!("{action} failed fast: studio_session_unavailable state={state}"),
+            None,
+        )),
+        None => Err(ErrorData::internal_error(
+            format!("{action} failed fast: studio_session_state_unknown"),
+            None,
+        )),
     }
+}
 
-    Ok(())
+fn require_start_stop_play_snapshot(
+    snapshot: &HubTaskRuntimeSnapshot,
+    action: &str,
+) -> Result<(), ErrorData> {
+    ensure_reported_age_fresh(
+        action,
+        "studio_session_state",
+        snapshot.studio_session_state_age_ms,
+    )?;
+    match snapshot.studio_session_state.as_deref() {
+        Some("stop") | Some("play") => Ok(()),
+        Some("starting_play") => Err(ErrorData::internal_error(
+            format!("{action} failed fast: launch_already_in_progress"),
+            None,
+        )),
+        Some("stopping") => Err(ErrorData::internal_error(
+            format!("{action} failed fast: studio_stop_in_progress"),
+            None,
+        )),
+        Some(state) => Err(ErrorData::internal_error(
+            format!("{action} failed fast: studio_session_unavailable state={state}"),
+            None,
+        )),
+        None => Err(ErrorData::internal_error(
+            format!("{action} failed fast: studio_session_state_unknown"),
+            None,
+        )),
+    }
 }
 
 async fn require_official_adapter_ready_snapshot(
@@ -804,6 +844,8 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
     let mut studio_mode = None;
     let mut studio_mode_age_ms = None;
     let mut studio_mode_source = None;
+    let mut studio_session_state = None;
+    let mut studio_session_state_age_ms = None;
     let mut studio_control_state = None;
     let mut studio_transition_phase = None;
     let mut studio_transition_age_ms = None;
@@ -825,6 +867,8 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
     let mut official_mcp_adapter_age_ms = None;
     let mut official_mcp_adapter_last_error = None;
     let mut task_services_ready = false;
+    let mut helper_route_ready = false;
+    let mut launch_chain_ready = false;
     let mut launch_ready = false;
     let mut edit_ready = false;
     let mut official_ready = false;
@@ -837,9 +881,13 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
             Ok(snapshot) => {
                 status_source = "hub".to_owned();
                 task_services_ready = snapshot.task_services_ready();
+                helper_route_ready = snapshot.helper_route_ready();
+                launch_chain_ready = snapshot.launch_chain_ready();
                 launch_ready = snapshot.launch_ready();
                 edit_ready = snapshot.edit_ready();
                 official_ready = snapshot.official_ready();
+                studio_session_state = snapshot.studio_session_state;
+                studio_session_state_age_ms = snapshot.studio_session_state_age_ms;
                 studio_mode = snapshot.studio_mode;
                 studio_mode_age_ms = snapshot.studio_mode_age_ms;
                 studio_mode_source = snapshot.studio_mode_source;
@@ -892,9 +940,13 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
         hub_base_url,
         hub_snapshot_error,
         task_services_ready,
+        helper_route_ready,
+        launch_chain_ready,
         launch_ready,
         edit_ready,
         official_ready,
+        studio_session_state,
+        studio_session_state_age_ms,
         studio_mode,
         studio_mode_age_ms,
         studio_mode_source,
@@ -1005,13 +1057,14 @@ impl ServerHandler for RBXStudioServer {
                 website_url: None,
             },
             instructions: Some(
-                "Prefer using launch_studio_session for high-level launches into start_play or run_server.
-get_studio_mode is for diagnostics and stop-path checks, not the normal launch entrypoint.
+                "Use launch_studio_session only after status shows studio_session_state=stop.
+get_studio_mode is for diagnostics, not the normal launch or stop entrypoint.
 Use run_code to query or edit the Roblox Studio place while Studio is in stop/edit mode.
 Only launch_studio_session may enter start_play or run_server. start_stop_play is stop-only.
 If Studio control reports a previous test is still pending after its settle wait, stop once with start_stop_play(stop) and inspect Studio logs; do not recover by sending another play+stop loop.
-If status reports studio_transition_phase=stopping_requested, wait for stop/idle instead of issuing another play or stop command.
-If status reports an uncontrolled play session, do not issue start_stop_play(stop); restore fresh runtime control or rebuild the session before launching again.
+If status shows studio_session_state=play and a restart is intended, call start_stop_play(stop), wait until status returns studio_session_state=stop, then call launch_studio_session.
+If status shows studio_session_state=starting_play or stopping, wait for it to settle or report that the transition is still in progress.
+If status shows studio_session_state=none_response or none_connected, report that Studio session state is unavailable instead of guessing.
 "
                     .to_string(),
             ),
@@ -1210,7 +1263,7 @@ struct LaunchStudioSession {
     )]
     task_id: String,
     #[schemars(
-        description = "Target mode to launch into, must be start_play or run_server. The Windows side will stop any previous running session before launching."
+        description = "Target mode to launch into, must be start_play or run_server. This only starts from studio_session_state=stop; use start_stop_play(stop) first when restart is required."
     )]
     mode: String,
 }
@@ -1344,7 +1397,7 @@ impl RBXStudioServer {
     }
 
     #[tool(
-        description = "Launch Roblox Studio into start_play or run_server. This is the only MCP tool that may enter play/run. If Studio is already running, Windows stops it first and then launches the requested mode. Returns a JSON object with requested_mode, restart_applied, previous_mode, final_mode, actions, and message."
+        description = "Launch Roblox Studio into start_play or run_server. This is the only MCP tool that may enter play/run. It only starts from studio_session_state=stop and never stops an existing play/run session; callers that want restart must call start_stop_play(stop) first."
     )]
     async fn launch_studio_session(
         &self,
@@ -1693,7 +1746,15 @@ impl RBXStudioServer {
             let snapshot =
                 fetch_hub_snapshot_for_gate(hub_status_client, &requested_task_id, tool_name)
                     .await?;
-            require_studio_control_snapshot(&snapshot, tool_name)?;
+            match &command.args {
+                ToolArgumentValues::LaunchStudioSession(_) => {
+                    require_launch_studio_session_snapshot(&snapshot, tool_name)?;
+                }
+                ToolArgumentValues::StartStopPlay(_) => {
+                    require_start_stop_play_snapshot(&snapshot, tool_name)?;
+                }
+                _ => {}
+            }
         }
         let (tx, mut rx) = mpsc::unbounded_channel::<Result<String>>();
         let (trigger, uploads, queued_requests, pending_responses) = {
@@ -1917,14 +1978,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stop_mode_gate_rejects_stale_reported_studio_mode_age() {
+    fn stop_mode_gate_rejects_stale_reported_studio_session_state_age() {
         let error = ensure_reported_age_fresh(
             "insert_model",
-            "studio_mode",
+            "studio_session_state",
             Some(HELPER_TASK_STATUS_STALE_AFTER.as_millis() + 1),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("studio_mode_snapshot_stale"));
+        assert!(error
+            .to_string()
+            .contains("studio_session_state_snapshot_stale"));
     }
 
     #[test]
@@ -1953,6 +2016,8 @@ mod tests {
                 active_tasks: vec![HubHelperActiveTaskPayload {
                     task_id: "t_test".to_owned(),
                     remote_state: "connected".to_owned(),
+                    studio_session_state: Some("stop".to_owned()),
+                    studio_session_state_age_ms: Some(4),
                     studio_mode: Some("stop".to_owned()),
                     studio_mode_age_ms: Some(4),
                     studio_mode_source: Some("edit_plugin".to_owned()),
@@ -1982,6 +2047,7 @@ mod tests {
         let snapshot = snapshot_from_hub_status_payload(payload, "t_test").unwrap();
         assert_eq!(snapshot.helper_id.as_deref(), Some("h_test"));
         assert_eq!(snapshot.remote_state.as_deref(), Some("connected"));
+        assert_eq!(snapshot.studio_session_state.as_deref(), Some("stop"));
         assert_eq!(snapshot.studio_mode.as_deref(), Some("stop"));
         assert_eq!(snapshot.studio_control_state.as_deref(), Some("none"));
         assert_eq!(snapshot.studio_transition_phase.as_deref(), Some("idle"));
@@ -2030,6 +2096,8 @@ mod tests {
                 active_tasks: vec![HubHelperActiveTaskPayload {
                     task_id: "t_test".to_owned(),
                     remote_state: "connected".to_owned(),
+                    studio_session_state: Some("stop".to_owned()),
+                    studio_session_state_age_ms: Some(4),
                     studio_mode: Some("stop".to_owned()),
                     studio_mode_age_ms: Some(4),
                     studio_mode_source: Some("edit_plugin".to_owned()),
@@ -2089,6 +2157,8 @@ mod tests {
                 active_tasks: vec![HubHelperActiveTaskPayload {
                     task_id: "t_test".to_owned(),
                     remote_state: "connected".to_owned(),
+                    studio_session_state: Some("play".to_owned()),
+                    studio_session_state_age_ms: Some(4),
                     studio_mode: Some("start_play".to_owned()),
                     studio_mode_age_ms: Some(4),
                     studio_mode_source: Some("play_control".to_owned()),
@@ -2126,10 +2196,7 @@ mod tests {
         assert_eq!(snapshot.studio_transition_phase.as_deref(), Some("running"));
     }
 
-    fn running_studio_snapshot(
-        control_state: &str,
-        transition_phase: &str,
-    ) -> HubTaskRuntimeSnapshot {
+    fn studio_session_snapshot(session_state: &str) -> HubTaskRuntimeSnapshot {
         HubTaskRuntimeSnapshot {
             claimed_by_helper_id: Some("h_test".to_owned()),
             helper_id: Some("h_test".to_owned()),
@@ -2140,11 +2207,13 @@ mod tests {
             task_accepting_launches: true,
             task_services_healthy: true,
             remote_state: Some("connected".to_owned()),
+            studio_session_state: Some(session_state.to_owned()),
+            studio_session_state_age_ms: Some(4),
             studio_mode: Some("start_play".to_owned()),
             studio_mode_age_ms: Some(4),
             studio_mode_source: Some("play_control".to_owned()),
-            studio_control_state: Some(control_state.to_owned()),
-            studio_transition_phase: Some(transition_phase.to_owned()),
+            studio_control_state: Some("ready".to_owned()),
+            studio_transition_phase: Some("running".to_owned()),
             studio_transition_age_ms: None,
             edit_runtime_state: Some("stale".to_owned()),
             edit_runtime_age_ms: Some(20_000),
@@ -2167,30 +2236,33 @@ mod tests {
     }
 
     #[test]
-    fn studio_control_preflight_allows_controlled_running_session() {
-        let snapshot = running_studio_snapshot("ready", "running");
-        require_studio_control_snapshot(&snapshot, "launch_studio_session")
-            .expect("controlled running session should be stoppable/relaunchable");
+    fn launch_preflight_rejects_play_but_stop_preflight_allows_it() {
+        let snapshot = studio_session_snapshot("play");
+        let launch_error =
+            require_launch_studio_session_snapshot(&snapshot, "launch_studio_session")
+                .expect_err("launch must not stop and restart internally");
+        assert!(launch_error.to_string().contains("studio_already_playing"));
+        require_start_stop_play_snapshot(&snapshot, "start_stop_play")
+            .expect("play state should be stoppable");
     }
 
     #[test]
-    fn studio_control_preflight_rejects_uncontrolled_running_session() {
-        let snapshot = running_studio_snapshot("lost", "error");
-        let error = require_studio_control_snapshot(&snapshot, "launch_studio_session")
-            .expect_err("uncontrolled running session cannot be stopped or relaunched safely");
+    fn studio_control_preflight_rejects_unavailable_session_state() {
+        let snapshot = studio_session_snapshot("none_response");
+        let error = require_start_stop_play_snapshot(&snapshot, "start_stop_play")
+            .expect_err("unavailable session state cannot be controlled");
 
-        assert!(error.to_string().contains("uncontrolled_play_session"));
-        assert!(error.to_string().contains("studio_control_state=lost"));
+        assert!(error.to_string().contains("studio_session_unavailable"));
+        assert!(error.to_string().contains("none_response"));
     }
 
     #[test]
     fn studio_control_preflight_rejects_stop_in_progress() {
-        let snapshot = running_studio_snapshot("stopping", "stopping_requested");
-        let error = require_studio_control_snapshot(&snapshot, "start_stop_play")
+        let snapshot = studio_session_snapshot("stopping");
+        let error = require_start_stop_play_snapshot(&snapshot, "start_stop_play")
             .expect_err("stopping session must wait for stop/idle");
 
         assert!(error.to_string().contains("studio_stop_in_progress"));
-        assert!(error.to_string().contains("stopping_requested"));
     }
 
     #[test]
@@ -2219,6 +2291,8 @@ mod tests {
                 active_tasks: vec![HubHelperActiveTaskPayload {
                     task_id: "t_test".to_owned(),
                     remote_state: "connected".to_owned(),
+                    studio_session_state: Some("stop".to_owned()),
+                    studio_session_state_age_ms: Some(4),
                     studio_mode: Some("stop".to_owned()),
                     studio_mode_age_ms: Some(4),
                     studio_mode_source: Some("edit_plugin".to_owned()),
@@ -2886,6 +2960,12 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
                         plugin_instance_count,
                         task_status,
                     }) => {
+                        let studio_session_state = task_status
+                            .as_ref()
+                            .and_then(|status| status.studio_session_state.clone());
+                        let studio_session_state_age_ms = task_status
+                            .as_ref()
+                            .and_then(|status| status.studio_session_state_age_ms);
                         let studio_mode = task_status
                             .as_ref()
                             .and_then(|status| status.studio_mode.clone());
@@ -2910,6 +2990,8 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
                             place_id,
                             task_id = ?task_id,
                             plugin_instance_count,
+                            studio_session_state = ?studio_session_state,
+                            studio_session_state_age_ms = ?studio_session_state_age_ms,
                             studio_mode = ?studio_mode,
                             studio_mode_age_ms = ?studio_mode_age_ms,
                             official_mcp_adapter_state = ?official_mcp_adapter_state,

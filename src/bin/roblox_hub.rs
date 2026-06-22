@@ -110,6 +110,8 @@ struct HelperActiveTaskRecord {
     remote_last_error: Option<String>,
     remote_last_ready_age_ms: Option<u128>,
     remote_last_server_message_age_ms: Option<u128>,
+    studio_session_state: Option<String>,
+    studio_session_state_age_ms: Option<u128>,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
     studio_mode_source: Option<String>,
@@ -328,6 +330,10 @@ struct HelperActiveTaskHeartbeat {
     #[serde(default)]
     remote_last_server_message_age_ms: Option<u128>,
     #[serde(default)]
+    studio_session_state: Option<String>,
+    #[serde(default)]
+    studio_session_state_age_ms: Option<u128>,
+    #[serde(default)]
     studio_mode: Option<String>,
     #[serde(default)]
     studio_mode_age_ms: Option<u128>,
@@ -458,6 +464,8 @@ struct HelperActiveTaskPayload {
     remote_last_error: Option<String>,
     remote_last_ready_age_ms: Option<u128>,
     remote_last_server_message_age_ms: Option<u128>,
+    studio_session_state: Option<String>,
+    studio_session_state_age_ms: Option<u128>,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
     studio_mode_source: Option<String>,
@@ -947,6 +955,10 @@ fn helper_status_payload(helper: &HelperRecord, blocked: bool) -> HelperStatusPa
                     remote_last_error: task.remote_last_error.clone(),
                     remote_last_ready_age_ms: task.remote_last_ready_age_ms,
                     remote_last_server_message_age_ms: task.remote_last_server_message_age_ms,
+                    studio_session_state: task.studio_session_state.clone(),
+                    studio_session_state_age_ms: task
+                        .studio_session_state_age_ms
+                        .map(|age| age + age_delta),
                     studio_mode: task.studio_mode.clone(),
                     studio_mode_age_ms: task.studio_mode_age_ms.map(|age| age + age_delta),
                     studio_mode_source: task.studio_mode_source.clone(),
@@ -987,6 +999,8 @@ fn helper_status_payload(helper: &HelperRecord, blocked: bool) -> HelperStatusPa
                     remote_last_error: None,
                     remote_last_ready_age_ms: None,
                     remote_last_server_message_age_ms: None,
+                    studio_session_state: None,
+                    studio_session_state_age_ms: None,
                     studio_mode: None,
                     studio_mode_age_ms: None,
                     studio_mode_source: None,
@@ -1765,6 +1779,8 @@ async fn helper_heartbeat_handler(
                 remote_last_error: active_task.remote_last_error,
                 remote_last_ready_age_ms: active_task.remote_last_ready_age_ms,
                 remote_last_server_message_age_ms: active_task.remote_last_server_message_age_ms,
+                studio_session_state: active_task.studio_session_state,
+                studio_session_state_age_ms: active_task.studio_session_state_age_ms,
                 studio_mode: active_task.studio_mode,
                 studio_mode_age_ms: active_task.studio_mode_age_ms,
                 studio_mode_source: active_task.studio_mode_source,
@@ -2183,6 +2199,8 @@ mod tests {
                     remote_last_error: Some("still active".to_owned()),
                     remote_last_ready_age_ms: None,
                     remote_last_server_message_age_ms: None,
+                    studio_session_state: Some("play".to_owned()),
+                    studio_session_state_age_ms: Some(15),
                     studio_mode: Some("start_play".to_owned()),
                     studio_mode_age_ms: Some(15),
                     studio_mode_source: Some("play_control".to_owned()),

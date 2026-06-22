@@ -30,6 +30,13 @@ pub struct HelperHello {
 pub struct HelperTaskStatusSnapshot {
     #[serde(rename = "task_id", alias = "taskId")]
     pub task_id: String,
+    #[serde(rename = "studio_session_state", alias = "studioSessionState")]
+    pub studio_session_state: Option<String>,
+    #[serde(
+        rename = "studio_session_state_age_ms",
+        alias = "studioSessionStateAgeMs"
+    )]
+    pub studio_session_state_age_ms: Option<u64>,
     #[serde(rename = "studio_mode", alias = "studioMode")]
     pub studio_mode: Option<String>,
     #[serde(rename = "studio_mode_age_ms", alias = "studioModeAgeMs")]
@@ -388,6 +395,8 @@ mod tests {
             plugin_instance_count: 2,
             task_status: Some(HelperTaskStatusSnapshot {
                 task_id: "tf2a83d456a".to_owned(),
+                studio_session_state: Some("stop".to_owned()),
+                studio_session_state_age_ms: Some(42),
                 studio_mode: Some("stop".to_owned()),
                 studio_mode_age_ms: Some(42),
                 studio_mode_source: Some("edit_plugin".to_owned()),
@@ -424,6 +433,7 @@ mod tests {
         assert_eq!(encoded["task_id"], "tf2a83d456a");
         assert_eq!(encoded["plugin_instance_count"], 2);
         assert_eq!(encoded["task_status"]["task_id"], "tf2a83d456a");
+        assert_eq!(encoded["task_status"]["studio_session_state"], "stop");
         assert_eq!(encoded["task_status"]["studio_mode"], "stop");
         assert_eq!(encoded["task_status"]["studio_mode_source"], "edit_plugin");
         assert_eq!(encoded["task_status"]["studio_control_state"], "none");
@@ -453,8 +463,10 @@ mod tests {
             "place_id": "93795519121520",
             "task_id": "tf2a83d456a",
             "plugin_instance_count": 1,
-            "task_status": {
+                "task_status": {
                 "task_id": "tf2a83d456a",
+                "studio_session_state": "stop",
+                "studio_session_state_age_ms": 12,
                 "studio_mode": "stop",
                 "studio_mode_age_ms": 12,
                 "studio_mode_source": "edit_plugin",
@@ -474,6 +486,8 @@ mod tests {
         match decoded {
             HelperToServerMessage::Heartbeat { task_status, .. } => {
                 let status = task_status.expect("task_status should be present");
+                assert_eq!(status.studio_session_state.as_deref(), Some("stop"));
+                assert_eq!(status.studio_session_state_age_ms, Some(12));
                 assert_eq!(status.studio_mode_age_ms, Some(12));
                 assert_eq!(status.studio_mode_source.as_deref(), Some("edit_plugin"));
                 assert_eq!(status.studio_transition_age_ms, Some(4));
