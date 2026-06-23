@@ -6580,7 +6580,7 @@ async fn wait_for_helper_observed_stop(
     let deadline = Instant::now() + PLUGIN_STUDIO_CONTROL_REQUEST_TIMEOUT;
 
     loop {
-        let (last_mode, last_phase, last_edit_state, observed_stopped) = {
+        let (last_mode, last_phase, last_edit_state, observed_stopped, runtime_stop_error) = {
             let state = app.state.lock().await;
             let instance = state.instances.get(instance_id).ok_or_else(|| {
                 eyre!("Studio plugin instance disappeared while waiting for stop")
@@ -6592,10 +6592,27 @@ async fn wait_for_helper_observed_stop(
                 && instance.studio_mode.as_deref() == Some("stop")
                 && last_phase == "idle"
                 && last_edit_state == "ready";
-            (last_mode, last_phase, last_edit_state, observed_stopped)
+            let runtime_stop_error = if instance.stop_request_id == stop_request_id {
+                instance.runtime_actuator_last_error.clone()
+            } else {
+                None
+            };
+            (
+                last_mode,
+                last_phase,
+                last_edit_state,
+                observed_stopped,
+                runtime_stop_error,
+            )
         };
         if observed_stopped {
             return Ok(());
+        }
+        if let Some(error) = runtime_stop_error {
+            return Err(eyre!(
+                "runtime_stop_failed: play runtime failed to execute stop_request_id={stop_request_id}; task_id={}; reason={error}",
+                task_id.unwrap_or("<none>")
+            ));
         }
 
         if Instant::now() >= deadline {
