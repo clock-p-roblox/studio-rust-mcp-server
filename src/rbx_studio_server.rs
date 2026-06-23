@@ -515,9 +515,14 @@ fn studio_transition_is_stopping(phase: Option<&str>) -> bool {
 
 #[derive(Clone, Copy)]
 enum LocalStudioGateKind {
-    Stop,
-    Control,
+    Edit,
+    Launch,
+    StopControl,
     Official,
+}
+
+fn local_gate_requires_hub_route_ready(kind: LocalStudioGateKind) -> bool {
+    !matches!(kind, LocalStudioGateKind::StopControl)
 }
 
 fn opt_age_to_u128(value: Option<u64>) -> Option<u128> {
@@ -607,9 +612,37 @@ fn local_studio_gate_wait_reason(
     if status.studio_mode.is_none() || status.studio_mode_age_ms.is_none() {
         return Some("studio_mode_unavailable");
     }
+    let studio_mode = status.studio_mode.as_deref();
     match kind {
-        LocalStudioGateKind::Stop => None,
-        LocalStudioGateKind::Control => match status.studio_mode.as_deref() {
+        LocalStudioGateKind::Edit => {
+            if studio_mode != Some("stop") {
+                return None;
+            }
+            if status.edit_runtime_state.is_none() || status.edit_runtime_age_ms.is_none() {
+                Some("edit_runtime_unavailable")
+            } else {
+                None
+            }
+        }
+        LocalStudioGateKind::Launch => match studio_mode {
+            Some("stop") => {
+                if status.edit_runtime_state.is_none() || status.edit_runtime_age_ms.is_none() {
+                    Some("edit_runtime_unavailable")
+                } else {
+                    None
+                }
+            }
+            Some("start_play" | "run_server") => {
+                if status.studio_control_state.is_none() || status.studio_transition_phase.is_none()
+                {
+                    Some("studio_control_unavailable")
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
+        LocalStudioGateKind::StopControl => match studio_mode {
             Some("start_play" | "run_server") => {
                 if status.studio_control_state.is_none() || status.studio_transition_phase.is_none()
                 {
@@ -621,6 +654,12 @@ fn local_studio_gate_wait_reason(
             _ => None,
         },
         LocalStudioGateKind::Official => {
+            if studio_mode != Some("stop") {
+                return None;
+            }
+            if status.edit_runtime_state.is_none() || status.edit_runtime_age_ms.is_none() {
+                return Some("edit_runtime_unavailable");
+            }
             if status.official_mcp_adapter_state.is_none()
                 || status.official_mcp_adapter_age_ms.is_none()
             {
@@ -659,7 +698,7 @@ async fn wait_for_local_studio_status_if_needed(
     }
 }
 
-fn require_local_stop_ready_locked(
+fn require_local_edit_ready_locked(
     state: &AppState,
     requested_task_id: &str,
     action: &str,
@@ -667,7 +706,19 @@ fn require_local_stop_ready_locked(
     let snapshot = local_studio_live_snapshot_locked(state, requested_task_id, action)?;
     ensure_reported_age_fresh(action, "studio_mode", snapshot.studio_mode_age_ms)?;
     match snapshot.studio_mode.as_deref() {
-        Some("stop") => Ok(snapshot),
+        Some("stop") => {
+            ensure_reported_age_fresh(action, "edit_runtime", snapshot.edit_runtime_age_ms)?;
+            if snapshot.edit_runtime_state.as_deref() != Some("ready") {
+                return Err(ErrorData::internal_error(
+                    format!(
+                        "{action} failed fast: edit_runtime_not_ready state={}",
+                        snapshot.edit_runtime_state.as_deref().unwrap_or("unknown")
+                    ),
+                    None,
+                ));
+            }
+            Ok(snapshot)
+        }
         Some(mode) => Err(ErrorData::internal_error(
             format!("{action} failed fast: studio_mode_not_stop current_mode={mode}"),
             None,
@@ -679,7 +730,33 @@ fn require_local_stop_ready_locked(
     }
 }
 
-fn require_local_control_ready_locked(
+fn require_local_launch_ready_locked(
+    state: &AppState,
+    requested_task_id: &str,
+    action: &str,
+) -> Result<(), ErrorData> {
+    let snapshot = local_studio_live_snapshot_locked(state, requested_task_id, action)?;
+    ensure_reported_age_fresh(action, "studio_mode", snapshot.studio_mode_age_ms)?;
+    let Some(mode) = snapshot.studio_mode.as_deref() else {
+        return Err(ErrorData::internal_error(
+            format!("{action} failed fast: studio_mode_unknown"),
+            None,
+        ));
+    };
+    if studio_mode_is_running(Some(mode)) {
+        return require_local_stop_control_ready_locked(state, requested_task_id, action);
+    }
+    if mode != "stop" {
+        return Err(ErrorData::internal_error(
+            format!("{action} failed fast: studio_mode_unknown current_mode={mode}"),
+            None,
+        ));
+    }
+    require_local_edit_ready_locked(state, requested_task_id, action)?;
+    Ok(())
+}
+
+fn require_local_stop_control_ready_locked(
     state: &AppState,
     requested_task_id: &str,
     action: &str,
@@ -734,7 +811,7 @@ fn require_local_official_ready_locked(
     requested_task_id: &str,
     action: &str,
 ) -> Result<(), ErrorData> {
-    let snapshot = require_local_stop_ready_locked(state, requested_task_id, action)?;
+    let snapshot = require_local_edit_ready_locked(state, requested_task_id, action)?;
     ensure_reported_age_fresh(
         action,
         "official_mcp_adapter",
@@ -1119,11 +1196,12 @@ impl ServerHandler for RBXStudioServer {
                 website_url: None,
             },
             instructions: Some(
-                "Prefer using launch_studio_session for high-level launches into start_play or run_server.
+                "Use launch_studio_session for high-level launches into start_play or run_server.
 get_studio_mode is for diagnostics and stop-path checks, not the normal launch entrypoint.
 Use run_code to query or edit the Roblox Studio place while Studio is in stop/edit mode.
-Only launch_studio_session may enter start_play or run_server. start_stop_play is stop-only.
-If Studio control reports previous_test_in_progress after its settle wait, restart Studio before launching again. Do not call start_stop_play(stop) as recovery when the helper snapshot is already stop, and do not recover by sending another play+stop loop.
+If Studio is already in start_play or run_server, launch_studio_session may stop/relaunch only when the live helper status proves fresh runtime control; otherwise it must fail fast as uncontrolled_play_session.
+start_stop_play is stop-only and is idempotent when Studio is already stopped.
+Do not recover by sending another play+stop loop.
 If status reports studio_transition_phase=stopping_requested or stopping_observed, wait for stop/idle instead of issuing another play or stop command.
 If status reports an uncontrolled play session, do not issue start_stop_play(stop); restore fresh runtime control or rebuild the session before launching again.
 "
@@ -1324,7 +1402,7 @@ struct LaunchStudioSession {
     )]
     task_id: String,
     #[schemars(
-        description = "Target mode to launch into, must be start_play or run_server. The Windows side will stop any previous running session before launching."
+        description = "Target mode to launch into, must be start_play or run_server. A controlled existing play/run session may be stopped and relaunched; uncontrolled play/run must fail fast."
     )]
     mode: String,
 }
@@ -1380,20 +1458,15 @@ impl ToolArgumentValues {
         }
     }
 
-    fn requires_studio_stop_snapshot(&self) -> bool {
+    fn local_studio_gate_kind(&self) -> Option<LocalStudioGateKind> {
         match self {
-            ToolArgumentValues::RunCode(args) => args.diagnostic != Some(true),
-            ToolArgumentValues::InsertModel(_) => true,
-            _ => false,
-        }
-    }
-
-    fn requires_studio_control_snapshot(&self) -> bool {
-        match self {
-            ToolArgumentValues::LaunchStudioSession(_) | ToolArgumentValues::StartStopPlay(_) => {
-                true
+            ToolArgumentValues::RunCode(args) if args.diagnostic != Some(true) => {
+                Some(LocalStudioGateKind::Edit)
             }
-            _ => false,
+            ToolArgumentValues::InsertModel(_) => Some(LocalStudioGateKind::Edit),
+            ToolArgumentValues::LaunchStudioSession(_) => Some(LocalStudioGateKind::Launch),
+            ToolArgumentValues::StartStopPlay(_) => Some(LocalStudioGateKind::StopControl),
+            _ => None,
         }
     }
 
@@ -1458,7 +1531,7 @@ impl RBXStudioServer {
     }
 
     #[tool(
-        description = "Launch Roblox Studio into start_play or run_server. This is the only MCP tool that may enter play/run. If Studio is already running, Windows stops it first and then launches the requested mode. Returns a JSON object with requested_mode, restart_applied, previous_mode, final_mode, actions, and message."
+        description = "Launch Roblox Studio into start_play or run_server. If Studio is already in play/run, the launch may stop/relaunch only when the live helper status proves fresh runtime control; uncontrolled play/run fails fast. Returns the plugin launch JSON with final_mode and message."
     )]
     async fn launch_studio_session(
         &self,
@@ -1865,17 +1938,20 @@ async fn queue_tool_request(
     };
     let tool_name = command.tool_name();
     let helper_request_timeout = command.args.helper_request_timeout();
-    let requires_stop_gate = command.args.requires_studio_stop_snapshot();
-    let requires_control_gate = command.args.requires_studio_control_snapshot();
+    let gate_kind = command.args.local_studio_gate_kind();
     let mut route_snapshot = None;
-    if requires_stop_gate || requires_control_gate {
-        let hub_status_client = { state.lock().await.hub_status_client.clone() };
-        require_hub_route_ready_snapshot(hub_status_client.clone(), &requested_task_id, tool_name)
+    if let Some(gate_kind) = gate_kind {
+        let hub_status_client = if local_gate_requires_hub_route_ready(gate_kind) {
+            let hub_status_client = { state.lock().await.hub_status_client.clone() };
+            require_hub_route_ready_snapshot(
+                hub_status_client.clone(),
+                &requested_task_id,
+                tool_name,
+            )
             .await?;
-        let gate_kind = if requires_control_gate {
-            LocalStudioGateKind::Control
+            Some(hub_status_client)
         } else {
-            LocalStudioGateKind::Stop
+            None
         };
         wait_for_local_studio_status_if_needed(
             Arc::clone(&state),
@@ -1884,10 +1960,12 @@ async fn queue_tool_request(
             gate_kind,
         )
         .await?;
-        route_snapshot = Some(
-            require_hub_route_ready_snapshot(hub_status_client, &requested_task_id, tool_name)
-                .await?,
-        );
+        if let Some(hub_status_client) = hub_status_client {
+            route_snapshot = Some(
+                require_hub_route_ready_snapshot(hub_status_client, &requested_task_id, tool_name)
+                    .await?,
+            );
+        }
     }
     let (tx, rx) = mpsc::unbounded_channel::<Result<String>>();
     let (trigger, uploads, queued_requests, pending_responses) = {
@@ -1915,11 +1993,17 @@ async fn queue_tool_request(
         if let Some(snapshot) = route_snapshot.as_ref() {
             require_active_helper_matches_hub_route_locked(helper, snapshot, tool_name)?;
         }
-        if requires_stop_gate {
-            require_local_stop_ready_locked(&state, &requested_task_id, tool_name)?;
-        }
-        if requires_control_gate {
-            require_local_control_ready_locked(&state, &requested_task_id, tool_name)?;
+        match gate_kind {
+            Some(LocalStudioGateKind::Edit) => {
+                require_local_edit_ready_locked(&state, &requested_task_id, tool_name)?;
+            }
+            Some(LocalStudioGateKind::Launch) => {
+                require_local_launch_ready_locked(&state, &requested_task_id, tool_name)?;
+            }
+            Some(LocalStudioGateKind::StopControl) => {
+                require_local_stop_control_ready_locked(&state, &requested_task_id, tool_name)?;
+            }
+            Some(LocalStudioGateKind::Official) | None => {}
         }
         if state.output_map.contains_key(&id)
             || state
@@ -2297,31 +2381,97 @@ mod tests {
     }
 
     #[test]
-    fn studio_control_preflight_allows_controlled_running_session() {
+    fn launch_preflight_allows_controlled_running_session() {
         let state =
             state_with_local_task_status(local_task_status("start_play", "ready", "running"));
-        require_local_control_ready_locked(&state, "t_test", "launch_studio_session")
-            .expect("controlled running session should be stoppable/relaunchable");
+        require_local_launch_ready_locked(&state, "t_test", "launch_studio_session").expect(
+            "controlled running session can be stopped/relaunched by the high-level launch",
+        );
     }
 
     #[test]
-    fn studio_control_preflight_rejects_uncontrolled_running_session() {
+    fn launch_wait_does_not_require_edit_runtime_fields_when_already_running() {
+        let mut state =
+            state_with_local_task_status(local_task_status("start_play", "ready", "running"));
+        let status = state
+            .active_helper
+            .as_mut()
+            .and_then(|helper| helper.task_status.as_mut())
+            .expect("test state should have helper task status");
+        status.edit_runtime_state = None;
+        status.edit_runtime_age_ms = None;
+
+        assert_eq!(
+            local_studio_gate_wait_reason(&state, "t_test", LocalStudioGateKind::Launch),
+            None
+        );
+        require_local_launch_ready_locked(&state, "t_test", "launch_studio_session")
+            .expect("controlled running launch should not require edit runtime fields");
+    }
+
+    #[test]
+    fn launch_wait_requires_control_fields_when_already_running() {
+        let mut state =
+            state_with_local_task_status(local_task_status("start_play", "ready", "running"));
+        let status = state
+            .active_helper
+            .as_mut()
+            .and_then(|helper| helper.task_status.as_mut())
+            .expect("test state should have helper task status");
+        status.studio_control_state = None;
+
+        assert_eq!(
+            local_studio_gate_wait_reason(&state, "t_test", LocalStudioGateKind::Launch),
+            Some("studio_control_unavailable")
+        );
+    }
+
+    #[test]
+    fn launch_preflight_rejects_uncontrolled_running_session() {
         let state = state_with_local_task_status(local_task_status("start_play", "lost", "error"));
-        let error = require_local_control_ready_locked(&state, "t_test", "launch_studio_session")
-            .expect_err("uncontrolled running session cannot be stopped or relaunched safely");
+        let error = require_local_launch_ready_locked(&state, "t_test", "launch_studio_session")
+            .expect_err("uncontrolled running session cannot be relaunched safely");
 
         assert!(error.to_string().contains("uncontrolled_play_session"));
         assert!(error.to_string().contains("studio_control_state=lost"));
     }
 
     #[test]
-    fn studio_control_preflight_rejects_stop_in_progress() {
+    fn stop_preflight_allows_controlled_running_session() {
+        let state =
+            state_with_local_task_status(local_task_status("start_play", "ready", "running"));
+        require_local_stop_control_ready_locked(&state, "t_test", "start_stop_play")
+            .expect("controlled running session should be stoppable");
+    }
+
+    #[test]
+    fn launch_preflight_allows_stable_edit_session() {
+        let mut status = local_task_status("stop", "none", "idle");
+        status.edit_runtime_state = Some("ready".to_owned());
+        status.edit_runtime_age_ms = Some(4);
+        let state = state_with_local_task_status(status);
+        require_local_launch_ready_locked(&state, "t_test", "launch_studio_session")
+            .expect("stable edit session should be launchable");
+    }
+
+    #[test]
+    fn stop_preflight_rejects_uncontrolled_running_session() {
+        let state = state_with_local_task_status(local_task_status("start_play", "lost", "error"));
+        let error = require_local_stop_control_ready_locked(&state, "t_test", "start_stop_play")
+            .expect_err("uncontrolled running session cannot be stopped safely");
+
+        assert!(error.to_string().contains("uncontrolled_play_session"));
+        assert!(error.to_string().contains("studio_control_state=lost"));
+    }
+
+    #[test]
+    fn stop_preflight_rejects_stop_in_progress() {
         let state = state_with_local_task_status(local_task_status(
             "start_play",
             "stopping",
             "stopping_requested",
         ));
-        let error = require_local_control_ready_locked(&state, "t_test", "start_stop_play")
+        let error = require_local_stop_control_ready_locked(&state, "t_test", "start_stop_play")
             .expect_err("stopping session must wait for stop/idle");
 
         assert!(error.to_string().contains("studio_stop_in_progress"));
@@ -2333,7 +2483,7 @@ mod tests {
             "stopping_observed",
         ));
         let observed_error =
-            require_local_control_ready_locked(&observed_state, "t_test", "launch_studio_session")
+            require_local_stop_control_ready_locked(&observed_state, "t_test", "start_stop_play")
                 .expect_err("observed stopping session must wait for stop/idle");
 
         assert!(observed_error
@@ -2418,19 +2568,90 @@ mod tests {
     }
 
     #[test]
-    fn run_code_requires_stop_unless_marked_diagnostic() {
-        assert!(!ToolArgumentValues::RunCode(RunCode {
+    fn run_code_requires_edit_gate_unless_marked_diagnostic() {
+        assert!(ToolArgumentValues::RunCode(RunCode {
             task_id: "t_test".to_owned(),
             command: "print('ok')".to_owned(),
             diagnostic: Some(true),
         })
-        .requires_studio_stop_snapshot());
+        .local_studio_gate_kind()
+        .is_none());
+        assert!(matches!(
+            ToolArgumentValues::RunCode(RunCode {
+                task_id: "t_test".to_owned(),
+                command: "workspace.Part:Destroy()".to_owned(),
+                diagnostic: None,
+            })
+            .local_studio_gate_kind(),
+            Some(LocalStudioGateKind::Edit)
+        ));
+    }
+
+    #[test]
+    fn studio_tools_use_distinct_local_gate_kinds() {
+        assert!(matches!(
+            ToolArgumentValues::StartStopPlay(StartStopPlay {
+                task_id: "t_test".to_owned(),
+                mode: "stop".to_owned(),
+            })
+            .local_studio_gate_kind(),
+            Some(LocalStudioGateKind::StopControl)
+        ));
+        assert!(matches!(
+            ToolArgumentValues::LaunchStudioSession(LaunchStudioSession {
+                task_id: "t_test".to_owned(),
+                mode: "start_play".to_owned(),
+            })
+            .local_studio_gate_kind(),
+            Some(LocalStudioGateKind::Launch)
+        ));
+        assert!(matches!(
+            ToolArgumentValues::InsertModel(InsertModel {
+                task_id: "t_test".to_owned(),
+                query: "tree".to_owned(),
+            })
+            .local_studio_gate_kind(),
+            Some(LocalStudioGateKind::Edit)
+        ));
+    }
+
+    #[test]
+    fn only_stop_control_skips_hub_route_readiness_gate() {
+        assert!(!local_gate_requires_hub_route_ready(
+            LocalStudioGateKind::StopControl
+        ));
+        assert!(local_gate_requires_hub_route_ready(
+            LocalStudioGateKind::Launch
+        ));
+        assert!(local_gate_requires_hub_route_ready(
+            LocalStudioGateKind::Edit
+        ));
+        assert!(local_gate_requires_hub_route_ready(
+            LocalStudioGateKind::Official
+        ));
+    }
+
+    #[test]
+    fn edit_gate_requires_edit_runtime_ready() {
+        let mut status = local_task_status("stop", "none", "idle");
+        status.edit_runtime_state = Some("missing".to_owned());
+        status.edit_runtime_age_ms = Some(4);
+        let state = state_with_local_task_status(status);
+        let error = require_local_edit_ready_locked(&state, "t_test", "insert_model")
+            .expect_err("edit tools require edit runtime readiness");
+
+        assert!(error.to_string().contains("edit_runtime_not_ready"));
+    }
+
+    #[test]
+    fn diagnostic_run_code_has_no_local_gate() {
         assert!(ToolArgumentValues::RunCode(RunCode {
             task_id: "t_test".to_owned(),
-            command: "workspace.Part:Destroy()".to_owned(),
-            diagnostic: None,
+            command: "print('ok')".to_owned(),
+            diagnostic: Some(true),
         })
-        .requires_studio_stop_snapshot());
+        .local_studio_gate_kind()
+        .is_none());
     }
 
     #[test]
@@ -2455,27 +2676,6 @@ mod tests {
         assert_eq!(launch_timeout, HELPER_STUDIO_CONTROL_REQUEST_TIMEOUT);
         assert_eq!(stop_timeout, HELPER_STUDIO_CONTROL_REQUEST_TIMEOUT);
         assert!(launch_timeout > run_code_timeout);
-    }
-
-    #[test]
-    fn studio_control_tools_require_local_control_preflight() {
-        assert!(ToolArgumentValues::StartStopPlay(StartStopPlay {
-            task_id: "t_test".to_owned(),
-            mode: "stop".to_owned(),
-        })
-        .requires_studio_control_snapshot());
-        assert!(ToolArgumentValues::StartStopPlay(StartStopPlay {
-            task_id: "t_test".to_owned(),
-            mode: "start_play".to_owned(),
-        })
-        .requires_studio_control_snapshot());
-        assert!(
-            ToolArgumentValues::LaunchStudioSession(LaunchStudioSession {
-                task_id: "t_test".to_owned(),
-                mode: "start_play".to_owned(),
-            })
-            .requires_studio_control_snapshot()
-        );
     }
 
     #[test]
