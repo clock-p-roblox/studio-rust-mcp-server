@@ -9,11 +9,16 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 PLUGIN_SESSION_CONTROL = REPO / "plugin/src/Utils/StudioSessionControl.luau"
 SERVER = REPO / "src/rbx_studio_server.rs"
+SERVER_STATE = REPO / "src/rbx_studio_server/state.rs"
 HELPER = REPO / "src/bin/studio_helper.rs"
 
 
 def read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def read_many(paths: list[Path]) -> str:
+    return "\n".join(read(path) for path in paths)
 
 
 def luau_seconds_constant(source: str, name: str) -> int:
@@ -37,7 +42,7 @@ class StudioStopTimeoutContractTests(unittest.TestCase):
     def test_stop_timeout_order_allows_plugin_to_report_before_transport_timeout(self) -> None:
         plugin = read(PLUGIN_SESSION_CONTROL)
         helper = read(HELPER)
-        server = read(SERVER)
+        server = read_many([SERVER, SERVER_STATE])
 
         plugin_stop_timeout = luau_seconds_constant(plugin, "STOP_TIMEOUT_SECONDS")
         helper_plugin_timeout = rust_secs_constant(helper, "PLUGIN_STUDIO_CONTROL_REQUEST_TIMEOUT")

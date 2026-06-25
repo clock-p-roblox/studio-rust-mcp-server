@@ -16,6 +16,7 @@ local DEFAULT_HELPER_PORT = "44750"
 local LOG_PAGE_SIZE = 400
 local MODE_LOG_PAGE_SIZE = 2_000
 local SESSION_CONTROL_SCRIPT_NAME = "MCPStudioSessionControl"
+local SESSION_CONTROL_MARKER = "clockp_mcp_session_control_v1"
 
 type LogBaseline = {
 	path: string,
@@ -142,10 +143,42 @@ local function sendHelperStudioModeStatus(mode: Types.StartStopPlayMode)
 	end
 end
 
+local function isManagedSessionControlScript(instance: Instance): boolean
+	if instance.Name ~= SESSION_CONTROL_SCRIPT_NAME or not instance:IsA("Script") then
+		return false
+	end
+	if instance:GetAttribute(SESSION_CONTROL_MARKER) == true then
+		return true
+	end
+	local ok, source = pcall(function()
+		return instance.Source
+	end)
+	return ok
+		and type(source) == "string"
+		and (
+			string.find(source, SESSION_CONTROL_MARKER, 1, true) ~= nil
+			or (
+				string.find(source, "/v1/mcp/plugin/stop-request", 1, true) ~= nil
+				and string.find(source, "runtime_stop_request_received", 1, true) ~= nil
+				and string.find(source, "StudioTestService:EndTest", 1, true) ~= nil
+			)
+		)
+end
+
 local function removeSessionControlScript()
-	local existing = ServerScriptService:FindFirstChild(SESSION_CONTROL_SCRIPT_NAME)
-	if existing then
-		existing:Destroy()
+	for _, child in ServerScriptService:GetChildren() do
+		if isManagedSessionControlScript(child) then
+			child:Destroy()
+		end
+	end
+end
+
+local function assertNoForeignSessionControlScript(targetMode: Types.StartStopPlayMode)
+	for _, child in ServerScriptService:GetChildren() do
+		if child.Name == SESSION_CONTROL_SCRIPT_NAME and not isManagedSessionControlScript(child) then
+			logTransitionStage(targetMode, "control_script_name_conflict", child:GetFullName())
+			error("Cannot install MCPStudioSessionControl because a non-clockp script already uses that name.")
+		end
 	end
 end
 
@@ -175,10 +208,12 @@ local function installSessionControlScript(targetMode: Types.StartStopPlayMode)
 
 	ensureHttpEnabledForSessionControl(targetMode)
 	removeSessionControlScript()
+	assertNoForeignSessionControlScript(targetMode)
 	local helperUrl = activeHelperBaseUrl()
 	local instanceId = currentInstanceId
 	local source = string.format(
 		[[
+-- clockp_mcp_session_control_v1
 local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 local StudioTestService = game:GetService("StudioTestService")
@@ -370,6 +405,7 @@ end
 	local controlScript = Instance.new("Script")
 	controlScript.Name = SESSION_CONTROL_SCRIPT_NAME
 	controlScript.Source = source
+	controlScript:SetAttribute(SESSION_CONTROL_MARKER, true)
 	controlScript.Parent = ServerScriptService
 	logTransitionStage(targetMode, "control_script_installed", string.format("instance_id=%s", instanceId))
 end
@@ -494,6 +530,13 @@ local function getStudioMode(): Types.StartStopPlayMode
 
 	StudioModeTracker.normalizeEditState()
 	return StudioModeTracker.getSnapshot().mode
+end
+
+local function cleanupStoppedSessionControl(mode: Types.StartStopPlayMode)
+	local snapshot = StudioModeTracker.getSnapshot()
+	if mode == "stop" and snapshot.pendingStartId == 0 then
+		removeSessionControlScript()
+	end
 end
 
 local function isPreviousTestStillInProgress(errorMessage: string): boolean
@@ -710,7 +753,7 @@ local function startPlayMode(successMessage: string): string?
 			"rejected_running_session",
 			string.format("current_mode=%s pending_start_id=%d", currentMode, snapshot.pendingStartId)
 		)
-		error("Cannot start play while Studio is already running; helper control must stop the current session before launch.")
+		error("Cannot start play while Studio is already running; call StartStopPlay(stop) and wait for edit mode before launch.")
 	end
 
 	local commandId = StudioModeTracker.beginStart("start_play")
@@ -737,7 +780,7 @@ local function startRunServerMode(executor: () -> any, successMessage: string): 
 			"rejected_running_session",
 			string.format("current_mode=%s pending_start_id=%d", currentMode, snapshot.pendingStartId)
 		)
-		error("Cannot run server while Studio is already running; helper control must stop the current session before launch.")
+		error("Cannot run server while Studio is already running; call StartStopPlay(stop) and wait for edit mode before launch.")
 	end
 
 	local commandId = StudioModeTracker.beginStart("run_server")
@@ -772,10 +815,7 @@ local function handleStartStopPlay(startStopPlayArgs: Types.StartStopPlayArgs): 
 	error("Invalid mode in StartStopPlay; start_stop_play only supports stop. Use LaunchStudioSession to enter start_play or run_server.")
 end
 
-local function buildLaunchMessage(requestedMode: Types.TestMode, restartApplied: boolean): string
-	if restartApplied then
-		return string.format("Stopped the previous Studio session and launched %s.", requestedMode)
-	end
+local function buildLaunchMessage(requestedMode: Types.TestMode): string
 	return string.format("Launched Studio session in %s.", requestedMode)
 end
 
@@ -790,16 +830,15 @@ local function handleLaunchStudioSession(launchStudioSessionArgs: Types.LaunchSt
 	local requestedMode = launchStudioSessionArgs.mode
 	local previousMode = getStudioMode()
 	local previousSnapshot = StudioModeTracker.getSnapshot()
-	local restartApplied = previousMode ~= "stop" or previousSnapshot.pendingStartId ~= 0
 	local actions = {}
 
-	if restartApplied then
+	if previousMode ~= "stop" or previousSnapshot.pendingStartId ~= 0 then
 		logTransitionStage(
 			requestedMode,
-			"rejected_restart_without_helper_stop",
+			"rejected_launch_not_in_stop",
 			string.format("previous_mode=%s pending_start_id=%d", previousMode, previousSnapshot.pendingStartId)
 		)
-		error("LaunchStudioSession requires helper-controlled stop before relaunch when Studio is already running.")
+		error("LaunchStudioSession requires Studio to be in edit mode before launch.")
 	end
 
 	table.insert(actions, requestedMode)
@@ -818,16 +857,17 @@ local function handleLaunchStudioSession(launchStudioSessionArgs: Types.LaunchSt
 
 	return HttpService:JSONEncode({
 		requested_mode = requestedMode,
-		restart_applied = restartApplied,
+		restart_applied = false,
 		previous_mode = previousMode,
 		final_mode = finalMode,
 		actions = actions,
-		message = buildLaunchMessage(requestedMode, restartApplied),
+		message = buildLaunchMessage(requestedMode),
 	})
 end
 
 return {
 	configureHelperContext = configureHelperContext,
+	cleanupStoppedSessionControl = cleanupStoppedSessionControl,
 	getStudioMode = getStudioMode,
 	handleLaunchStudioSession = handleLaunchStudioSession,
 	handleStartStopPlay = handleStartStopPlay,

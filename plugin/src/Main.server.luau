@@ -298,6 +298,7 @@ end
 
 local function currentStudioMode(): string
 	local mode = StudioSessionControl.getStudioMode()
+	StudioSessionControl.cleanupStoppedSessionControl(mode)
 	logPluginEvent("studio_mode_sample", {
 		mode = mode,
 	})

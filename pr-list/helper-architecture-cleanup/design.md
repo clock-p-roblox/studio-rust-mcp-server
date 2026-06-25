@@ -898,6 +898,24 @@ terminal 后：
 - `launch-game.py` 在 play 且 restart=true 时显式 stop -> 确认 stop -> launch。
 - `launch-game.py --restart false` 在 play 时失败且不 stop。
 
+Phase 3 Windows 侧实施记录：
+
+- `LaunchStudioSession` 分支只做 mode 校验、`studio_session_state` 校验和插件转发。
+- helper 已删除内部 stop-before-launch 路径，不能再在 low-level launch 内登记 stop request。
+- `studio_session_state=play` 时 low-level launch 返回 `studio_already_playing`，由上层显式调用 `start_stop_play(stop)` 后再 launch。
+- `starting_play / stopping / none_response / none_connected` 都直接返回单一 reason，不做隐式补救。
+- 插件仍保留本地“非 stop 不启动”的保护；返回 JSON 里 `restart_applied=false` 仅表示本次 low-level launch 没做 restart。
+- 插件在 launch 时创建的一次性 `MCPStudioSessionControl` 必须由插件生命周期清理：状态轮询确认 `stop` 且没有 pending start 后，删除带 clockp marker 的控制脚本。重复 stop 不再承担清理职责。
+- 本机没有 `roblox-dev-infra` 仓库，Linux `launch-game.py` 同步修改未在本提交内完成；上线时必须同批切换，否则默认 restart 会在 play 状态收到 `studio_already_playing`。
+
+Phase 3 Windows 侧验证：
+
+- `cargo test --bin studio_helper`
+- `cargo test --bin rbx-studio-mcp`
+- `py -3 -m unittest util.test_plugin_session_control_cleanup util.test_studio_stop_timeout_contract`
+- `py -3 util/local_state_sync_probe.py`
+- 本地 probe 覆盖真实 Studio：stop -> launch、play 中重复 low-level launch 被拒且状态保持 play、stop、repeat stop、`MCPStudioSessionControl` 清理为 true。
+
 ### Phase 4：runtime-log 快速 ack + 后台转发
 
 目标：

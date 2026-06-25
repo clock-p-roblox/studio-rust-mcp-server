@@ -946,14 +946,13 @@ impl ServerHandler for RBXStudioServer {
                 website_url: None,
             },
             instructions: Some(
-                "Use launch_studio_session for high-level launches into start_play or run_server.
+                "Use launch_studio_session only to launch from a confirmed stop/edit Studio session into start_play or run_server.
 get_studio_mode is for diagnostics and stop-path checks, not the normal launch entrypoint.
 Use run_code to query or edit the Roblox Studio place while Studio is in stop/edit mode.
-If Studio is already in start_play or run_server, launch_studio_session may stop/relaunch only when the live helper status proves fresh runtime control; otherwise it must fail fast as uncontrolled_play_session.
+If Studio is already in start_play or run_server, call start_stop_play(stop), wait for studio_session_state=stop, then call launch_studio_session.
 start_stop_play is stop-only and is idempotent when Studio is already stopped.
 Do not recover by sending another play+stop loop.
 If status reports studio_transition_phase=stopping_requested or stopping_observed, wait for stop/idle instead of issuing another play or stop command.
-If status reports an uncontrolled play session, do not issue start_stop_play(stop); restore fresh runtime control or rebuild the session before launching again.
 "
                     .to_string(),
             ),
@@ -1152,7 +1151,7 @@ struct LaunchStudioSession {
     )]
     task_id: String,
     #[schemars(
-        description = "Target mode to launch into, must be start_play or run_server. A controlled existing play/run session may be stopped and relaunched; uncontrolled play/run must fail fast."
+        description = "Target mode to launch into, must be start_play or run_server. The current Studio session must already be in stop/edit mode; this tool never stops an existing play/run session."
     )]
     mode: String,
 }
@@ -1281,7 +1280,7 @@ impl RBXStudioServer {
     }
 
     #[tool(
-        description = "Launch Roblox Studio into start_play or run_server. If Studio is already in play/run, the launch may stop/relaunch only when the live helper status proves fresh runtime control; uncontrolled play/run fails fast. Returns the plugin launch JSON with final_mode and message."
+        description = "Launch Roblox Studio from confirmed stop/edit mode into start_play or run_server. This tool never stops an existing play/run session; call start_stop_play(stop) first and wait for studio_session_state=stop. Returns the plugin launch JSON with final_mode and message."
     )]
     async fn launch_studio_session(
         &self,

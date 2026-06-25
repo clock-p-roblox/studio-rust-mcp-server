@@ -401,6 +401,19 @@ def main() -> int:
         start_elapsed_ms = int((time.perf_counter() - started) * 1000)
         start_triplet = wait_triplet(task_id, "start_play", "ready", "running")
 
+        try:
+            relaunch_result, _relaunch_diagnostics = client.call_tool_with_diagnostics(
+                "launch_studio_session",
+                {"task_id": task_id, "mode": "start_play"},
+            )
+        except RuntimeError as exc:
+            relaunch_text = str(exc)
+        else:
+            relaunch_text = extract_text_content(relaunch_result)
+        if "studio_session_state_not_stop" not in relaunch_text:
+            raise RuntimeError(f"low-level launch while play should fail without stopping: {relaunch_text}")
+        relaunch_rejected_triplet = wait_triplet(task_id, "start_play", "ready", "running")
+
         started = time.perf_counter()
         stop_result = call_tool(
             client,
@@ -440,6 +453,8 @@ def main() -> int:
                     "start_elapsed_ms": start_elapsed_ms,
                     "stop_elapsed_ms": stop_elapsed_ms,
                     "start_result": start_result,
+                    "relaunch_rejected": relaunch_text,
+                    "relaunch_rejected_triplet": relaunch_rejected_triplet,
                     "stop_result": stop_result,
                     "repeat_stop": repeat_stop,
                     "start_triplet": start_triplet,

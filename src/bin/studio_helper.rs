@@ -5790,15 +5790,8 @@ async fn handle_remote_command(
         "LaunchStudioSession" | "launch_studio_session" => {
             let args: LaunchStudioSessionCommandArgs = serde_json::from_value(payload)?;
             validate_launch_studio_session_mode(&args.mode)?;
-            let stopped_previous_mode =
-                stop_running_session_before_launch_if_needed(app.clone(), place_id, task_id)
-                    .await?;
-            let response = forward_to_plugin(app, place_id, task_id, command).await?;
-            Ok(merge_launch_response_with_helper_restart(
-                response,
-                stopped_previous_mode.as_deref(),
-                &args.mode,
-            ))
+            validate_launch_studio_session_state(&app, place_id, task_id).await?;
+            forward_to_plugin(app, place_id, task_id, command).await
         }
         _ => forward_to_plugin(app, place_id, task_id, command).await,
     }
@@ -5811,6 +5804,49 @@ fn validate_launch_studio_session_mode(mode: &str) -> Result<()> {
     Err(eyre!(
         "Invalid mode in LaunchStudioSession, must be start_play or run_server"
     ))
+}
+
+async fn validate_launch_studio_session_state(
+    app: &AppState,
+    place_id: &str,
+    task_id: Option<&str>,
+) -> Result<()> {
+    let mut state = app.state.lock().await;
+    cleanup_stale_instances(&mut state);
+    sync_remote_connections(app, &mut state);
+    let session_state = task_id
+        .map(|task_id| task_studio_mode_snapshot(&state, task_id).studio_session_state)
+        .or_else(|| {
+            select_instance_for_route(place_id, task_id, &state.instances).map(|instance_id| {
+                state
+                    .instances
+                    .get(&instance_id)
+                    .and_then(current_session_state_for_instance)
+                    .unwrap_or("none_response")
+                    .to_owned()
+            })
+        })
+        .unwrap_or_else(|| "none_connected".to_owned());
+
+    match session_state.as_str() {
+        "stop" => Ok(()),
+        "play" => Err(eyre!(
+            "studio_already_playing: Studio is already in play/run mode; call start_stop_play(stop) and wait for studio_session_state=stop before launching"
+        )),
+        "starting_play" => Err(eyre!(
+            "launch_already_in_progress: Studio is still entering play/run mode; wait for play or stop before issuing launch"
+        )),
+        "stopping" => Err(eyre!(
+            "studio_stop_in_progress: Studio stop is already in progress; wait for helper status to return stop before issuing launch"
+        )),
+        "none_response" => Err(eyre!(
+            "studio_plugin_no_response: helper cannot confirm Studio is in stop/edit mode for placeId {place_id}"
+        )),
+        "none_connected" => Err(eyre!(
+            "studio_plugin_not_connected: no active Studio plugin registered for placeId {place_id}"
+        )),
+        other => Err(eyre!("studio_session_state_not_launchable: current_state={other}")),
+    }
 }
 
 async fn handle_helper_start_stop_play(
@@ -5896,107 +5932,6 @@ async fn handle_helper_start_stop_play(
     )
     .await?;
     Ok("Stopped".to_owned())
-}
-
-async fn stop_running_session_before_launch_if_needed(
-    app: AppState,
-    place_id: &str,
-    task_id: Option<&str>,
-) -> Result<Option<String>> {
-    let wait_for_stop = {
-        let mut state = app.state.lock().await;
-        cleanup_stale_instances(&mut state);
-        sync_remote_connections(&app, &mut state);
-        let Some(selected_instance_id) =
-            select_instance_for_route(place_id, task_id, &state.instances)
-        else {
-            return Ok(None);
-        };
-        ensure_studio_control_slot_available(&state, &selected_instance_id, "LaunchStudioSession")?;
-        let instance = state
-            .instances
-            .get(&selected_instance_id)
-            .ok_or_else(|| eyre!("selected helper instance disappeared"))?;
-        if !studio_mode_is_running(instance.studio_mode.as_deref()) {
-            return Ok(None);
-        }
-        let previous_mode = instance.studio_mode.clone();
-        if is_stopping_transition_phase(&effective_studio_transition_phase(instance)) {
-            Some((
-                selected_instance_id,
-                instance.task_id.clone(),
-                instance.stop_request_id,
-                previous_mode,
-            ))
-        } else {
-            let recorded = match record_stop_request_for_instance(&mut state, &selected_instance_id)
-            {
-                Ok(recorded) => recorded,
-                Err(StopRequestRecordError::MissingInstance) => {
-                    return Err(eyre!("selected helper instance disappeared"));
-                }
-                Err(StopRequestRecordError::Rejected(reason)) => {
-                    return Err(eyre!("{reason}"));
-                }
-            };
-            if let Some(task_id) = recorded.task_id.as_deref() {
-                queue_task_status_updates(&state, &app.helper, task_id);
-            }
-            Some((
-                selected_instance_id,
-                recorded.task_id.clone(),
-                recorded.stop_request_id,
-                previous_mode,
-            ))
-        }
-    };
-
-    if let Some((instance_id, task_id_to_queue, stop_request_id, previous_mode)) = wait_for_stop {
-        wait_for_helper_observed_stop(
-            app,
-            &instance_id,
-            task_id_to_queue.as_deref(),
-            stop_request_id,
-        )
-        .await?;
-        return Ok(previous_mode);
-    }
-    Ok(None)
-}
-
-fn merge_launch_response_with_helper_restart(
-    response: String,
-    stopped_previous_mode: Option<&str>,
-    requested_mode: &str,
-) -> String {
-    let Some(previous_mode) = stopped_previous_mode else {
-        return response;
-    };
-    let Ok(mut value) = serde_json::from_str::<Value>(&response) else {
-        return response;
-    };
-    let Some(object) = value.as_object_mut() else {
-        return response;
-    };
-    object.insert("restart_applied".to_owned(), Value::Bool(true));
-    object.insert(
-        "previous_mode".to_owned(),
-        Value::String(previous_mode.to_owned()),
-    );
-    object.insert(
-        "message".to_owned(),
-        Value::String(format!(
-            "Stopped the previous Studio session and launched {requested_mode}."
-        )),
-    );
-    object.insert(
-        "actions".to_owned(),
-        Value::Array(vec![
-            Value::String("stop".to_owned()),
-            Value::String(requested_mode.to_owned()),
-        ]),
-    );
-    serde_json::to_string(&value).unwrap_or(response)
 }
 
 async fn wait_for_helper_observed_stop(
@@ -7027,9 +6962,71 @@ mod tests {
         assert!(ensure_studio_control_slot_available(&state, "instance-a", "RunCode").is_ok());
     }
 
-    #[test]
-    fn helper_launch_response_preserves_plain_launch_and_marks_helper_restart() {
-        let plain = serde_json::json!({
+    #[tokio::test]
+    async fn helper_launch_rejects_play_state_without_recording_stop_request() {
+        let app = test_app_state();
+        {
+            let mut state = app.state.lock().await;
+            let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+            instance.studio_mode = Some("start_play".to_owned());
+            instance.studio_mode_source = "play_control".to_owned();
+            instance.studio_mode_observed_at = Some(Instant::now());
+            instance.studio_control_state = "ready".to_owned();
+            instance.studio_transition_phase = "running".to_owned();
+            instance.studio_control_observed_at = Some(Instant::now());
+            state.instances.insert("instance-a".to_owned(), instance);
+        }
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let command = serde_json::json!({
+            "id": "request-a",
+            "args": {
+                "LaunchStudioSession": {
+                    "mode": "start_play"
+                }
+            }
+        });
+
+        let error = handle_remote_command(
+            app.clone(),
+            "93795519121520",
+            Some("task-a"),
+            command,
+            sender,
+            Arc::new(Mutex::new(HashMap::new())),
+            "request-a".to_owned(),
+        )
+        .await
+        .expect_err("low-level launch must not stop and relaunch an existing play session");
+
+        assert!(error.to_string().contains("studio_already_playing"));
+        let state = app.state.lock().await;
+        let instance = state.instances.get("instance-a").unwrap();
+        assert_eq!(instance.stop_request_id, 0);
+        assert_eq!(instance.studio_transition_phase, "running");
+        assert!(instance.queue.is_empty());
+        assert!(state.waiting_for_plugin.is_empty());
+    }
+
+    #[tokio::test]
+    async fn helper_launch_forwards_from_stop_without_rewriting_response() {
+        let app = test_app_state();
+        {
+            let mut state = app.state.lock().await;
+            state.instances.insert(
+                "instance-a".to_owned(),
+                test_instance("93795519121520", Some("task-a"), 0),
+            );
+        }
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let command = serde_json::json!({
+            "id": "request-a",
+            "args": {
+                "LaunchStudioSession": {
+                    "mode": "start_play"
+                }
+            }
+        });
+        let expected_response = serde_json::json!({
             "message": "Launched Studio session in start_play.",
             "actions": ["start_play"],
             "requested_mode": "start_play",
@@ -7038,35 +7035,65 @@ mod tests {
             "final_mode": "start_play"
         })
         .to_string();
-
-        assert_eq!(
-            merge_launch_response_with_helper_restart(plain.clone(), None, "start_play"),
-            plain
-        );
-
-        let merged =
-            merge_launch_response_with_helper_restart(plain, Some("start_play"), "start_play");
-        let value: Value = serde_json::from_str(&merged).unwrap();
-
-        assert_eq!(value["restart_applied"], Value::Bool(true));
-        assert_eq!(
-            value["previous_mode"],
-            Value::String("start_play".to_owned())
-        );
-        assert_eq!(
-            value["actions"],
-            Value::Array(vec![
-                Value::String("stop".to_owned()),
-                Value::String("start_play".to_owned())
-            ])
-        );
-        assert_eq!(
-            value["message"],
-            Value::String(
-                "Stopped the previous Studio session and launched start_play.".to_owned()
+        let app_for_command = app.clone();
+        let handle = tokio::spawn(async move {
+            handle_remote_command(
+                app_for_command,
+                "93795519121520",
+                Some("task-a"),
+                command,
+                sender,
+                Arc::new(Mutex::new(HashMap::new())),
+                "request-a".to_owned(),
             )
-        );
-        assert_eq!(value["final_mode"], Value::String("start_play".to_owned()));
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let ready = {
+                    let state = app.state.lock().await;
+                    state.waiting_for_plugin.contains_key("request-a")
+                };
+                if ready {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("launch command should be queued for the plugin");
+        {
+            let state = app.state.lock().await;
+            let instance = state.instances.get("instance-a").unwrap();
+            assert_eq!(instance.stop_request_id, 0);
+            assert_eq!(instance.queue.len(), 1);
+            assert_eq!(
+                instance.queue.front().unwrap()["args"]["LaunchStudioSession"]["mode"],
+                Value::String("start_play".to_owned())
+            );
+        }
+        mcp_plugin_response_handler(
+            State(app.clone()),
+            Json(PluginResponsePayload {
+                instance_id: Some("instance-a".to_owned()),
+                id: "request-a".to_owned(),
+                success: true,
+                response: expected_response.clone(),
+                studio_mode: Some("stop".to_owned()),
+            }),
+        )
+        .await
+        .expect("plugin response should be accepted");
+
+        let response = handle
+            .await
+            .expect("remote command task should join")
+            .expect("launch response should succeed");
+        assert_eq!(response, expected_response);
+        let state = app.state.lock().await;
+        let instance = state.instances.get("instance-a").unwrap();
+        assert_eq!(instance.stop_request_id, 0);
     }
 
     #[test]
