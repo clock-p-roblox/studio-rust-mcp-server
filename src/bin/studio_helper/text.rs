@@ -30,6 +30,38 @@ pub(super) fn summarize_error(value: &str) -> String {
     if trimmed.len() <= LIMIT {
         trimmed.to_owned()
     } else {
-        format!("{}...", &trimmed[..LIMIT])
+        let end = trimmed
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= LIMIT)
+            .last()
+            .unwrap_or(0);
+        format!("{}...", &trimmed[..end])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::summarize_error;
+
+    #[test]
+    fn summarize_error_keeps_short_ascii_error() {
+        assert_eq!(
+            summarize_error("  failed to connect  "),
+            "failed to connect"
+        );
+    }
+
+    #[test]
+    fn summarize_error_truncates_long_ascii_error() {
+        let input = "x".repeat(181);
+        assert_eq!(summarize_error(&input), format!("{}...", "x".repeat(180)));
+    }
+
+    #[test]
+    fn summarize_error_truncates_on_utf8_char_boundary() {
+        let input = format!("{}中", "x".repeat(179));
+        assert_eq!(input.len(), 182);
+        assert_eq!(summarize_error(&input), format!("{}...", "x".repeat(179)));
     }
 }
