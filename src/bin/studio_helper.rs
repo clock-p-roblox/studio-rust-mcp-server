@@ -448,6 +448,9 @@ struct ClaimedTaskStatus {
     remote_last_error: Option<String>,
     remote_last_ready_age_ms: Option<u128>,
     remote_last_server_message_age_ms: Option<u128>,
+    studio_session_state: String,
+    last_known_session_state: Option<String>,
+    last_session_error_reason: Option<String>,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
     studio_mode_source: String,
@@ -528,6 +531,9 @@ struct HelperHeartbeatTaskStatus {
     remote_last_error: Option<String>,
     remote_last_ready_age_ms: Option<u128>,
     remote_last_server_message_age_ms: Option<u128>,
+    studio_session_state: String,
+    last_known_session_state: Option<String>,
+    last_session_error_reason: Option<String>,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
     studio_mode_source: String,
@@ -588,6 +594,9 @@ struct HelperInstanceStatus {
     task_id: Option<String>,
     remote_base_url: String,
     studio_pid: Option<u32>,
+    studio_session_state: String,
+    last_known_session_state: Option<String>,
+    last_session_error_reason: Option<String>,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
     studio_mode_source: String,
@@ -907,6 +916,36 @@ fn bind_launch_process_to_pid(
         },
     );
     Ok(())
+}
+
+fn task_instance_pids(state: &HelperState, task_id: &str) -> Vec<u32> {
+    let mut pids = state
+        .instances
+        .values()
+        .filter(|instance| instance.task_id.as_deref() == Some(task_id))
+        .filter_map(|instance| instance.studio_pid)
+        .collect::<Vec<_>>();
+    pids.sort();
+    pids.dedup();
+    pids
+}
+
+fn launch_process_is_active_for_status(state: &HelperState, launch: &LaunchProcessRecord) -> bool {
+    let instance_pids = task_instance_pids(state, &launch.task_id);
+    instance_pids.is_empty() || instance_pids.contains(&launch.studio_pid)
+}
+
+fn task_active_studio_pid(state: &HelperState, task_id: &str) -> Option<u32> {
+    task_instance_pids(state, task_id)
+        .into_iter()
+        .next()
+        .or_else(|| {
+            state
+                .launch_processes
+                .get(task_id)
+                .filter(|launch| launch_process_is_active_for_status(state, launch))
+                .map(|launch| launch.studio_pid)
+        })
 }
 
 fn remove_instances_for_claimed_task(state: &mut HelperState, task_id: &str) {
@@ -1688,6 +1727,12 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
             task_id: instance.task_id.clone(),
             remote_base_url: instance.remote_base_url.clone(),
             studio_pid: instance.studio_pid,
+            studio_session_state: current_session_state_for_instance(instance)
+                .unwrap_or("none_response")
+                .to_owned(),
+            last_known_session_state: last_known_session_state_for_instance(instance)
+                .map(str::to_owned),
+            last_session_error_reason: instance.studio_control_last_error.clone(),
             studio_mode: instance.studio_mode.clone(),
             studio_mode_age_ms: instance
                 .studio_mode_observed_at
@@ -1723,13 +1768,9 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
                 studio_snapshot.studio_mode.as_deref(),
             );
             let launch_process = state.launch_processes.get(&task.task_id);
-            let studio_pid = launch_process.map(|launch| launch.studio_pid).or_else(|| {
-                state
-                    .instances
-                    .values()
-                    .find(|instance| route_identity_matches(instance, Some(task.task_id.as_str())))
-                    .and_then(|instance| instance.studio_pid)
-            });
+            let studio_pid = task_active_studio_pid(&state, &task.task_id);
+            let active_launch_process =
+                launch_process.filter(|launch| launch_process_is_active_for_status(&state, launch));
             let runtime_log_base_url = task.runtime_log_base_url.as_ref().map(|_| {
                 runtime_log_forward_base_url(app.helper.port, &task.place_id, &task.task_id)
             });
@@ -1746,7 +1787,7 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
                 runtime_log_remote_base_url: task.runtime_log_base_url.clone(),
                 runtime_log_upload_url,
                 studio_pid,
-                launched_by_helper: launch_process
+                launched_by_helper: active_launch_process
                     .map(|launch| launch.launched_by_helper)
                     .unwrap_or(false),
                 claimed_age_ms: task.claimed_at.elapsed().as_millis(),
@@ -1772,6 +1813,9 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
                         .last_server_message_at
                         .map(|value| value.elapsed().as_millis())
                 }),
+                studio_session_state: studio_snapshot.studio_session_state,
+                last_known_session_state: studio_snapshot.last_known_session_state,
+                last_session_error_reason: studio_snapshot.last_session_error_reason,
                 studio_mode: studio_snapshot.studio_mode,
                 studio_mode_age_ms: studio_snapshot.studio_mode_age_ms,
                 studio_mode_source: studio_snapshot.studio_mode_source,
@@ -1791,6 +1835,7 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
     let mut launched_studios: Vec<_> = state
         .launch_processes
         .values()
+        .filter(|launch| launch_process_is_active_for_status(&state, launch))
         .map(|launch| LaunchProcessStatus {
             task_id: launch.task_id.clone(),
             place_id: launch.place_id.clone(),
@@ -1839,7 +1884,9 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
         }
         if let Some(claimed_task) = claimed_task.as_ref() {
             if let Some(launch) = state.launch_processes.get(&claimed_task.task_id) {
-                studio_pids.push(launch.studio_pid);
+                if launch_process_is_active_for_status(&state, launch) {
+                    studio_pids.push(launch.studio_pid);
+                }
             }
         }
         registered_instance_ids.sort();
@@ -2858,6 +2905,9 @@ fn studio_mode_is_running(mode: Option<&str>) -> bool {
 
 #[derive(Clone, Debug)]
 struct StudioTaskStatusSnapshot {
+    studio_session_state: String,
+    last_known_session_state: Option<String>,
+    last_session_error_reason: Option<String>,
     studio_mode: Option<String>,
     studio_mode_age_ms: Option<u128>,
     studio_mode_source: String,
@@ -2890,6 +2940,140 @@ fn is_stop_request_deliverable_phase(phase: &str) -> bool {
 
 fn is_error_transition_phase(phase: &str) -> bool {
     phase == "error"
+}
+
+fn current_session_state_for_instance(instance: &PluginInstance) -> Option<&'static str> {
+    let transition_phase = effective_studio_transition_phase(instance);
+    if is_stopping_transition_phase(&transition_phase) {
+        return Some("stopping");
+    }
+    if studio_mode_is_running(instance.studio_mode.as_deref()) {
+        if instance_has_fresh_control(instance) {
+            return Some("play");
+        }
+        if transition_phase == "starting" {
+            return Some("starting_play");
+        }
+        return None;
+    }
+    if instance.studio_mode.as_deref() == Some("stop") && edit_runtime_state(instance) == "ready" {
+        return Some("stop");
+    }
+    None
+}
+
+fn last_known_session_state_for_instance(instance: &PluginInstance) -> Option<&'static str> {
+    let transition_phase = effective_studio_transition_phase(instance);
+    if is_stopping_transition_phase(&transition_phase) {
+        return Some("stopping");
+    }
+    match instance.studio_mode.as_deref() {
+        Some("start_play") | Some("run_server") => {
+            if instance_has_fresh_control(instance) {
+                Some("play")
+            } else {
+                Some("starting_play")
+            }
+        }
+        Some("stop") => Some("stop"),
+        _ => None,
+    }
+}
+
+fn task_studio_session_state_snapshot(
+    state: &HelperState,
+    task_id: &str,
+) -> (String, Option<String>, Option<String>) {
+    let mut has_instance = false;
+    let mut has_stopping = false;
+    let mut has_play = false;
+    let mut has_starting = false;
+    let mut has_stop = false;
+    let mut newest_known: Option<(&'static str, u128)> = None;
+    let mut newest_error: Option<(String, u128)> = None;
+
+    for instance in state
+        .instances
+        .values()
+        .filter(|instance| instance.task_id.as_deref() == Some(task_id))
+    {
+        has_instance = true;
+        match current_session_state_for_instance(instance) {
+            Some("stopping") => has_stopping = true,
+            Some("play") => has_play = true,
+            Some("starting_play") => has_starting = true,
+            Some("stop") => has_stop = true,
+            _ => {}
+        }
+        if let Some(known) = last_known_session_state_for_instance(instance) {
+            let age = instance
+                .studio_mode_observed_at
+                .or(instance.studio_transition_started_at)
+                .map(|observed_at| observed_at.elapsed().as_millis())
+                .unwrap_or(u128::MAX);
+            if newest_known
+                .as_ref()
+                .map(|(_, current_age)| age < *current_age)
+                .unwrap_or(true)
+            {
+                newest_known = Some((known, age));
+            }
+        }
+        if let Some(error) = instance.studio_control_last_error.as_ref() {
+            let age = instance
+                .studio_transition_started_at
+                .or(instance.studio_control_observed_at)
+                .or(instance.studio_mode_observed_at)
+                .map(|observed_at| observed_at.elapsed().as_millis())
+                .unwrap_or(u128::MAX);
+            if newest_error
+                .as_ref()
+                .map(|(_, current_age)| age < *current_age)
+                .unwrap_or(true)
+            {
+                newest_error = Some((error.clone(), age));
+            }
+        }
+    }
+
+    let studio_session_state = if !has_instance {
+        "none_connected"
+    } else if has_stopping {
+        "stopping"
+    } else if has_play {
+        "play"
+    } else if has_starting {
+        "starting_play"
+    } else if has_stop {
+        "stop"
+    } else {
+        "none_response"
+    }
+    .to_owned();
+
+    let last_known_session_state = if matches!(
+        studio_session_state.as_str(),
+        "stop" | "starting_play" | "play" | "stopping"
+    ) {
+        Some(studio_session_state.clone())
+    } else {
+        newest_known.map(|(state, _)| state.to_owned())
+    };
+
+    let last_session_error_reason =
+        newest_error
+            .map(|(error, _)| error)
+            .or_else(|| match studio_session_state.as_str() {
+                "none_connected" => Some("studio_plugin_not_connected".to_owned()),
+                "none_response" => Some("studio_plugin_no_response".to_owned()),
+                _ => None,
+            });
+
+    (
+        studio_session_state,
+        last_known_session_state,
+        last_session_error_reason,
+    )
 }
 
 fn set_studio_transition_phase(instance: &mut PluginInstance, phase: &str) {
@@ -3097,6 +3281,8 @@ fn update_instance_studio_mode(
 }
 
 fn task_studio_mode_snapshot(state: &HelperState, task_id: &str) -> StudioTaskStatusSnapshot {
+    let (studio_session_state, last_known_session_state, last_session_error_reason) =
+        task_studio_session_state_snapshot(state, task_id);
     state
         .instances
         .values()
@@ -3133,6 +3319,9 @@ fn task_studio_mode_snapshot(state: &HelperState, task_id: &str) -> StudioTaskSt
                 control_last_error,
             )| {
                 mode.map(|mode| StudioTaskStatusSnapshot {
+                    studio_session_state: studio_session_state.clone(),
+                    last_known_session_state: last_known_session_state.clone(),
+                    last_session_error_reason: last_session_error_reason.clone(),
                     studio_mode: Some(mode),
                     studio_mode_age_ms: Some(age),
                     studio_mode_source: mode_source,
@@ -3146,6 +3335,9 @@ fn task_studio_mode_snapshot(state: &HelperState, task_id: &str) -> StudioTaskSt
             },
         )
         .unwrap_or(StudioTaskStatusSnapshot {
+            studio_session_state,
+            last_known_session_state,
+            last_session_error_reason,
             studio_mode: None,
             studio_mode_age_ms: None,
             studio_mode_source: "none".to_owned(),
@@ -3192,6 +3384,9 @@ fn helper_task_status_snapshot(state: &HelperState, task_id: &str) -> HelperTask
         task_official_adapter_snapshot(state, task_id, studio_snapshot.studio_mode.as_deref());
     HelperTaskStatusSnapshot {
         task_id: task_id.to_owned(),
+        studio_session_state: Some(studio_snapshot.studio_session_state),
+        last_known_session_state: studio_snapshot.last_known_session_state,
+        last_session_error_reason: studio_snapshot.last_session_error_reason,
         studio_mode: studio_snapshot.studio_mode,
         studio_mode_age_ms: ws_age_ms(studio_snapshot.studio_mode_age_ms),
         studio_mode_source: Some(studio_snapshot.studio_mode_source),
@@ -3293,6 +3488,9 @@ fn heartbeat_task_statuses(state: &HelperState) -> Vec<HelperHeartbeatTaskStatus
                         .last_server_message_at
                         .map(|value| value.elapsed().as_millis())
                 }),
+                studio_session_state: studio_snapshot.studio_session_state,
+                last_known_session_state: studio_snapshot.last_known_session_state,
+                last_session_error_reason: studio_snapshot.last_session_error_reason,
                 studio_mode: studio_snapshot.studio_mode,
                 studio_mode_age_ms: studio_snapshot.studio_mode_age_ms,
                 studio_mode_source: studio_snapshot.studio_mode_source,
@@ -6690,6 +6888,94 @@ mod tests {
         assert_eq!(control_state, "none");
         assert_eq!(transition_phase, "idle");
         assert!(observed_at.is_none());
+    }
+
+    #[test]
+    fn task_studio_session_state_reports_none_connected_without_instances() {
+        let state = empty_helper_state();
+        let snapshot = task_studio_mode_snapshot(&state, "task-a");
+
+        assert_eq!(snapshot.studio_session_state, "none_connected");
+        assert!(snapshot.last_known_session_state.is_none());
+        assert_eq!(
+            snapshot.last_session_error_reason.as_deref(),
+            Some("studio_plugin_not_connected")
+        );
+    }
+
+    #[test]
+    fn task_studio_session_state_prioritizes_play_over_stop() {
+        let mut state = empty_helper_state();
+        let mut edit_instance = test_instance("93795519121520", Some("task-a"), 0);
+        edit_instance.studio_mode = Some("stop".to_owned());
+        edit_instance.studio_mode_source = "edit_plugin".to_owned();
+        edit_instance.edit_runtime_observed_at = Some(Instant::now());
+        let mut play_instance = test_instance("93795519121520", Some("task-a"), 0);
+        play_instance.studio_mode = Some("start_play".to_owned());
+        play_instance.studio_mode_source = "play_control".to_owned();
+        play_instance.studio_control_state = "ready".to_owned();
+        play_instance.studio_transition_phase = "running".to_owned();
+        play_instance.studio_control_observed_at = Some(Instant::now());
+        state
+            .instances
+            .insert("edit-instance".to_owned(), edit_instance);
+        state
+            .instances
+            .insert("play-instance".to_owned(), play_instance);
+
+        let snapshot = task_studio_mode_snapshot(&state, "task-a");
+
+        assert_eq!(snapshot.studio_session_state, "play");
+        assert_eq!(snapshot.last_known_session_state.as_deref(), Some("play"));
+    }
+
+    #[test]
+    fn task_studio_session_state_prioritizes_stopping_over_play() {
+        let mut state = empty_helper_state();
+        let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+        instance.studio_mode = Some("start_play".to_owned());
+        instance.studio_mode_source = "play_control".to_owned();
+        instance.studio_control_state = "stopping".to_owned();
+        instance.studio_transition_phase = "stopping_requested".to_owned();
+        instance.studio_control_observed_at = Some(Instant::now());
+        state.instances.insert("instance-a".to_owned(), instance);
+
+        let snapshot = task_studio_mode_snapshot(&state, "task-a");
+
+        assert_eq!(snapshot.studio_session_state, "stopping");
+        assert_eq!(
+            snapshot.last_known_session_state.as_deref(),
+            Some("stopping")
+        );
+    }
+
+    #[test]
+    fn task_active_studio_pid_prefers_registered_plugin_pid() {
+        let mut state = empty_helper_state();
+        state.claimed_tasks.insert(
+            "task-a".to_owned(),
+            test_claimed_task("task-a", "93795519121520"),
+        );
+        state.launch_processes.insert(
+            "task-a".to_owned(),
+            LaunchProcessRecord {
+                task_id: "task-a".to_owned(),
+                place_id: "93795519121520".to_owned(),
+                universe_id: Some("999".to_owned()),
+                studio_pid: 21632,
+                launched_by_helper: true,
+                #[cfg(target_os = "windows")]
+                kill_on_close_job: None,
+                child: None,
+            },
+        );
+        let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+        instance.studio_pid = Some(19180);
+        state.instances.insert("instance-a".to_owned(), instance);
+
+        assert_eq!(task_active_studio_pid(&state, "task-a"), Some(19180));
+        let launch = state.launch_processes.get("task-a").unwrap();
+        assert!(!launch_process_is_active_for_status(&state, launch));
     }
 
     #[test]

@@ -47,6 +47,12 @@ pub(super) struct HubHelperActiveTaskPayload {
     #[serde(default)]
     pub(super) remote_state: String,
     #[serde(default)]
+    pub(super) studio_session_state: Option<String>,
+    #[serde(default)]
+    pub(super) last_known_session_state: Option<String>,
+    #[serde(default)]
+    pub(super) last_session_error_reason: Option<String>,
+    #[serde(default)]
     pub(super) studio_mode: Option<String>,
     #[serde(default)]
     pub(super) studio_mode_age_ms: Option<u128>,
@@ -83,10 +89,16 @@ pub(super) struct HubTaskRouteSnapshot {
     pub(super) task_accepting_launches: bool,
     pub(super) task_services_healthy: bool,
     pub(super) remote_state: Option<String>,
+    pub(super) studio_session_state: Option<String>,
+    pub(super) last_known_session_state: Option<String>,
+    pub(super) last_session_error_reason: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct LocalStudioLiveSnapshot {
+    pub(super) studio_session_state: Option<String>,
+    pub(super) last_known_session_state: Option<String>,
+    pub(super) last_session_error_reason: Option<String>,
     pub(super) studio_mode: Option<String>,
     pub(super) studio_mode_age_ms: Option<u128>,
     pub(super) studio_mode_source: Option<String>,
@@ -136,7 +148,7 @@ impl LocalStudioLiveSnapshot {
 
     pub(super) fn edit_ready(&self) -> bool {
         self.studio_snapshot_fresh()
-            && self.studio_mode.as_deref() == Some("stop")
+            && self.studio_session_state.as_deref() == Some("stop")
             && self.edit_runtime_state.as_deref() == Some("ready")
             && self
                 .edit_runtime_age_ms

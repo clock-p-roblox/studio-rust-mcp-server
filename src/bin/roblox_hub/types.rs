@@ -96,6 +96,9 @@ pub(super) struct HelperActiveTaskRecord {
     pub(super) remote_last_error: Option<String>,
     pub(super) remote_last_ready_age_ms: Option<u128>,
     pub(super) remote_last_server_message_age_ms: Option<u128>,
+    pub(super) studio_session_state: Option<String>,
+    pub(super) last_known_session_state: Option<String>,
+    pub(super) last_session_error_reason: Option<String>,
     pub(super) studio_mode: Option<String>,
     pub(super) studio_mode_age_ms: Option<u128>,
     pub(super) studio_mode_source: Option<String>,
@@ -303,6 +306,12 @@ pub(super) struct HelperActiveTaskHeartbeat {
     #[serde(default)]
     pub(super) remote_last_server_message_age_ms: Option<u128>,
     #[serde(default)]
+    pub(super) studio_session_state: Option<String>,
+    #[serde(default)]
+    pub(super) last_known_session_state: Option<String>,
+    #[serde(default)]
+    pub(super) last_session_error_reason: Option<String>,
+    #[serde(default)]
     pub(super) studio_mode: Option<String>,
     #[serde(default)]
     pub(super) studio_mode_age_ms: Option<u128>,
@@ -411,6 +420,9 @@ pub(super) struct HelperActiveTaskPayload {
     pub(super) remote_last_error: Option<String>,
     pub(super) remote_last_ready_age_ms: Option<u128>,
     pub(super) remote_last_server_message_age_ms: Option<u128>,
+    pub(super) studio_session_state: Option<String>,
+    pub(super) last_known_session_state: Option<String>,
+    pub(super) last_session_error_reason: Option<String>,
     pub(super) studio_mode: Option<String>,
     pub(super) studio_mode_age_ms: Option<u128>,
     pub(super) studio_mode_source: Option<String>,
