@@ -960,6 +960,10 @@ Phase 4 reviewer 结论：
 
 - 3 个 reviewer 最终通过。
 - 审核重点包括：无持久缓存、无复杂重试、无无界队列、queue full 不错误扣减、HTTP 失败和无 HTTP status 的连接/协议失败都可观测、状态能从 helper 透传到 hub 和 MCP server。
+- 第二轮 3 个新 reviewer 发现并推动补修两处边界：
+  - 后台 job 完成前 task release 时，完成回写必须校验 `task_id / place_id / claimed_at` 仍匹配；release 后 late completion 不得重建 `runtime_log_forward_statuses`。
+  - 上传白名单必须按 path-only 校验，合法 query 继续透传到上游。
+- 第二轮最终复审 3 人通过，无必须修项；剩余只是不影响行为的命名/抽函数/测试等待方式优化。
 
 Phase 4 验证：
 
@@ -968,6 +972,9 @@ Phase 4 验证：
 - `py -3 -m py_compile util/local_state_sync_probe.py util/studio_debug_preflight.py`
 - `cargo build --release --bins`
 - `py -3 util/local_state_sync_probe.py` 的 runtime-log 部分通过：慢 sink 下 helper 0-1ms 返回 `202`，后台成功后 helper / hub / MCP server debug / MCP server `/status` 都看到 `state=ready`；失败 sink 下 helper 3-11ms 返回 `202`，后台失败后四处都看到 `state=error`、`last_http_status=503` 和同一错误文本。
+- 第二轮补修后新增测试：
+  - `runtime_log_forward_allows_upload_query_and_forwards_it`
+  - `runtime_log_forward_completion_after_release_does_not_recreate_status`
 
 Phase 4 验证遗留：
 

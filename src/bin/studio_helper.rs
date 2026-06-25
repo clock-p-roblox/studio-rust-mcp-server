@@ -3690,6 +3690,50 @@ fn mark_runtime_log_forward_failed(
     record.last_error_at = record.last_attempt_at;
 }
 
+fn runtime_log_forward_task_is_current(
+    state: &HelperState,
+    task_id: &str,
+    place_id: &str,
+    claimed_at: Instant,
+) -> bool {
+    state
+        .claimed_tasks
+        .get(task_id)
+        .map(|task| task.place_id == place_id && task.claimed_at == claimed_at)
+        .unwrap_or(false)
+}
+
+fn mark_runtime_log_forward_succeeded_if_current(
+    state: &mut HelperState,
+    task_id: &str,
+    place_id: &str,
+    claimed_at: Instant,
+    target_path: String,
+    http_status: u16,
+) -> bool {
+    if !runtime_log_forward_task_is_current(state, task_id, place_id, claimed_at) {
+        return false;
+    }
+    mark_runtime_log_forward_succeeded(state, task_id, target_path, http_status);
+    true
+}
+
+fn mark_runtime_log_forward_failed_if_current(
+    state: &mut HelperState,
+    task_id: &str,
+    place_id: &str,
+    claimed_at: Instant,
+    target_path: String,
+    http_status: Option<u16>,
+    error: String,
+) -> bool {
+    if !runtime_log_forward_task_is_current(state, task_id, place_id, claimed_at) {
+        return false;
+    }
+    mark_runtime_log_forward_failed(state, task_id, target_path, http_status, error);
+    true
+}
+
 fn mark_runtime_log_forward_rejected(
     state: &mut HelperState,
     task_id: &str,
@@ -6953,6 +6997,14 @@ mod tests {
         app: AppState,
         path: &str,
     ) -> std::result::Result<Response, HelperError> {
+        call_runtime_log_forward_with_uri(app, path, Uri::from_static("/v1/runtime-logs")).await
+    }
+
+    async fn call_runtime_log_forward_with_uri(
+        app: AppState,
+        path: &str,
+        uri: Uri,
+    ) -> std::result::Result<Response, HelperError> {
         runtime_log_forward_task_path_handler(
             State(app),
             AxumPath((
@@ -6961,7 +7013,7 @@ mod tests {
                 path.to_owned(),
             )),
             Method::POST,
-            Uri::from_static("/v1/runtime-logs"),
+            uri,
             HeaderMap::new(),
             Bytes::from_static(b"{\"ok\":true}"),
         )
@@ -7002,6 +7054,66 @@ mod tests {
         assert_eq!(status.forwarded_count, 1);
         assert_eq!(status.failed_count, 0);
         assert_eq!(status.state, "ready");
+    }
+
+    #[tokio::test]
+    async fn runtime_log_forward_allows_upload_query_and_forwards_it() {
+        let app = test_app_state_with_runtime_log_worker();
+        let (sink_base_url, received_rx) =
+            spawn_test_runtime_log_sink(204, Duration::from_millis(0)).await;
+        insert_claimed_task_with_runtime_log_base(
+            &app,
+            "task-a",
+            "134795435066737",
+            sink_base_url,
+        )
+        .await;
+
+        let response = call_runtime_log_forward_with_uri(
+            app,
+            "v1/runtime-logs",
+            Uri::from_static("/v1/runtime-logs?cursor=abc"),
+        )
+        .await
+        .expect("runtime-log upload with query should be accepted");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let request = received_rx
+            .await
+            .expect("sink should receive background request");
+        assert!(request.starts_with("POST /v1/runtime-logs?cursor=abc "));
+    }
+
+    #[tokio::test]
+    async fn runtime_log_forward_completion_after_release_does_not_recreate_status() {
+        let app = test_app_state_with_runtime_log_worker();
+        let (sink_base_url, _received_rx) =
+            spawn_test_runtime_log_sink(204, Duration::from_millis(750)).await;
+        insert_claimed_task_with_runtime_log_base(
+            &app,
+            "task-a",
+            "134795435066737",
+            sink_base_url,
+        )
+        .await;
+
+        let response = call_runtime_log_forward(app.clone(), "v1/runtime-logs")
+            .await
+            .expect("runtime-log upload should be accepted before release");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        {
+            let mut state = app.state.lock().await;
+            assert!(state.runtime_log_forward_statuses.contains_key("task-a"));
+            let _ = release_claimed_task(&mut state, "task-a", false, "test release");
+            assert!(!state.runtime_log_forward_statuses.contains_key("task-a"));
+        }
+
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let state = app.state.lock().await;
+        assert!(
+            !state.runtime_log_forward_statuses.contains_key("task-a"),
+            "released task must not be recreated by a late runtime-log forward completion"
+        );
     }
 
     #[tokio::test]
