@@ -43,30 +43,52 @@ use helper_ws::{
     OFFICIAL_MCP_ADAPTER_CAPABILITY, OFFICIAL_MCP_STORE_IMAGE_BASE64_CAPABILITY,
 };
 
+#[path = "studio_helper/config.rs"]
+mod config;
+#[path = "studio_helper/runtime_log_forward.rs"]
+mod runtime_log_forward;
+#[path = "studio_helper/studio_process.rs"]
+mod studio_process;
+#[path = "studio_helper/text.rs"]
+mod text;
+#[path = "studio_helper/urls.rs"]
+mod urls;
+
+use config::{
+    build_http_client, helper_data_dir, resolve_bearer_token, resolve_bearer_token_candidates,
+    resolve_helper_id, resolve_user_name, Args, HelperConfig, ResolvedToken,
+};
+#[cfg(test)]
+use config::{helper_id_from_machine_guid, parse_machine_guid_reg_query_output};
+use runtime_log_forward::runtime_log_forward_task_path_handler;
+#[cfg(target_os = "windows")]
+use studio_process::launch_studio_for_claim;
+#[cfg(test)]
+use studio_process::studio_launch_args_for_claim;
+use studio_process::{ensure_claimed_task_universe_id, now_stamp};
+use text::{sanitize_identifier, sanitize_place_id, summarize_error, trim};
+use urls::{
+    derive_remote_helper_ws_url_from_base_url, rojo_forward_base_url, rojo_forward_target_path,
+    rojo_forward_target_ws_url, runtime_log_forward_base_url, runtime_log_forward_upload_url,
+    runtime_screenshot_helper_upload_url, runtime_screenshot_upload_url_for_base_url,
+};
+
 #[cfg(target_os = "windows")]
 use regex::Regex;
 #[cfg(target_os = "windows")]
 use std::mem::size_of;
 #[cfg(target_os = "windows")]
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::OwnedHandle;
 #[cfg(target_os = "windows")]
 use std::ptr::null_mut;
 #[cfg(target_os = "windows")]
-use std::time::{SystemTime, UNIX_EPOCH};
-#[cfg(target_os = "windows")]
-use windows_sys::Win32::Foundation::{HANDLE, HWND, LPARAM, RECT};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Networking::WinSock::AF_INET;
-#[cfg(target_os = "windows")]
-use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, EnumWindows, GetClientRect, GetWindowRect, GetWindowTextLengthW,
@@ -85,7 +107,7 @@ const OFFICIAL_MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(1800);
 const OBSERVABLE_UPSTREAM_SLOW_AFTER: Duration = Duration::from_secs(5);
 const OFFICIAL_STORE_IMAGE_MAX_DECODED_BYTES: usize = 20 * 1024 * 1024;
 const OFFICIAL_STORE_IMAGE_MAX_BASE64_CHARS: usize =
-    ((OFFICIAL_STORE_IMAGE_MAX_DECODED_BYTES + 2) / 3) * 4;
+    OFFICIAL_STORE_IMAGE_MAX_DECODED_BYTES.div_ceil(3) * 4;
 const INSTANCE_STALE_AFTER: Duration = Duration::from_secs(45);
 const REMOTE_WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const REMOTE_WS_STALE_RESTART_AFTER: Duration = Duration::from_secs(30);
@@ -100,53 +122,6 @@ const ALLOWED_OFFICIAL_MCP_TOOLS: &[&str] = &[
     "generate_procedural_model",
     "wait_job_finished",
 ];
-
-#[derive(Parser, Debug, Clone)]
-struct Args {
-    #[arg(long, default_value_t = DEFAULT_HELPER_PORT)]
-    port: u16,
-    #[arg(long)]
-    user_name: Option<String>,
-    #[arg(long)]
-    bearer_token: Option<String>,
-    #[arg(long)]
-    bearer_token_file: Option<PathBuf>,
-    #[arg(long, default_value = DEFAULT_DOMAIN_SUFFIX)]
-    domain_suffix: String,
-    #[arg(long)]
-    helper_id: Option<String>,
-    #[arg(long, required = true)]
-    hub_base_url: Option<String>,
-    #[arg(long)]
-    studio_path: Option<PathBuf>,
-    #[arg(long, default_value_t = 4)]
-    capacity: usize,
-    #[arg(long, default_value_t = false)]
-    skip_claim_studio_launch: bool,
-}
-
-#[derive(Clone)]
-struct HelperConfig {
-    port: u16,
-    helper_id: String,
-    capacity: usize,
-    user_name: String,
-    bearer_token: Arc<Mutex<String>>,
-    bearer_token_source: Arc<Mutex<String>>,
-    bearer_token_candidates: Arc<Vec<ResolvedToken>>,
-    domain_suffix: String,
-    hub_base_url: Option<String>,
-    studio_path: Option<PathBuf>,
-    skip_claim_studio_launch: bool,
-    client: reqwest::Client,
-    hub_heartbeat_notify: Arc<Notify>,
-}
-
-#[derive(Clone)]
-struct ResolvedToken {
-    value: String,
-    source: String,
-}
 
 struct PluginInstance {
     place_id: String,
@@ -226,17 +201,6 @@ struct PendingLaunchTermination {
     child: Child,
 }
 
-fn runtime_screenshot_upload_url_for_base_url(base_url: &str) -> String {
-    format!("{}/v1/runtime-screenshots", base_url.trim_end_matches('/'))
-}
-
-fn runtime_screenshot_helper_upload_url(helper_port: u16, place_id: &str, task_id: &str) -> String {
-    format!(
-        "{}/v1/runtime-screenshots",
-        runtime_log_forward_base_url(helper_port, place_id, task_id)
-    )
-}
-
 #[derive(Clone)]
 struct RemoteTarget {
     connection_key: String,
@@ -258,8 +222,11 @@ struct RemoteConnectionHandle {
     worker_id: Uuid,
     stop_tx: watch::Sender<bool>,
     sender: mpsc::UnboundedSender<RemoteOutgoingFrame>,
+    #[allow(dead_code)]
     remote_base_url: String,
+    #[allow(dead_code)]
     place_id: String,
+    #[allow(dead_code)]
     task_id: Option<String>,
     connection_state: RemoteConnectionState,
     state_changed_at: Instant,
@@ -515,6 +482,7 @@ struct RegisterHelperHubRequest {
 
 #[derive(Debug, Deserialize)]
 struct RegisterHelperHubResponse {
+    #[allow(dead_code)]
     helper_id: String,
     heartbeat_interval_sec: u64,
     heartbeat_timeout_sec: u64,
@@ -588,15 +556,11 @@ struct ClaimTaskHubRequest {
 
 #[derive(Debug, Deserialize)]
 struct ClaimTaskHubResponse {
+    #[allow(dead_code)]
     claimed: bool,
+    #[allow(dead_code)]
     helper_id: String,
     task: Option<ClaimedTaskHubPayload>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RobloxPlaceUniverseResponse {
-    #[serde(rename = "universeId")]
-    universe_id: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -699,48 +663,6 @@ struct RojoConfigResponse {
     auth_header: String,
 }
 
-fn rojo_forward_base_url(helper_port: u16, place_id: &str, task_id: &str) -> String {
-    format!("http://127.0.0.1:{helper_port}/rojo-forward/{place_id}/task/{task_id}")
-}
-
-fn runtime_log_forward_base_url(helper_port: u16, place_id: &str, task_id: &str) -> String {
-    format!("http://127.0.0.1:{helper_port}/runtime-log-forward/{place_id}/task/{task_id}")
-}
-
-fn runtime_log_forward_upload_url(helper_port: u16, place_id: &str, task_id: &str) -> String {
-    format!(
-        "{}/v1/runtime-logs",
-        runtime_log_forward_base_url(helper_port, place_id, task_id)
-    )
-}
-
-fn rojo_forward_target_path(path: &str, query: Option<&str>) -> String {
-    let mut target = String::from("/");
-    target.push_str(path.trim_start_matches('/'));
-    if let Some(query) = query.filter(|value| !value.is_empty()) {
-        target.push('?');
-        target.push_str(query);
-    }
-    target
-}
-
-fn rojo_forward_target_ws_url(base_url: &str, path: &str, query: Option<&str>) -> Result<String> {
-    let ws_base_url = if let Some(rest) = base_url.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if let Some(rest) = base_url.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else if base_url.starts_with("wss://") || base_url.starts_with("ws://") {
-        base_url.to_owned()
-    } else {
-        return Err(eyre!("Rojo forward base_url must use http(s) or ws(s)"));
-    };
-    Ok(format!(
-        "{}{}",
-        ws_base_url.trim_end_matches('/'),
-        rojo_forward_target_path(path, query)
-    ))
-}
-
 #[derive(Debug, Deserialize)]
 struct ScreenshotQuery {
     #[serde(rename = "placeId")]
@@ -815,10 +737,6 @@ struct ReadStudioLogResponse {
     lines: Vec<String>,
 }
 
-fn trim(value: &str) -> String {
-    value.trim().to_owned()
-}
-
 async fn await_observable_upstream_result<T, F>(
     operation: &'static str,
     target: String,
@@ -843,470 +761,6 @@ where
             future.await
         }
     }
-}
-
-fn normalize_bearer_token(value: &str) -> Option<String> {
-    let trimmed = value.trim().trim_start_matches('\u{feff}').trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let raw = trimmed.strip_prefix("Bearer ").unwrap_or(trimmed).trim();
-    if raw.is_empty() {
-        return None;
-    }
-
-    Some(raw.to_owned())
-}
-
-fn home_dir() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-}
-
-fn windows_appdata_dir() -> Option<PathBuf> {
-    env::var_os("APPDATA").map(PathBuf::from)
-}
-
-fn user_name_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(appdata) = windows_appdata_dir() {
-        candidates.push(appdata.join("dev.clock-p.com").join("feishu-user_name"));
-    }
-    if let Some(home) = home_dir() {
-        candidates.push(home.join(".dev.clock-p.com").join("feishu-user_name"));
-    }
-    candidates
-}
-
-fn token_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(appdata) = windows_appdata_dir() {
-        candidates.push(appdata.join("dev.clock-p.com").join("feishu-token"));
-    }
-    if let Some(home) = home_dir() {
-        candidates.push(home.join(".dev.clock-p.com").join("feishu-token"));
-    }
-    candidates
-}
-
-fn read_trimmed_file(path: &Path) -> Result<String> {
-    Ok(trim(
-        &fs::read_to_string(path)
-            .wrap_err_with(|| format!("failed to read {}", path.display()))?
-            .replace('\r', "")
-            .replace('\n', ""),
-    ))
-}
-
-fn resolve_user_name(args: &Args) -> Result<String> {
-    if let Some(value) = args.user_name.as_ref() {
-        let trimmed = trim(value).to_lowercase();
-        if !trimmed.is_empty() {
-            return Ok(trimmed);
-        }
-    }
-
-    for candidate in user_name_candidates() {
-        if candidate.is_file() {
-            let value = read_trimmed_file(&candidate)?.to_lowercase();
-            if !value.is_empty() {
-                return Ok(value);
-            }
-        }
-    }
-
-    Err(eyre!("cannot resolve feishu-user_name for helper"))
-}
-
-fn resolve_bearer_token(args: &Args) -> Result<String> {
-    Ok(resolve_bearer_token_candidates(args)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| eyre!("cannot resolve feishu-token for helper"))?
-        .value)
-}
-
-fn resolve_bearer_token_candidates(args: &Args) -> Result<Vec<ResolvedToken>> {
-    let mut resolved = Vec::new();
-
-    if let Some(value) = args.bearer_token.as_ref() {
-        if let Some(normalized) = normalize_bearer_token(value) {
-            resolved.push(ResolvedToken {
-                value: normalized,
-                source: "cli --bearer-token".to_owned(),
-            });
-        }
-    }
-
-    if let Some(path) = args.bearer_token_file.as_ref() {
-        if let Some(normalized) = normalize_bearer_token(&read_trimmed_file(path)?) {
-            resolved.push(ResolvedToken {
-                value: normalized,
-                source: path.display().to_string(),
-            });
-        }
-    }
-
-    for candidate in token_candidates() {
-        if candidate.is_file() {
-            if let Some(normalized) = normalize_bearer_token(&read_trimmed_file(&candidate)?) {
-                resolved.push(ResolvedToken {
-                    value: normalized,
-                    source: candidate.display().to_string(),
-                });
-            }
-        }
-    }
-
-    let mut unique = Vec::new();
-    let mut seen = HashSet::new();
-    for item in resolved {
-        if seen.insert(item.value.clone()) {
-            unique.push(item);
-        }
-    }
-
-    if unique.is_empty() {
-        return Err(eyre!("cannot resolve feishu-token for helper"));
-    }
-
-    Ok(unique)
-}
-
-fn helper_data_dir() -> Result<PathBuf> {
-    if let Some(appdata) = windows_appdata_dir() {
-        return Ok(appdata.join("dev.clock-p.com").join("studio-helper"));
-    }
-    if let Some(home) = home_dir() {
-        return Ok(home.join(".dev.clock-p.com").join("studio-helper"));
-    }
-    Err(eyre!("cannot resolve helper data directory"))
-}
-
-fn helper_id_from_machine_guid(machine_guid: &str) -> Result<String> {
-    let normalized = trim(machine_guid).to_ascii_lowercase();
-    if normalized.is_empty() {
-        return Err(eyre!("MachineGuid must not be empty"));
-    }
-    let source = format!("windows-machine-guid:{normalized}");
-    let derived = Uuid::new_v5(&Uuid::NAMESPACE_OID, source.as_bytes())
-        .simple()
-        .to_string();
-    sanitize_identifier("helper_id", &format!("h_{}", &derived[..12]))
-}
-
-fn parse_machine_guid_reg_query_output(output: &str) -> Result<String> {
-    for line in output.lines() {
-        let trimmed = trim(line);
-        if !trimmed.starts_with("MachineGuid") {
-            continue;
-        }
-        let mut parts = trimmed.split_whitespace();
-        let name = parts.next();
-        let value_type = parts.next();
-        let value = parts.collect::<Vec<_>>().join(" ");
-        if name == Some("MachineGuid") && value_type == Some("REG_SZ") && !value.is_empty() {
-            return Ok(trim(&value).to_owned());
-        }
-    }
-    Err(eyre!("reg query did not return MachineGuid"))
-}
-
-#[cfg(target_os = "windows")]
-fn resolve_default_helper_id() -> Result<String> {
-    let output = std::process::Command::new("reg")
-        .args([
-            "query",
-            r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Cryptography",
-            "/v",
-            "MachineGuid",
-        ])
-        .output()
-        .wrap_err("failed to query Windows MachineGuid with reg.exe")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(eyre!(
-            "failed to query MachineGuid: status={}, stderr={}",
-            output.status,
-            trim(&stderr)
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let machine_guid = parse_machine_guid_reg_query_output(&stdout)?;
-    helper_id_from_machine_guid(&machine_guid)
-}
-
-#[cfg(not(target_os = "windows"))]
-fn resolve_default_helper_id() -> Result<String> {
-    let data_dir = helper_data_dir()?;
-    fs::create_dir_all(&data_dir)?;
-    let path = data_dir.join("helper-id");
-    if path.exists() {
-        let existing = trim(&fs::read_to_string(&path)?);
-        return sanitize_identifier("helper_id", &existing);
-    }
-    let generated = format!("h_{}", &Uuid::new_v4().simple().to_string()[..10]);
-    fs::write(&path, format!("{generated}\n"))?;
-    Ok(generated)
-}
-
-#[cfg(target_os = "windows")]
-fn create_kill_on_close_job() -> Result<OwnedHandle> {
-    let job = unsafe { CreateJobObjectW(null_mut(), null_mut()) };
-    if job.is_null() {
-        return Err(eyre!(
-            "failed to create Studio kill-on-close job object: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-
-    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    let ok = unsafe {
-        SetInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            &limits as *const _ as *const _,
-            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        )
-    };
-    if ok == 0 {
-        let error = std::io::Error::last_os_error();
-        unsafe {
-            let _ = OwnedHandle::from_raw_handle(job as _);
-        }
-        return Err(eyre!(
-            "failed to configure Studio kill-on-close job object: {error}"
-        ));
-    }
-
-    Ok(unsafe { OwnedHandle::from_raw_handle(job as _) })
-}
-
-#[cfg(target_os = "windows")]
-fn assign_child_to_kill_on_close_job(job: &OwnedHandle, child: &Child) -> Result<()> {
-    let process_handle = child.as_raw_handle() as HANDLE;
-    let ok = unsafe { AssignProcessToJobObject(job.as_raw_handle() as HANDLE, process_handle) };
-    if ok == 0 {
-        return Err(eyre!(
-            "failed to assign helper-launched Studio to kill-on-close job object: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn now_stamp() -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    millis.to_string()
-}
-
-#[cfg(target_os = "windows")]
-fn resolve_studio_path(helper: &HelperConfig) -> Result<PathBuf> {
-    if let Some(path) = helper.studio_path.as_ref() {
-        if path.is_file() {
-            return Ok(path.clone());
-        }
-        return Err(eyre!(
-            "configured studio_path does not exist: {}",
-            path.display()
-        ));
-    }
-    if let Some(path) = env::var_os("CLOCK_P_STUDIO_PATH").map(PathBuf::from) {
-        if path.is_file() {
-            return Ok(path);
-        }
-        return Err(eyre!(
-            "CLOCK_P_STUDIO_PATH does not exist: {}",
-            path.display()
-        ));
-    }
-    let versions_root = env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .map(|path| path.join("Roblox").join("Versions"))
-        .ok_or_else(|| eyre!("cannot resolve LOCALAPPDATA for Studio discovery"))?;
-    let entries = fs::read_dir(&versions_root).wrap_err_with(|| {
-        format!(
-            "cannot read Roblox Studio versions directory: {}",
-            versions_root.display()
-        )
-    })?;
-    let mut candidates = Vec::new();
-    for entry in entries {
-        let entry = entry?;
-        let candidate = entry.path().join("RobloxStudioBeta.exe");
-        if !candidate.is_file() {
-            continue;
-        }
-        let modified = candidate
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .unwrap_or(UNIX_EPOCH);
-        candidates.push((modified, candidate));
-    }
-    candidates.sort_by_key(|(modified, _)| *modified);
-    candidates.pop().map(|(_, path)| path).ok_or_else(|| {
-        eyre!(
-            "could not locate RobloxStudioBeta.exe under {}",
-            versions_root.display()
-        )
-    })
-}
-
-#[cfg(target_os = "windows")]
-fn launch_studio_for_claim(
-    helper: &HelperConfig,
-    task: &ClaimedTask,
-) -> Result<LaunchProcessRecord> {
-    let studio_path = resolve_studio_path(helper)?;
-    let mut command = std::process::Command::new(&studio_path);
-    let launch_args = studio_launch_args_for_claim(task)?;
-    for arg in &launch_args {
-        command.arg(arg);
-    }
-    if let Some(parent) = studio_path.parent() {
-        command.current_dir(parent);
-    }
-    let mut child = command
-        .spawn()
-        .wrap_err_with(|| format!("failed to launch Studio at {}", studio_path.display()))?;
-    let kill_on_close_job = match create_kill_on_close_job() {
-        Ok(job) => job,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error).wrap_err_with(|| {
-                format!(
-                    "failed to arm helper-launched Studio for helper-exit cleanup at {}",
-                    studio_path.display()
-                )
-            });
-        }
-    };
-    if let Err(error) = assign_child_to_kill_on_close_job(&kill_on_close_job, &child) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error).wrap_err_with(|| {
-            format!(
-                "failed to tie helper-launched Studio to helper lifetime at {}",
-                studio_path.display()
-            )
-        });
-    }
-    let studio_pid = child.id();
-    tracing::info!(
-        task_id = task.task_id.as_str(),
-        place_id = task.place_id.as_str(),
-        universe_id = task.universe_id.as_deref(),
-        studio_pid,
-        studio_path = %studio_path.display(),
-        studio_args = ?launch_args,
-        "launched Roblox Studio for claimed task"
-    );
-    Ok(LaunchProcessRecord {
-        task_id: task.task_id.clone(),
-        place_id: task.place_id.clone(),
-        universe_id: task.universe_id.clone(),
-        studio_pid,
-        launched_by_helper: true,
-        kill_on_close_job: Some(kill_on_close_job),
-        child: Some(child),
-    })
-}
-
-fn studio_launch_args_for_claim(task: &ClaimedTask) -> Result<Vec<String>> {
-    let universe_id = task.universe_id.as_deref().ok_or_else(|| {
-        eyre!(
-            "cannot launch Studio for placeId {} without universeId",
-            task.place_id
-        )
-    })?;
-    Ok(vec![
-        "-task".to_owned(),
-        "EditPlace".to_owned(),
-        "-placeId".to_owned(),
-        task.place_id.clone(),
-        "-universeId".to_owned(),
-        universe_id.to_owned(),
-    ])
-}
-
-async fn ensure_claimed_task_universe_id(
-    helper: &HelperConfig,
-    task: &mut ClaimedTask,
-) -> Result<()> {
-    if task
-        .universe_id
-        .as_deref()
-        .is_some_and(|value| !trim(value).is_empty())
-    {
-        return Ok(());
-    }
-    let universe_id = resolve_universe_id_for_place(helper, &task.place_id).await?;
-    tracing::info!(
-        task_id = task.task_id.as_str(),
-        place_id = task.place_id.as_str(),
-        universe_id = universe_id.as_str(),
-        "resolved universeId for Studio launch"
-    );
-    task.universe_id = Some(universe_id);
-    Ok(())
-}
-
-async fn resolve_universe_id_for_place(helper: &HelperConfig, place_id: &str) -> Result<String> {
-    let place_id = sanitize_place_id(place_id)?;
-    let url = format!("https://apis.roblox.com/universes/v1/places/{place_id}/universe");
-    let response = tokio::time::timeout(
-        ROBLOX_PLACE_UNIVERSE_LOOKUP_TIMEOUT,
-        helper.client.get(&url).send(),
-    )
-    .await
-    .wrap_err_with(|| {
-        format!(
-            "timed out resolving universeId for placeId {place_id} after {}s",
-            ROBLOX_PLACE_UNIVERSE_LOOKUP_TIMEOUT.as_secs()
-        )
-    })?
-    .wrap_err_with(|| format!("failed to resolve universeId for placeId {place_id}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(eyre!(
-            "failed to resolve universeId for placeId {place_id}: HTTP {status}: {}",
-            summarize_error(&body)
-        ));
-    }
-    let payload = response
-        .json::<RobloxPlaceUniverseResponse>()
-        .await
-        .wrap_err_with(|| format!("failed to parse universeId response for placeId {place_id}"))?;
-    Ok(payload.universe_id.to_string())
-}
-
-fn sanitize_place_id(value: &str) -> Result<String> {
-    let trimmed = trim(value);
-    if trimmed.is_empty() || !trimmed.chars().all(|ch| ch.is_ascii_digit()) {
-        return Err(eyre!("placeId must be digits only"));
-    }
-    Ok(trimmed)
-}
-
-fn sanitize_identifier(label: &str, value: &str) -> Result<String> {
-    let trimmed = trim(value);
-    if trimmed.is_empty()
-        || !trimmed
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-    {
-        return Err(eyre!("{label} must use [A-Za-z0-9_-] only"));
-    }
-    Ok(trimmed)
 }
 
 fn maybe_sanitize_identifier(label: &str, value: Option<&str>) -> Result<Option<String>> {
@@ -1617,13 +1071,6 @@ fn reconcile_launch_processes(state: &mut HelperState) {
     }
 }
 
-fn resolve_helper_id(args: &Args) -> Result<String> {
-    if let Some(value) = args.helper_id.as_deref() {
-        return sanitize_identifier("helper_id", value);
-    }
-    resolve_default_helper_id()
-}
-
 async fn hub_post_json<TRequest: Serialize, TResponse: DeserializeOwned>(
     helper: &HelperConfig,
     path: &str,
@@ -1710,7 +1157,7 @@ async fn hub_register_helper(
         },
     )
     .await
-    .map_err(|error| RegisterHelperError::Other(error.into()))?;
+    .map_err(RegisterHelperError::Other)?;
     if let Some(message) = parse_helper_id_conflict(status, error_code.as_deref(), &body) {
         return Err(RegisterHelperError::HelperIdConflict(message));
     }
@@ -1937,16 +1384,6 @@ fn plugin_request_timeout_for_tool(tool_name: &str) -> Duration {
         PLUGIN_STUDIO_CONTROL_REQUEST_TIMEOUT
     } else {
         PLUGIN_REQUEST_TIMEOUT
-    }
-}
-
-fn summarize_error(value: &str) -> String {
-    const LIMIT: usize = 180;
-    let trimmed = value.trim();
-    if trimmed.len() <= LIMIT {
-        trimmed.to_owned()
-    } else {
-        format!("{}...", &trimmed[..LIMIT])
     }
 }
 
@@ -2623,18 +2060,6 @@ async fn resolve_rojo_forward_target_base_url(
         .ok_or_else(|| eyre!("claimed task has no rojo_base_url"))
 }
 
-async fn resolve_runtime_log_forward_target_base_url(
-    app: &AppState,
-    place_id: &str,
-    task_id: &str,
-) -> Result<String> {
-    let state = app.state.lock().await;
-    let claimed_task = select_claimed_task(&state, place_id, Some(task_id))?;
-    claimed_task
-        .runtime_log_base_url
-        .ok_or_else(|| eyre!("claimed task has no runtime_log_base_url"))
-}
-
 async fn rojo_forward_root_handler(
     State(app): State<AppState>,
     AxumPath(place_id): AxumPath<String>,
@@ -2869,6 +2294,7 @@ fn rojo_remote_ws_to_client(message: WsMessage) -> Option<AxumWsMessage> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn rojo_forward_request(
     app: AppState,
     place_id: String,
@@ -2938,91 +2364,6 @@ async fn rojo_forward_request(
     builder
         .body(Body::from(bytes))
         .wrap_err("failed to build Rojo forward response")
-        .map_err(HelperError)
-}
-
-async fn runtime_log_forward_task_path_handler(
-    State(app): State<AppState>,
-    AxumPath((place_id, task_id, path)): AxumPath<(String, String, String)>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, HelperError> {
-    runtime_log_forward_request(app, place_id, task_id, path, method, uri, headers, body).await
-}
-
-async fn runtime_log_forward_request(
-    app: AppState,
-    place_id: String,
-    task_id: String,
-    path: String,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, HelperError> {
-    let place_id = sanitize_place_id(&place_id)?;
-    let task_id = sanitize_identifier("task_id", &task_id)?;
-    let target_base_url =
-        resolve_runtime_log_forward_target_base_url(&app, &place_id, &task_id).await?;
-    let target_path = rojo_forward_target_path(&path, uri.query());
-    let target_url = format!("{}{}", target_base_url.trim_end_matches('/'), target_path);
-    let bearer_token = app.helper.bearer_token.lock().await.clone();
-    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
-        .wrap_err_with(|| format!("unsupported runtime-log forward method {method}"))?;
-    let mut request = app
-        .helper
-        .client
-        .request(reqwest_method, &target_url)
-        .bearer_auth(bearer_token);
-    if let Some(content_type) = headers
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-    {
-        request = request.header(CONTENT_TYPE, content_type);
-    }
-    if !body.is_empty() {
-        request = request.body(body.to_vec());
-    }
-    let (status, content_type, bytes) = await_observable_upstream_result(
-        "runtime_log_forward_http",
-        target_path.clone(),
-        async move {
-            let response = request.send().await.wrap_err_with(|| {
-                format!("failed to forward runtime-log request to {target_url}")
-            })?;
-            let status =
-                StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let content_type = response
-                .headers()
-                .get(CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .map(ToOwned::to_owned);
-            let bytes = response
-                .bytes()
-                .await
-                .wrap_err("failed to read runtime-log forward response body")?;
-            Result::<(StatusCode, Option<String>, Bytes)>::Ok((status, content_type, bytes))
-        },
-    )
-    .await?;
-    tracing::debug!(
-        place_id,
-        task_id,
-        method = method.as_str(),
-        target_path,
-        status = status.as_u16(),
-        bytes = bytes.len(),
-        "forwarded runtime-log request through helper"
-    );
-    let mut builder = Response::builder().status(status);
-    if let Some(content_type) = content_type {
-        builder = builder.header(CONTENT_TYPE, content_type);
-    }
-    builder
-        .body(Body::from(bytes))
-        .wrap_err("failed to build runtime-log forward response")
         .map_err(HelperError)
 }
 
@@ -3994,17 +3335,6 @@ fn validate_remote_ready_ack(
     Ok(())
 }
 
-fn derive_remote_helper_ws_url_from_base_url(remote_base_url: &str) -> String {
-    let base = if remote_base_url.starts_with("https://") {
-        remote_base_url.replacen("https://", "wss://", 1)
-    } else if remote_base_url.starts_with("http://") {
-        remote_base_url.replacen("http://", "ws://", 1)
-    } else {
-        remote_base_url.to_owned()
-    };
-    format!("{}{}", base.trim_end_matches('/'), HELPER_WS_PATH)
-}
-
 fn build_active_remote_targets(app: &AppState, state: &HelperState) -> Vec<RemoteTarget> {
     let mut targets = Vec::new();
     for claimed_task in state.claimed_tasks.values() {
@@ -4789,9 +4119,9 @@ async fn run_remote_ws_session(
     let writer_task = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
             let message = match frame {
-                RemoteOutgoingFrame::Text(text) => WsMessage::Text(text.into()),
-                RemoteOutgoingFrame::Ping(payload) => WsMessage::Ping(payload.into()),
-                RemoteOutgoingFrame::Pong(payload) => WsMessage::Pong(payload.into()),
+                RemoteOutgoingFrame::Text(text) => WsMessage::Text(text),
+                RemoteOutgoingFrame::Ping(payload) => WsMessage::Ping(payload),
+                RemoteOutgoingFrame::Pong(payload) => WsMessage::Pong(payload),
             };
             if let Err(error) = writer.send(message).await {
                 tracing::warn!(
@@ -6591,11 +5921,11 @@ $memory.Dispose()
             byte_len = output.stdout.len(),
             "captured Studio screenshot bytes from helper"
         );
-        return Ok(CapturedScreenshot {
+        Ok(CapturedScreenshot {
             resolved_place_id,
             png_bytes: output.stdout,
             window_title,
-        });
+        })
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -6627,7 +5957,7 @@ async fn take_screenshot(
         let output_path = output_dir.join(file_name);
         fs::write(&output_path, captured.png_bytes)?;
         tracing::info!(path = %output_path.display(), window_title = captured.window_title, "saved Studio screenshot debug file from helper");
-        return Ok(output_path.display().to_string());
+        Ok(output_path.display().to_string())
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -6730,12 +6060,12 @@ fn read_studio_log(args: ReadStudioLogArgs) -> Result<ReadStudioLogResponse> {
             all_lines[(start - 1)..end].to_vec()
         };
         tracing::debug!(path = %log_path.display(), total_lines, returned_lines = lines.len(), "read Studio log from helper");
-        return Ok(ReadStudioLogResponse {
+        Ok(ReadStudioLogResponse {
             path: log_path.display().to_string(),
             total_lines,
             range: [if total_lines == 0 { 0 } else { start }, end],
             lines,
-        });
+        })
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -6881,9 +6211,7 @@ async fn main() -> Result<()> {
         hub_base_url: args.hub_base_url.clone(),
         studio_path: args.studio_path.clone(),
         skip_claim_studio_launch: args.skip_claim_studio_launch,
-        client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(20))
-            .build()?,
+        client: build_http_client()?,
         hub_heartbeat_notify: Arc::new(Notify::new()),
     };
     let token_source = helper.bearer_token_source.lock().await.clone();

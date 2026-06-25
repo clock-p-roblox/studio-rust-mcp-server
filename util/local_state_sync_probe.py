@@ -13,10 +13,9 @@ from typing import Any
 
 
 REPO = Path(__file__).resolve().parents[1]
-PLATFORM_BRIDGE = REPO.parent / "clock-p-platform" / "tools" / "bridge"
-sys.path.insert(0, str(PLATFORM_BRIDGE))
+sys.path.insert(0, str(REPO / "util"))
 
-from mcp_client import McpClient, extract_text_content, require_non_error_result  # type: ignore
+from local_mcp_client import McpClient, extract_text_content, require_non_error_result
 
 
 HUB_URL = "http://127.0.0.1:44758"

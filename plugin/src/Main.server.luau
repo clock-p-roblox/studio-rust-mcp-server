@@ -5,6 +5,7 @@ local PluginUtils = require(Main.Utils.PluginUtils)
 local StudioSessionControl = require(Main.Utils.StudioSessionControl)
 local StudioModeTracker = require(Main.Utils.StudioModeTracker)
 local ToolDispatcher = require(Main.Utils.ToolDispatcher)
+local TextFormat = require(Main.Utils.TextFormat)
 local Types = require(Main.Types)
 
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
@@ -56,56 +57,6 @@ local connMessageOut = ConsoleOutput.startListener()
 plugin.Unloading:Connect(function()
 	connMessageOut:Disconnect()
 end)
-
-local function trim(value: string): string
-	return value:gsub("^%s+", ""):gsub("%s+$", "")
-end
-
-local function summarizeText(value: string?): string
-	if value == nil or value == "" then
-		return ""
-	end
-
-	if #value <= 180 then
-		return value
-	end
-
-	return string.sub(value, 1, 180) .. "..."
-end
-
-local function formatAgeMs(value: number?): string?
-	if value == nil then
-		return nil
-	end
-
-	if value < 1000 then
-		return "just now"
-	end
-
-	local seconds = math.floor(value / 1000)
-	if seconds < 60 then
-		return tostring(seconds) .. "s ago"
-	end
-
-	local minutes = math.floor(seconds / 60)
-	if minutes < 60 then
-		return tostring(minutes) .. "m ago"
-	end
-
-	local hours = math.floor(minutes / 60)
-	return tostring(hours) .. "h ago"
-end
-
-local function joinSentences(parts: { string }): string
-	local filtered = {}
-	for _, part in parts do
-		if part ~= "" then
-			table.insert(filtered, part)
-		end
-	end
-
-	return table.concat(filtered, " ")
-end
 
 local function logInfo(message: string, force: boolean?)
 	if force or VERBOSE_LOGS then
@@ -181,7 +132,7 @@ local function logPluginEvent(action: string, fields: { [string]: any }?)
 end
 
 local function normalizeHelperPort(value: string): string
-	local digits = trim(value):gsub("%D", "")
+	local digits = TextFormat.trim(value):gsub("%D", "")
 	if digits == "" then
 		return DEFAULT_HELPER_PORT
 	end
@@ -314,9 +265,9 @@ local function requestJson(baseUrl: string, method: string, path: string, body: 
 			path = path,
 			status = response.StatusCode,
 			elapsed_ms = elapsedMs,
-			body = summarizeText(response.Body),
+			body = TextFormat.summarizeText(response.Body),
 		})
-		error(string.format("Helper request %s %s failed with status %d: %s", method, path, response.StatusCode, summarizeText(response.Body)))
+		error(string.format("Helper request %s %s failed with status %d: %s", method, path, response.StatusCode, TextFormat.summarizeText(response.Body)))
 	end
 
 	logPluginEvent("helper_http_response", {
@@ -338,7 +289,7 @@ local function requestJson(baseUrl: string, method: string, path: string, body: 
 			method = method,
 			path = path,
 			error = tostring(decoded),
-			body = summarizeText(response.Body),
+			body = TextFormat.summarizeText(response.Body),
 		})
 		error("Failed to decode helper JSON response: " .. tostring(decoded))
 	end
@@ -372,7 +323,7 @@ local function toolCallHandler(args: Types.ToolArgs): string
 	end
 
 	if success then
-		logInfo("Tool " .. toolName .. " succeeded: " .. summarizeText(response or ""))
+		logInfo("Tool " .. toolName .. " succeeded: " .. TextFormat.summarizeText(response or ""))
 		return response or ""
 	end
 
@@ -927,7 +878,7 @@ local function refreshStatusFromHelper()
 			task_id = taskIdForPoll,
 			error = errorMessage,
 		})
-		setStatusSection("helper", "error", "Unavailable", summarizeText(errorMessage))
+		setStatusSection("helper", "error", "Unavailable", TextFormat.summarizeText(errorMessage))
 		setStatusSection(
 			"registration",
 			"warning",
@@ -1029,8 +980,8 @@ local function refreshStatusFromHelper()
 	local remoteLastError = if type(remoteSource.remote_last_error) == "string" and remoteSource.remote_last_error ~= ""
 		then remoteSource.remote_last_error
 		else nil
-	local lastReadyAge = formatAgeMs(tonumber(remoteSource.remote_last_ready_age_ms))
-	local lastServerAge = formatAgeMs(tonumber(remoteSource.remote_last_server_message_age_ms))
+	local lastReadyAge = TextFormat.formatAgeMs(tonumber(remoteSource.remote_last_ready_age_ms))
+	local lastServerAge = TextFormat.formatAgeMs(tonumber(remoteSource.remote_last_server_message_age_ms))
 	logPluginEvent("status_poll_claim_found", {
 		task_id = currentTaskId,
 		remote_state = remoteState,
@@ -1048,7 +999,7 @@ local function refreshStatusFromHelper()
 			"remote",
 			"connected",
 			"Connected",
-			joinSentences({
+			TextFormat.joinSentences({
 				remoteBaseUrl ~= nil and ("Remote bridge healthy at " .. remoteBaseUrl .. ".") or "",
 				remoteConnectionId ~= nil and ("Connection " .. remoteConnectionId .. ".") or "",
 				lastServerAge ~= nil and ("Last server traffic " .. lastServerAge .. ".") or "",
@@ -1062,7 +1013,7 @@ local function refreshStatusFromHelper()
 			"remote",
 			"info",
 			"Connecting",
-			joinSentences({
+			TextFormat.joinSentences({
 				remoteBaseUrl ~= nil and ("Opening remote bridge at " .. remoteBaseUrl .. ".") or "",
 				lastReadyAge ~= nil and ("Last ready acknowledgement " .. lastReadyAge .. ".") or "",
 			})
@@ -1075,7 +1026,7 @@ local function refreshStatusFromHelper()
 			"remote",
 			"error",
 			"Retrying",
-			joinSentences({
+			TextFormat.joinSentences({
 				remoteBaseUrl ~= nil and ("Remote bridge retrying at " .. remoteBaseUrl .. ".") or "",
 				remoteLastError ~= nil and ("Last error: " .. remoteLastError .. ".") or "",
 				lastReadyAge ~= nil and ("Last healthy acknowledgement " .. lastReadyAge .. ".") or "",
@@ -1088,7 +1039,7 @@ local function refreshStatusFromHelper()
 		"remote",
 		"warning",
 		"Disconnected",
-		joinSentences({
+		TextFormat.joinSentences({
 			remoteBaseUrl ~= nil and ("No active remote bridge at " .. remoteBaseUrl .. ".") or "",
 			remoteLastError ~= nil and ("Last error: " .. remoteLastError .. ".") or "",
 		})
@@ -1299,7 +1250,7 @@ local function connectToHelper(helperPort: string)
 				id = id,
 				success = success,
 				studio_mode = responseMode,
-				response = summarizeText(response),
+				response = TextFormat.summarizeText(response),
 			})
 			client:Send({
 				instance_id = instanceId,
@@ -1360,7 +1311,7 @@ local function connectToHelper(helperPort: string)
 					task_id = taskId,
 					id = id,
 					tool = toolName,
-					response = summarizeText(response),
+					response = TextFormat.summarizeText(response),
 				})
 				sendResponseOnce(true, response)
 				if isCurrentClient(client) then
