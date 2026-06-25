@@ -54,6 +54,31 @@ pub struct HelperTaskStatusSnapshot {
     pub edit_runtime_age_ms: Option<u64>,
     #[serde(rename = "studio_control_last_error", alias = "studioControlLastError")]
     pub studio_control_last_error: Option<String>,
+    #[serde(rename = "active_stop_request_id", alias = "activeStopRequestId")]
+    pub active_stop_request_id: Option<u64>,
+    #[serde(rename = "last_stop_request_id", alias = "lastStopRequestId")]
+    pub last_stop_request_id: Option<u64>,
+    #[serde(
+        rename = "stop_request_recorded_age_ms",
+        alias = "stopRequestRecordedAgeMs"
+    )]
+    pub stop_request_recorded_age_ms: Option<u64>,
+    #[serde(
+        rename = "runtime_actuator_last_poll_id",
+        alias = "runtimeActuatorLastPollId"
+    )]
+    pub runtime_actuator_last_poll_id: Option<u64>,
+    #[serde(
+        rename = "runtime_actuator_last_poll_age_ms",
+        alias = "runtimeActuatorLastPollAgeMs"
+    )]
+    pub runtime_actuator_last_poll_age_ms: Option<u64>,
+    #[serde(rename = "stop_result_phase", alias = "stopResultPhase")]
+    pub stop_result_phase: Option<String>,
+    #[serde(rename = "stop_result_age_ms", alias = "stopResultAgeMs")]
+    pub stop_result_age_ms: Option<u64>,
+    #[serde(rename = "stop_result_error", alias = "stopResultError")]
+    pub stop_result_error: Option<String>,
     #[serde(
         rename = "official_mcp_adapter_state",
         alias = "officialMcpAdapterState"
@@ -336,6 +361,14 @@ mod tests {
                 edit_runtime_state: Some("ready".to_owned()),
                 edit_runtime_age_ms: Some(3),
                 studio_control_last_error: None,
+                active_stop_request_id: Some(12),
+                last_stop_request_id: Some(12),
+                stop_request_recorded_age_ms: Some(25),
+                runtime_actuator_last_poll_id: Some(12),
+                runtime_actuator_last_poll_age_ms: Some(11),
+                stop_result_phase: Some("observed".to_owned()),
+                stop_result_age_ms: Some(9),
+                stop_result_error: None,
                 official_mcp_adapter_state: Some("ready".to_owned()),
                 official_mcp_adapter_age_ms: Some(7),
                 official_mcp_adapter_last_error: None,
@@ -355,6 +388,9 @@ mod tests {
         assert_eq!(encoded["task_status"]["studio_control_state"], "none");
         assert_eq!(encoded["task_status"]["studio_transition_phase"], "idle");
         assert_eq!(encoded["task_status"]["edit_runtime_state"], "ready");
+        assert_eq!(encoded["task_status"]["active_stop_request_id"], 12);
+        assert_eq!(encoded["task_status"]["last_stop_request_id"], 12);
+        assert_eq!(encoded["task_status"]["stop_result_phase"], "observed");
         assert_eq!(
             encoded["task_status"]["official_mcp_adapter_state"],
             "ready"
@@ -395,6 +431,14 @@ mod tests {
                 assert!(status.studio_session_state.is_none());
                 assert!(status.last_known_session_state.is_none());
                 assert!(status.last_session_error_reason.is_none());
+                assert!(status.active_stop_request_id.is_none());
+                assert!(status.last_stop_request_id.is_none());
+                assert!(status.stop_request_recorded_age_ms.is_none());
+                assert!(status.runtime_actuator_last_poll_id.is_none());
+                assert!(status.runtime_actuator_last_poll_age_ms.is_none());
+                assert!(status.stop_result_phase.is_none());
+                assert!(status.stop_result_age_ms.is_none());
+                assert!(status.stop_result_error.is_none());
                 assert_eq!(status.studio_mode_age_ms, Some(12));
                 assert_eq!(status.studio_mode_source.as_deref(), Some("edit_plugin"));
                 assert_eq!(status.studio_transition_age_ms, Some(4));

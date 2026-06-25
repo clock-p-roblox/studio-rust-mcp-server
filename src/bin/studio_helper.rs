@@ -138,6 +138,12 @@ struct PluginInstance {
     edit_runtime_observed_at: Option<Instant>,
     studio_control_last_error: Option<String>,
     stop_request_id: u64,
+    stop_request_recorded_at: Option<Instant>,
+    stop_request_last_polled_at: Option<Instant>,
+    stop_request_last_poll_id: Option<u64>,
+    stop_result_phase: Option<String>,
+    stop_result_error: Option<String>,
+    stop_result_observed_at: Option<Instant>,
     last_seen_at: Instant,
     queue: VecDeque<Value>,
     notify: Arc<Notify>,
@@ -460,6 +466,14 @@ struct ClaimedTaskStatus {
     edit_runtime_state: String,
     edit_runtime_age_ms: Option<u128>,
     studio_control_last_error: Option<String>,
+    active_stop_request_id: Option<u64>,
+    last_stop_request_id: u64,
+    stop_request_recorded_age_ms: Option<u128>,
+    runtime_actuator_last_poll_id: Option<u64>,
+    runtime_actuator_last_poll_age_ms: Option<u128>,
+    stop_result_phase: Option<String>,
+    stop_result_age_ms: Option<u128>,
+    stop_result_error: Option<String>,
     official_mcp_adapter_state: String,
     official_mcp_adapter_age_ms: Option<u128>,
     official_mcp_adapter_last_error: Option<String>,
@@ -543,6 +557,14 @@ struct HelperHeartbeatTaskStatus {
     edit_runtime_state: String,
     edit_runtime_age_ms: Option<u128>,
     studio_control_last_error: Option<String>,
+    active_stop_request_id: Option<u64>,
+    last_stop_request_id: u64,
+    stop_request_recorded_age_ms: Option<u128>,
+    runtime_actuator_last_poll_id: Option<u64>,
+    runtime_actuator_last_poll_age_ms: Option<u128>,
+    stop_result_phase: Option<String>,
+    stop_result_age_ms: Option<u128>,
+    stop_result_error: Option<String>,
     official_mcp_adapter_state: String,
     official_mcp_adapter_age_ms: Option<u128>,
     official_mcp_adapter_last_error: Option<String>,
@@ -606,6 +628,14 @@ struct HelperInstanceStatus {
     edit_runtime_state: String,
     edit_runtime_age_ms: Option<u128>,
     studio_control_last_error: Option<String>,
+    active_stop_request_id: Option<u64>,
+    last_stop_request_id: u64,
+    stop_request_recorded_age_ms: Option<u128>,
+    runtime_actuator_last_poll_id: Option<u64>,
+    runtime_actuator_last_poll_age_ms: Option<u128>,
+    stop_result_phase: Option<String>,
+    stop_result_age_ms: Option<u128>,
+    stop_result_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1721,33 +1751,44 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
     let mut instances: Vec<_> = state
         .instances
         .iter()
-        .map(|(instance_id, instance)| HelperInstanceStatus {
-            instance_id: instance_id.clone(),
-            place_id: instance.place_id.clone(),
-            task_id: instance.task_id.clone(),
-            remote_base_url: instance.remote_base_url.clone(),
-            studio_pid: instance.studio_pid,
-            studio_session_state: current_session_state_for_instance(instance)
-                .unwrap_or("none_response")
-                .to_owned(),
-            last_known_session_state: last_known_session_state_for_instance(instance)
-                .map(str::to_owned),
-            last_session_error_reason: instance.studio_control_last_error.clone(),
-            studio_mode: instance.studio_mode.clone(),
-            studio_mode_age_ms: instance
-                .studio_mode_observed_at
-                .map(|value| value.elapsed().as_millis()),
-            studio_mode_source: instance.studio_mode_source.clone(),
-            studio_control_state: effective_studio_control_state(instance),
-            studio_transition_phase: effective_studio_transition_phase(instance),
-            studio_transition_age_ms: instance
-                .studio_transition_started_at
-                .map(|value| value.elapsed().as_millis()),
-            edit_runtime_state: edit_runtime_state(instance),
-            edit_runtime_age_ms: instance
-                .edit_runtime_observed_at
-                .map(|value| value.elapsed().as_millis()),
-            studio_control_last_error: instance.studio_control_last_error.clone(),
+        .map(|(instance_id, instance)| {
+            let stop_snapshot = stop_request_snapshot_for_instance(instance);
+            HelperInstanceStatus {
+                instance_id: instance_id.clone(),
+                place_id: instance.place_id.clone(),
+                task_id: instance.task_id.clone(),
+                remote_base_url: instance.remote_base_url.clone(),
+                studio_pid: instance.studio_pid,
+                studio_session_state: current_session_state_for_instance(instance)
+                    .unwrap_or("none_response")
+                    .to_owned(),
+                last_known_session_state: last_known_session_state_for_instance(instance)
+                    .map(str::to_owned),
+                last_session_error_reason: instance.studio_control_last_error.clone(),
+                studio_mode: instance.studio_mode.clone(),
+                studio_mode_age_ms: instance
+                    .studio_mode_observed_at
+                    .map(|value| value.elapsed().as_millis()),
+                studio_mode_source: instance.studio_mode_source.clone(),
+                studio_control_state: effective_studio_control_state(instance),
+                studio_transition_phase: effective_studio_transition_phase(instance),
+                studio_transition_age_ms: instance
+                    .studio_transition_started_at
+                    .map(|value| value.elapsed().as_millis()),
+                edit_runtime_state: edit_runtime_state(instance),
+                edit_runtime_age_ms: instance
+                    .edit_runtime_observed_at
+                    .map(|value| value.elapsed().as_millis()),
+                studio_control_last_error: instance.studio_control_last_error.clone(),
+                active_stop_request_id: stop_snapshot.active_stop_request_id,
+                last_stop_request_id: stop_snapshot.last_stop_request_id,
+                stop_request_recorded_age_ms: stop_snapshot.stop_request_recorded_age_ms,
+                runtime_actuator_last_poll_id: stop_snapshot.runtime_actuator_last_poll_id,
+                runtime_actuator_last_poll_age_ms: stop_snapshot.runtime_actuator_last_poll_age_ms,
+                stop_result_phase: stop_snapshot.stop_result_phase,
+                stop_result_age_ms: stop_snapshot.stop_result_age_ms,
+                stop_result_error: stop_snapshot.stop_result_error,
+            }
         })
         .collect();
     instances.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
@@ -1825,6 +1866,15 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
                 edit_runtime_state: studio_snapshot.edit_runtime_state,
                 edit_runtime_age_ms: studio_snapshot.edit_runtime_age_ms,
                 studio_control_last_error: studio_snapshot.studio_control_last_error,
+                active_stop_request_id: studio_snapshot.active_stop_request_id,
+                last_stop_request_id: studio_snapshot.last_stop_request_id,
+                stop_request_recorded_age_ms: studio_snapshot.stop_request_recorded_age_ms,
+                runtime_actuator_last_poll_id: studio_snapshot.runtime_actuator_last_poll_id,
+                runtime_actuator_last_poll_age_ms: studio_snapshot
+                    .runtime_actuator_last_poll_age_ms,
+                stop_result_phase: studio_snapshot.stop_result_phase,
+                stop_result_age_ms: studio_snapshot.stop_result_age_ms,
+                stop_result_error: studio_snapshot.stop_result_error,
                 official_mcp_adapter_state,
                 official_mcp_adapter_age_ms,
                 official_mcp_adapter_last_error,
@@ -2459,6 +2509,12 @@ async fn mcp_register_handler(
                 edit_runtime_observed_at: Some(Instant::now()),
                 studio_control_last_error: None,
                 stop_request_id: 0,
+                stop_request_recorded_at: None,
+                stop_request_last_polled_at: None,
+                stop_request_last_poll_id: None,
+                stop_result_phase: None,
+                stop_result_error: None,
+                stop_result_observed_at: None,
                 last_seen_at: Instant::now(),
                 queue: VecDeque::new(),
                 notify: Arc::new(Notify::new()),
@@ -2559,14 +2615,26 @@ async fn mcp_plugin_stop_request_poll_handler(
     State(app): State<AppState>,
     Query(query): Query<PluginStopRequestQuery>,
 ) -> Result<Response, HelperError> {
-    let state = app.state.lock().await;
-    let Some(instance) = state.instances.get(&query.instance_id) else {
-        return Ok((StatusCode::GONE, "instance expired").into_response());
+    let mut state = app.state.lock().await;
+    let (stop_requested, stop_request_id, task_id) = {
+        let Some(instance) = state.instances.get_mut(&query.instance_id) else {
+            return Ok((StatusCode::GONE, "instance expired").into_response());
+        };
+        let after_id = query.after_id.unwrap_or(0);
+        let stop_request_id = instance.stop_request_id;
+        let stop_requested = stop_request_id > after_id
+            && is_stop_request_deliverable_phase(&effective_studio_transition_phase(instance));
+        instance.stop_request_last_polled_at = Some(Instant::now());
+        instance.stop_request_last_poll_id = Some(if stop_requested {
+            stop_request_id
+        } else {
+            after_id
+        });
+        (stop_requested, stop_request_id, instance.task_id.clone())
     };
-    let after_id = query.after_id.unwrap_or(0);
-    let stop_request_id = instance.stop_request_id;
-    let stop_requested = stop_request_id > after_id
-        && is_stop_request_deliverable_phase(&effective_studio_transition_phase(instance));
+    if let Some(task_id) = task_id.as_deref() {
+        queue_task_status_updates(&state, &app.helper, task_id);
+    }
     Ok(Json(PluginStopRequestResponse {
         stop_requested,
         stop_request_id,
@@ -2610,6 +2678,9 @@ async fn mcp_plugin_stop_result_handler(
                 instance.studio_control_state = "stopping".to_owned();
                 set_studio_transition_phase(instance, "stopping_observed");
                 instance.studio_control_last_error = None;
+                instance.stop_result_phase = Some("observed".to_owned());
+                instance.stop_result_error = None;
+                instance.stop_result_observed_at = Some(Instant::now());
             }
             "failed" => {
                 let message =
@@ -2622,6 +2693,9 @@ async fn mcp_plugin_stop_result_handler(
                 set_studio_transition_phase(instance, "error");
                 instance.studio_control_observed_at = None;
                 instance.studio_control_last_error = Some(message);
+                instance.stop_result_phase = Some("failed".to_owned());
+                instance.stop_result_error = instance.studio_control_last_error.clone();
+                instance.stop_result_observed_at = Some(Instant::now());
             }
             _ => return Ok((StatusCode::BAD_REQUEST, "invalid stop result phase").into_response()),
         }
@@ -2917,6 +2991,26 @@ struct StudioTaskStatusSnapshot {
     edit_runtime_state: String,
     edit_runtime_age_ms: Option<u128>,
     studio_control_last_error: Option<String>,
+    active_stop_request_id: Option<u64>,
+    last_stop_request_id: u64,
+    stop_request_recorded_age_ms: Option<u128>,
+    runtime_actuator_last_poll_id: Option<u64>,
+    runtime_actuator_last_poll_age_ms: Option<u128>,
+    stop_result_phase: Option<String>,
+    stop_result_age_ms: Option<u128>,
+    stop_result_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct StudioStopRequestSnapshot {
+    active_stop_request_id: Option<u64>,
+    last_stop_request_id: u64,
+    stop_request_recorded_age_ms: Option<u128>,
+    runtime_actuator_last_poll_id: Option<u64>,
+    runtime_actuator_last_poll_age_ms: Option<u128>,
+    stop_result_phase: Option<String>,
+    stop_result_age_ms: Option<u128>,
+    stop_result_error: Option<String>,
 }
 
 struct RecordedStopRequest {
@@ -2932,6 +3026,48 @@ enum StopRequestRecordError {
 
 fn is_stopping_transition_phase(phase: &str) -> bool {
     phase == "stopping_requested" || phase == "stopping_observed"
+}
+
+fn active_stop_request_id_for_instance(instance: &PluginInstance) -> Option<u64> {
+    if instance.stop_request_id > 0
+        && is_stopping_transition_phase(&instance.studio_transition_phase)
+    {
+        Some(instance.stop_request_id)
+    } else {
+        None
+    }
+}
+
+fn stop_request_snapshot_for_instance(instance: &PluginInstance) -> StudioStopRequestSnapshot {
+    StudioStopRequestSnapshot {
+        active_stop_request_id: active_stop_request_id_for_instance(instance),
+        last_stop_request_id: instance.stop_request_id,
+        stop_request_recorded_age_ms: instance
+            .stop_request_recorded_at
+            .map(|value| value.elapsed().as_millis()),
+        runtime_actuator_last_poll_id: instance.stop_request_last_poll_id,
+        runtime_actuator_last_poll_age_ms: instance
+            .stop_request_last_polled_at
+            .map(|value| value.elapsed().as_millis()),
+        stop_result_phase: instance.stop_result_phase.clone(),
+        stop_result_age_ms: instance
+            .stop_result_observed_at
+            .map(|value| value.elapsed().as_millis()),
+        stop_result_error: instance.stop_result_error.clone(),
+    }
+}
+
+fn empty_stop_request_snapshot() -> StudioStopRequestSnapshot {
+    StudioStopRequestSnapshot {
+        active_stop_request_id: None,
+        last_stop_request_id: 0,
+        stop_request_recorded_age_ms: None,
+        runtime_actuator_last_poll_id: None,
+        runtime_actuator_last_poll_age_ms: None,
+        stop_result_phase: None,
+        stop_result_age_ms: None,
+        stop_result_error: None,
+    }
 }
 
 fn is_stop_request_deliverable_phase(phase: &str) -> bool {
@@ -3133,22 +3269,16 @@ fn effective_studio_transition_phase(instance: &PluginInstance) -> String {
 }
 
 fn stop_request_rejection_reason(instance: &PluginInstance) -> Option<String> {
-    if !studio_mode_is_running(instance.studio_mode.as_deref()) {
-        return Some("studio_not_running: Studio is not currently in start_play or run_server; stop is a no-op".to_owned());
+    match current_session_state_for_instance(instance) {
+        Some("play") => None,
+        Some("stop") => Some("studio_already_stopped: Studio is already in stop/edit mode".to_owned()),
+        Some("stopping") => Some("studio_stop_in_progress: Studio stop is already in progress; wait for helper status to return stop/idle before issuing another control command".to_owned()),
+        Some("starting_play") => Some("studio_starting_play: Studio is still entering play mode; wait for play or stop before issuing stop".to_owned()),
+        Some(other) => Some(format!("studio_session_state_not_stoppable: current_state={other}")),
+        None => Some(instance.studio_control_last_error.clone().unwrap_or_else(|| {
+            "studio_plugin_no_response: helper cannot confirm a current play runtime stop actuator for this Studio instance".to_owned()
+        })),
     }
-    let transition_phase = effective_studio_transition_phase(instance);
-    if is_error_transition_phase(&transition_phase) {
-        return Some(instance.studio_control_last_error.clone().unwrap_or_else(|| {
-            "studio_stop_failed: previous Studio stop request failed; manually return Studio to stop before relaunching".to_owned()
-        }));
-    }
-    if is_stopping_transition_phase(&transition_phase) {
-        return Some("stopping_requested: Studio stop is already in progress; wait for helper status to return stop/idle before issuing another control command".to_owned());
-    }
-    if !instance_has_fresh_control(instance) {
-        return Some("uncontrolled_play_session: no fresh server runtime control heartbeat; refusing to request stop because the play/run runtime may not be running the stop actuator".to_owned());
-    }
-    None
 }
 
 fn record_stop_request_for_instance(
@@ -3168,6 +3298,12 @@ fn record_stop_request_for_instance(
     instance.studio_control_state = "stopping".to_owned();
     set_studio_transition_phase(instance, "stopping_requested");
     instance.studio_control_last_error = None;
+    instance.stop_request_recorded_at = Some(Instant::now());
+    instance.stop_request_last_polled_at = None;
+    instance.stop_request_last_poll_id = None;
+    instance.stop_result_phase = None;
+    instance.stop_result_error = None;
+    instance.stop_result_observed_at = None;
     instance.last_seen_at = Instant::now();
     Ok(RecordedStopRequest {
         place_id: instance.place_id.clone(),
@@ -3192,6 +3328,9 @@ fn mark_stop_request_timeout(
     set_studio_transition_phase(instance, "error");
     instance.studio_control_observed_at = None;
     instance.studio_control_last_error = Some(message);
+    instance.stop_result_phase = Some("timed_out".to_owned());
+    instance.stop_result_error = instance.studio_control_last_error.clone();
+    instance.stop_result_observed_at = Some(Instant::now());
     instance.last_seen_at = Instant::now();
     instance.task_id.clone()
 }
@@ -3199,6 +3338,13 @@ fn mark_stop_request_timeout(
 fn settle_instance_control_state(instance: &mut PluginInstance, mode: &str) {
     match mode {
         "stop" => {
+            if is_stopping_transition_phase(&instance.studio_transition_phase)
+                && instance.stop_request_id > 0
+            {
+                instance.stop_result_phase = Some("completed".to_owned());
+                instance.stop_result_error = None;
+                instance.stop_result_observed_at = Some(Instant::now());
+            }
             instance.studio_control_state = "none".to_owned();
             set_studio_transition_phase(instance, "idle");
             instance.studio_control_observed_at = None;
@@ -3283,6 +3429,19 @@ fn update_instance_studio_mode(
 fn task_studio_mode_snapshot(state: &HelperState, task_id: &str) -> StudioTaskStatusSnapshot {
     let (studio_session_state, last_known_session_state, last_session_error_reason) =
         task_studio_session_state_snapshot(state, task_id);
+    let stop_snapshot = state
+        .instances
+        .values()
+        .filter(|instance| instance.task_id.as_deref() == Some(task_id))
+        .max_by_key(|instance| {
+            (
+                active_stop_request_id_for_instance(instance).is_some(),
+                instance.stop_request_id,
+                instance.last_seen_at,
+            )
+        })
+        .map(stop_request_snapshot_for_instance)
+        .unwrap_or_else(empty_stop_request_snapshot);
     state
         .instances
         .values()
@@ -3331,6 +3490,15 @@ fn task_studio_mode_snapshot(state: &HelperState, task_id: &str) -> StudioTaskSt
                     edit_runtime_state,
                     edit_runtime_age_ms,
                     studio_control_last_error: control_last_error,
+                    active_stop_request_id: stop_snapshot.active_stop_request_id,
+                    last_stop_request_id: stop_snapshot.last_stop_request_id,
+                    stop_request_recorded_age_ms: stop_snapshot.stop_request_recorded_age_ms,
+                    runtime_actuator_last_poll_id: stop_snapshot.runtime_actuator_last_poll_id,
+                    runtime_actuator_last_poll_age_ms: stop_snapshot
+                        .runtime_actuator_last_poll_age_ms,
+                    stop_result_phase: stop_snapshot.stop_result_phase.clone(),
+                    stop_result_age_ms: stop_snapshot.stop_result_age_ms,
+                    stop_result_error: stop_snapshot.stop_result_error.clone(),
                 })
             },
         )
@@ -3347,6 +3515,14 @@ fn task_studio_mode_snapshot(state: &HelperState, task_id: &str) -> StudioTaskSt
             edit_runtime_state: "missing".to_owned(),
             edit_runtime_age_ms: None,
             studio_control_last_error: None,
+            active_stop_request_id: stop_snapshot.active_stop_request_id,
+            last_stop_request_id: stop_snapshot.last_stop_request_id,
+            stop_request_recorded_age_ms: stop_snapshot.stop_request_recorded_age_ms,
+            runtime_actuator_last_poll_id: stop_snapshot.runtime_actuator_last_poll_id,
+            runtime_actuator_last_poll_age_ms: stop_snapshot.runtime_actuator_last_poll_age_ms,
+            stop_result_phase: stop_snapshot.stop_result_phase,
+            stop_result_age_ms: stop_snapshot.stop_result_age_ms,
+            stop_result_error: stop_snapshot.stop_result_error,
         })
 }
 
@@ -3396,6 +3572,16 @@ fn helper_task_status_snapshot(state: &HelperState, task_id: &str) -> HelperTask
         edit_runtime_state: Some(studio_snapshot.edit_runtime_state),
         edit_runtime_age_ms: ws_age_ms(studio_snapshot.edit_runtime_age_ms),
         studio_control_last_error: studio_snapshot.studio_control_last_error,
+        active_stop_request_id: studio_snapshot.active_stop_request_id,
+        last_stop_request_id: Some(studio_snapshot.last_stop_request_id),
+        stop_request_recorded_age_ms: ws_age_ms(studio_snapshot.stop_request_recorded_age_ms),
+        runtime_actuator_last_poll_id: studio_snapshot.runtime_actuator_last_poll_id,
+        runtime_actuator_last_poll_age_ms: ws_age_ms(
+            studio_snapshot.runtime_actuator_last_poll_age_ms,
+        ),
+        stop_result_phase: studio_snapshot.stop_result_phase,
+        stop_result_age_ms: ws_age_ms(studio_snapshot.stop_result_age_ms),
+        stop_result_error: studio_snapshot.stop_result_error,
         official_mcp_adapter_state: Some(official_state),
         official_mcp_adapter_age_ms: ws_age_ms(official_age_ms),
         official_mcp_adapter_last_error: official_last_error,
@@ -3500,6 +3686,15 @@ fn heartbeat_task_statuses(state: &HelperState) -> Vec<HelperHeartbeatTaskStatus
                 edit_runtime_state: studio_snapshot.edit_runtime_state,
                 edit_runtime_age_ms: studio_snapshot.edit_runtime_age_ms,
                 studio_control_last_error: studio_snapshot.studio_control_last_error,
+                active_stop_request_id: studio_snapshot.active_stop_request_id,
+                last_stop_request_id: studio_snapshot.last_stop_request_id,
+                stop_request_recorded_age_ms: studio_snapshot.stop_request_recorded_age_ms,
+                runtime_actuator_last_poll_id: studio_snapshot.runtime_actuator_last_poll_id,
+                runtime_actuator_last_poll_age_ms: studio_snapshot
+                    .runtime_actuator_last_poll_age_ms,
+                stop_result_phase: studio_snapshot.stop_result_phase,
+                stop_result_age_ms: studio_snapshot.stop_result_age_ms,
+                stop_result_error: studio_snapshot.stop_result_error,
                 official_mcp_adapter_state,
                 official_mcp_adapter_age_ms,
                 official_mcp_adapter_last_error,
@@ -5635,18 +5830,45 @@ async fn handle_helper_start_stop_play(
         let mut state = app.state.lock().await;
         cleanup_stale_instances(&mut state);
         sync_remote_connections(&app, &mut state);
-        let selected_instance_id = select_instance_for_route(place_id, task_id, &state.instances)
-            .ok_or_else(|| {
-            eyre!("no active Studio plugin registered for placeId {place_id}")
-        })?;
-        ensure_studio_control_slot_available(&state, &selected_instance_id, "StartStopPlay")?;
-        let instance = state
-            .instances
-            .get(&selected_instance_id)
-            .ok_or_else(|| eyre!("selected helper instance disappeared"))?;
-        if !studio_mode_is_running(instance.studio_mode.as_deref()) {
-            return Ok("Stopped".to_owned());
+        let session_state = task_id
+            .map(|task_id| task_studio_mode_snapshot(&state, task_id).studio_session_state)
+            .or_else(|| {
+                select_instance_for_route(place_id, task_id, &state.instances).map(|instance_id| {
+                    state
+                        .instances
+                        .get(&instance_id)
+                        .and_then(current_session_state_for_instance)
+                        .unwrap_or("none_response")
+                        .to_owned()
+                })
+            })
+            .unwrap_or_else(|| "none_connected".to_owned());
+        match session_state.as_str() {
+            "stop" => return Ok("Stopped".to_owned()),
+            "play" => {}
+            "stopping" => {
+                return Err(eyre!("studio_stop_in_progress: Studio stop is already in progress; wait for helper status to return stop/idle before issuing another control command"));
+            }
+            "starting_play" => {
+                return Err(eyre!("studio_starting_play: Studio is still entering play mode; wait for play or stop before issuing stop"));
+            }
+            "none_response" => {
+                return Err(eyre!("studio_plugin_no_response: helper cannot confirm a current play runtime stop actuator for this Studio instance"));
+            }
+            "none_connected" => {
+                return Err(eyre!("studio_plugin_not_connected: no active Studio plugin registered for placeId {place_id}"));
+            }
+            other => {
+                return Err(eyre!(
+                    "studio_session_state_not_stoppable: current_state={other}"
+                ));
+            }
         }
+        let selected_instance_id = select_play_instance_for_route(place_id, task_id, &state.instances)
+            .ok_or_else(|| {
+                eyre!("stop_actuator_unavailable: helper session state is play but no matching play runtime plugin instance is available for placeId {place_id}")
+            })?;
+        ensure_studio_control_slot_available(&state, &selected_instance_id, "StartStopPlay")?;
         let recorded = match record_stop_request_for_instance(&mut state, &selected_instance_id) {
             Ok(recorded) => recorded,
             Err(StopRequestRecordError::MissingInstance) => {
@@ -5964,6 +6186,22 @@ fn select_instance_for_route(
         return None;
     }
     select_instance_for_place(place_id, instances)
+}
+
+fn select_play_instance_for_route(
+    place_id: &str,
+    task_id: Option<&str>,
+    instances: &HashMap<String, PluginInstance>,
+) -> Option<String> {
+    instances
+        .iter()
+        .filter(|(_, instance)| {
+            instance.place_id == place_id
+                && route_identity_matches(instance, task_id)
+                && current_session_state_for_instance(instance) == Some("play")
+        })
+        .max_by_key(|(_, instance)| instance.last_seen_at)
+        .map(|(instance_id, _)| instance_id.clone())
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -6571,6 +6809,12 @@ mod tests {
             edit_runtime_observed_at: Some(Instant::now()),
             studio_control_last_error: None,
             stop_request_id: 0,
+            stop_request_recorded_at: None,
+            stop_request_last_polled_at: None,
+            stop_request_last_poll_id: None,
+            stop_result_phase: None,
+            stop_result_error: None,
+            stop_result_observed_at: None,
             last_seen_at: Instant::now() - Duration::from_millis(age_ms),
             queue: VecDeque::new(),
             notify: Arc::new(Notify::new()),
@@ -6843,7 +7087,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_request_rejects_running_instance_without_fresh_control_heartbeat() {
+    fn stop_request_reports_no_response_without_fresh_control_heartbeat() {
         let mut instance = test_instance("93795519121520", Some("task-a"), 0);
         instance.studio_mode = Some("start_play".to_owned());
         instance.studio_control_state = "lost".to_owned();
@@ -6852,7 +7096,7 @@ mod tests {
 
         assert_eq!(
             stop_request_rejection_reason(&instance).as_deref(),
-            Some("uncontrolled_play_session: no fresh server runtime control heartbeat; refusing to request stop because the play/run runtime may not be running the stop actuator")
+            Some("studio_plugin_no_response: helper cannot confirm a current play runtime stop actuator for this Studio instance")
         );
     }
 
@@ -6869,7 +7113,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_request_rejects_stopped_instance_without_control_heartbeat() {
+    fn stop_request_reports_already_stopped_for_stopped_instance() {
         let mut instance = test_instance("93795519121520", Some("task-a"), 0);
         instance.studio_mode = Some("stop".to_owned());
         instance.studio_control_state = "none".to_owned();
@@ -6877,7 +7121,7 @@ mod tests {
 
         assert_eq!(
             stop_request_rejection_reason(&instance).as_deref(),
-            Some("studio_not_running: Studio is not currently in start_play or run_server; stop is a no-op")
+            Some("studio_already_stopped: Studio is already in stop/edit mode")
         );
     }
 
@@ -6938,11 +7182,21 @@ mod tests {
         instance.studio_control_state = "stopping".to_owned();
         instance.studio_transition_phase = "stopping_requested".to_owned();
         instance.studio_control_observed_at = Some(Instant::now());
+        instance.stop_request_id = 3;
+        instance.stop_request_recorded_at = Some(Instant::now());
+        let mut edit_instance = test_instance("93795519121520", Some("task-a"), 0);
+        edit_instance.studio_mode = Some("stop".to_owned());
+        edit_instance.studio_mode_source = "edit_plugin".to_owned();
+        edit_instance.edit_runtime_observed_at = Some(Instant::now());
         state.instances.insert("instance-a".to_owned(), instance);
+        state
+            .instances
+            .insert("edit-instance".to_owned(), edit_instance);
 
         let snapshot = task_studio_mode_snapshot(&state, "task-a");
 
         assert_eq!(snapshot.studio_session_state, "stopping");
+        assert_eq!(snapshot.active_stop_request_id, Some(3));
         assert_eq!(
             snapshot.last_known_session_state.as_deref(),
             Some("stopping")
@@ -7165,7 +7419,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_request_requires_fresh_runtime_control_and_runtime_poll_consumes_request() {
+    async fn stop_request_records_poll_and_completion_diagnostics() {
         let app = test_app_state();
         {
             let mut state = app.state.lock().await;
@@ -7199,7 +7453,7 @@ mod tests {
                 .studio_control_last_error
                 .as_deref()
                 .unwrap_or_default()
-                .starts_with("uncontrolled_play_session"));
+                .starts_with("studio_plugin_no_response"));
         }
 
         let heartbeat = mcp_plugin_control_heartbeat_handler(
@@ -7234,6 +7488,9 @@ mod tests {
             assert_eq!(instance.stop_request_id, 1);
             assert_eq!(instance.studio_control_state, "stopping");
             assert_eq!(instance.studio_transition_phase, "stopping_requested");
+            assert!(instance.stop_request_recorded_at.is_some());
+            assert_eq!(active_stop_request_id_for_instance(instance), Some(1));
+            assert!(instance.stop_result_phase.is_none());
         }
 
         let poll_stop = mcp_plugin_stop_request_poll_handler(
@@ -7252,6 +7509,12 @@ mod tests {
         let payload: PluginStopRequestResponse = serde_json::from_slice(&body).unwrap();
         assert!(payload.stop_requested);
         assert_eq!(payload.stop_request_id, 1);
+        {
+            let state = app.state.lock().await;
+            let instance = state.instances.get("instance-a").unwrap();
+            assert!(instance.stop_request_last_polled_at.is_some());
+            assert_eq!(instance.stop_request_last_poll_id, Some(1));
+        }
 
         let duplicate_stop = mcp_plugin_stop_request_handler(
             State(app.clone()),
@@ -7275,6 +7538,9 @@ mod tests {
             let snapshot = task_studio_mode_snapshot(&state, "task-a");
             assert_eq!(snapshot.studio_transition_phase, "stopping_requested");
             assert_eq!(snapshot.studio_control_state, "stopping");
+            assert_eq!(snapshot.active_stop_request_id, Some(1));
+            assert_eq!(snapshot.last_stop_request_id, 1);
+            assert_eq!(snapshot.runtime_actuator_last_poll_id, Some(1));
         }
 
         {
@@ -7291,6 +7557,9 @@ mod tests {
         assert_eq!(instance.studio_mode.as_deref(), Some("stop"));
         assert_eq!(instance.studio_control_state, "none");
         assert_eq!(instance.studio_transition_phase, "idle");
+        assert_eq!(instance.stop_result_phase.as_deref(), Some("completed"));
+        assert!(instance.stop_result_error.is_none());
+        assert!(instance.stop_result_observed_at.is_some());
     }
 
     #[tokio::test]

@@ -121,6 +121,30 @@ fn snapshot_from_hub_status_payload(
         last_session_error_reason: active_task_match
             .as_ref()
             .and_then(|active_task| active_task.last_session_error_reason.clone()),
+        active_stop_request_id: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.active_stop_request_id),
+        last_stop_request_id: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.last_stop_request_id),
+        stop_request_recorded_age_ms: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.stop_request_recorded_age_ms),
+        runtime_actuator_last_poll_id: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.runtime_actuator_last_poll_id),
+        runtime_actuator_last_poll_age_ms: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.runtime_actuator_last_poll_age_ms),
+        stop_result_phase: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.stop_result_phase.clone()),
+        stop_result_age_ms: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.stop_result_age_ms),
+        stop_result_error: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.stop_result_error.clone()),
     })
 }
 
@@ -217,10 +241,6 @@ async fn require_hub_route_ready_snapshot(
     Ok(snapshot)
 }
 
-fn studio_transition_is_stopping(phase: Option<&str>) -> bool {
-    matches!(phase, Some("stopping_requested" | "stopping_observed"))
-}
-
 #[derive(Clone, Copy)]
 enum LocalStudioGateKind {
     Edit,
@@ -288,6 +308,16 @@ fn local_studio_live_snapshot_locked(
         studio_session_state: status.studio_session_state.clone(),
         last_known_session_state: status.last_known_session_state.clone(),
         last_session_error_reason: status.last_session_error_reason.clone(),
+        active_stop_request_id: status.active_stop_request_id,
+        last_stop_request_id: status.last_stop_request_id,
+        stop_request_recorded_age_ms: opt_age_to_u128(status.stop_request_recorded_age_ms),
+        runtime_actuator_last_poll_id: status.runtime_actuator_last_poll_id,
+        runtime_actuator_last_poll_age_ms: opt_age_to_u128(
+            status.runtime_actuator_last_poll_age_ms,
+        ),
+        stop_result_phase: status.stop_result_phase.clone(),
+        stop_result_age_ms: opt_age_to_u128(status.stop_result_age_ms),
+        stop_result_error: status.stop_result_error.clone(),
         studio_mode: status.studio_mode.clone(),
         studio_mode_age_ms: opt_age_to_u128(status.studio_mode_age_ms),
         studio_mode_source: status.studio_mode_source.clone(),
@@ -348,17 +378,7 @@ fn local_studio_gate_wait_reason(
             }
             _ => None,
         },
-        LocalStudioGateKind::StopControl => match studio_session_state {
-            Some("play") => {
-                if status.studio_control_state.is_none() || status.studio_transition_phase.is_none()
-                {
-                    Some("studio_control_unavailable")
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        },
+        LocalStudioGateKind::StopControl => None,
         LocalStudioGateKind::Official => {
             if studio_session_state != Some("stop") {
                 return None;
@@ -481,33 +501,6 @@ fn require_local_stop_control_ready_locked(
         return Err(ErrorData::internal_error(
             format!(
                 "{action} failed fast: studio_session_state_not_play current_state={session_state}"
-            ),
-            None,
-        ));
-    }
-    ensure_reported_age_fresh(action, "studio_mode", snapshot.studio_mode_age_ms)?;
-    let transition_phase = snapshot
-        .studio_transition_phase
-        .as_deref()
-        .unwrap_or("unknown");
-    if studio_transition_is_stopping(Some(transition_phase)) {
-        return Err(ErrorData::internal_error(
-            format!(
-                "{action} failed fast: studio_stop_in_progress current_mode={} transition_phase={transition_phase}",
-                snapshot.studio_mode.as_deref().unwrap_or("unknown")
-            ),
-            None,
-        ));
-    }
-    if snapshot.studio_control_state.as_deref() != Some("ready") {
-        return Err(ErrorData::internal_error(
-            format!(
-                "{action} failed fast: uncontrolled_play_session current_mode={} studio_control_state={} transition_phase={transition_phase}",
-                snapshot.studio_mode.as_deref().unwrap_or("unknown"),
-                snapshot
-                    .studio_control_state
-                    .as_deref()
-                    .unwrap_or("unknown")
             ),
             None,
         ));
@@ -725,6 +718,14 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
     let mut studio_session_state = None;
     let mut last_known_session_state = None;
     let mut last_session_error_reason = None;
+    let mut active_stop_request_id = None;
+    let mut last_stop_request_id = None;
+    let mut stop_request_recorded_age_ms = None;
+    let mut runtime_actuator_last_poll_id = None;
+    let mut runtime_actuator_last_poll_age_ms = None;
+    let mut stop_result_phase = None;
+    let mut stop_result_age_ms = None;
+    let mut stop_result_error = None;
     let mut studio_mode = None;
     let mut studio_mode_age_ms = None;
     let mut studio_mode_source = None;
@@ -773,6 +774,14 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
         studio_session_state = snapshot.studio_session_state.clone();
         last_known_session_state = snapshot.last_known_session_state.clone();
         last_session_error_reason = snapshot.last_session_error_reason.clone();
+        active_stop_request_id = snapshot.active_stop_request_id;
+        last_stop_request_id = snapshot.last_stop_request_id;
+        stop_request_recorded_age_ms = snapshot.stop_request_recorded_age_ms;
+        runtime_actuator_last_poll_id = snapshot.runtime_actuator_last_poll_id;
+        runtime_actuator_last_poll_age_ms = snapshot.runtime_actuator_last_poll_age_ms;
+        stop_result_phase = snapshot.stop_result_phase.clone();
+        stop_result_age_ms = snapshot.stop_result_age_ms;
+        stop_result_error = snapshot.stop_result_error.clone();
         studio_mode = snapshot.studio_mode.clone();
         studio_mode_age_ms = snapshot.studio_mode_age_ms;
         studio_mode_source = snapshot.studio_mode_source.clone();
@@ -792,6 +801,14 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
         studio_session_state = snapshot.studio_session_state.clone();
         last_known_session_state = snapshot.last_known_session_state.clone();
         last_session_error_reason = snapshot.last_session_error_reason.clone();
+        active_stop_request_id = snapshot.active_stop_request_id;
+        last_stop_request_id = snapshot.last_stop_request_id;
+        stop_request_recorded_age_ms = snapshot.stop_request_recorded_age_ms;
+        runtime_actuator_last_poll_id = snapshot.runtime_actuator_last_poll_id;
+        runtime_actuator_last_poll_age_ms = snapshot.runtime_actuator_last_poll_age_ms;
+        stop_result_phase = snapshot.stop_result_phase.clone();
+        stop_result_age_ms = snapshot.stop_result_age_ms;
+        stop_result_error = snapshot.stop_result_error.clone();
     } else if official_mcp_adapter_state == "hub_unconfigured"
         || official_mcp_adapter_state == "task_id_unconfigured"
     {
@@ -836,6 +853,14 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
         studio_session_state,
         last_known_session_state,
         last_session_error_reason,
+        active_stop_request_id,
+        last_stop_request_id,
+        stop_request_recorded_age_ms,
+        runtime_actuator_last_poll_id,
+        runtime_actuator_last_poll_age_ms,
+        stop_result_phase,
+        stop_result_age_ms,
+        stop_result_error,
         studio_mode,
         studio_mode_age_ms,
         studio_mode_source,
@@ -1946,6 +1971,14 @@ mod tests {
                     studio_session_state: Some("stop".to_owned()),
                     last_known_session_state: Some("stop".to_owned()),
                     last_session_error_reason: None,
+                    active_stop_request_id: None,
+                    last_stop_request_id: Some(0),
+                    stop_request_recorded_age_ms: None,
+                    runtime_actuator_last_poll_id: None,
+                    runtime_actuator_last_poll_age_ms: None,
+                    stop_result_phase: None,
+                    stop_result_age_ms: None,
+                    stop_result_error: None,
                     studio_mode: Some("stop".to_owned()),
                     studio_mode_age_ms: Some(4),
                     studio_mode_source: Some("edit_plugin".to_owned()),
@@ -2000,6 +2033,14 @@ mod tests {
                     studio_session_state: Some("stop".to_owned()),
                     last_known_session_state: Some("stop".to_owned()),
                     last_session_error_reason: None,
+                    active_stop_request_id: None,
+                    last_stop_request_id: Some(0),
+                    stop_request_recorded_age_ms: None,
+                    runtime_actuator_last_poll_id: None,
+                    runtime_actuator_last_poll_age_ms: None,
+                    stop_result_phase: None,
+                    stop_result_age_ms: None,
+                    stop_result_error: None,
                     studio_mode: Some("stop".to_owned()),
                     studio_mode_age_ms: Some(4),
                     studio_mode_source: Some("edit_plugin".to_owned()),
@@ -2049,6 +2090,14 @@ mod tests {
                     studio_session_state: Some("play".to_owned()),
                     last_known_session_state: Some("play".to_owned()),
                     last_session_error_reason: None,
+                    active_stop_request_id: Some(7),
+                    last_stop_request_id: Some(7),
+                    stop_request_recorded_age_ms: Some(12),
+                    runtime_actuator_last_poll_id: Some(7),
+                    runtime_actuator_last_poll_age_ms: Some(4),
+                    stop_result_phase: Some("observed".to_owned()),
+                    stop_result_age_ms: Some(3),
+                    stop_result_error: None,
                     studio_mode: Some("start_play".to_owned()),
                     studio_mode_age_ms: Some(4),
                     studio_mode_source: Some("play_control".to_owned()),
@@ -2100,6 +2149,14 @@ mod tests {
             edit_runtime_state: Some("stale".to_owned()),
             edit_runtime_age_ms: Some(20_000),
             studio_control_last_error: None,
+            active_stop_request_id: None,
+            last_stop_request_id: Some(0),
+            stop_request_recorded_age_ms: None,
+            runtime_actuator_last_poll_id: None,
+            runtime_actuator_last_poll_age_ms: None,
+            stop_result_phase: None,
+            stop_result_age_ms: None,
+            stop_result_error: None,
             official_mcp_adapter_state: Some("blocked_by_studio_mode".to_owned()),
             official_mcp_adapter_age_ms: Some(5),
             official_mcp_adapter_last_error: None,
@@ -2223,6 +2280,22 @@ mod tests {
     }
 
     #[test]
+    fn stop_preflight_does_not_wait_on_legacy_control_fields_when_session_state_is_play() {
+        let mut status = local_task_status("start_play", "ready", "running");
+        status.studio_session_state = Some("play".to_owned());
+        status.studio_control_state = None;
+        status.studio_transition_phase = None;
+        let state = state_with_local_task_status(status);
+
+        assert_eq!(
+            local_studio_gate_wait_reason(&state, "t_test", LocalStudioGateKind::StopControl),
+            None
+        );
+        require_local_stop_control_ready_locked(&state, "t_test", "start_stop_play")
+            .expect("stop gate should trust studio_session_state=play");
+    }
+
+    #[test]
     fn launch_preflight_allows_stable_edit_session() {
         let mut status = local_task_status("stop", "none", "idle");
         status.edit_runtime_state = Some("ready".to_owned());
@@ -2292,6 +2365,14 @@ mod tests {
             studio_session_state: Some("play".to_owned()),
             last_known_session_state: Some("play".to_owned()),
             last_session_error_reason: None,
+            active_stop_request_id: Some(7),
+            last_stop_request_id: Some(7),
+            stop_request_recorded_age_ms: Some(12),
+            runtime_actuator_last_poll_id: Some(7),
+            runtime_actuator_last_poll_age_ms: Some(4),
+            stop_result_phase: Some("observed".to_owned()),
+            stop_result_age_ms: Some(3),
+            stop_result_error: None,
         };
         let error =
             require_active_helper_matches_hub_route_locked(helper, &snapshot, "start_stop_play")
@@ -2331,6 +2412,14 @@ mod tests {
                     studio_session_state: Some("stop".to_owned()),
                     last_known_session_state: Some("stop".to_owned()),
                     last_session_error_reason: None,
+                    active_stop_request_id: None,
+                    last_stop_request_id: Some(0),
+                    stop_request_recorded_age_ms: None,
+                    runtime_actuator_last_poll_id: None,
+                    runtime_actuator_last_poll_age_ms: None,
+                    stop_result_phase: None,
+                    stop_result_age_ms: None,
+                    stop_result_error: None,
                     studio_mode: Some("stop".to_owned()),
                     studio_mode_age_ms: Some(4),
                     studio_mode_source: Some("edit_plugin".to_owned()),

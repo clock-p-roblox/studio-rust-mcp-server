@@ -108,6 +108,14 @@ pub(super) struct HelperActiveTaskRecord {
     pub(super) edit_runtime_state: Option<String>,
     pub(super) edit_runtime_age_ms: Option<u128>,
     pub(super) studio_control_last_error: Option<String>,
+    pub(super) active_stop_request_id: Option<u64>,
+    pub(super) last_stop_request_id: Option<u64>,
+    pub(super) stop_request_recorded_age_ms: Option<u128>,
+    pub(super) runtime_actuator_last_poll_id: Option<u64>,
+    pub(super) runtime_actuator_last_poll_age_ms: Option<u128>,
+    pub(super) stop_result_phase: Option<String>,
+    pub(super) stop_result_age_ms: Option<u128>,
+    pub(super) stop_result_error: Option<String>,
     pub(super) official_mcp_adapter_state: Option<String>,
     pub(super) official_mcp_adapter_age_ms: Option<u128>,
     pub(super) official_mcp_adapter_last_error: Option<String>,
@@ -330,6 +338,22 @@ pub(super) struct HelperActiveTaskHeartbeat {
     #[serde(default)]
     pub(super) studio_control_last_error: Option<String>,
     #[serde(default)]
+    pub(super) active_stop_request_id: Option<u64>,
+    #[serde(default)]
+    pub(super) last_stop_request_id: Option<u64>,
+    #[serde(default)]
+    pub(super) stop_request_recorded_age_ms: Option<u128>,
+    #[serde(default)]
+    pub(super) runtime_actuator_last_poll_id: Option<u64>,
+    #[serde(default)]
+    pub(super) runtime_actuator_last_poll_age_ms: Option<u128>,
+    #[serde(default)]
+    pub(super) stop_result_phase: Option<String>,
+    #[serde(default)]
+    pub(super) stop_result_age_ms: Option<u128>,
+    #[serde(default)]
+    pub(super) stop_result_error: Option<String>,
+    #[serde(default)]
     pub(super) official_mcp_adapter_state: Option<String>,
     #[serde(default)]
     pub(super) official_mcp_adapter_age_ms: Option<u128>,
@@ -432,6 +456,14 @@ pub(super) struct HelperActiveTaskPayload {
     pub(super) edit_runtime_state: Option<String>,
     pub(super) edit_runtime_age_ms: Option<u128>,
     pub(super) studio_control_last_error: Option<String>,
+    pub(super) active_stop_request_id: Option<u64>,
+    pub(super) last_stop_request_id: Option<u64>,
+    pub(super) stop_request_recorded_age_ms: Option<u128>,
+    pub(super) runtime_actuator_last_poll_id: Option<u64>,
+    pub(super) runtime_actuator_last_poll_age_ms: Option<u128>,
+    pub(super) stop_result_phase: Option<String>,
+    pub(super) stop_result_age_ms: Option<u128>,
+    pub(super) stop_result_error: Option<String>,
     pub(super) official_mcp_adapter_state: Option<String>,
     pub(super) official_mcp_adapter_age_ms: Option<u128>,
     pub(super) official_mcp_adapter_last_error: Option<String>,
