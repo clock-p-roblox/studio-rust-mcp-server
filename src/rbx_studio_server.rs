@@ -145,6 +145,9 @@ fn snapshot_from_hub_status_payload(
         stop_result_error: active_task_match
             .as_ref()
             .and_then(|active_task| active_task.stop_result_error.clone()),
+        runtime_log_forward: active_task_match
+            .as_ref()
+            .and_then(|active_task| active_task.runtime_log_forward.clone()),
     })
 }
 
@@ -330,6 +333,7 @@ fn local_studio_live_snapshot_locked(
         official_mcp_adapter_state: status.official_mcp_adapter_state.clone(),
         official_mcp_adapter_age_ms: opt_age_to_u128(status.official_mcp_adapter_age_ms),
         official_mcp_adapter_last_error: status.official_mcp_adapter_last_error.clone(),
+        runtime_log_forward: status.runtime_log_forward.clone(),
     })
 }
 
@@ -738,6 +742,7 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
     let mut official_mcp_adapter_state = "hub_unconfigured".to_owned();
     let mut official_mcp_adapter_age_ms = None;
     let mut official_mcp_adapter_last_error = None;
+    let mut runtime_log_forward = None;
     let mut task_services_ready = false;
     let mut route_launch_ready = false;
     let mut hub_route_snapshot = None;
@@ -797,6 +802,7 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
             .unwrap_or_else(|| "not_started".to_owned());
         official_mcp_adapter_age_ms = snapshot.official_mcp_adapter_age_ms;
         official_mcp_adapter_last_error = snapshot.official_mcp_adapter_last_error.clone();
+        runtime_log_forward = snapshot.runtime_log_forward.clone();
     } else if let Some(snapshot) = hub_route_snapshot.as_ref() {
         studio_session_state = snapshot.studio_session_state.clone();
         last_known_session_state = snapshot.last_known_session_state.clone();
@@ -809,6 +815,7 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
         stop_result_phase = snapshot.stop_result_phase.clone();
         stop_result_age_ms = snapshot.stop_result_age_ms;
         stop_result_error = snapshot.stop_result_error.clone();
+        runtime_log_forward = snapshot.runtime_log_forward.clone();
     } else if official_mcp_adapter_state == "hub_unconfigured"
         || official_mcp_adapter_state == "task_id_unconfigured"
     {
@@ -873,6 +880,7 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
         official_mcp_adapter_state,
         official_mcp_adapter_age_ms,
         official_mcp_adapter_last_error,
+        runtime_log_forward,
         helper_last_message_age_ms,
     })
 }
@@ -1990,6 +1998,7 @@ mod tests {
                     official_mcp_adapter_state: Some("ready".to_owned()),
                     official_mcp_adapter_age_ms: Some(5),
                     official_mcp_adapter_last_error: None,
+                    runtime_log_forward: None,
                 }],
             }],
         };
@@ -2052,6 +2061,7 @@ mod tests {
                     official_mcp_adapter_state: Some("ready".to_owned()),
                     official_mcp_adapter_age_ms: Some(5),
                     official_mcp_adapter_last_error: None,
+                    runtime_log_forward: None,
                 }],
             }],
         };
@@ -2109,6 +2119,7 @@ mod tests {
                     official_mcp_adapter_state: Some("blocked_by_studio_mode".to_owned()),
                     official_mcp_adapter_age_ms: Some(5),
                     official_mcp_adapter_last_error: None,
+                    runtime_log_forward: None,
                 }],
             }],
         };
@@ -2159,6 +2170,7 @@ mod tests {
             official_mcp_adapter_state: Some("blocked_by_studio_mode".to_owned()),
             official_mcp_adapter_age_ms: Some(5),
             official_mcp_adapter_last_error: None,
+            runtime_log_forward: None,
         }
     }
 
@@ -2372,6 +2384,7 @@ mod tests {
             stop_result_phase: Some("observed".to_owned()),
             stop_result_age_ms: Some(3),
             stop_result_error: None,
+            runtime_log_forward: None,
         };
         let error =
             require_active_helper_matches_hub_route_locked(helper, &snapshot, "start_stop_play")
@@ -2431,6 +2444,7 @@ mod tests {
                     official_mcp_adapter_state: Some("ready".to_owned()),
                     official_mcp_adapter_age_ms: Some(5),
                     official_mcp_adapter_last_error: None,
+                    runtime_log_forward: None,
                 }],
             }],
         };

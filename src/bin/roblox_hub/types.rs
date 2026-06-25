@@ -119,6 +119,30 @@ pub(super) struct HelperActiveTaskRecord {
     pub(super) official_mcp_adapter_state: Option<String>,
     pub(super) official_mcp_adapter_age_ms: Option<u128>,
     pub(super) official_mcp_adapter_last_error: Option<String>,
+    pub(super) runtime_log_forward: Option<RuntimeLogForwardStatusPayload>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct RuntimeLogForwardStatusPayload {
+    pub(super) state: String,
+    pub(super) queued_count: u64,
+    pub(super) accepted_count: u64,
+    pub(super) forwarded_count: u64,
+    pub(super) failed_count: u64,
+    #[serde(default)]
+    pub(super) last_accepted_age_ms: Option<u128>,
+    #[serde(default)]
+    pub(super) last_forwarded_age_ms: Option<u128>,
+    #[serde(default)]
+    pub(super) last_attempt_age_ms: Option<u128>,
+    #[serde(default)]
+    pub(super) last_target_path: Option<String>,
+    #[serde(default)]
+    pub(super) last_http_status: Option<u16>,
+    #[serde(default)]
+    pub(super) last_error: Option<String>,
+    #[serde(default)]
+    pub(super) last_error_age_ms: Option<u128>,
 }
 
 #[derive(Debug, Clone)]
@@ -359,6 +383,8 @@ pub(super) struct HelperActiveTaskHeartbeat {
     pub(super) official_mcp_adapter_age_ms: Option<u128>,
     #[serde(default)]
     pub(super) official_mcp_adapter_last_error: Option<String>,
+    #[serde(default)]
+    pub(super) runtime_log_forward: Option<RuntimeLogForwardStatusPayload>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -467,6 +493,7 @@ pub(super) struct HelperActiveTaskPayload {
     pub(super) official_mcp_adapter_state: Option<String>,
     pub(super) official_mcp_adapter_age_ms: Option<u128>,
     pub(super) official_mcp_adapter_last_error: Option<String>,
+    pub(super) runtime_log_forward: Option<RuntimeLogForwardStatusPayload>,
 }
 
 #[derive(Debug, Serialize)]

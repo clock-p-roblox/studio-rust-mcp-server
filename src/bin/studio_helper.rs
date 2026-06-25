@@ -39,7 +39,8 @@ mod helper_ws;
 use helper_ws::{
     ArtifactAbort, ArtifactBegin, ArtifactChunk, ArtifactCommitted, ArtifactFinish, HelperHello,
     HelperTaskStatusSnapshot, HelperToServerMessage, OfficialMcpRequest, OfficialMcpResponse,
-    ServerToHelperMessage, HELPER_WS_PATH, MAX_ARTIFACT_CHUNK_PAYLOAD_BYTES,
+    RuntimeLogForwardStatusSnapshot, ServerToHelperMessage, HELPER_WS_PATH,
+    MAX_ARTIFACT_CHUNK_PAYLOAD_BYTES,
     OFFICIAL_MCP_ADAPTER_CAPABILITY, OFFICIAL_MCP_STORE_IMAGE_BASE64_CAPABILITY,
 };
 
@@ -61,6 +62,7 @@ use config::{
 #[cfg(test)]
 use config::{helper_id_from_machine_guid, parse_machine_guid_reg_query_output};
 use runtime_log_forward::runtime_log_forward_task_path_handler;
+use runtime_log_forward::{runtime_log_forward_worker, RuntimeLogForwardJob};
 #[cfg(target_os = "windows")]
 use studio_process::launch_studio_for_claim;
 #[cfg(test)]
@@ -108,6 +110,7 @@ const OBSERVABLE_UPSTREAM_SLOW_AFTER: Duration = Duration::from_secs(5);
 const OFFICIAL_STORE_IMAGE_MAX_DECODED_BYTES: usize = 20 * 1024 * 1024;
 const OFFICIAL_STORE_IMAGE_MAX_BASE64_CHARS: usize =
     OFFICIAL_STORE_IMAGE_MAX_DECODED_BYTES.div_ceil(3) * 4;
+const RUNTIME_LOG_FORWARD_QUEUE_CAPACITY: usize = 64;
 const INSTANCE_STALE_AFTER: Duration = Duration::from_secs(45);
 const REMOTE_WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const REMOTE_WS_STALE_RESTART_AFTER: Duration = Duration::from_secs(30);
@@ -164,10 +167,44 @@ struct HelperState {
     remote_connections: HashMap<String, RemoteConnectionHandle>,
     official_adapters: HashMap<String, OfficialAdapterHandle>,
     official_adapter_states: HashMap<String, OfficialAdapterStateRecord>,
+    runtime_log_forward_statuses: HashMap<String, RuntimeLogForwardStatusRecord>,
     last_remote_errors: HashMap<String, String>,
     hub_last_error: Option<String>,
     hub_last_claim_error: Option<String>,
     hub_last_ready_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeLogForwardStatusRecord {
+    queued_count: u64,
+    accepted_count: u64,
+    forwarded_count: u64,
+    failed_count: u64,
+    last_accepted_at: Option<Instant>,
+    last_forwarded_at: Option<Instant>,
+    last_attempt_at: Option<Instant>,
+    last_target_path: Option<String>,
+    last_http_status: Option<u16>,
+    last_error: Option<String>,
+    last_error_at: Option<Instant>,
+}
+
+impl Default for RuntimeLogForwardStatusRecord {
+    fn default() -> Self {
+        Self {
+            queued_count: 0,
+            accepted_count: 0,
+            forwarded_count: 0,
+            failed_count: 0,
+            last_accepted_at: None,
+            last_forwarded_at: None,
+            last_attempt_at: None,
+            last_target_path: None,
+            last_http_status: None,
+            last_error: None,
+            last_error_at: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -325,6 +362,7 @@ type SharedState = Arc<Mutex<HelperState>>;
 struct AppState {
     helper: HelperConfig,
     state: SharedState,
+    runtime_log_forward_tx: mpsc::Sender<RuntimeLogForwardJob>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -446,6 +484,7 @@ struct ClaimedTaskStatus {
     runtime_log_base_url: Option<String>,
     runtime_log_remote_base_url: Option<String>,
     runtime_log_upload_url: Option<String>,
+    runtime_log_forward: RuntimeLogForwardStatusSnapshot,
     studio_pid: Option<u32>,
     launched_by_helper: bool,
     claimed_age_ms: u128,
@@ -568,6 +607,7 @@ struct HelperHeartbeatTaskStatus {
     official_mcp_adapter_state: String,
     official_mcp_adapter_age_ms: Option<u128>,
     official_mcp_adapter_last_error: Option<String>,
+    runtime_log_forward: RuntimeLogForwardStatusSnapshot,
 }
 
 #[derive(Debug, Deserialize)]
@@ -647,6 +687,7 @@ struct HelperPlaceStatus {
     runtime_log_remote_base_url: Option<String>,
     runtime_log_upload_url: Option<String>,
     runtime_screenshot_upload_url: Option<String>,
+    runtime_log_forward: Option<RuntimeLogForwardStatusSnapshot>,
     registered_instance_count: usize,
     registered_instance_ids: Vec<String>,
     studio_pids: Vec<u32>,
@@ -1036,6 +1077,7 @@ fn release_claimed_task(
         );
     }
     state.claimed_tasks.remove(task_id);
+    state.runtime_log_forward_statuses.remove(task_id);
     stop_removed_official_adapter(state, task_id);
     state.last_remote_errors.remove(&connection_key);
     tracing::info!(task_id, reason, "released claimed task from helper state");
@@ -1818,6 +1860,7 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
             let runtime_log_upload_url = task.runtime_log_base_url.as_ref().map(|_| {
                 runtime_log_forward_upload_url(app.helper.port, &task.place_id, &task.task_id)
             });
+            let runtime_log_forward = runtime_log_forward_status_snapshot(&state, &task.task_id);
             ClaimedTaskStatus {
                 task_id: task.task_id.clone(),
                 place_id: task.place_id.clone(),
@@ -1827,6 +1870,7 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
                 runtime_log_base_url,
                 runtime_log_remote_base_url: task.runtime_log_base_url.clone(),
                 runtime_log_upload_url,
+                runtime_log_forward,
                 studio_pid,
                 launched_by_helper: active_launch_process
                     .map(|launch| launch.launched_by_helper)
@@ -1963,6 +2007,9 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
                 runtime_screenshot_helper_upload_url(app.helper.port, &task.place_id, &task.task_id)
             })
         });
+        let runtime_log_forward = claimed_task
+            .as_ref()
+            .map(|task| runtime_log_forward_status_snapshot(&state, &task.task_id));
         place_statuses.push(HelperPlaceStatus {
             remote_base_url: claimed_task
                 .as_ref()
@@ -1976,6 +2023,7 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
                 .and_then(|task| task.runtime_log_base_url.clone()),
             runtime_log_upload_url,
             runtime_screenshot_upload_url,
+            runtime_log_forward,
             registered_instance_count: registered_instance_ids.len(),
             registered_instance_ids,
             studio_pids,
@@ -2073,6 +2121,7 @@ async fn helper_debug_task_handler(
         .runtime_log_base_url
         .as_ref()
         .map(|_| runtime_log_forward_upload_url(app.helper.port, &task.place_id, &task.task_id));
+    let runtime_log_forward = runtime_log_forward_status_snapshot(&state, &task.task_id);
     let payload = serde_json::json!({
         "ok": true,
         "task_id": task.task_id,
@@ -2101,6 +2150,7 @@ async fn helper_debug_task_handler(
             "last_server_message_age_ms": connection.last_server_message_at.map(|value| value.elapsed().as_millis()),
             "last_error": state.last_remote_errors.get(&connection_key),
         })),
+        "runtime_log_forward": runtime_log_forward,
         "instances": instances,
         "task_status": task_status,
     });
@@ -3554,6 +3604,110 @@ fn ws_age_ms(value: Option<u128>) -> Option<u64> {
     value.map(|age| age.min(u64::MAX as u128) as u64)
 }
 
+fn runtime_log_forward_status_snapshot(
+    state: &HelperState,
+    task_id: &str,
+) -> RuntimeLogForwardStatusSnapshot {
+    let record = state
+        .runtime_log_forward_statuses
+        .get(task_id)
+        .cloned()
+        .unwrap_or_default();
+    let state_name = if record.queued_count > 0 {
+        "forwarding"
+    } else if record.last_error.is_some() {
+        "error"
+    } else if record.forwarded_count > 0 {
+        "ready"
+    } else {
+        "idle"
+    };
+    RuntimeLogForwardStatusSnapshot {
+        state: state_name.to_owned(),
+        queued_count: record.queued_count,
+        accepted_count: record.accepted_count,
+        forwarded_count: record.forwarded_count,
+        failed_count: record.failed_count,
+        last_accepted_age_ms: ws_age_ms(record.last_accepted_at.map(|value| value.elapsed().as_millis())),
+        last_forwarded_age_ms: ws_age_ms(record.last_forwarded_at.map(|value| value.elapsed().as_millis())),
+        last_attempt_age_ms: ws_age_ms(record.last_attempt_at.map(|value| value.elapsed().as_millis())),
+        last_target_path: record.last_target_path,
+        last_http_status: record.last_http_status,
+        last_error: record.last_error,
+        last_error_age_ms: ws_age_ms(record.last_error_at.map(|value| value.elapsed().as_millis())),
+    }
+}
+
+fn mark_runtime_log_forward_accepted(state: &mut HelperState, task_id: &str, target_path: String) {
+    let record = state
+        .runtime_log_forward_statuses
+        .entry(task_id.to_owned())
+        .or_default();
+    record.queued_count = record.queued_count.saturating_add(1);
+    record.accepted_count = record.accepted_count.saturating_add(1);
+    record.last_accepted_at = Some(Instant::now());
+    record.last_target_path = Some(target_path);
+    record.last_http_status = None;
+}
+
+fn mark_runtime_log_forward_succeeded(
+    state: &mut HelperState,
+    task_id: &str,
+    target_path: String,
+    http_status: u16,
+) {
+    let record = state
+        .runtime_log_forward_statuses
+        .entry(task_id.to_owned())
+        .or_default();
+    record.queued_count = record.queued_count.saturating_sub(1);
+    record.forwarded_count = record.forwarded_count.saturating_add(1);
+    record.last_forwarded_at = Some(Instant::now());
+    record.last_attempt_at = record.last_forwarded_at;
+    record.last_target_path = Some(target_path);
+    record.last_http_status = Some(http_status);
+    record.last_error = None;
+    record.last_error_at = None;
+}
+
+fn mark_runtime_log_forward_failed(
+    state: &mut HelperState,
+    task_id: &str,
+    target_path: String,
+    http_status: Option<u16>,
+    error: String,
+) {
+    let record = state
+        .runtime_log_forward_statuses
+        .entry(task_id.to_owned())
+        .or_default();
+    record.queued_count = record.queued_count.saturating_sub(1);
+    record.failed_count = record.failed_count.saturating_add(1);
+    record.last_attempt_at = Some(Instant::now());
+    record.last_target_path = Some(target_path);
+    record.last_http_status = http_status;
+    record.last_error = Some(error);
+    record.last_error_at = record.last_attempt_at;
+}
+
+fn mark_runtime_log_forward_rejected(
+    state: &mut HelperState,
+    task_id: &str,
+    target_path: String,
+    error: String,
+) {
+    let record = state
+        .runtime_log_forward_statuses
+        .entry(task_id.to_owned())
+        .or_default();
+    record.failed_count = record.failed_count.saturating_add(1);
+    record.last_attempt_at = Some(Instant::now());
+    record.last_target_path = Some(target_path);
+    record.last_http_status = None;
+    record.last_error = Some(error);
+    record.last_error_at = record.last_attempt_at;
+}
+
 fn helper_task_status_snapshot(state: &HelperState, task_id: &str) -> HelperTaskStatusSnapshot {
     let studio_snapshot = task_studio_mode_snapshot(state, task_id);
     let (official_state, official_age_ms, official_last_error) =
@@ -3585,6 +3739,7 @@ fn helper_task_status_snapshot(state: &HelperState, task_id: &str) -> HelperTask
         official_mcp_adapter_state: Some(official_state),
         official_mcp_adapter_age_ms: ws_age_ms(official_age_ms),
         official_mcp_adapter_last_error: official_last_error,
+        runtime_log_forward: Some(runtime_log_forward_status_snapshot(state, task_id)),
     }
 }
 
@@ -3658,6 +3813,7 @@ fn heartbeat_task_statuses(state: &HelperState) -> Vec<HelperHeartbeatTaskStatus
                 &task.task_id,
                 studio_snapshot.studio_mode.as_deref(),
             );
+            let runtime_log_forward = runtime_log_forward_status_snapshot(state, &task.task_id);
             HelperHeartbeatTaskStatus {
                 task_id: task.task_id.clone(),
                 remote_state: remote_connection_state_name(remote_connection).to_owned(),
@@ -3698,6 +3854,7 @@ fn heartbeat_task_statuses(state: &HelperState) -> Vec<HelperHeartbeatTaskStatus
                 official_mcp_adapter_state,
                 official_mcp_adapter_age_ms,
                 official_mcp_adapter_last_error,
+                runtime_log_forward,
             }
         })
         .collect::<Vec<_>>();
@@ -6631,13 +6788,25 @@ async fn main() -> Result<()> {
         remote_connections: HashMap::new(),
         official_adapters: HashMap::new(),
         official_adapter_states: HashMap::new(),
+        runtime_log_forward_statuses: HashMap::new(),
         last_remote_errors: HashMap::new(),
         hub_last_error: initial_hub_error,
         hub_last_claim_error: None,
         hub_last_ready_at: initial_hub_registration.as_ref().map(|_| Instant::now()),
     }));
 
-    let app_state = AppState { helper, state };
+    let (runtime_log_forward_tx, runtime_log_forward_rx) =
+        mpsc::channel(RUNTIME_LOG_FORWARD_QUEUE_CAPACITY);
+    let app_state = AppState {
+        helper,
+        state,
+        runtime_log_forward_tx,
+    };
+
+    let runtime_log_forward_app = app_state.clone();
+    tokio::spawn(async move {
+        runtime_log_forward_worker(runtime_log_forward_app, runtime_log_forward_rx).await;
+    });
 
     let maintenance_app = app_state.clone();
     tokio::spawn(async move {
@@ -6768,6 +6937,218 @@ mod tests {
         }
     }
 
+    async fn insert_claimed_task_with_runtime_log_base(
+        app: &AppState,
+        task_id: &str,
+        place_id: &str,
+        runtime_log_base_url: String,
+    ) {
+        let mut task = test_claimed_task(task_id, place_id);
+        task.runtime_log_base_url = Some(runtime_log_base_url);
+        let mut state = app.state.lock().await;
+        state.claimed_tasks.insert(task_id.to_owned(), task);
+    }
+
+    async fn call_runtime_log_forward(
+        app: AppState,
+        path: &str,
+    ) -> std::result::Result<Response, HelperError> {
+        runtime_log_forward_task_path_handler(
+            State(app),
+            AxumPath((
+                "134795435066737".to_owned(),
+                "task-a".to_owned(),
+                path.to_owned(),
+            )),
+            Method::POST,
+            Uri::from_static("/v1/runtime-logs"),
+            HeaderMap::new(),
+            Bytes::from_static(b"{\"ok\":true}"),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn runtime_log_forward_fast_acks_slow_upstream() {
+        let app = test_app_state_with_runtime_log_worker();
+        let (sink_base_url, received_rx) =
+            spawn_test_runtime_log_sink(204, Duration::from_millis(750)).await;
+        insert_claimed_task_with_runtime_log_base(
+            &app,
+            "task-a",
+            "134795435066737",
+            sink_base_url,
+        )
+        .await;
+
+        let started = Instant::now();
+        let response = call_runtime_log_forward(app.clone(), "v1/runtime-logs")
+            .await
+            .expect("runtime-log upload should be accepted");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "runtime-log forward waited for slow upstream instead of acking quickly"
+        );
+        let request = received_rx
+            .await
+            .expect("sink should receive background request");
+        assert!(request.starts_with("POST /v1/runtime-logs "));
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let state = app.state.lock().await;
+        let status = runtime_log_forward_status_snapshot(&state, "task-a");
+        assert_eq!(status.accepted_count, 1);
+        assert_eq!(status.forwarded_count, 1);
+        assert_eq!(status.failed_count, 0);
+        assert_eq!(status.state, "ready");
+    }
+
+    #[tokio::test]
+    async fn runtime_log_forward_records_background_http_failure() {
+        let app = test_app_state_with_runtime_log_worker();
+        let (sink_base_url, _received_rx) =
+            spawn_test_runtime_log_sink(503, Duration::from_millis(0)).await;
+        insert_claimed_task_with_runtime_log_base(
+            &app,
+            "task-a",
+            "134795435066737",
+            sink_base_url,
+        )
+        .await;
+
+        let response = call_runtime_log_forward(app.clone(), "v1/runtime-logs")
+            .await
+            .expect("runtime-log upload should be accepted before background failure");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let state = app.state.lock().await;
+                let status = runtime_log_forward_status_snapshot(&state, "task-a");
+                if status.failed_count == 1 {
+                    assert_eq!(status.state, "error");
+                    assert_eq!(status.last_http_status, Some(503));
+                    assert!(
+                        status
+                            .last_error
+                            .as_deref()
+                            .unwrap_or_default()
+                            .contains("HTTP 503")
+                    );
+                    break;
+                }
+                drop(state);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("runtime-log background failure should update status");
+    }
+
+    #[tokio::test]
+    async fn runtime_log_forward_records_background_connection_failure() {
+        let app = test_app_state_with_runtime_log_worker();
+        let sink_base_url = spawn_disconnect_runtime_log_sink().await;
+        insert_claimed_task_with_runtime_log_base(
+            &app,
+            "task-a",
+            "134795435066737",
+            sink_base_url,
+        )
+        .await;
+
+        let response = call_runtime_log_forward(app.clone(), "v1/runtime-logs")
+            .await
+            .expect("runtime-log upload should be accepted before background connection failure");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let state = app.state.lock().await;
+                let status = runtime_log_forward_status_snapshot(&state, "task-a");
+                if status.failed_count == 1 {
+                    assert_eq!(status.state, "error");
+                    assert_eq!(status.last_http_status, None);
+                    assert!(
+                        status
+                            .last_error
+                            .as_deref()
+                            .unwrap_or_default()
+                            .contains("runtime-log forward failed")
+                    );
+                    break;
+                }
+                drop(state);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("runtime-log background connection failure should update status");
+    }
+
+    #[tokio::test]
+    async fn runtime_log_forward_queue_full_does_not_decrement_existing_queue() {
+        let (app, _runtime_log_forward_rx) = test_app_state_with_runtime_log_queue_only();
+        insert_claimed_task_with_runtime_log_base(
+            &app,
+            "task-a",
+            "134795435066737",
+            "http://127.0.0.1:9".to_owned(),
+        )
+        .await;
+
+        for _ in 0..RUNTIME_LOG_FORWARD_QUEUE_CAPACITY {
+            let response = call_runtime_log_forward(app.clone(), "v1/runtime-logs")
+                .await
+                .expect("runtime-log upload should be accepted while queue has capacity");
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+        let response = call_runtime_log_forward(app.clone(), "v1/runtime-logs")
+            .await
+            .expect("full runtime-log queue should return a response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let state = app.state.lock().await;
+        let status = runtime_log_forward_status_snapshot(&state, "task-a");
+        assert_eq!(
+            status.queued_count, RUNTIME_LOG_FORWARD_QUEUE_CAPACITY as u64,
+            "queue_full must not decrement jobs that were already queued"
+        );
+        assert_eq!(
+            status.accepted_count, RUNTIME_LOG_FORWARD_QUEUE_CAPACITY as u64
+        );
+        assert_eq!(status.failed_count, 1);
+        assert!(status
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("queue is full"));
+    }
+
+    #[tokio::test]
+    async fn runtime_log_forward_rejects_non_upload_proxy_paths() {
+        let app = test_app_state_with_runtime_log_worker();
+        insert_claimed_task_with_runtime_log_base(
+            &app,
+            "task-a",
+            "134795435066737",
+            "http://127.0.0.1:1".to_owned(),
+        )
+        .await;
+
+        let response = call_runtime_log_forward(app.clone(), "v1/not-runtime-log")
+            .await
+            .expect("unsupported runtime-log forward path should return a response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let state = app.state.lock().await;
+        let status = runtime_log_forward_status_snapshot(&state, "task-a");
+        assert_eq!(status.accepted_count, 0);
+        assert_eq!(status.failed_count, 0);
+        assert_eq!(status.state, "idle");
+    }
+
     #[test]
     fn studio_launch_args_include_place_and_universe_ids() {
         let task = test_claimed_task("task-a", "134795435066737");
@@ -6850,6 +7231,7 @@ mod tests {
             remote_connections: HashMap::new(),
             official_adapters: HashMap::new(),
             official_adapter_states: HashMap::new(),
+            runtime_log_forward_statuses: HashMap::new(),
             last_remote_errors: HashMap::new(),
             hub_last_error: None,
             hub_last_claim_error: None,
@@ -6858,6 +7240,8 @@ mod tests {
     }
 
     fn test_app_state() -> AppState {
+        let (runtime_log_forward_tx, _runtime_log_forward_rx) =
+            mpsc::channel(RUNTIME_LOG_FORWARD_QUEUE_CAPACITY);
         AppState {
             helper: HelperConfig {
                 port: DEFAULT_HELPER_PORT,
@@ -6875,7 +7259,130 @@ mod tests {
                 hub_heartbeat_notify: Arc::new(Notify::new()),
             },
             state: Arc::new(Mutex::new(empty_helper_state())),
+            runtime_log_forward_tx,
         }
+    }
+
+    fn test_app_state_with_runtime_log_worker() -> AppState {
+        let (runtime_log_forward_tx, runtime_log_forward_rx) =
+            mpsc::channel(RUNTIME_LOG_FORWARD_QUEUE_CAPACITY);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client should build");
+        let app = AppState {
+            helper: HelperConfig {
+                port: DEFAULT_HELPER_PORT,
+                helper_id: "h_test".to_owned(),
+                capacity: 1,
+                user_name: "local-test".to_owned(),
+                bearer_token: Arc::new(Mutex::new("test-token".to_owned())),
+                bearer_token_source: Arc::new(Mutex::new("test".to_owned())),
+                bearer_token_candidates: Arc::new(Vec::new()),
+                domain_suffix: DEFAULT_DOMAIN_SUFFIX.to_owned(),
+                hub_base_url: Some("http://127.0.0.1:1".to_owned()),
+                studio_path: None,
+                skip_claim_studio_launch: true,
+                client,
+                hub_heartbeat_notify: Arc::new(Notify::new()),
+            },
+            state: Arc::new(Mutex::new(empty_helper_state())),
+            runtime_log_forward_tx,
+        };
+        let worker_app = app.clone();
+        tokio::spawn(async move {
+            runtime_log_forward_worker(worker_app, runtime_log_forward_rx).await;
+        });
+        app
+    }
+
+    fn test_app_state_with_runtime_log_queue_only() -> (
+        AppState,
+        mpsc::Receiver<RuntimeLogForwardJob>,
+    ) {
+        let (runtime_log_forward_tx, runtime_log_forward_rx) =
+            mpsc::channel(RUNTIME_LOG_FORWARD_QUEUE_CAPACITY);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client should build");
+        let app = AppState {
+            helper: HelperConfig {
+                port: DEFAULT_HELPER_PORT,
+                helper_id: "h_test".to_owned(),
+                capacity: 1,
+                user_name: "local-test".to_owned(),
+                bearer_token: Arc::new(Mutex::new("test-token".to_owned())),
+                bearer_token_source: Arc::new(Mutex::new("test".to_owned())),
+                bearer_token_candidates: Arc::new(Vec::new()),
+                domain_suffix: DEFAULT_DOMAIN_SUFFIX.to_owned(),
+                hub_base_url: Some("http://127.0.0.1:1".to_owned()),
+                studio_path: None,
+                skip_claim_studio_launch: true,
+                client,
+                hub_heartbeat_notify: Arc::new(Notify::new()),
+            },
+            state: Arc::new(Mutex::new(empty_helper_state())),
+            runtime_log_forward_tx,
+        };
+        (app, runtime_log_forward_rx)
+    }
+
+    async fn spawn_test_runtime_log_sink(
+        status: u16,
+        delay: Duration,
+    ) -> (String, oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("test sink should bind");
+        let addr = listener.local_addr().expect("test sink should have addr");
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = vec![0; 4096];
+            let Ok(read) = socket.read(&mut buffer).await else {
+                return;
+            };
+            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+            let _ = tx.send(request);
+            tokio::time::sleep(delay).await;
+            let reason = if (200..300).contains(&status) {
+                "OK"
+            } else {
+                "ERROR"
+            };
+            let body = if (200..300).contains(&status) {
+                ""
+            } else {
+                "sink failure"
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    async fn spawn_disconnect_runtime_log_sink() -> String {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("test sink should bind");
+        let addr = listener.local_addr().expect("test sink should have addr");
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let _ = socket.write_all(b"not an http response\r\n\r\n").await;
+                drop(socket);
+            }
+        });
+        format!("http://{addr}")
     }
 
     #[test]

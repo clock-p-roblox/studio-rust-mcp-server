@@ -427,6 +427,19 @@ fn task_status_payload(task: &TaskRecord) -> TaskStatusPayload {
     }
 }
 
+fn runtime_log_forward_with_age(
+    status: Option<RuntimeLogForwardStatusPayload>,
+    age_delta: u128,
+) -> Option<RuntimeLogForwardStatusPayload> {
+    status.map(|mut status| {
+        status.last_accepted_age_ms = status.last_accepted_age_ms.map(|age| age + age_delta);
+        status.last_forwarded_age_ms = status.last_forwarded_age_ms.map(|age| age + age_delta);
+        status.last_attempt_age_ms = status.last_attempt_age_ms.map(|age| age + age_delta);
+        status.last_error_age_ms = status.last_error_age_ms.map(|age| age + age_delta);
+        status
+    })
+}
+
 fn helper_status_payload(helper: &HelperRecord, blocked: bool) -> HelperStatusPayload {
     let age_delta = helper.last_seen_at.elapsed().as_millis();
     let mut active_tasks = helper
@@ -472,6 +485,10 @@ fn helper_status_payload(helper: &HelperRecord, blocked: bool) -> HelperStatusPa
                         .official_mcp_adapter_age_ms
                         .map(|age| age + age_delta),
                     official_mcp_adapter_last_error: task.official_mcp_adapter_last_error.clone(),
+                    runtime_log_forward: runtime_log_forward_with_age(
+                        task.runtime_log_forward.clone(),
+                        age_delta,
+                    ),
                 }
             } else {
                 HelperActiveTaskPayload {
@@ -504,6 +521,7 @@ fn helper_status_payload(helper: &HelperRecord, blocked: bool) -> HelperStatusPa
                     official_mcp_adapter_state: None,
                     official_mcp_adapter_age_ms: None,
                     official_mcp_adapter_last_error: None,
+                    runtime_log_forward: None,
                 }
             }
         })
@@ -1282,6 +1300,7 @@ async fn helper_heartbeat_handler(
                 official_mcp_adapter_state: active_task.official_mcp_adapter_state,
                 official_mcp_adapter_age_ms: active_task.official_mcp_adapter_age_ms,
                 official_mcp_adapter_last_error: active_task.official_mcp_adapter_last_error,
+                runtime_log_forward: active_task.runtime_log_forward,
             },
         );
     }
@@ -1700,6 +1719,7 @@ mod tests {
                     official_mcp_adapter_state: Some("blocked_by_studio_mode".to_owned()),
                     official_mcp_adapter_age_ms: Some(15),
                     official_mcp_adapter_last_error: None,
+                    runtime_log_forward: None,
                 }],
             }),
         )

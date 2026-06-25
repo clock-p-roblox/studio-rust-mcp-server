@@ -947,6 +947,34 @@ Phase 3 Windows 侧验证：
 - MCP status / preflight / wait marker 能把 runtime-log forward reason 打印给 LLM。
 - shutdown 不再因 runtime-log 慢卡 20s/60s。
 
+Phase 4 Windows 侧实施记录：
+
+- helper 的 `/runtime-log-forward/{place_id}/task/{task_id}/{path}` 不再作为普通 HTTP 反代使用，只接受 `POST /v1/runtime-logs` 和 `POST /v1/runtime-screenshots`。
+- helper 入队成功后返回 `202 accepted`；这个返回只表示 helper 已接收并进入后台转发队列，不代表 Linux runtime-log artifact 已落盘。
+- 后台转发使用固定容量 `mpsc` 队列和单 worker。队列满时同步返回 `503 runtime_log_forward_queue_full`，不先 ack 后丢弃。
+- 后台转发只发送一次；HTTP 非 2xx、连接/协议错误都只记录状态和日志，不做持久缓存、不做自动重试、不做兜底通道。
+- `runtime_log_forward` 状态暴露到 helper `/status`、helper `/v1/debug/tasks/{task_id}`、hub active task、MCP server helper `task_status`、MCP server `/status`。
+- queue full 是“拒绝接收”，不扣减已有 `queued_count`；后台发送失败才消费一个已入队 item。
+
+Phase 4 reviewer 结论：
+
+- 3 个 reviewer 最终通过。
+- 审核重点包括：无持久缓存、无复杂重试、无无界队列、queue full 不错误扣减、HTTP 失败和无 HTTP status 的连接/协议失败都可观测、状态能从 helper 透传到 hub 和 MCP server。
+
+Phase 4 验证：
+
+- `cargo test runtime_log_forward --bins`
+- `cargo test --bins`
+- `py -3 -m py_compile util/local_state_sync_probe.py util/studio_debug_preflight.py`
+- `cargo build --release --bins`
+- `py -3 util/local_state_sync_probe.py` 的 runtime-log 部分通过：慢 sink 下 helper 0-1ms 返回 `202`，后台成功后 helper / hub / MCP server debug / MCP server `/status` 都看到 `state=ready`；失败 sink 下 helper 3-11ms 返回 `202`，后台失败后四处都看到 `state=error`、`last_http_status=503` 和同一错误文本。
+
+Phase 4 验证遗留：
+
+- 同一次 release probe 的后续 Studio `launch_studio_session` 阶段失败，错误是 MCP server 读取本地 hub `/status` 时报 `hub_snapshot_unavailable` / reqwest send error。
+- 复跑稳定复现；失败发生在 runtime-log 验证已经完成、`studio_debug_preflight` 已 OK、`get_studio_mode` 已返回 `stop` 之后。
+- Studio 日志显示 place `134795435066737` 打开成功。3 个 reviewer 一致认为该问题不指向 Phase 4 runtime-log forward 代码，不应通过 runtime-log forward 兜底或绕过 launch hub gate 解决；如果要求整条 release probe 全绿，应作为独立 hub/probe 可达性问题继续定位。
+
 ### Phase 5：结构治理，不改行为
 
 目标：

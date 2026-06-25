@@ -1,4 +1,5 @@
 use super::{ActiveHelperConnection, ArtifactUploadState, ToolArgumentValues};
+use crate::helper_ws::RuntimeLogForwardStatusSnapshot;
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -115,6 +116,7 @@ pub struct StatusResponse {
     pub(super) official_mcp_adapter_state: String,
     pub(super) official_mcp_adapter_age_ms: Option<u128>,
     pub(super) official_mcp_adapter_last_error: Option<String>,
+    pub(super) runtime_log_forward: Option<RuntimeLogForwardStatusSnapshot>,
     pub(super) helper_last_message_age_ms: Option<u128>,
 }
 

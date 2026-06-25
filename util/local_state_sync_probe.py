@@ -8,6 +8,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,62 @@ HELPER_ID = "h_local_state_sync"
 PLACE_ID = "134795435066737"
 UNIVERSE_ID = "9327304100"
 TOKEN = "local-test-token"
+RUNTIME_LOG_SINK_URL = "http://127.0.0.1:44759"
+
+
+class RuntimeLogSinkState:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.delay_sec = 0.0
+        self.fail_next = False
+        self.received: list[dict[str, Any]] = []
+
+
+class RuntimeLogSinkHandler(BaseHTTPRequestHandler):
+    sink_state: RuntimeLogSinkState
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler name
+        length = int(self.headers.get("Content-Length") or "0")
+        body = self.rfile.read(length)
+        with self.sink_state.lock:
+            delay_sec = self.sink_state.delay_sec
+            fail = self.sink_state.fail_next
+            self.sink_state.fail_next = False
+            self.sink_state.received.append(
+                {
+                    "path": self.path,
+                    "bytes": len(body),
+                    "failed": fail,
+                    "received_at": time.time(),
+                }
+            )
+        if delay_sec > 0:
+            time.sleep(delay_sec)
+        if fail:
+            payload = b"runtime log sink forced failure"
+            self.send_response(503)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        else:
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    def log_message(self, _format: str, *_args: Any) -> None:
+        return
+
+
+def start_runtime_log_sink() -> tuple[ThreadingHTTPServer, RuntimeLogSinkState]:
+    state = RuntimeLogSinkState()
+
+    class Handler(RuntimeLogSinkHandler):
+        sink_state = state
+
+    server = ThreadingHTTPServer(("127.0.0.1", 44759), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, state
 
 
 def request_json(url: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> Any:
@@ -91,7 +148,7 @@ def task_heartbeat_loop(task_id: str, task_token: str, stop_event: threading.Eve
         "routes": {
             "rojo_base_url": ROJO_URL,
             "mcp_base_url": SERVER_URL,
-            "runtime_log_base_url": "http://127.0.0.1:44759",
+            "runtime_log_base_url": RUNTIME_LOG_SINK_URL,
         },
         "services": {
             "rojo": "healthy",
@@ -123,6 +180,62 @@ def hub_active_task(task_id: str) -> dict[str, Any] | None:
 
 def helper_task(task_id: str) -> dict[str, Any]:
     return request_json(f"{HELPER_URL}/v1/debug/tasks/{task_id}")
+
+
+def post_helper_runtime_log(upload_url: str, timeout_sec: float = 1.0) -> tuple[int, float]:
+    payload = json.dumps(
+        {
+            "session_id": "probe-runtime-log-forward",
+            "runtime_id": "server",
+            "lines": [{"message": "[probe] runtime-log-forward"}],
+        }
+    ).encode("utf-8")
+    started = time.perf_counter()
+    request = urllib.request.Request(
+        upload_url,
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+        response.read()
+        status = response.status
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    return status, elapsed_ms
+
+
+def wait_runtime_log_forward_status(task_id: str, predicate, label: str) -> dict[str, Any]:
+    def sample():
+        status = (helper_task(task_id).get("runtime_log_forward") or {})
+        if predicate(status):
+            return status
+        return None
+
+    return wait_until(label, sample, timeout_sec=8, interval_sec=0.1)
+
+
+def wait_runtime_log_forward_everywhere(task_id: str, predicate, label: str) -> dict[str, Any]:
+    def sample():
+        helper_status = helper_task(task_id).get("runtime_log_forward") or {}
+        hub_status = hub_active_task(task_id) or {}
+        hub_runtime = hub_status.get("runtime_log_forward") or {}
+        server = server_state()
+        server_runtime = (
+            ((server.get("active_helper") or {}).get("task_status") or {}).get("runtime_log_forward")
+            or {}
+        )
+        server_top = request_json(f"{SERVER_URL}/status").get("runtime_log_forward") or {}
+        observed = {
+            "helper": helper_status,
+            "hub": hub_runtime,
+            "server_task_status": server_runtime,
+            "server_status": server_top,
+        }
+        if all(predicate(value) for value in observed.values()):
+            return observed
+        return None
+
+    return wait_until(label, sample, timeout_sec=8, interval_sec=0.1)
 
 
 def server_state() -> dict[str, Any]:
@@ -199,8 +312,11 @@ def main() -> int:
     procs: list[subprocess.Popen] = []
     heartbeat_stop = threading.Event()
     heartbeat_thread: threading.Thread | None = None
+    runtime_log_sink: ThreadingHTTPServer | None = None
+    runtime_log_sink_state: RuntimeLogSinkState | None = None
     task_id = ""
     try:
+        runtime_log_sink, runtime_log_sink_state = start_runtime_log_sink()
         hub_exe = str(REPO / "target" / "release" / "roblox_hub.exe")
         server_exe = str(REPO / "target" / "release" / "rbx-studio-mcp.exe")
         helper_exe = str(REPO / "target" / "release" / "studio_helper.exe")
@@ -325,6 +441,68 @@ def main() -> int:
             lambda: request_json(f"{HUB_URL}/v1/tasks/{task_id}").get("claimed_by_helper_id") == HELPER_ID,
             timeout_sec=45,
         )
+
+        helper_claim = helper_task(task_id)
+        upload_url = (helper_claim.get("claimed_task") or {}).get("runtime_log_upload_url")
+        if not upload_url:
+            raise RuntimeError(f"helper did not expose runtime_log_upload_url: {helper_claim}")
+        assert runtime_log_sink_state is not None
+        runtime_log_sink_state.delay_sec = 1.0
+        status, slow_ack_elapsed_ms = post_helper_runtime_log(upload_url, timeout_sec=1.0)
+        if status != 202 or slow_ack_elapsed_ms > 500:
+            raise RuntimeError(
+                f"runtime-log forward did not fast ack slow sink: status={status} elapsed_ms={slow_ack_elapsed_ms:.1f}"
+            )
+        first_forward = wait_runtime_log_forward_status(
+            task_id,
+            lambda status: status.get("forwarded_count") == 1 and status.get("state") == "ready",
+            "runtime-log slow sink background forward",
+        )
+        first_forward_everywhere = wait_runtime_log_forward_everywhere(
+            task_id,
+            lambda status: status.get("forwarded_count") == 1 and status.get("state") == "ready",
+            "runtime-log slow sink status propagated to hub/server",
+        )
+        runtime_log_sink_state.delay_sec = 0.0
+        with runtime_log_sink_state.lock:
+            runtime_log_sink_state.fail_next = True
+        status, failing_ack_elapsed_ms = post_helper_runtime_log(upload_url, timeout_sec=1.0)
+        if status != 202 or failing_ack_elapsed_ms > 500:
+            raise RuntimeError(
+                f"runtime-log forward did not fast ack failing sink: status={status} elapsed_ms={failing_ack_elapsed_ms:.1f}"
+            )
+        failed_forward = wait_runtime_log_forward_status(
+            task_id,
+            lambda status: status.get("failed_count") == 1
+            and status.get("last_http_status") == 503
+            and "HTTP 503" in str(status.get("last_error")),
+            "runtime-log failing sink status",
+        )
+        failed_forward_everywhere = wait_runtime_log_forward_everywhere(
+            task_id,
+            lambda status: status.get("failed_count") == 1
+            and status.get("last_http_status") == 503
+            and "HTTP 503" in str(status.get("last_error")),
+            "runtime-log failing sink status propagated to hub/server",
+        )
+        print(
+            json.dumps(
+                {
+                    "runtime_log_forward_probe": {
+                        "slow_ack_elapsed_ms": int(slow_ack_elapsed_ms),
+                        "failing_ack_elapsed_ms": int(failing_ack_elapsed_ms),
+                        "first_forward": first_forward,
+                        "first_forward_everywhere": first_forward_everywhere,
+                        "failed_forward": failed_forward,
+                        "failed_forward_everywhere": failed_forward_everywhere,
+                    }
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            flush=True,
+        )
+
         try:
             wait_until(
                 "plugin registration",
@@ -471,6 +649,9 @@ def main() -> int:
         heartbeat_stop.set()
         if heartbeat_thread is not None:
             heartbeat_thread.join(timeout=2)
+        if runtime_log_sink is not None:
+            runtime_log_sink.shutdown()
+            runtime_log_sink.server_close()
         for proc in reversed(procs):
             proc.terminate()
         for proc in reversed(procs):

@@ -94,6 +94,39 @@ pub struct HelperTaskStatusSnapshot {
         alias = "officialMcpAdapterLastError"
     )]
     pub official_mcp_adapter_last_error: Option<String>,
+    #[serde(
+        default,
+        rename = "runtime_log_forward",
+        alias = "runtimeLogForward"
+    )]
+    pub runtime_log_forward: Option<RuntimeLogForwardStatusSnapshot>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RuntimeLogForwardStatusSnapshot {
+    pub state: String,
+    #[serde(rename = "queued_count", alias = "queuedCount")]
+    pub queued_count: u64,
+    #[serde(rename = "accepted_count", alias = "acceptedCount")]
+    pub accepted_count: u64,
+    #[serde(rename = "forwarded_count", alias = "forwardedCount")]
+    pub forwarded_count: u64,
+    #[serde(rename = "failed_count", alias = "failedCount")]
+    pub failed_count: u64,
+    #[serde(rename = "last_accepted_age_ms", alias = "lastAcceptedAgeMs")]
+    pub last_accepted_age_ms: Option<u64>,
+    #[serde(rename = "last_forwarded_age_ms", alias = "lastForwardedAgeMs")]
+    pub last_forwarded_age_ms: Option<u64>,
+    #[serde(rename = "last_attempt_age_ms", alias = "lastAttemptAgeMs")]
+    pub last_attempt_age_ms: Option<u64>,
+    #[serde(rename = "last_target_path", alias = "lastTargetPath")]
+    pub last_target_path: Option<String>,
+    #[serde(rename = "last_http_status", alias = "lastHttpStatus")]
+    pub last_http_status: Option<u16>,
+    #[serde(rename = "last_error", alias = "lastError")]
+    pub last_error: Option<String>,
+    #[serde(rename = "last_error_age_ms", alias = "lastErrorAgeMs")]
+    pub last_error_age_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -278,7 +311,8 @@ pub enum ServerToHelperMessage {
 #[cfg(test)]
 mod tests {
     use super::{
-        HelperHello, HelperTaskStatusSnapshot, HelperToServerMessage, ServerToHelperMessage,
+        HelperHello, HelperTaskStatusSnapshot, HelperToServerMessage,
+        RuntimeLogForwardStatusSnapshot, ServerToHelperMessage,
     };
 
     #[test]
@@ -372,6 +406,20 @@ mod tests {
                 official_mcp_adapter_state: Some("ready".to_owned()),
                 official_mcp_adapter_age_ms: Some(7),
                 official_mcp_adapter_last_error: None,
+                runtime_log_forward: Some(RuntimeLogForwardStatusSnapshot {
+                    state: "idle".to_owned(),
+                    queued_count: 0,
+                    accepted_count: 0,
+                    forwarded_count: 0,
+                    failed_count: 0,
+                    last_accepted_age_ms: None,
+                    last_forwarded_age_ms: None,
+                    last_attempt_age_ms: None,
+                    last_target_path: None,
+                    last_http_status: None,
+                    last_error: None,
+                    last_error_age_ms: None,
+                }),
             }),
         })
         .expect("heartbeat should serialize");
@@ -395,6 +443,7 @@ mod tests {
             encoded["task_status"]["official_mcp_adapter_state"],
             "ready"
         );
+        assert_eq!(encoded["task_status"]["runtime_log_forward"]["state"], "idle");
         assert!(encoded.get("helperId").is_none());
         assert!(encoded.get("taskId").is_none());
     }

@@ -1,4 +1,5 @@
 use super::state::{HubStatusClient, HELPER_TASK_STATUS_STALE_AFTER, HUB_STATUS_TIMEOUT};
+use crate::helper_ws::RuntimeLogForwardStatusSnapshot;
 use crate::error::Result;
 use color_eyre::eyre::eyre;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -92,6 +93,8 @@ pub(super) struct HubHelperActiveTaskPayload {
     pub(super) official_mcp_adapter_age_ms: Option<u128>,
     #[serde(default)]
     pub(super) official_mcp_adapter_last_error: Option<String>,
+    #[serde(default)]
+    pub(super) runtime_log_forward: Option<RuntimeLogForwardStatusSnapshot>,
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +119,7 @@ pub(super) struct HubTaskRouteSnapshot {
     pub(super) stop_result_phase: Option<String>,
     pub(super) stop_result_age_ms: Option<u128>,
     pub(super) stop_result_error: Option<String>,
+    pub(super) runtime_log_forward: Option<RuntimeLogForwardStatusSnapshot>,
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +147,7 @@ pub(super) struct LocalStudioLiveSnapshot {
     pub(super) official_mcp_adapter_state: Option<String>,
     pub(super) official_mcp_adapter_age_ms: Option<u128>,
     pub(super) official_mcp_adapter_last_error: Option<String>,
+    pub(super) runtime_log_forward: Option<RuntimeLogForwardStatusSnapshot>,
 }
 
 impl HubTaskRouteSnapshot {
