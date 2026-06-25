@@ -114,6 +114,7 @@ local function markStopped()
 	PluginUtils.setSettings(MODE_KEY, "stop")
 	PluginUtils.setSettings(ACTIVE_SESSION_ID_KEY, 0)
 	PluginUtils.setSettings(CONTROL_READY_SESSION_ID_KEY, 0)
+	PluginUtils.setSettings(STOP_REQUEST_ID_KEY, 0)
 	PluginUtils.setSettings(RUNNING_OBSERVED_AT_MS_KEY, 0)
 	clearPendingStart()
 	clearLastError()
@@ -130,23 +131,6 @@ local function markStarted(commandId: number, targetMode: Types.StartStopPlayMod
 	clearLastError()
 end
 
-local function markObservedRunning(targetMode: Types.StartStopPlayMode)
-	assert(targetMode == "start_play" or targetMode == "run_server", "markObservedRunning expects a running mode")
-	local snapshot = getSnapshot()
-	local activeSessionId = snapshot.activeSessionId
-	if activeSessionId == 0 or snapshot.mode ~= targetMode then
-		activeSessionId = nextCommandId()
-	end
-
-	PluginUtils.setSettings(MODE_KEY, targetMode)
-	PluginUtils.setSettings(ACTIVE_SESSION_ID_KEY, activeSessionId)
-	PluginUtils.setSettings(CONTROL_READY_SESSION_ID_KEY, activeSessionId)
-	ensureNextCommandIdAtLeast(activeSessionId)
-	markRunningObserved()
-	clearPendingStart()
-	clearLastError()
-end
-
 local function normalizeEditState()
 	if RunService:IsRunning() then
 		markRunningObserved()
@@ -156,9 +140,6 @@ local function normalizeEditState()
 	if RunService:IsEdit() then
 		local snapshot = getSnapshot()
 		if snapshot.pendingStartId > 0 then
-			return
-		end
-		if snapshot.mode == "start_play" or snapshot.mode == "run_server" or snapshot.activeSessionId > 0 then
 			return
 		end
 		markStopped()
@@ -257,11 +238,9 @@ local function markControlReadyForActiveSession()
 	end
 end
 
-local function requestStop(): number
-	local commandId = nextCommandId()
-	PluginUtils.setSettings(STOP_REQUEST_ID_KEY, commandId)
+local function markStopping(stopRequestId: number)
+	PluginUtils.setSettings(STOP_REQUEST_ID_KEY, stopRequestId)
 	clearLastError()
-	return commandId
 end
 
 local function waitForStart(
@@ -325,13 +304,12 @@ return {
 	getStopRequestId = getStopRequestId,
 	inferLiveMode = inferLiveMode,
 	markControlReadyForActiveSession = markControlReadyForActiveSession,
-	markObservedRunning = markObservedRunning,
 	markStarted = markStarted,
 	markStopped = markStopped,
+	markStopping = markStopping,
 	normalizeEditState = normalizeEditState,
 	observeCurrentDataModel = observeCurrentDataModel,
 	recordTransitionError = recordTransitionError,
-	requestStop = requestStop,
 	startRunningObservationHeartbeat = startRunningObservationHeartbeat,
 	waitForStart = waitForStart,
 	waitForStop = waitForStop,

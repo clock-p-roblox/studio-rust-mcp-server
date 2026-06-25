@@ -10,6 +10,7 @@ export type RunCodeArgs = {
 export type TestMode = "start_play" | "run_server"
 
 export type StartStopPlayMode = TestMode | "stop"
+export type StudioSessionState = "stop" | "starting_play" | "play" | "stopping"
 
 export type StartStopPlayArgs = {
 	mode: StartStopPlayMode,
@@ -23,6 +24,7 @@ export type ToolArgs =
 	{}
 	| { InsertModel: InsertModelArgs }
 	| { RunCode: RunCodeArgs }
+	| { GetStudioSessionState: {} }
 	| { StartStopPlay: StartStopPlayArgs }
 	| { LaunchStudioSession: LaunchStudioSessionArgs }
 

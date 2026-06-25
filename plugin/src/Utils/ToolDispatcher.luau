@@ -4,6 +4,7 @@ local Types = require(Main.Types)
 local tools: { [string]: Types.ToolFunction } = {
 	["GetConsoleOutput"] = require(Main.Tools.GetConsoleOutput),
 	["GetStudioMode"] = require(Main.Tools.GetStudioMode),
+	["GetStudioSessionState"] = require(Main.Tools.GetStudioSessionState),
 	["InsertModel"] = require(Main.Tools.InsertModel),
 	["LaunchStudioSession"] = require(Main.Tools.LaunchStudioSession),
 	["RunCode"] = require(Main.Tools.RunCode),

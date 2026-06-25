@@ -5,6 +5,7 @@ local StudioModeTracker = require(Main.Utils.StudioModeTracker)
 local Types = require(Main.Types)
 
 local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
 local ServerScriptService = game:GetService("ServerScriptService")
 local StudioTestService = game:GetService("StudioTestService")
 
@@ -14,7 +15,6 @@ local POLL_INTERVAL_SECONDS = 0.25
 local HELPER_PORT_SETTING_KEY = "MCP-helper-port"
 local DEFAULT_HELPER_PORT = "44750"
 local LOG_PAGE_SIZE = 400
-local MODE_LOG_PAGE_SIZE = 2_000
 local SESSION_CONTROL_SCRIPT_NAME = "MCPStudioSessionControl"
 local SESSION_CONTROL_MARKER = "clockp_mcp_session_control_v1"
 
@@ -23,23 +23,10 @@ type LogBaseline = {
 	totalLines: number,
 }
 
-type ModeLogInference = {
-	mode: Types.StartStopPlayMode,
-	path: string,
-	lineNumber: number,
-}
-
 type AsyncCallState = {
 	done: boolean,
 	success: boolean?,
 	errorMessage: string?,
-}
-
-local STOP_MARKERS = {
-	"State: StopPlaySolo",
-	"StudioStopPlaySolo",
-	"Handling test has ended",
-	"State: PlaceIdle",
 }
 
 local START_PLAY_MARKERS = {
@@ -49,8 +36,6 @@ local START_PLAY_MARKERS = {
 	"PlaySoloSuccess",
 }
 
-local lastModeInferencePath: string? = nil
-local lastModeInferenceLineNumber = 0
 local currentHelperBaseUrl: string? = nil
 local currentInstanceId: string? = nil
 local currentTaskId: string? = nil
@@ -89,60 +74,6 @@ local function activeHelperBaseUrl(): string
 	return currentHelperBaseUrl or helperBaseUrl()
 end
 
-local function requestHelperStatus()
-	local response = HttpService:RequestAsync({
-		Url = activeHelperBaseUrl() .. "/status",
-		Method = "GET",
-	})
-	if not response.Success then
-		error(string.format("Windows helper status failed with HTTP %d: %s", response.StatusCode, response.Body))
-	end
-	return HttpService:JSONDecode(response.Body)
-end
-
-local function findCurrentHelperInstance(statusPayload: any): any
-	if currentInstanceId == nil or currentInstanceId == "" then
-		return nil
-	end
-	if type(statusPayload) ~= "table" or type(statusPayload.instances) ~= "table" then
-		return nil
-	end
-	for _, instance in statusPayload.instances do
-		if type(instance) == "table" and tostring(instance.instance_id) == currentInstanceId then
-			if currentTaskId == nil or currentTaskId == "" or tostring(instance.task_id) == currentTaskId then
-				return instance
-			end
-		end
-	end
-	return nil
-end
-
-local function sendHelperStudioModeStatus(mode: Types.StartStopPlayMode)
-	if currentInstanceId == nil or currentInstanceId == "" then
-		return
-	end
-
-	local ok, errorMessage = pcall(function()
-		local response = HttpService:RequestAsync({
-			Url = activeHelperBaseUrl() .. "/v1/mcp/plugin/status",
-			Method = "POST",
-			Headers = {
-				["Content-Type"] = "application/json",
-			},
-			Body = HttpService:JSONEncode({
-				instance_id = currentInstanceId,
-				studio_mode = mode,
-			}),
-		})
-		if not response.Success then
-			error(string.format("HTTP %d: %s", response.StatusCode, response.Body))
-		end
-	end)
-	if not ok then
-		logTransitionStage(mode, "status_update_failed", tostring(errorMessage))
-	end
-end
-
 local function isManagedSessionControlScript(instance: Instance): boolean
 	if instance.Name ~= SESSION_CONTROL_SCRIPT_NAME or not instance:IsA("Script") then
 		return false
@@ -171,6 +102,32 @@ local function removeSessionControlScript()
 			child:Destroy()
 		end
 	end
+end
+
+local function requestHelperStop(): number
+	if currentInstanceId == nil or currentInstanceId == "" then
+		error("Cannot request Studio stop before plugin is registered with the helper.")
+	end
+
+	local response = HttpService:RequestAsync({
+		Url = activeHelperBaseUrl() .. "/v1/mcp/plugin/stop-request",
+		Method = "POST",
+		Headers = {
+			["Content-Type"] = "application/json",
+		},
+		Body = HttpService:JSONEncode({
+			instance_id = currentInstanceId,
+		}),
+	})
+	if not response.Success then
+		error(string.format("HTTP %d: %s", response.StatusCode, response.Body))
+	end
+	local payload = HttpService:JSONDecode(response.Body)
+	local stopRequestId = tonumber(payload.stop_request_id) or 0
+	if payload.stop_requested ~= true or stopRequestId <= 0 then
+		error("helper did not record a valid stop request")
+	end
+	return stopRequestId
 end
 
 local function assertNoForeignSessionControlScript(targetMode: Types.StartStopPlayMode)
@@ -468,67 +425,44 @@ local function tryFindLogMarker(baseline: LogBaseline, markers: { string }): str
 	return nil
 end
 
-local function inferStudioModeFromRecentLog(): ModeLogInference?
-	local payload = requestStudioLog(-MODE_LOG_PAGE_SIZE, MODE_LOG_PAGE_SIZE)
-	local lines = payload.lines
-	if type(lines) ~= "table" then
-		return nil
+local function refreshTrackerFromLiveDataModel()
+	if RunService:IsRunning() then
+		StudioModeTracker.observeCurrentDataModel()
+	else
+		StudioModeTracker.normalizeEditState()
 	end
-
-	local path = tostring(payload.path or "")
-	local startLine = 1
-	local range = payload.range
-	if type(range) == "table" then
-		startLine = tonumber(range[1]) or startLine
-	end
-
-	local inference: ModeLogInference? = nil
-	for index, line in ipairs(lines) do
-		local text = tostring(line)
-		if lineMatchesAny(text, START_PLAY_MARKERS) then
-			inference = {
-				mode = "start_play",
-				path = path,
-				lineNumber = startLine + index - 1,
-			}
-		elseif lineMatchesAny(text, STOP_MARKERS) then
-			inference = {
-				mode = "stop",
-				path = path,
-				lineNumber = startLine + index - 1,
-			}
-		end
-	end
-
-	return inference
 end
 
-local function isNewModeInference(inference: ModeLogInference): boolean
-	return inference.path ~= lastModeInferencePath or inference.lineNumber ~= lastModeInferenceLineNumber
+local function getStudioSessionState(): Types.StudioSessionState
+	refreshTrackerFromLiveDataModel()
+	local snapshot = StudioModeTracker.getSnapshot()
+	if snapshot.pendingStartId > 0 then
+		return "starting_play"
+	end
+	if snapshot.mode == "stop" then
+		return "stop"
+	end
+	if StudioModeTracker.getStopRequestId() > 0 then
+		return "stopping"
+	end
+	return "play"
 end
 
-local function rememberModeInference(inference: ModeLogInference)
-	lastModeInferencePath = inference.path
-	lastModeInferenceLineNumber = inference.lineNumber
+local function getStudioSessionStateJson(): string
+	local state = getStudioSessionState()
+	local snapshot = StudioModeTracker.getSnapshot()
+	return HttpService:JSONEncode({
+		studio_session_state = state,
+		mode = snapshot.mode,
+		pending_start_id = snapshot.pendingStartId,
+		active_session_id = snapshot.activeSessionId,
+		stop_request_id = StudioModeTracker.getStopRequestId(),
+		last_error = snapshot.lastError,
+	})
 end
 
 local function getStudioMode(): Types.StartStopPlayMode
-	local success, inference = pcall(inferStudioModeFromRecentLog)
-	if success and type(inference) == "table" then
-		if inference.mode == "stop" then
-			rememberModeInference(inference)
-			StudioModeTracker.markStopped()
-			return "stop"
-		elseif inference.mode == "start_play" or inference.mode == "run_server" then
-			if isNewModeInference(inference) then
-				rememberModeInference(inference)
-				StudioModeTracker.markObservedRunning(inference.mode)
-				return inference.mode
-			end
-		end
-	end
-
-	StudioModeTracker.normalizeEditState()
+	refreshTrackerFromLiveDataModel()
 	return StudioModeTracker.getSnapshot().mode
 end
 
@@ -571,41 +505,11 @@ local function startAsyncCall(executor: () -> any): AsyncCallState
 	return state
 end
 
-local function waitForStopLog(baseline: LogBaseline, timeoutSeconds: number): string
-	local deadline = os.clock() + timeoutSeconds
-	local lastLogError: string? = nil
-
-	while os.clock() < deadline do
-		local success, matchedLine = pcall(function()
-			return tryFindLogMarker(baseline, STOP_MARKERS)
-		end)
-		if success and matchedLine ~= nil then
-			return matchedLine
-		elseif not success then
-			lastLogError = tostring(matchedLine)
-		end
-
-		StudioModeTracker.normalizeEditState()
-		task.wait(POLL_INTERVAL_SECONDS)
-	end
-
-	local snapshot = StudioModeTracker.getSnapshot()
-	error(
-		string.format(
-			"Timed out waiting for Studio stop log. mode=%s active_session_id=%d pending_start_id=%d last_log_error=%s",
-			snapshot.mode,
-			snapshot.activeSessionId,
-			snapshot.pendingStartId,
-			tostring(lastLogError)
-		)
-	)
-end
-
 local function stop(force: boolean?): string?
 	ConsoleOutput.outputMessage = ""
-	local currentMode = getStudioMode()
+	local currentState = getStudioSessionState()
 	local snapshot = StudioModeTracker.getSnapshot()
-	if force ~= true and currentMode == "stop" then
+	if force ~= true and currentState == "stop" then
 		StudioModeTracker.markStopped()
 		removeSessionControlScript()
 		if snapshot.pendingStartId > 0 then
@@ -620,14 +524,41 @@ local function stop(force: boolean?): string?
 		return "Stopped"
 	end
 
+	if currentState == "starting_play" then
+		logTransitionStage(
+			"stop",
+			"rejected_starting_play",
+			string.format("pending_start_id=%d", snapshot.pendingStartId)
+		)
+		error("studio_starting_play: Studio is still entering play mode; wait for play or stop before issuing stop")
+	end
+
+	if currentState == "stopping" then
+		logTransitionStage(
+			"stop",
+			"rejected_stop_in_progress",
+			string.format("stop_request_id=%d", StudioModeTracker.getStopRequestId())
+		)
+		error("studio_stop_in_progress: Studio stop is already in progress")
+	end
+
+	if currentState == "play" then
+		local stopRequestId = requestHelperStop()
+		StudioModeTracker.markStopping(stopRequestId)
+		logTransitionStage("stop", "requested", string.format("stop_request_id=%d", stopRequestId))
+		StudioModeTracker.waitForStop(STOP_TIMEOUT_SECONDS)
+		removeSessionControlScript()
+		logTransitionStage("stop", "observed", string.format("stop_request_id=%d", stopRequestId))
+		return "Stopped"
+	end
+
 	logTransitionStage(
 		"stop",
 		"rejected_edit_runtime_stop",
-		string.format("current_mode=%s pending_start_id=%d force=%s", currentMode, snapshot.pendingStartId, tostring(force == true))
+		string.format("current_state=%s pending_start_id=%d force=%s", currentState, snapshot.pendingStartId, tostring(force == true))
 	)
 	error(
-		"Cannot stop a running Studio session from the edit plugin runtime. "
-			.. "Use the helper-controlled start_stop_play(stop) path so the play/run server runtime actuator can stop the session."
+		"studio_session_state_not_stoppable: current_state=" .. currentState
 	)
 end
 
@@ -683,77 +614,24 @@ local function waitForStartPlayLog(
 	error(errorMessage)
 end
 
-local function waitForHelperControlReady(targetMode: Types.TestMode, commandId: number, deadline: number)
-	local lastHelperError: string? = nil
-	local lastMode: string? = nil
-	local lastModeSource: string? = nil
-	local lastControlState: string? = nil
-	local lastTransitionPhase: string? = nil
-
-	logTransitionStage(targetMode, "helper_control_wait", string.format("command_id=%d", commandId))
-	while os.clock() < deadline do
-		local success, statusPayload = pcall(requestHelperStatus)
-		if success then
-			local instance = findCurrentHelperInstance(statusPayload)
-			if type(instance) == "table" then
-				lastHelperError = nil
-				lastMode = tostring(instance.studio_mode)
-				lastModeSource = tostring(instance.studio_mode_source)
-				lastControlState = tostring(instance.studio_control_state)
-				lastTransitionPhase = tostring(instance.studio_transition_phase)
-				if
-					lastMode == targetMode
-					and lastModeSource == "play_control"
-					and lastControlState == "ready"
-					and lastTransitionPhase == "running"
-				then
-					logTransitionStage(
-						targetMode,
-						"control_ready",
-						string.format(
-							"command_id=%d source=%s control_state=%s transition_phase=%s",
-							commandId,
-							lastModeSource,
-							lastControlState,
-							lastTransitionPhase
-						)
-					)
-					return
-				end
-			else
-				lastHelperError = "helper_status_missing_current_instance"
-			end
-		else
-			lastHelperError = tostring(statusPayload)
-		end
-		task.wait(POLL_INTERVAL_SECONDS)
-	end
-
-	local errorMessage = string.format(
-		"Timed out waiting for helper control heartbeat. mode=%s command_id=%d helper_mode=%s helper_mode_source=%s helper_control_state=%s helper_transition_phase=%s last_helper_error=%s",
-		targetMode,
-		commandId,
-		tostring(lastMode),
-		tostring(lastModeSource),
-		tostring(lastControlState),
-		tostring(lastTransitionPhase),
-		tostring(lastHelperError)
-	)
-	StudioModeTracker.recordTransitionError(commandId, errorMessage)
-	error(errorMessage)
-end
-
 local function startPlayMode(successMessage: string): string?
 	ConsoleOutput.outputMessage = ""
-	local currentMode = getStudioMode()
+	local currentState = getStudioSessionState()
 	local snapshot = StudioModeTracker.getSnapshot()
-	if currentMode ~= "stop" or snapshot.pendingStartId ~= 0 then
+	if currentState ~= "stop" or snapshot.pendingStartId ~= 0 then
 		logTransitionStage(
 			"start_play",
 			"rejected_running_session",
-			string.format("current_mode=%s pending_start_id=%d", currentMode, snapshot.pendingStartId)
+			string.format("current_state=%s pending_start_id=%d", currentState, snapshot.pendingStartId)
 		)
-		error("Cannot start play while Studio is already running; call StartStopPlay(stop) and wait for edit mode before launch.")
+		if currentState == "starting_play" then
+			error("launch_already_in_progress: Studio is already entering play/run mode")
+		elseif currentState == "stopping" then
+			error("studio_stop_in_progress: Studio stop is already in progress")
+		elseif currentState == "play" then
+			error("studio_already_playing: Studio is already in play/run mode")
+		end
+		error("studio_session_state_not_launchable: current_state=" .. currentState)
 	end
 
 	local commandId = StudioModeTracker.beginStart("start_play")
@@ -766,21 +644,27 @@ local function startPlayMode(successMessage: string): string?
 
 	local deadline = os.clock() + START_TIMEOUT_SECONDS
 	waitForStartPlayLog(baseline, commandId, startCall, deadline)
-	waitForHelperControlReady("start_play", commandId, deadline)
 	return successMessage
 end
 
 local function startRunServerMode(executor: () -> any, successMessage: string): string?
 	ConsoleOutput.outputMessage = ""
-	local currentMode = getStudioMode()
+	local currentState = getStudioSessionState()
 	local snapshot = StudioModeTracker.getSnapshot()
-	if currentMode ~= "stop" or snapshot.pendingStartId ~= 0 then
+	if currentState ~= "stop" or snapshot.pendingStartId ~= 0 then
 		logTransitionStage(
 			"run_server",
 			"rejected_running_session",
-			string.format("current_mode=%s pending_start_id=%d", currentMode, snapshot.pendingStartId)
+			string.format("current_state=%s pending_start_id=%d", currentState, snapshot.pendingStartId)
 		)
-		error("Cannot run server while Studio is already running; call StartStopPlay(stop) and wait for edit mode before launch.")
+		if currentState == "starting_play" then
+			error("launch_already_in_progress: Studio is already entering play/run mode")
+		elseif currentState == "stopping" then
+			error("studio_stop_in_progress: Studio stop is already in progress")
+		elseif currentState == "play" then
+			error("studio_already_playing: Studio is already in play/run mode")
+		end
+		error("studio_session_state_not_launchable: current_state=" .. currentState)
 	end
 
 	local commandId = StudioModeTracker.beginStart("run_server")
@@ -828,16 +712,23 @@ local function handleLaunchStudioSession(launchStudioSessionArgs: Types.LaunchSt
 	end
 
 	local requestedMode = launchStudioSessionArgs.mode
-	local previousMode = getStudioMode()
+	local previousState = getStudioSessionState()
 	local previousSnapshot = StudioModeTracker.getSnapshot()
 	local actions = {}
 
-	if previousMode ~= "stop" or previousSnapshot.pendingStartId ~= 0 then
+	if previousState ~= "stop" or previousSnapshot.pendingStartId ~= 0 then
 		logTransitionStage(
 			requestedMode,
 			"rejected_launch_not_in_stop",
-			string.format("previous_mode=%s pending_start_id=%d", previousMode, previousSnapshot.pendingStartId)
+			string.format("previous_state=%s pending_start_id=%d", previousState, previousSnapshot.pendingStartId)
 		)
+		if previousState == "starting_play" then
+			error("launch_already_in_progress: Studio is already entering play/run mode")
+		elseif previousState == "stopping" then
+			error("studio_stop_in_progress: Studio stop is already in progress")
+		elseif previousState == "play" then
+			error("studio_already_playing: Studio is already in play/run mode")
+		end
 		error("LaunchStudioSession requires Studio to be in edit mode before launch.")
 	end
 
@@ -858,7 +749,7 @@ local function handleLaunchStudioSession(launchStudioSessionArgs: Types.LaunchSt
 	return HttpService:JSONEncode({
 		requested_mode = requestedMode,
 		restart_applied = false,
-		previous_mode = previousMode,
+		previous_mode = previousState,
 		final_mode = finalMode,
 		actions = actions,
 		message = buildLaunchMessage(requestedMode),
@@ -869,6 +760,8 @@ return {
 	configureHelperContext = configureHelperContext,
 	cleanupStoppedSessionControl = cleanupStoppedSessionControl,
 	getStudioMode = getStudioMode,
+	getStudioSessionState = getStudioSessionState,
+	getStudioSessionStateJson = getStudioSessionStateJson,
 	handleLaunchStudioSession = handleLaunchStudioSession,
 	handleStartStopPlay = handleStartStopPlay,
 	installSessionControlScript = installSessionControlScript,

@@ -305,6 +305,41 @@ local function currentStudioMode(): string
 	return mode
 end
 
+local function isStudioControlOrSessionQuery(toolName: string?): boolean
+	return toolName == "LaunchStudioSession" or toolName == "StartStopPlay" or toolName == "GetStudioSessionState"
+end
+
+local function busyControlResponse(toolName: string)
+	if toolName == "GetStudioSessionState" then
+		return true, StudioSessionControl.getStudioSessionStateJson()
+	end
+
+	local stateJson = StudioSessionControl.getStudioSessionStateJson()
+	local ok, decoded = pcall(function()
+		return HttpService:JSONDecode(stateJson)
+	end)
+	local state = if ok and type(decoded) == "table" then tostring(decoded.studio_session_state) else "none_response"
+	if toolName == "LaunchStudioSession" then
+		if state == "starting_play" then
+			return false, "launch_already_in_progress: Studio is already entering play/run mode"
+		elseif state == "stopping" then
+			return false, "studio_stop_in_progress: Studio stop is already in progress"
+		elseif state == "play" then
+			return false, "studio_already_playing: Studio is already in play/run mode"
+		end
+		return false, "studio_control_in_progress: current_state=" .. state
+	end
+	if toolName == "StartStopPlay" then
+		if state == "stopping" then
+			return false, "studio_stop_in_progress: Studio stop is already in progress"
+		elseif state == "starting_play" then
+			return false, "studio_starting_play: Studio is still entering play mode"
+		end
+		return false, "studio_control_in_progress: current_state=" .. state
+	end
+	return nil
+end
+
 local function toolCallHandler(args: Types.ToolArgs): string
 	local toolName = next(args)
 	if not toolName then
@@ -362,6 +397,7 @@ local statusPollToken = 0
 local connectCurrentClient = nil
 local toolDispatchBusy = false
 local toolDispatchToken = 0
+local toolDispatchBusyToolName: string? = nil
 
 local panel = Instance.new("ScrollingFrame")
 panel.Size = UDim2.fromScale(1, 1)
@@ -839,37 +875,13 @@ local function refreshStatusFromHelper()
 	local helperBaseUrlForPoll = currentHelperBaseUrl
 	local instanceIdForPoll = currentInstanceId
 	local taskIdForPoll = currentTaskId
-	local localStudioMode = currentStudioMode()
 	logPluginEvent("status_poll_begin", {
 		instance_id = instanceIdForPoll,
 		task_id = taskIdForPoll,
 		place_id = tostring(game.PlaceId),
-		studio_mode = localStudioMode,
 		helper_base_url = helperBaseUrlForPoll,
 	})
 	local ok, statusPayload = pcall(function()
-		if instanceIdForPoll ~= nil then
-			local updateOk, updateError = pcall(function()
-				requestJson(helperBaseUrlForPoll, "POST", "/v1/mcp/plugin/status", {
-					instance_id = instanceIdForPoll,
-					studio_mode = localStudioMode,
-				})
-			end)
-			if updateOk then
-				logPluginEvent("plugin_status_update_sent", {
-					instance_id = instanceIdForPoll,
-					task_id = taskIdForPoll,
-					studio_mode = localStudioMode,
-				})
-			else
-				logPluginEvent("plugin_status_update_failed", {
-					instance_id = instanceIdForPoll,
-					task_id = taskIdForPoll,
-					studio_mode = localStudioMode,
-					error = tostring(updateError),
-				})
-			end
-		end
 		return requestJson(helperBaseUrlForPoll, "GET", "/status")
 	end)
 	if not ok then
@@ -1244,13 +1256,11 @@ local function connectToHelper(helperPort: string)
 			end
 
 			responseSent = true
-			local responseMode = currentStudioMode()
 			logPluginEvent("helper_tool_response_send", {
 				instance_id = instanceId,
 				task_id = taskId,
 				id = id,
 				success = success,
-				studio_mode = responseMode,
 				response = TextFormat.summarizeText(response),
 			})
 			client:Send({
@@ -1258,12 +1268,25 @@ local function connectToHelper(helperPort: string)
 				id = id,
 				success = success,
 				response = response,
-				studio_mode = responseMode,
 			})
 		end
 
 		local args = body.args :: Types.ToolArgs
 		local toolName = next(args)
+		if toolDispatchBusy and isStudioControlOrSessionQuery(toolName) then
+			local busySuccess, busyResponse = busyControlResponse(tostring(toolName))
+			logPluginEvent("helper_tool_busy_immediate_response", {
+				instance_id = instanceId,
+				task_id = taskId,
+				id = id,
+				tool = toolName,
+				busy_tool = toolDispatchBusyToolName,
+				success = busySuccess,
+				response = TextFormat.summarizeText(busyResponse),
+			})
+			sendResponseOnce(busySuccess, busyResponse)
+			return
+		end
 		local busyWaitStartedAt = os.clock()
 		while toolDispatchBusy do
 			if os.clock() - busyWaitStartedAt >= TOOL_DISPATCH_BUSY_TIMEOUT_SECONDS then
@@ -1296,6 +1319,7 @@ local function connectToHelper(helperPort: string)
 		toolDispatchToken += 1
 		local dispatchToken = toolDispatchToken
 		toolDispatchBusy = true
+		toolDispatchBusyToolName = tostring(toolName)
 		local dispatchOk, dispatchError = pcall(function()
 			logInfo("Received helper tool request " .. tostring(toolName) .. " (id=" .. id .. ")")
 			logPluginEvent("helper_tool_dispatch", {
@@ -1335,6 +1359,7 @@ local function connectToHelper(helperPort: string)
 		end)
 		if dispatchToken == toolDispatchToken then
 			toolDispatchBusy = false
+			toolDispatchBusyToolName = nil
 		end
 		if not dispatchOk then
 			local errorMessage = tostring(dispatchError)

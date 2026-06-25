@@ -39,23 +39,22 @@ class PluginSessionControlCleanupTests(unittest.TestCase):
         self.assertIn("isPreviousTestStillInProgress(errorMessage)", run_server_function)
         self.assertIn("previousTestInProgressError(errorMessage)", run_server_function)
 
-    def test_start_play_waits_for_helper_control_ready(self) -> None:
+    def test_start_play_uses_plugin_state_without_helper_control_ready_wait(self) -> None:
         session_control = (REPO / "plugin/src/Utils/StudioSessionControl.luau").read_text(encoding="utf-8")
+        dispatcher = (REPO / "plugin/src/Utils/ToolDispatcher.luau").read_text(encoding="utf-8")
+        types = (REPO / "plugin/src/Types.luau").read_text(encoding="utf-8")
 
         start_play_start = session_control.index("local function startPlayMode")
         start_play_end = session_control.index("local function startRunServerMode", start_play_start)
         start_play_function = session_control[start_play_start:start_play_end]
 
+        self.assertIn("getStudioSessionState()", start_play_function)
         self.assertIn("waitForStartPlayLog", start_play_function)
-        self.assertIn("waitForHelperControlReady", start_play_function)
-        self.assertLess(
-            start_play_function.index("waitForStartPlayLog"),
-            start_play_function.index("waitForHelperControlReady"),
-            "start_play must first observe Studio entering play, then wait for helper-owned control heartbeat",
-        )
-        self.assertIn('lastModeSource == "play_control"', session_control)
-        self.assertIn('lastControlState == "ready"', session_control)
-        self.assertIn('lastTransitionPhase == "running"', session_control)
+        self.assertNotIn("waitForHelperControlReady", session_control)
+        self.assertNotIn("requestHelperStatus", session_control)
+        self.assertIn("getStudioSessionStateJson", session_control)
+        self.assertIn("GetStudioSessionState", dispatcher)
+        self.assertIn("GetStudioSessionState", types)
 
 
 if __name__ == "__main__":

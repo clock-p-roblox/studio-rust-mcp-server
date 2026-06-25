@@ -247,13 +247,7 @@ async fn require_hub_route_ready_snapshot(
 #[derive(Clone, Copy)]
 enum LocalStudioGateKind {
     Edit,
-    Launch,
-    StopControl,
     Official,
-}
-
-fn local_gate_requires_hub_route_ready(kind: LocalStudioGateKind) -> bool {
-    !matches!(kind, LocalStudioGateKind::StopControl)
 }
 
 fn opt_age_to_u128(value: Option<u64>) -> Option<u128> {
@@ -369,20 +363,6 @@ fn local_studio_gate_wait_reason(
                 None
             }
         }
-        LocalStudioGateKind::Launch => match studio_session_state {
-            Some("stop") => {
-                if status.edit_runtime_state.is_none() || status.edit_runtime_age_ms.is_none() {
-                    Some("edit_runtime_unavailable")
-                } else {
-                    None
-                }
-            }
-            Some("play" | "starting_play" | "stopping" | "none_response" | "none_connected") => {
-                None
-            }
-            _ => None,
-        },
-        LocalStudioGateKind::StopControl => None,
         LocalStudioGateKind::Official => {
             if studio_session_state != Some("stop") {
                 return None;
@@ -460,57 +440,6 @@ fn require_local_edit_ready_locked(
             None,
         )),
     }
-}
-
-fn require_local_launch_ready_locked(
-    state: &AppState,
-    requested_task_id: &str,
-    action: &str,
-) -> Result<(), ErrorData> {
-    let snapshot = local_studio_live_snapshot_locked(state, requested_task_id, action)?;
-    let Some(session_state) = snapshot.studio_session_state.as_deref() else {
-        return Err(ErrorData::internal_error(
-            format!("{action} failed fast: studio_session_state_unknown"),
-            None,
-        ));
-    };
-    if session_state != "stop" {
-        return Err(ErrorData::internal_error(
-            format!(
-                "{action} failed fast: studio_session_state_not_stop current_state={session_state}"
-            ),
-            None,
-        ));
-    }
-    require_local_edit_ready_locked(state, requested_task_id, action)?;
-    Ok(())
-}
-
-fn require_local_stop_control_ready_locked(
-    state: &AppState,
-    requested_task_id: &str,
-    action: &str,
-) -> Result<(), ErrorData> {
-    let snapshot = local_studio_live_snapshot_locked(state, requested_task_id, action)?;
-    let Some(session_state) = snapshot.studio_session_state.as_deref() else {
-        return Err(ErrorData::internal_error(
-            format!("{action} failed fast: studio_session_state_unknown"),
-            None,
-        ));
-    };
-    if session_state == "stop" {
-        return Ok(());
-    }
-    if session_state != "play" {
-        return Err(ErrorData::internal_error(
-            format!(
-                "{action} failed fast: studio_session_state_not_play current_state={session_state}"
-            ),
-            None,
-        ));
-    }
-
-    Ok(())
 }
 
 fn require_local_official_ready_locked(
@@ -1221,8 +1150,6 @@ impl ToolArgumentValues {
                 Some(LocalStudioGateKind::Edit)
             }
             ToolArgumentValues::InsertModel(_) => Some(LocalStudioGateKind::Edit),
-            ToolArgumentValues::LaunchStudioSession(_) => Some(LocalStudioGateKind::Launch),
-            ToolArgumentValues::StartStopPlay(_) => Some(LocalStudioGateKind::StopControl),
             _ => None,
         }
     }
@@ -1698,18 +1625,9 @@ async fn queue_tool_request(
     let gate_kind = command.args.local_studio_gate_kind();
     let mut route_snapshot = None;
     if let Some(gate_kind) = gate_kind {
-        let hub_status_client = if local_gate_requires_hub_route_ready(gate_kind) {
-            let hub_status_client = { state.lock().await.hub_status_client.clone() };
-            require_hub_route_ready_snapshot(
-                hub_status_client.clone(),
-                &requested_task_id,
-                tool_name,
-            )
+        let hub_status_client = { state.lock().await.hub_status_client.clone() };
+        require_hub_route_ready_snapshot(hub_status_client.clone(), &requested_task_id, tool_name)
             .await?;
-            Some(hub_status_client)
-        } else {
-            None
-        };
         wait_for_local_studio_status_if_needed(
             Arc::clone(&state),
             &requested_task_id,
@@ -1717,12 +1635,10 @@ async fn queue_tool_request(
             gate_kind,
         )
         .await?;
-        if let Some(hub_status_client) = hub_status_client {
-            route_snapshot = Some(
-                require_hub_route_ready_snapshot(hub_status_client, &requested_task_id, tool_name)
-                    .await?,
-            );
-        }
+        route_snapshot = Some(
+            require_hub_route_ready_snapshot(hub_status_client, &requested_task_id, tool_name)
+                .await?,
+        );
     }
     let (tx, rx) = mpsc::unbounded_channel::<Result<String>>();
     let (trigger, uploads, queued_requests, pending_responses) = {
@@ -1753,12 +1669,6 @@ async fn queue_tool_request(
         match gate_kind {
             Some(LocalStudioGateKind::Edit) => {
                 require_local_edit_ready_locked(&state, &requested_task_id, tool_name)?;
-            }
-            Some(LocalStudioGateKind::Launch) => {
-                require_local_launch_ready_locked(&state, &requested_task_id, tool_name)?;
-            }
-            Some(LocalStudioGateKind::StopControl) => {
-                require_local_stop_control_ready_locked(&state, &requested_task_id, tool_name)?;
             }
             Some(LocalStudioGateKind::Official) | None => {}
         }
@@ -2201,161 +2111,6 @@ mod tests {
     }
 
     #[test]
-    fn launch_preflight_fails_fast_for_none_connected_session_state() {
-        let mut status = local_task_status("stop", "none", "idle");
-        status.studio_session_state = Some("none_connected".to_owned());
-        status.last_known_session_state = None;
-        status.last_session_error_reason = Some("studio_plugin_not_connected".to_owned());
-        status.studio_mode = None;
-        status.studio_mode_age_ms = None;
-        let state = state_with_local_task_status(status);
-
-        assert_eq!(
-            local_studio_gate_wait_reason(&state, "t_test", LocalStudioGateKind::Launch),
-            None
-        );
-        let error = require_local_launch_ready_locked(&state, "t_test", "launch_studio_session")
-            .expect_err("none_connected is a final preflight state, not a wait condition");
-        assert!(error
-            .to_string()
-            .contains("studio_session_state_not_stop current_state=none_connected"));
-    }
-
-    #[test]
-    fn launch_preflight_rejects_running_session_state() {
-        let state =
-            state_with_local_task_status(local_task_status("start_play", "ready", "running"));
-        let error = require_local_launch_ready_locked(&state, "t_test", "launch_studio_session")
-            .expect_err("launch gate only accepts stop session state");
-
-        assert!(error
-            .to_string()
-            .contains("studio_session_state_not_stop current_state=play"));
-    }
-
-    #[test]
-    fn launch_wait_does_not_require_edit_runtime_fields_when_not_stop() {
-        let mut state =
-            state_with_local_task_status(local_task_status("start_play", "ready", "running"));
-        let status = state
-            .active_helper
-            .as_mut()
-            .and_then(|helper| helper.task_status.as_mut())
-            .expect("test state should have helper task status");
-        status.edit_runtime_state = None;
-        status.edit_runtime_age_ms = None;
-
-        assert_eq!(
-            local_studio_gate_wait_reason(&state, "t_test", LocalStudioGateKind::Launch),
-            None
-        );
-        let error = require_local_launch_ready_locked(&state, "t_test", "launch_studio_session")
-            .expect_err("launch gate should fail without waiting for edit runtime fields");
-        assert!(error.to_string().contains("studio_session_state_not_stop"));
-    }
-
-    #[test]
-    fn launch_wait_does_not_require_control_fields_when_not_stop() {
-        let mut state =
-            state_with_local_task_status(local_task_status("start_play", "ready", "running"));
-        let status = state
-            .active_helper
-            .as_mut()
-            .and_then(|helper| helper.task_status.as_mut())
-            .expect("test state should have helper task status");
-        status.studio_control_state = None;
-
-        assert_eq!(
-            local_studio_gate_wait_reason(&state, "t_test", LocalStudioGateKind::Launch),
-            None
-        );
-    }
-
-    #[test]
-    fn launch_preflight_rejects_uncontrolled_running_session_by_session_state() {
-        let state = state_with_local_task_status(local_task_status("start_play", "lost", "error"));
-        let error = require_local_launch_ready_locked(&state, "t_test", "launch_studio_session")
-            .expect_err("running session cannot pass launch gate");
-
-        assert!(error
-            .to_string()
-            .contains("studio_session_state_not_stop current_state=starting_play"));
-    }
-
-    #[test]
-    fn stop_preflight_allows_controlled_running_session() {
-        let state =
-            state_with_local_task_status(local_task_status("start_play", "ready", "running"));
-        require_local_stop_control_ready_locked(&state, "t_test", "start_stop_play")
-            .expect("controlled running session should be stoppable");
-    }
-
-    #[test]
-    fn stop_preflight_does_not_wait_on_legacy_control_fields_when_session_state_is_play() {
-        let mut status = local_task_status("start_play", "ready", "running");
-        status.studio_session_state = Some("play".to_owned());
-        status.studio_control_state = None;
-        status.studio_transition_phase = None;
-        let state = state_with_local_task_status(status);
-
-        assert_eq!(
-            local_studio_gate_wait_reason(&state, "t_test", LocalStudioGateKind::StopControl),
-            None
-        );
-        require_local_stop_control_ready_locked(&state, "t_test", "start_stop_play")
-            .expect("stop gate should trust studio_session_state=play");
-    }
-
-    #[test]
-    fn launch_preflight_allows_stable_edit_session() {
-        let mut status = local_task_status("stop", "none", "idle");
-        status.edit_runtime_state = Some("ready".to_owned());
-        status.edit_runtime_age_ms = Some(4);
-        let state = state_with_local_task_status(status);
-        require_local_launch_ready_locked(&state, "t_test", "launch_studio_session")
-            .expect("stable edit session should be launchable");
-    }
-
-    #[test]
-    fn stop_preflight_rejects_uncontrolled_running_session() {
-        let state = state_with_local_task_status(local_task_status("start_play", "lost", "error"));
-        let error = require_local_stop_control_ready_locked(&state, "t_test", "start_stop_play")
-            .expect_err("uncontrolled running session cannot be stopped safely");
-
-        assert!(error
-            .to_string()
-            .contains("studio_session_state_not_play current_state=starting_play"));
-    }
-
-    #[test]
-    fn stop_preflight_rejects_stop_in_progress() {
-        let state = state_with_local_task_status(local_task_status(
-            "start_play",
-            "stopping",
-            "stopping_requested",
-        ));
-        let error = require_local_stop_control_ready_locked(&state, "t_test", "start_stop_play")
-            .expect_err("stopping session must wait for stop/idle");
-
-        assert!(error
-            .to_string()
-            .contains("studio_session_state_not_play current_state=stopping"));
-
-        let observed_state = state_with_local_task_status(local_task_status(
-            "start_play",
-            "stopping",
-            "stopping_observed",
-        ));
-        let observed_error =
-            require_local_stop_control_ready_locked(&observed_state, "t_test", "start_stop_play")
-                .expect_err("observed stopping session must wait for stop/idle");
-
-        assert!(observed_error
-            .to_string()
-            .contains("studio_session_state_not_play current_state=stopping"));
-    }
-
-    #[test]
     fn active_helper_route_mismatch_is_rejected_before_dispatch() {
         let state =
             state_with_local_task_status(local_task_status("start_play", "ready", "running"));
@@ -2475,23 +2230,19 @@ mod tests {
     }
 
     #[test]
-    fn studio_tools_use_distinct_local_gate_kinds() {
-        assert!(matches!(
-            ToolArgumentValues::StartStopPlay(StartStopPlay {
+    fn studio_control_tools_do_not_use_local_status_gate() {
+        assert!(ToolArgumentValues::StartStopPlay(StartStopPlay {
                 task_id: "t_test".to_owned(),
                 mode: "stop".to_owned(),
             })
-            .local_studio_gate_kind(),
-            Some(LocalStudioGateKind::StopControl)
-        ));
-        assert!(matches!(
-            ToolArgumentValues::LaunchStudioSession(LaunchStudioSession {
+            .local_studio_gate_kind()
+            .is_none());
+        assert!(ToolArgumentValues::LaunchStudioSession(LaunchStudioSession {
                 task_id: "t_test".to_owned(),
                 mode: "start_play".to_owned(),
             })
-            .local_studio_gate_kind(),
-            Some(LocalStudioGateKind::Launch)
-        ));
+            .local_studio_gate_kind()
+            .is_none());
         assert!(matches!(
             ToolArgumentValues::InsertModel(InsertModel {
                 task_id: "t_test".to_owned(),
@@ -2499,22 +2250,6 @@ mod tests {
             })
             .local_studio_gate_kind(),
             Some(LocalStudioGateKind::Edit)
-        ));
-    }
-
-    #[test]
-    fn only_stop_control_skips_hub_route_readiness_gate() {
-        assert!(!local_gate_requires_hub_route_ready(
-            LocalStudioGateKind::StopControl
-        ));
-        assert!(local_gate_requires_hub_route_ready(
-            LocalStudioGateKind::Launch
-        ));
-        assert!(local_gate_requires_hub_route_ready(
-            LocalStudioGateKind::Edit
-        ));
-        assert!(local_gate_requires_hub_route_ready(
-            LocalStudioGateKind::Official
         ));
     }
 
