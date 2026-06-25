@@ -1,6 +1,6 @@
 use super::state::{HubStatusClient, HELPER_TASK_STATUS_STALE_AFTER, HUB_STATUS_TIMEOUT};
-use crate::helper_ws::RuntimeLogForwardStatusSnapshot;
 use crate::error::Result;
+use crate::helper_ws::RuntimeLogForwardStatusSnapshot;
 use color_eyre::eyre::eyre;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
@@ -177,16 +177,8 @@ impl HubTaskRouteSnapshot {
 }
 
 impl LocalStudioLiveSnapshot {
-    pub(super) fn studio_snapshot_fresh(&self) -> bool {
-        self.studio_mode_age_ms
-            .map(|age| age <= HELPER_TASK_STATUS_STALE_AFTER.as_millis())
-            .unwrap_or(false)
-    }
-
     pub(super) fn edit_ready(&self) -> bool {
-        self.studio_snapshot_fresh()
-            && self.studio_session_state.as_deref() == Some("stop")
-            && self.edit_runtime_state.as_deref() == Some("ready")
+        self.edit_runtime_state.as_deref() == Some("ready")
             && self
                 .edit_runtime_age_ms
                 .map(|age| age <= HELPER_TASK_STATUS_STALE_AFTER.as_millis())

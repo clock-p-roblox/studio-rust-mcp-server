@@ -94,11 +94,7 @@ pub struct HelperTaskStatusSnapshot {
         alias = "officialMcpAdapterLastError"
     )]
     pub official_mcp_adapter_last_error: Option<String>,
-    #[serde(
-        default,
-        rename = "runtime_log_forward",
-        alias = "runtimeLogForward"
-    )]
+    #[serde(default, rename = "runtime_log_forward", alias = "runtimeLogForward")]
     pub runtime_log_forward: Option<RuntimeLogForwardStatusSnapshot>,
 }
 
@@ -443,7 +439,10 @@ mod tests {
             encoded["task_status"]["official_mcp_adapter_state"],
             "ready"
         );
-        assert_eq!(encoded["task_status"]["runtime_log_forward"]["state"], "idle");
+        assert_eq!(
+            encoded["task_status"]["runtime_log_forward"]["state"],
+            "idle"
+        );
         assert!(encoded.get("helperId").is_none());
         assert!(encoded.get("taskId").is_none());
     }

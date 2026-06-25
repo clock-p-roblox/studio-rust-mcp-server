@@ -72,7 +72,7 @@ local QUIET_PLUGIN_EVENT_ACTIONS = {
 	helper_http_request = true,
 	helper_http_response = true,
 	long_poll_status_changed = true,
-	plugin_status_update_sent = true,
+	plugin_edit_heartbeat_sent = true,
 	status_poll_begin = true,
 	status_poll_claim_found = true,
 	status_poll_helper_ready = true,
@@ -80,7 +80,6 @@ local QUIET_PLUGIN_EVENT_ACTIONS = {
 	status_poll_skip = true,
 	status_poll_start = true,
 	status_poll_stop = true,
-	studio_mode_sample = true,
 }
 
 local function formatLogValue(value: any): string
@@ -104,7 +103,7 @@ local IMPORTANT_PLUGIN_EVENTS = {
 	helper_tool_malformed = true,
 	long_poll_closed = true,
 	plugin_connect_failed = true,
-	plugin_status_update_failed = true,
+	plugin_edit_heartbeat_failed = true,
 	status_poll_error = true,
 }
 
@@ -294,15 +293,6 @@ local function requestJson(baseUrl: string, method: string, path: string, body: 
 		error("Failed to decode helper JSON response: " .. tostring(decoded))
 	end
 	return decoded
-end
-
-local function currentStudioMode(): string
-	local mode = StudioSessionControl.getStudioMode()
-	StudioSessionControl.cleanupStoppedSessionControl(mode)
-	logPluginEvent("studio_mode_sample", {
-		mode = mode,
-	})
-	return mode
 end
 
 local function isStudioControlOrSessionQuery(toolName: string?): boolean
@@ -862,6 +852,31 @@ local function stopStatusPolling()
 	})
 end
 
+local function sendEditHeartbeat(helperBaseUrlForPoll: string, instanceIdForPoll: string?, taskIdForPoll: string?)
+	if instanceIdForPoll == nil then
+		return
+	end
+
+	local updateOk, updateError = pcall(function()
+		requestJson(helperBaseUrlForPoll, "POST", "/v1/mcp/plugin/edit-heartbeat", {
+			instance_id = instanceIdForPoll,
+		})
+	end)
+	if updateOk then
+		StudioSessionControl.ensurePreinstalledSessionControlScript()
+		logPluginEvent("plugin_edit_heartbeat_sent", {
+			instance_id = instanceIdForPoll,
+			task_id = taskIdForPoll,
+		})
+	else
+		logPluginEvent("plugin_edit_heartbeat_failed", {
+			instance_id = instanceIdForPoll,
+			task_id = taskIdForPoll,
+			error = tostring(updateError),
+		})
+	end
+end
+
 local function refreshStatusFromHelper()
 	if currentClient == nil or currentHelperBaseUrl == nil then
 		logPluginEvent("status_poll_skip", {
@@ -882,6 +897,7 @@ local function refreshStatusFromHelper()
 		helper_base_url = helperBaseUrlForPoll,
 	})
 	local ok, statusPayload = pcall(function()
+		sendEditHeartbeat(helperBaseUrlForPoll, instanceIdForPoll, taskIdForPoll)
 		return requestJson(helperBaseUrlForPoll, "GET", "/status")
 	end)
 	if not ok then
@@ -1114,16 +1130,13 @@ end
 
 local function connectToHelper(helperPort: string)
 	local baseUrl = helperBaseUrl(helperPort)
-	local initialStudioMode = currentStudioMode()
 	local registrationPayload = {
 		place_id = tostring(game.PlaceId),
-		studio_mode = initialStudioMode,
 	}
 	logPluginEvent("plugin_register_request", {
 		helper_port = helperPort,
 		base_url = baseUrl,
 		place_id = tostring(game.PlaceId),
-		studio_mode = initialStudioMode,
 	})
 	local registration = requestJson(baseUrl, "POST", "/v1/mcp/register", registrationPayload)
 	local instanceId = registration.instance_id
@@ -1137,6 +1150,7 @@ local function connectToHelper(helperPort: string)
 		then registration.task_id
 		else nil
 	StudioSessionControl.configureHelperContext(baseUrl, instanceId, taskId)
+	StudioSessionControl.ensurePreinstalledSessionControlScript()
 	logPluginEvent("plugin_register_response", {
 		instance_id = instanceId,
 		task_id = taskId,

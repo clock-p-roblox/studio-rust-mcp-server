@@ -215,10 +215,9 @@ async fn forward_runtime_log_job(app: &AppState, job: RuntimeLogForwardJob) {
         "runtime_log_forward_http",
         target_path.clone(),
         async move {
-            let response = request
-                .send()
-                .await
-                .wrap_err_with(|| format!("failed to forward runtime-log request to {target_url}"))?;
+            let response = request.send().await.wrap_err_with(|| {
+                format!("failed to forward runtime-log request to {target_url}")
+            })?;
             let status = response.status();
             let body = response
                 .bytes()
@@ -276,7 +275,10 @@ async fn forward_runtime_log_job(app: &AppState, job: RuntimeLogForwardJob) {
                 job.claimed_at,
                 target_path,
                 None,
-                format!("runtime-log forward failed: {}", summarize_error(&error.to_string())),
+                format!(
+                    "runtime-log forward failed: {}",
+                    summarize_error(&error.to_string())
+                ),
             )
             .await;
         }
@@ -292,7 +294,13 @@ async fn record_runtime_log_forward_failure(
     http_status: Option<u16>,
     error: String,
 ) {
-    tracing::warn!(task_id, target_path, http_status, error, "runtime-log forward failed");
+    tracing::warn!(
+        task_id,
+        target_path,
+        http_status,
+        error,
+        "runtime-log forward failed"
+    );
     let mut state = app.state.lock().await;
     if mark_runtime_log_forward_failed_if_current(
         &mut state,

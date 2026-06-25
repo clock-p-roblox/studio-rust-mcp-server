@@ -40,8 +40,8 @@ use helper_ws::{
     ArtifactAbort, ArtifactBegin, ArtifactChunk, ArtifactCommitted, ArtifactFinish, HelperHello,
     HelperTaskStatusSnapshot, HelperToServerMessage, OfficialMcpRequest, OfficialMcpResponse,
     RuntimeLogForwardStatusSnapshot, ServerToHelperMessage, HELPER_WS_PATH,
-    MAX_ARTIFACT_CHUNK_PAYLOAD_BYTES,
-    OFFICIAL_MCP_ADAPTER_CAPABILITY, OFFICIAL_MCP_STORE_IMAGE_BASE64_CAPABILITY,
+    MAX_ARTIFACT_CHUNK_PAYLOAD_BYTES, OFFICIAL_MCP_ADAPTER_CAPABILITY,
+    OFFICIAL_MCP_STORE_IMAGE_BASE64_CAPABILITY,
 };
 
 #[path = "studio_helper/config.rs"]
@@ -139,6 +139,7 @@ struct PluginInstance {
     studio_transition_started_at: Option<Instant>,
     studio_control_observed_at: Option<Instant>,
     edit_runtime_observed_at: Option<Instant>,
+    edit_runtime_unavailable_reason: Option<String>,
     studio_control_last_error: Option<String>,
     stop_request_id: u64,
     stop_request_recorded_at: Option<Instant>,
@@ -173,7 +174,7 @@ struct HelperState {
     hub_last_ready_at: Option<Instant>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct RuntimeLogForwardStatusRecord {
     queued_count: u64,
     accepted_count: u64,
@@ -186,24 +187,6 @@ struct RuntimeLogForwardStatusRecord {
     last_http_status: Option<u16>,
     last_error: Option<String>,
     last_error_at: Option<Instant>,
-}
-
-impl Default for RuntimeLogForwardStatusRecord {
-    fn default() -> Self {
-        Self {
-            queued_count: 0,
-            accepted_count: 0,
-            forwarded_count: 0,
-            failed_count: 0,
-            last_accepted_at: None,
-            last_forwarded_at: None,
-            last_attempt_at: None,
-            last_target_path: None,
-            last_http_status: None,
-            last_error: None,
-            last_error_at: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -368,8 +351,6 @@ struct AppState {
 struct RegisterPluginRequest {
     place_id: String,
     task_id: Option<String>,
-    #[serde(default)]
-    studio_mode: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -394,10 +375,8 @@ struct PluginRequestQuery {
 }
 
 #[derive(Debug, Deserialize)]
-struct PluginStatusUpdateRequest {
+struct PluginEditHeartbeatRequest {
     instance_id: String,
-    #[serde(default)]
-    studio_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -439,8 +418,6 @@ struct PluginResponsePayload {
     id: String,
     success: bool,
     response: String,
-    #[serde(default)]
-    studio_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1779,9 +1756,7 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
                 task_id: instance.task_id.clone(),
                 remote_base_url: instance.remote_base_url.clone(),
                 studio_pid: instance.studio_pid,
-                studio_session_state: current_session_state_for_instance(instance)
-                    .unwrap_or("none_response")
-                    .to_owned(),
+                studio_session_state: reported_session_state_for_instance(instance).to_owned(),
                 last_known_session_state: last_known_session_state_for_instance(instance)
                     .map(str::to_owned),
                 last_session_error_reason: instance.studio_control_last_error.clone(),
@@ -1826,7 +1801,7 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
             ) = task_official_adapter_snapshot(
                 &state,
                 &task.task_id,
-                studio_snapshot.studio_mode.as_deref(),
+                studio_snapshot.edit_runtime_state == "ready",
             );
             let launch_process = state.launch_processes.get(&task.task_id);
             let studio_pid = task_active_studio_pid(&state, &task.task_id);
@@ -2516,9 +2491,6 @@ async fn mcp_register_handler(
         .map(|_| runtime_log_forward_upload_url(app.helper.port, &place_id, &claimed_task.task_id));
     {
         let mut state = app.state.lock().await;
-        let studio_mode = normalize_studio_mode(payload.studio_mode.as_deref());
-        let (studio_control_state, studio_transition_phase, studio_control_observed_at) =
-            initial_control_state_for_mode(studio_mode.as_deref());
         state.instances.insert(
             instance_id.clone(),
             PluginInstance {
@@ -2526,15 +2498,15 @@ async fn mcp_register_handler(
                 task_id: Some(claimed_task.task_id.clone()),
                 remote_base_url: remote_base_url.clone(),
                 studio_pid,
-                studio_mode,
-                studio_mode_observed_at: normalize_studio_mode(payload.studio_mode.as_deref())
-                    .map(|_| Instant::now()),
-                studio_mode_source: "edit_plugin".to_owned(),
-                studio_control_state,
-                studio_transition_phase,
+                studio_mode: None,
+                studio_mode_observed_at: None,
+                studio_mode_source: "none".to_owned(),
+                studio_control_state: "none".to_owned(),
+                studio_transition_phase: "idle".to_owned(),
                 studio_transition_started_at: None,
-                studio_control_observed_at,
+                studio_control_observed_at: None,
                 edit_runtime_observed_at: Some(Instant::now()),
+                edit_runtime_unavailable_reason: None,
                 studio_control_last_error: None,
                 stop_request_id: 0,
                 stop_request_recorded_at: None,
@@ -2560,7 +2532,6 @@ async fn mcp_register_handler(
         task_id = claimed_task.task_id,
         studio_pid,
         remote_base_url,
-        studio_mode = ?payload.studio_mode,
         "registered MCP plugin instance with helper"
     );
     Ok(Json(RegisterPluginResponse {
@@ -2613,6 +2584,18 @@ async fn mcp_plugin_stop_request_handler(
                 payload.instance_id
             )));
         }
+        Err(StopRequestRecordError::RuntimeActuatorUnavailable(detail)) => {
+            tracing::warn!(
+                instance_id = payload.instance_id,
+                detail,
+                "rejected MCP plugin stop request because runtime actuator is not fresh"
+            );
+            return Ok((
+                StatusCode::CONFLICT,
+                format!("runtime_stop_actuator_unavailable: {detail}"),
+            )
+                .into_response());
+        }
     };
     if let Some(task_id) = recorded.task_id.as_deref() {
         queue_task_status_updates(&state, &app.helper, task_id);
@@ -2643,7 +2626,7 @@ async fn mcp_plugin_stop_request_poll_handler(
         let after_id = query.after_id.unwrap_or(0);
         let stop_request_id = instance.stop_request_id;
         let stop_requested = stop_request_id > after_id
-            && is_stop_request_deliverable_phase(&effective_studio_transition_phase(instance));
+            && is_stop_request_deliverable_phase(&instance.studio_transition_phase);
         instance.stop_request_last_polled_at = Some(Instant::now());
         instance.stop_request_last_poll_id = Some(if stop_requested {
             stop_request_id
@@ -2761,12 +2744,8 @@ async fn mcp_plugin_control_heartbeat_handler(
         let Some(instance) = state.instances.get_mut(&payload.instance_id) else {
             return Ok((StatusCode::GONE, "instance expired").into_response());
         };
-        let previous_mode = instance.studio_mode.clone();
         let previous_control_state = effective_studio_control_state(instance);
         let previous_transition_phase = effective_studio_transition_phase(instance);
-        instance.studio_mode = Some(mode.clone());
-        instance.studio_mode_observed_at = Some(Instant::now());
-        instance.studio_mode_source = "play_control".to_owned();
         instance.studio_control_observed_at = Some(Instant::now());
         if is_error_transition_phase(&instance.studio_transition_phase) {
             instance.studio_control_state = "lost".to_owned();
@@ -2776,14 +2755,13 @@ async fn mcp_plugin_control_heartbeat_handler(
             instance.studio_control_state = "ready".to_owned();
             set_studio_transition_phase(instance, "running");
             instance.studio_control_last_error = None;
+            set_edit_runtime_unavailable(instance, "runtime");
         }
         instance.last_seen_at = Instant::now();
         (
             instance.place_id.clone(),
             instance.task_id.clone(),
-            previous_mode.as_deref() != Some(mode.as_str())
-                || previous_control_state != "ready"
-                || previous_transition_phase != "running",
+            previous_control_state != "ready" || previous_transition_phase != "running",
         )
     };
     if should_push_status {
@@ -2839,29 +2817,75 @@ async fn mcp_plugin_request_handler(
     }
 }
 
-async fn mcp_plugin_status_update_handler(
+async fn mcp_plugin_edit_heartbeat_handler(
     State(app): State<AppState>,
-    Json(payload): Json<PluginStatusUpdateRequest>,
+    Json(payload): Json<PluginEditHeartbeatRequest>,
 ) -> Result<Response, HelperError> {
     let mut state = app.state.lock().await;
-    let updated = update_instance_studio_mode(
-        &mut state,
-        &payload.instance_id,
-        payload.studio_mode.as_deref(),
-        "edit_plugin",
-    );
-    if !updated {
-        tracing::warn!(
-            instance_id = payload.instance_id,
-            studio_mode = ?payload.studio_mode,
-            "rejected MCP plugin status update"
-        );
-        return Ok((StatusCode::GONE, "instance expired or studio_mode invalid").into_response());
-    }
-    let task_id = state
-        .instances
-        .get(&payload.instance_id)
-        .and_then(|instance| instance.task_id.clone());
+    let task_id = {
+        let Some(instance) = state.instances.get_mut(&payload.instance_id) else {
+            tracing::warn!(
+                instance_id = payload.instance_id,
+                "rejected MCP plugin edit heartbeat for missing instance"
+            );
+            return Ok((StatusCode::GONE, "instance expired").into_response());
+        };
+        if is_stopping_transition_phase(&instance.studio_transition_phase)
+            && instance.stop_request_id > 0
+        {
+            instance.edit_runtime_observed_at = Some(Instant::now());
+            if instance.stop_result_phase.as_deref() == Some("observed")
+                && runtime_control_heartbeat_is_stale(instance)
+            {
+                instance.studio_control_state = "none".to_owned();
+                set_studio_transition_phase(instance, "idle");
+                instance.studio_control_observed_at = None;
+                instance.studio_control_last_error = None;
+                instance.stop_result_phase = Some("completed".to_owned());
+                instance.stop_result_error = None;
+                instance.stop_result_observed_at = Some(Instant::now());
+                set_edit_runtime_available(instance);
+            } else {
+                set_edit_runtime_unavailable(instance, "stopping");
+            }
+        } else {
+            match instance.edit_runtime_unavailable_reason.as_deref() {
+                Some("launching") => {
+                    instance.edit_runtime_observed_at = Some(Instant::now());
+                }
+                Some("launch_failed")
+                    if runtime_control_heartbeat_expired_after_observation(instance) =>
+                {
+                    instance.studio_control_state = "none".to_owned();
+                    set_studio_transition_phase(instance, "idle");
+                    instance.studio_control_observed_at = None;
+                    instance.studio_control_last_error = None;
+                    set_edit_runtime_available(instance);
+                }
+                Some("launch_failed") => {
+                    instance.edit_runtime_observed_at = Some(Instant::now());
+                }
+                Some("runtime")
+                    if runtime_control_heartbeat_expired_after_observation(instance) =>
+                {
+                    instance.studio_control_state = "none".to_owned();
+                    set_studio_transition_phase(instance, "idle");
+                    instance.studio_control_observed_at = None;
+                    instance.studio_control_last_error = None;
+                    set_edit_runtime_available(instance);
+                }
+                Some("runtime") => {
+                    instance.edit_runtime_observed_at = Some(Instant::now());
+                    set_edit_runtime_unavailable(instance, "runtime");
+                }
+                _ => {
+                    set_edit_runtime_available(instance);
+                }
+            }
+        }
+        instance.last_seen_at = Instant::now();
+        instance.task_id.clone()
+    };
     if let Some(task_id) = task_id {
         queue_task_status_updates(&state, &app.helper, &task_id);
     }
@@ -2871,11 +2895,10 @@ async fn mcp_plugin_status_update_handler(
             place_id = instance.place_id,
             task_id = ?instance.task_id,
             studio_pid = ?instance.studio_pid,
-            studio_mode = ?instance.studio_mode,
-            studio_mode_age_ms = instance
-                .studio_mode_observed_at
+            edit_runtime_age_ms = instance
+                .edit_runtime_observed_at
                 .map(|value| value.elapsed().as_millis()),
-            "accepted MCP plugin status update"
+            "accepted MCP plugin edit heartbeat"
         );
     }
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -2894,17 +2917,9 @@ async fn mcp_plugin_response_handler(
                 .map(|pending| pending.tool_name.clone())
                 .unwrap_or_else(|| "unknown".to_owned());
             if let Some(instance_id) = payload.instance_id.as_deref() {
-                let updated = update_instance_studio_mode(
-                    &mut state,
-                    instance_id,
-                    payload.studio_mode.as_deref(),
-                    "edit_plugin",
-                );
                 if let Some(instance) = state.instances.get(instance_id) {
-                    if updated {
-                        if let Some(task_id) = instance.task_id.clone() {
-                            queue_task_status_updates(&state, &app.helper, &task_id);
-                        }
+                    if let Some(task_id) = instance.task_id.clone() {
+                        queue_task_status_updates(&state, &app.helper, &task_id);
                     }
                     tracing::info!(
                         instance_id,
@@ -2913,10 +2928,8 @@ async fn mcp_plugin_response_handler(
                         id = payload.id,
                         tool = pending_tool_name.as_str(),
                         success = payload.success,
-                        studio_mode = ?instance.studio_mode,
                         response_bytes = payload.response.len(),
-                        status_updated = updated,
-                        "helper received MCP plugin tool response status"
+                        "helper received MCP plugin tool response"
                     );
                 } else {
                     tracing::warn!(
@@ -2924,7 +2937,6 @@ async fn mcp_plugin_response_handler(
                         id = payload.id,
                         tool = pending_tool_name.as_str(),
                         success = payload.success,
-                        studio_mode = ?payload.studio_mode,
                         response_bytes = payload.response.len(),
                         "helper received MCP plugin response for missing instance"
                     );
@@ -2939,7 +2951,6 @@ async fn mcp_plugin_response_handler(
             id = payload.id,
             instance_id = ?payload.instance_id,
             success = payload.success,
-            studio_mode = ?payload.studio_mode,
             response_bytes = payload.response.len(),
             "helper received plugin tool response"
         );
@@ -3041,6 +3052,7 @@ struct RecordedStopRequest {
 
 enum StopRequestRecordError {
     MissingInstance,
+    RuntimeActuatorUnavailable(String),
 }
 
 fn is_stopping_transition_phase(phase: &str) -> bool {
@@ -3097,22 +3109,35 @@ fn is_error_transition_phase(phase: &str) -> bool {
     phase == "error"
 }
 
+fn set_edit_runtime_available(instance: &mut PluginInstance) {
+    instance.edit_runtime_observed_at = Some(Instant::now());
+    instance.edit_runtime_unavailable_reason = None;
+}
+
+fn set_edit_runtime_unavailable(instance: &mut PluginInstance, reason: &str) {
+    instance.edit_runtime_unavailable_reason = Some(reason.to_owned());
+}
+
+fn edit_unavailable_reason_priority(reason: &str) -> u8 {
+    match reason {
+        "stopping" => 4,
+        "launching" => 3,
+        "runtime" => 2,
+        "launch_failed" => 1,
+        _ => 0,
+    }
+}
+
 fn current_session_state_for_instance(instance: &PluginInstance) -> Option<&'static str> {
     let transition_phase = effective_studio_transition_phase(instance);
     if is_stopping_transition_phase(&transition_phase) {
         return Some("stopping");
     }
-    if studio_mode_is_running(instance.studio_mode.as_deref()) {
-        if instance_has_fresh_control(instance) {
-            return Some("play");
-        }
-        if transition_phase == "starting" {
-            return Some("starting_play");
-        }
-        return None;
+    if instance.edit_runtime_unavailable_reason.as_deref() == Some("launching") {
+        return Some("launching");
     }
-    if instance.studio_mode.as_deref() == Some("stop") && edit_runtime_state(instance) == "ready" {
-        return Some("stop");
+    if instance.edit_runtime_unavailable_reason.as_deref() == Some("launch_failed") {
+        return Some("launch_failed");
     }
     None
 }
@@ -3122,17 +3147,24 @@ fn last_known_session_state_for_instance(instance: &PluginInstance) -> Option<&'
     if is_stopping_transition_phase(&transition_phase) {
         return Some("stopping");
     }
-    match instance.studio_mode.as_deref() {
-        Some("start_play") | Some("run_server") => {
-            if instance_has_fresh_control(instance) {
-                Some("play")
-            } else {
-                Some("starting_play")
-            }
-        }
-        Some("stop") => Some("stop"),
-        _ => None,
+    if instance.edit_runtime_unavailable_reason.as_deref() == Some("launching") {
+        return Some("launching");
     }
+    if instance.edit_runtime_unavailable_reason.as_deref() == Some("launch_failed") {
+        return Some("launch_failed");
+    }
+    None
+}
+
+fn reported_session_state_for_instance(instance: &PluginInstance) -> &'static str {
+    current_session_state_for_instance(instance).unwrap_or_else(|| {
+        match edit_runtime_state(instance).as_str() {
+            "ready" => "edit_connected",
+            "runtime" => "edit_suspended_by_runtime",
+            "launch_failed" => "launch_failed",
+            _ => "none_response",
+        }
+    })
 }
 
 fn task_studio_session_state_snapshot(
@@ -3141,9 +3173,13 @@ fn task_studio_session_state_snapshot(
 ) -> (String, Option<String>, Option<String>) {
     let mut has_instance = false;
     let mut has_stopping = false;
+    let mut has_launching = false;
+    let mut has_launch_failed = false;
+    let mut has_runtime = false;
     let mut has_play = false;
     let mut has_starting = false;
     let mut has_stop = false;
+    let mut has_edit_connected = false;
     let mut newest_known: Option<(&'static str, u128)> = None;
     let mut newest_error: Option<(String, u128)> = None;
 
@@ -3155,9 +3191,16 @@ fn task_studio_session_state_snapshot(
         has_instance = true;
         match current_session_state_for_instance(instance) {
             Some("stopping") => has_stopping = true,
+            Some("launching") => has_launching = true,
+            Some("launch_failed") => has_launch_failed = true,
             Some("play") => has_play = true,
             Some("starting_play") => has_starting = true,
             Some("stop") => has_stop = true,
+            _ => {}
+        }
+        match edit_runtime_state(instance).as_str() {
+            "ready" => has_edit_connected = true,
+            "runtime" => has_runtime = true,
             _ => {}
         }
         if let Some(known) = last_known_session_state_for_instance(instance) {
@@ -3195,12 +3238,20 @@ fn task_studio_session_state_snapshot(
         "none_connected"
     } else if has_stopping {
         "stopping"
+    } else if has_launching {
+        "launching"
+    } else if has_launch_failed {
+        "launch_failed"
+    } else if has_runtime {
+        "edit_suspended_by_runtime"
     } else if has_play {
         "play"
     } else if has_starting {
         "starting_play"
     } else if has_stop {
         "stop"
+    } else if has_edit_connected {
+        "edit_connected"
     } else {
         "none_response"
     }
@@ -3208,7 +3259,14 @@ fn task_studio_session_state_snapshot(
 
     let last_known_session_state = if matches!(
         studio_session_state.as_str(),
-        "stop" | "starting_play" | "play" | "stopping"
+        "stop"
+            | "starting_play"
+            | "play"
+            | "stopping"
+            | "launching"
+            | "launch_failed"
+            | "edit_suspended_by_runtime"
+            | "edit_connected"
     ) {
         Some(studio_session_state.clone())
     } else {
@@ -3250,10 +3308,21 @@ fn instance_has_fresh_control(instance: &PluginInstance) -> bool {
             .unwrap_or(false)
 }
 
+fn runtime_control_heartbeat_is_stale(instance: &PluginInstance) -> bool {
+    instance
+        .studio_control_observed_at
+        .map(|observed_at| observed_at.elapsed() > STUDIO_CONTROL_HEARTBEAT_STALE_AFTER)
+        .unwrap_or(true)
+}
+
+fn runtime_control_heartbeat_expired_after_observation(instance: &PluginInstance) -> bool {
+    instance
+        .studio_control_observed_at
+        .map(|observed_at| observed_at.elapsed() > STUDIO_CONTROL_HEARTBEAT_STALE_AFTER)
+        .unwrap_or(false)
+}
+
 fn effective_studio_control_state(instance: &PluginInstance) -> String {
-    if !studio_mode_is_running(instance.studio_mode.as_deref()) {
-        return "none".to_owned();
-    }
     if is_error_transition_phase(&effective_studio_transition_phase(instance)) {
         return "lost".to_owned();
     }
@@ -3268,22 +3337,15 @@ fn effective_studio_control_state(instance: &PluginInstance) -> String {
 }
 
 fn effective_studio_transition_phase(instance: &PluginInstance) -> String {
-    match instance.studio_mode.as_deref() {
-        Some("stop") => "idle".to_owned(),
-        Some("start_play") | Some("run_server") => {
-            if is_error_transition_phase(&instance.studio_transition_phase) {
-                return instance.studio_transition_phase.clone();
-            }
-            if is_stopping_transition_phase(&instance.studio_transition_phase) {
-                return instance.studio_transition_phase.clone();
-            }
-            if instance_has_fresh_control(instance) {
-                "running".to_owned()
-            } else {
-                instance.studio_transition_phase.clone()
-            }
-        }
-        _ => instance.studio_transition_phase.clone(),
+    if is_error_transition_phase(&instance.studio_transition_phase)
+        || is_stopping_transition_phase(&instance.studio_transition_phase)
+    {
+        return instance.studio_transition_phase.clone();
+    }
+    if instance_has_fresh_control(instance) {
+        "running".to_owned()
+    } else {
+        instance.studio_transition_phase.clone()
     }
 }
 
@@ -3294,6 +3356,11 @@ fn record_stop_request_for_instance(
     let Some(instance) = state.instances.get_mut(instance_id) else {
         return Err(StopRequestRecordError::MissingInstance);
     };
+    if !instance_has_fresh_control(instance) {
+        return Err(StopRequestRecordError::RuntimeActuatorUnavailable(
+            runtime_actuator_unavailable_detail(instance),
+        ));
+    }
     instance.stop_request_id = instance.stop_request_id.saturating_add(1);
     instance.studio_control_state = "stopping".to_owned();
     set_studio_transition_phase(instance, "stopping_requested");
@@ -3304,6 +3371,7 @@ fn record_stop_request_for_instance(
     instance.stop_result_phase = None;
     instance.stop_result_error = None;
     instance.stop_result_observed_at = None;
+    set_edit_runtime_unavailable(instance, "stopping");
     instance.last_seen_at = Instant::now();
     Ok(RecordedStopRequest {
         place_id: instance.place_id.clone(),
@@ -3312,44 +3380,33 @@ fn record_stop_request_for_instance(
     })
 }
 
-fn settle_instance_control_state(instance: &mut PluginInstance, mode: &str) {
-    match mode {
-        "stop" => {
-            if is_stopping_transition_phase(&instance.studio_transition_phase)
-                && instance.stop_request_id > 0
-            {
-                instance.stop_result_phase = Some("completed".to_owned());
-                instance.stop_result_error = None;
-                instance.stop_result_observed_at = Some(Instant::now());
-            }
-            instance.studio_control_state = "none".to_owned();
-            set_studio_transition_phase(instance, "idle");
-            instance.studio_control_observed_at = None;
-            instance.studio_control_last_error = None;
-        }
-        "start_play" | "run_server" => {
-            if is_error_transition_phase(&instance.studio_transition_phase) {
-                instance.studio_control_state = "lost".to_owned();
-            } else if is_stopping_transition_phase(&instance.studio_transition_phase) {
-                instance.studio_control_state = "stopping".to_owned();
-            } else if instance_has_fresh_control(instance) {
-                instance.studio_control_state = "ready".to_owned();
-                set_studio_transition_phase(instance, "running");
-            } else {
-                instance.studio_control_state = "lost".to_owned();
-                if instance.studio_transition_phase == "idle" {
-                    set_studio_transition_phase(instance, "starting");
-                }
-            }
-        }
-        _ => {
-            instance.studio_control_state = "lost".to_owned();
-            set_studio_transition_phase(instance, "error");
-            instance.studio_control_observed_at = None;
-        }
-    }
+fn runtime_actuator_unavailable_detail(instance: &PluginInstance) -> String {
+    format!(
+        "studio_control_state={} studio_transition_phase={} control_age_ms={:?} edit_runtime_state={} unavailable_reason={:?}",
+        instance.studio_control_state,
+        instance.studio_transition_phase,
+        instance
+            .studio_control_observed_at
+            .map(|observed_at| observed_at.elapsed().as_millis()),
+        edit_runtime_state(instance),
+        instance.edit_runtime_unavailable_reason
+    )
 }
 
+fn mark_runtime_stop_timeout(instance: &mut PluginInstance, stop_request_id: u64, detail: String) {
+    instance.studio_control_state = "lost".to_owned();
+    set_studio_transition_phase(instance, "error");
+    instance.studio_control_last_error = Some(format!(
+        "runtime_stop_timeout: stop_request_id={stop_request_id} {detail}"
+    ));
+    instance.stop_result_phase = Some("failed".to_owned());
+    instance.stop_result_error = instance.studio_control_last_error.clone();
+    instance.stop_result_observed_at = Some(Instant::now());
+    set_edit_runtime_unavailable(instance, "runtime");
+    instance.last_seen_at = Instant::now();
+}
+
+#[cfg(test)]
 fn initial_control_state_for_mode(mode: Option<&str>) -> (String, String, Option<Instant>) {
     match mode {
         None | Some("stop") => ("none".to_owned(), "idle".to_owned(), None),
@@ -3359,8 +3416,8 @@ fn initial_control_state_for_mode(mode: Option<&str>) -> (String, String, Option
 }
 
 fn edit_runtime_state(instance: &PluginInstance) -> String {
-    if studio_mode_is_running(instance.studio_mode.as_deref()) {
-        return "stale".to_owned();
+    if let Some(reason) = instance.edit_runtime_unavailable_reason.as_deref() {
+        return reason.to_owned();
     }
     let Some(observed_at) = instance.edit_runtime_observed_at else {
         return "missing".to_owned();
@@ -3372,35 +3429,54 @@ fn edit_runtime_state(instance: &PluginInstance) -> String {
     }
 }
 
-fn update_instance_studio_mode(
-    state: &mut HelperState,
-    instance_id: &str,
-    studio_mode: Option<&str>,
-    source: &str,
-) -> bool {
-    let Some(mode) = normalize_studio_mode(studio_mode) else {
-        return false;
-    };
-    let Some(instance) = state.instances.get_mut(instance_id) else {
-        return false;
-    };
-    let preserve_play_control_source = source == "edit_plugin"
-        && studio_mode_is_running(Some(mode.as_str()))
-        && instance.studio_mode.as_deref() == Some(mode.as_str())
-        && instance.studio_mode_source == "play_control"
-        && instance_has_fresh_control(instance);
-    if !preserve_play_control_source {
-        instance.studio_mode = Some(mode.clone());
-        instance.studio_mode_observed_at = Some(Instant::now());
-        instance.studio_mode_source = source.to_owned();
+fn task_edit_runtime_snapshot<'a>(
+    instances: impl Iterator<Item = &'a PluginInstance>,
+) -> (String, Option<u128>) {
+    let mut has_instance = false;
+    let mut unavailable_reason: Option<String> = None;
+    let mut newest_edit_age_ms: Option<u128> = None;
+
+    for instance in instances {
+        has_instance = true;
+        if let Some(reason) = instance.edit_runtime_unavailable_reason.as_ref() {
+            if unavailable_reason
+                .as_deref()
+                .map(|current| {
+                    edit_unavailable_reason_priority(reason)
+                        > edit_unavailable_reason_priority(current)
+                })
+                .unwrap_or(true)
+            {
+                unavailable_reason = Some(reason.clone());
+            }
+        }
+        if let Some(observed_at) = instance.edit_runtime_observed_at {
+            let age_ms = observed_at.elapsed().as_millis();
+            if newest_edit_age_ms
+                .map(|current| age_ms < current)
+                .unwrap_or(true)
+            {
+                newest_edit_age_ms = Some(age_ms);
+            }
+        }
     }
-    if source == "edit_plugin" && mode == "stop" {
-        instance.edit_runtime_observed_at = Some(Instant::now());
-    }
-    let current_mode = instance.studio_mode.clone().unwrap_or_default();
-    settle_instance_control_state(instance, &current_mode);
-    instance.last_seen_at = Instant::now();
-    true
+
+    let state = if !has_instance {
+        "missing"
+    } else if let Some(reason) = unavailable_reason.as_deref() {
+        reason
+    } else if newest_edit_age_ms
+        .map(|age_ms| age_ms <= EDIT_RUNTIME_STALE_AFTER.as_millis())
+        .unwrap_or(false)
+    {
+        "ready"
+    } else if newest_edit_age_ms.is_some() {
+        "stale"
+    } else {
+        "missing"
+    };
+
+    (state.to_owned(), newest_edit_age_ms)
 }
 
 fn task_studio_mode_snapshot(state: &HelperState, task_id: &str) -> StudioTaskStatusSnapshot {
@@ -3419,30 +3495,33 @@ fn task_studio_mode_snapshot(state: &HelperState, task_id: &str) -> StudioTaskSt
         })
         .map(stop_request_snapshot_for_instance)
         .unwrap_or_else(empty_stop_request_snapshot);
+    let (task_edit_runtime_state, task_edit_runtime_age_ms) = task_edit_runtime_snapshot(
+        state
+            .instances
+            .values()
+            .filter(|instance| instance.task_id.as_deref() == Some(task_id)),
+    );
     state
         .instances
         .values()
         .filter(|instance| instance.task_id.as_deref() == Some(task_id))
-        .filter_map(|instance| {
-            let observed_at = instance.studio_mode_observed_at?;
-            Some((
+        .max_by_key(|instance| instance.last_seen_at)
+        .map(|instance| {
+            (
                 instance.studio_mode.clone(),
-                observed_at.elapsed().as_millis(),
+                instance
+                    .studio_mode_observed_at
+                    .map(|observed_at| observed_at.elapsed().as_millis()),
                 instance.studio_mode_source.clone(),
                 effective_studio_control_state(instance),
                 effective_studio_transition_phase(instance),
                 instance
                     .studio_transition_started_at
                     .map(|value| value.elapsed().as_millis()),
-                edit_runtime_state(instance),
-                instance
-                    .edit_runtime_observed_at
-                    .map(|value| value.elapsed().as_millis()),
                 instance.studio_control_last_error.clone(),
-            ))
+            )
         })
-        .min_by_key(|(_, age, _, _, _, _, _, _, _)| *age)
-        .and_then(
+        .map(
             |(
                 mode,
                 age,
@@ -3450,33 +3529,28 @@ fn task_studio_mode_snapshot(state: &HelperState, task_id: &str) -> StudioTaskSt
                 control_state,
                 transition_phase,
                 transition_age_ms,
-                edit_runtime_state,
-                edit_runtime_age_ms,
                 control_last_error,
-            )| {
-                mode.map(|mode| StudioTaskStatusSnapshot {
-                    studio_session_state: studio_session_state.clone(),
-                    last_known_session_state: last_known_session_state.clone(),
-                    last_session_error_reason: last_session_error_reason.clone(),
-                    studio_mode: Some(mode),
-                    studio_mode_age_ms: Some(age),
-                    studio_mode_source: mode_source,
-                    studio_control_state: control_state,
-                    studio_transition_phase: transition_phase,
-                    studio_transition_age_ms: transition_age_ms,
-                    edit_runtime_state,
-                    edit_runtime_age_ms,
-                    studio_control_last_error: control_last_error,
-                    active_stop_request_id: stop_snapshot.active_stop_request_id,
-                    last_stop_request_id: stop_snapshot.last_stop_request_id,
-                    stop_request_recorded_age_ms: stop_snapshot.stop_request_recorded_age_ms,
-                    runtime_actuator_last_poll_id: stop_snapshot.runtime_actuator_last_poll_id,
-                    runtime_actuator_last_poll_age_ms: stop_snapshot
-                        .runtime_actuator_last_poll_age_ms,
-                    stop_result_phase: stop_snapshot.stop_result_phase.clone(),
-                    stop_result_age_ms: stop_snapshot.stop_result_age_ms,
-                    stop_result_error: stop_snapshot.stop_result_error.clone(),
-                })
+            )| StudioTaskStatusSnapshot {
+                studio_session_state: studio_session_state.clone(),
+                last_known_session_state: last_known_session_state.clone(),
+                last_session_error_reason: last_session_error_reason.clone(),
+                studio_mode: mode,
+                studio_mode_age_ms: age,
+                studio_mode_source: mode_source,
+                studio_control_state: control_state,
+                studio_transition_phase: transition_phase,
+                studio_transition_age_ms: transition_age_ms,
+                edit_runtime_state: task_edit_runtime_state.clone(),
+                edit_runtime_age_ms: task_edit_runtime_age_ms,
+                studio_control_last_error: control_last_error,
+                active_stop_request_id: stop_snapshot.active_stop_request_id,
+                last_stop_request_id: stop_snapshot.last_stop_request_id,
+                stop_request_recorded_age_ms: stop_snapshot.stop_request_recorded_age_ms,
+                runtime_actuator_last_poll_id: stop_snapshot.runtime_actuator_last_poll_id,
+                runtime_actuator_last_poll_age_ms: stop_snapshot.runtime_actuator_last_poll_age_ms,
+                stop_result_phase: stop_snapshot.stop_result_phase.clone(),
+                stop_result_age_ms: stop_snapshot.stop_result_age_ms,
+                stop_result_error: stop_snapshot.stop_result_error.clone(),
             },
         )
         .unwrap_or(StudioTaskStatusSnapshot {
@@ -3489,8 +3563,8 @@ fn task_studio_mode_snapshot(state: &HelperState, task_id: &str) -> StudioTaskSt
             studio_control_state: "none".to_owned(),
             studio_transition_phase: "idle".to_owned(),
             studio_transition_age_ms: None,
-            edit_runtime_state: "missing".to_owned(),
-            edit_runtime_age_ms: None,
+            edit_runtime_state: task_edit_runtime_state,
+            edit_runtime_age_ms: task_edit_runtime_age_ms,
             studio_control_last_error: None,
             active_stop_request_id: stop_snapshot.active_stop_request_id,
             last_stop_request_id: stop_snapshot.last_stop_request_id,
@@ -3506,16 +3580,16 @@ fn task_studio_mode_snapshot(state: &HelperState, task_id: &str) -> StudioTaskSt
 fn task_official_adapter_snapshot(
     state: &HelperState,
     task_id: &str,
-    studio_mode: Option<&str>,
+    edit_runtime_ready: bool,
 ) -> (String, Option<u128>, Option<String>) {
     let Some(record) = state.official_adapter_states.get(task_id) else {
         return ("not_started".to_owned(), None, None);
     };
     let state_name = if record.state == "ready" {
-        match studio_mode {
-            Some("stop") => "ready".to_owned(),
-            Some(_) => "blocked_by_studio_mode".to_owned(),
-            None => "stale".to_owned(),
+        if edit_runtime_ready {
+            "ready".to_owned()
+        } else {
+            "stale".to_owned()
         }
     } else {
         record.state.clone()
@@ -3555,13 +3629,29 @@ fn runtime_log_forward_status_snapshot(
         accepted_count: record.accepted_count,
         forwarded_count: record.forwarded_count,
         failed_count: record.failed_count,
-        last_accepted_age_ms: ws_age_ms(record.last_accepted_at.map(|value| value.elapsed().as_millis())),
-        last_forwarded_age_ms: ws_age_ms(record.last_forwarded_at.map(|value| value.elapsed().as_millis())),
-        last_attempt_age_ms: ws_age_ms(record.last_attempt_at.map(|value| value.elapsed().as_millis())),
+        last_accepted_age_ms: ws_age_ms(
+            record
+                .last_accepted_at
+                .map(|value| value.elapsed().as_millis()),
+        ),
+        last_forwarded_age_ms: ws_age_ms(
+            record
+                .last_forwarded_at
+                .map(|value| value.elapsed().as_millis()),
+        ),
+        last_attempt_age_ms: ws_age_ms(
+            record
+                .last_attempt_at
+                .map(|value| value.elapsed().as_millis()),
+        ),
         last_target_path: record.last_target_path,
         last_http_status: record.last_http_status,
         last_error: record.last_error,
-        last_error_age_ms: ws_age_ms(record.last_error_at.map(|value| value.elapsed().as_millis())),
+        last_error_age_ms: ws_age_ms(
+            record
+                .last_error_at
+                .map(|value| value.elapsed().as_millis()),
+        ),
     }
 }
 
@@ -3681,8 +3771,11 @@ fn mark_runtime_log_forward_rejected(
 
 fn helper_task_status_snapshot(state: &HelperState, task_id: &str) -> HelperTaskStatusSnapshot {
     let studio_snapshot = task_studio_mode_snapshot(state, task_id);
-    let (official_state, official_age_ms, official_last_error) =
-        task_official_adapter_snapshot(state, task_id, studio_snapshot.studio_mode.as_deref());
+    let (official_state, official_age_ms, official_last_error) = task_official_adapter_snapshot(
+        state,
+        task_id,
+        studio_snapshot.edit_runtime_state == "ready",
+    );
     HelperTaskStatusSnapshot {
         task_id: task_id.to_owned(),
         studio_session_state: Some(studio_snapshot.studio_session_state),
@@ -3782,7 +3875,7 @@ fn heartbeat_task_statuses(state: &HelperState) -> Vec<HelperHeartbeatTaskStatus
             ) = task_official_adapter_snapshot(
                 state,
                 &task.task_id,
-                studio_snapshot.studio_mode.as_deref(),
+                studio_snapshot.edit_runtime_state == "ready",
             );
             let runtime_log_forward = runtime_log_forward_status_snapshot(state, &task.task_id);
             HelperHeartbeatTaskStatus {
@@ -5919,14 +6012,190 @@ async fn handle_remote_command(
                     "start_stop_play is stop-only. Use launch_studio_session to enter start_play or run_server."
                 ));
             }
+            if let Some(result) =
+                stop_via_runtime_actuator_if_available(app.clone(), place_id, task_id).await?
+            {
+                return Ok(result);
+            }
+            ensure_edit_runtime_ready_for_stop_fallback(&app, place_id, task_id).await?;
             forward_to_plugin(app, place_id, task_id, command).await
         }
         "LaunchStudioSession" | "launch_studio_session" => {
             let args: LaunchStudioSessionCommandArgs = serde_json::from_value(payload)?;
             validate_launch_studio_session_mode(&args.mode)?;
-            forward_to_plugin(app, place_id, task_id, command).await
+            forward_launch_to_plugin(app, place_id, task_id, command).await
         }
         _ => forward_to_plugin(app, place_id, task_id, command).await,
+    }
+}
+
+async fn stop_via_runtime_actuator_if_available(
+    app: AppState,
+    place_id: &str,
+    task_id: Option<&str>,
+) -> Result<Option<String>> {
+    let (instance_id, stop_request_id, reused_existing) = {
+        let mut state = app.state.lock().await;
+        cleanup_stale_instances(&mut state);
+        sync_remote_connections(&app, &mut state);
+        if let Some((instance_id, stop_request_id)) =
+            select_active_stop_request_for_route(place_id, task_id, &state.instances)
+        {
+            return Ok(Some({
+                let status_task_id = if let Some(instance) = state.instances.get_mut(&instance_id) {
+                    set_edit_runtime_unavailable(instance, "stopping");
+                    instance.task_id.clone()
+                } else {
+                    None
+                };
+                if let Some(task_id) = status_task_id.as_deref() {
+                    queue_task_status_updates(&state, &app.helper, task_id);
+                }
+                drop(state);
+                tracing::info!(
+                    instance_id,
+                    place_id,
+                    task_id,
+                    stop_request_id,
+                    "reusing active runtime actuator stop request for remote stop command"
+                );
+                wait_for_runtime_actuator_stop(&app, &instance_id, stop_request_id).await?;
+                "Stopped".to_owned()
+            }));
+        }
+        let Some(instance_id) =
+            select_runtime_actuator_for_route(place_id, task_id, &state.instances)
+        else {
+            if let Some(instance_id) =
+                select_known_runtime_session_for_route(place_id, task_id, &state.instances)
+            {
+                return Err(eyre!(
+                    "runtime_stop_actuator_unavailable: instance_id={instance_id}; known runtime session has no fresh runtime actuator, refusing unsafe edit-stop fallback"
+                ));
+            }
+            return Ok(None);
+        };
+        let recorded = match record_stop_request_for_instance(&mut state, &instance_id) {
+            Ok(recorded) => recorded,
+            Err(StopRequestRecordError::MissingInstance) => return Ok(None),
+            Err(StopRequestRecordError::RuntimeActuatorUnavailable(detail)) => {
+                return Err(eyre!(
+                    "runtime_stop_actuator_unavailable: instance_id={instance_id}; {detail}; refusing unsafe edit-stop fallback"
+                ));
+            }
+        };
+        if let Some(task_id) = recorded.task_id.as_deref() {
+            queue_task_status_updates(&state, &app.helper, task_id);
+        }
+        (instance_id, recorded.stop_request_id, false)
+    };
+
+    tracing::info!(
+        instance_id,
+        place_id,
+        task_id,
+        stop_request_id,
+        reused_existing,
+        "recorded runtime actuator stop request for remote stop command"
+    );
+    wait_for_runtime_actuator_stop(&app, &instance_id, stop_request_id).await?;
+    Ok(Some("Stopped".to_owned()))
+}
+
+async fn ensure_edit_runtime_ready_for_stop_fallback(
+    app: &AppState,
+    place_id: &str,
+    task_id: Option<&str>,
+) -> Result<()> {
+    let state = app.state.lock().await;
+    let Some(instance_id) = select_instance_for_route(place_id, task_id, &state.instances) else {
+        return Err(eyre!(
+            "no active Studio plugin registered for placeId {place_id}"
+        ));
+    };
+    let instance = state
+        .instances
+        .get(&instance_id)
+        .ok_or_else(|| eyre!("selected helper instance disappeared"))?;
+    let edit_state = edit_runtime_state(instance);
+    if edit_state == "ready" && effective_studio_transition_phase(instance) == "idle" {
+        return Ok(());
+    }
+    Err(eyre!(
+        "runtime_stop_actuator_unavailable: instance_id={instance_id}; edit runtime is not ready for safe stop fallback; edit_runtime_state={edit_state}; studio_transition_phase={}; studio_control_state={}; refusing unsafe edit-stop fallback",
+        effective_studio_transition_phase(instance),
+        effective_studio_control_state(instance)
+    ))
+}
+
+async fn wait_for_runtime_actuator_stop(
+    app: &AppState,
+    instance_id: &str,
+    stop_request_id: u64,
+) -> Result<()> {
+    let deadline = Instant::now() + PLUGIN_STUDIO_CONTROL_REQUEST_TIMEOUT;
+    loop {
+        {
+            let state = app.state.lock().await;
+            let Some(instance) = state.instances.get(instance_id) else {
+                return Err(eyre!(
+                    "runtime_stop_instance_disappeared: instance_id={instance_id} stop_request_id={stop_request_id}"
+                ));
+            };
+            if instance.stop_request_id > stop_request_id {
+                return Err(eyre!(
+                    "runtime_stop_superseded: instance_id={instance_id} stop_request_id={stop_request_id} current_stop_request_id={}",
+                    instance.stop_request_id
+                ));
+            }
+            if instance.stop_request_id == stop_request_id {
+                if instance.stop_result_phase.as_deref() == Some("failed") {
+                    return Err(eyre!(
+                        "{}",
+                        instance
+                            .stop_result_error
+                            .as_deref()
+                            .unwrap_or("runtime_stop_failed")
+                    ));
+                }
+                if instance.stop_result_phase.as_deref() == Some("completed")
+                    && effective_studio_transition_phase(instance) == "idle"
+                    && edit_runtime_state(instance) == "ready"
+                {
+                    return Ok(());
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            let mut state = app.state.lock().await;
+            let mut status_task_id: Option<String> = None;
+            let detail = state
+                .instances
+                .get_mut(instance_id)
+                .map(|instance| {
+                    let detail = format!(
+                        "phase={} stop_result_phase={} runtime_actuator_last_poll_id={:?} runtime_actuator_last_poll_age_ms={:?} edit_runtime_state={}",
+                        effective_studio_transition_phase(instance),
+                        instance.stop_result_phase.as_deref().unwrap_or("none"),
+                        instance.stop_request_last_poll_id,
+                        instance.stop_request_last_polled_at.map(|value| value.elapsed().as_millis()),
+                        edit_runtime_state(instance)
+                    );
+                    if instance.stop_request_id == stop_request_id {
+                        mark_runtime_stop_timeout(instance, stop_request_id, detail.clone());
+                        status_task_id = instance.task_id.clone();
+                    }
+                    detail
+                })
+                .unwrap_or_else(|| "instance_missing".to_owned());
+            if let Some(task_id) = status_task_id.as_deref() {
+                queue_task_status_updates(&state, &app.helper, task_id);
+            }
+            return Err(eyre!(
+                "runtime_stop_timeout: stop_request_id={stop_request_id} {detail}"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -5945,9 +6214,55 @@ async fn forward_to_plugin(
     task_id: Option<&str>,
     command: Value,
 ) -> Result<String> {
+    let (_, response) = forward_to_plugin_raw(app, place_id, task_id, command, None).await?;
+    if response.success {
+        Ok(response.response)
+    } else {
+        Err(eyre!(response.response))
+    }
+}
+
+async fn forward_launch_to_plugin(
+    app: AppState,
+    place_id: &str,
+    task_id: Option<&str>,
+    command: Value,
+) -> Result<String> {
+    let (instance_id, response) =
+        forward_to_plugin_raw(app.clone(), place_id, task_id, command, Some("launching")).await?;
+    {
+        let mut state = app.state.lock().await;
+        let status_task_id = if let Some(instance) = state.instances.get_mut(&instance_id) {
+            if response.success {
+                set_edit_runtime_unavailable(instance, "runtime");
+            } else {
+                set_edit_runtime_unavailable(instance, "launch_failed");
+            }
+            instance.task_id.clone()
+        } else {
+            None
+        };
+        if let Some(task_id) = status_task_id.as_deref() {
+            queue_task_status_updates(&state, &app.helper, task_id);
+        }
+    }
+    if response.success {
+        Ok(response.response)
+    } else {
+        Err(eyre!(response.response))
+    }
+}
+
+async fn forward_to_plugin_raw(
+    app: AppState,
+    place_id: &str,
+    task_id: Option<&str>,
+    command: Value,
+    edit_unavailable_reason: Option<&str>,
+) -> Result<(String, PluginResponsePayload)> {
     let request_id = extract_command_id(&command)?;
     let (tool_name, _) = extract_tool_name_and_args(&command)?;
-    let (instance_id, notify) = {
+    let (instance_id, notify, status_task_id) = {
         let mut state = app.state.lock().await;
         cleanup_stale_instances(&mut state);
         sync_remote_connections(&app, &mut state);
@@ -5959,6 +6274,10 @@ async fn forward_to_plugin(
             .instances
             .get_mut(&selected_instance_id)
             .ok_or_else(|| eyre!("selected helper instance disappeared"))?;
+        if let Some(reason) = edit_unavailable_reason {
+            set_edit_runtime_unavailable(instance, reason);
+        }
+        let status_task_id = instance.task_id.clone();
         instance.queue.push_back(command);
         let notify = Arc::clone(&instance.notify);
         let (tx, rx) = oneshot::channel();
@@ -5970,8 +6289,14 @@ async fn forward_to_plugin(
                 response_tx: tx,
             },
         );
-        (selected_instance_id, (notify, rx))
+        (selected_instance_id, (notify, rx), status_task_id)
     };
+    if edit_unavailable_reason.is_some() {
+        if let Some(task_id) = status_task_id.as_deref() {
+            let state = app.state.lock().await;
+            queue_task_status_updates(&state, &app.helper, task_id);
+        }
+    }
     notify.0.notify_waiters();
     tracing::info!(
         instance_id,
@@ -5993,11 +6318,7 @@ async fn forward_to_plugin(
             ));
         }
     };
-    if response.success {
-        Ok(response.response)
-    } else {
-        Err(eyre!(response.response))
-    }
+    Ok((instance_id, response))
 }
 
 fn cleanup_stale_instances(state: &mut HelperState) {
@@ -6056,6 +6377,69 @@ fn select_instance_for_route(
         return None;
     }
     select_instance_for_place(place_id, instances)
+}
+
+fn select_runtime_actuator_for_route(
+    place_id: &str,
+    task_id: Option<&str>,
+    instances: &HashMap<String, PluginInstance>,
+) -> Option<String> {
+    instances
+        .iter()
+        .filter(|(_, instance)| {
+            instance.place_id == place_id
+                && route_identity_matches(instance, task_id)
+                && instance_has_fresh_control(instance)
+        })
+        .max_by_key(|(_, instance)| instance.studio_control_observed_at)
+        .map(|(instance_id, _)| instance_id.clone())
+}
+
+fn instance_is_known_runtime_session(instance: &PluginInstance) -> bool {
+    instance.edit_runtime_unavailable_reason.as_deref() == Some("runtime")
+        || instance.edit_runtime_unavailable_reason.as_deref() == Some("launch_failed")
+        || instance.edit_runtime_unavailable_reason.as_deref() == Some("launching")
+        || matches!(
+            instance.studio_mode.as_deref(),
+            Some("start_play") | Some("run_server")
+        )
+        || instance.studio_transition_phase == "running"
+        || instance_has_fresh_control(instance)
+}
+
+fn select_known_runtime_session_for_route(
+    place_id: &str,
+    task_id: Option<&str>,
+    instances: &HashMap<String, PluginInstance>,
+) -> Option<String> {
+    instances
+        .iter()
+        .filter(|(_, instance)| {
+            instance.place_id == place_id
+                && route_identity_matches(instance, task_id)
+                && instance_is_known_runtime_session(instance)
+        })
+        .max_by_key(|(_, instance)| instance.last_seen_at)
+        .map(|(instance_id, _)| instance_id.clone())
+}
+
+fn select_active_stop_request_for_route(
+    place_id: &str,
+    task_id: Option<&str>,
+    instances: &HashMap<String, PluginInstance>,
+) -> Option<(String, u64)> {
+    instances
+        .iter()
+        .filter_map(|(instance_id, instance)| {
+            if instance.place_id != place_id || !route_identity_matches(instance, task_id) {
+                return None;
+            }
+            active_stop_request_id_for_instance(instance).map(|stop_request_id| {
+                (instance_id.clone(), stop_request_id, instance.last_seen_at)
+            })
+        })
+        .max_by_key(|(_, stop_request_id, last_seen_at)| (*stop_request_id, *last_seen_at))
+        .map(|(instance_id, stop_request_id, _)| (instance_id, stop_request_id))
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -6629,8 +7013,8 @@ async fn main() -> Result<()> {
             post(mcp_plugin_stop_result_handler),
         )
         .route(
-            "/v1/mcp/plugin/status",
-            post(mcp_plugin_status_update_handler),
+            "/v1/mcp/plugin/edit-heartbeat",
+            post(mcp_plugin_edit_heartbeat_handler),
         )
         .route(
             "/v1/mcp/plugin/control-heartbeat",
@@ -6673,6 +7057,7 @@ mod tests {
             studio_transition_started_at: None,
             studio_control_observed_at: None,
             edit_runtime_observed_at: Some(Instant::now()),
+            edit_runtime_unavailable_reason: None,
             studio_control_last_error: None,
             stop_request_id: 0,
             stop_request_recorded_at: None,
@@ -6743,13 +7128,8 @@ mod tests {
         let app = test_app_state_with_runtime_log_worker();
         let (sink_base_url, received_rx) =
             spawn_test_runtime_log_sink(204, Duration::from_millis(750)).await;
-        insert_claimed_task_with_runtime_log_base(
-            &app,
-            "task-a",
-            "134795435066737",
-            sink_base_url,
-        )
-        .await;
+        insert_claimed_task_with_runtime_log_base(&app, "task-a", "134795435066737", sink_base_url)
+            .await;
 
         let started = Instant::now();
         let response = call_runtime_log_forward(app.clone(), "v1/runtime-logs")
@@ -6779,13 +7159,8 @@ mod tests {
         let app = test_app_state_with_runtime_log_worker();
         let (sink_base_url, received_rx) =
             spawn_test_runtime_log_sink(204, Duration::from_millis(0)).await;
-        insert_claimed_task_with_runtime_log_base(
-            &app,
-            "task-a",
-            "134795435066737",
-            sink_base_url,
-        )
-        .await;
+        insert_claimed_task_with_runtime_log_base(&app, "task-a", "134795435066737", sink_base_url)
+            .await;
 
         let response = call_runtime_log_forward_with_uri(
             app,
@@ -6807,13 +7182,8 @@ mod tests {
         let app = test_app_state_with_runtime_log_worker();
         let (sink_base_url, _received_rx) =
             spawn_test_runtime_log_sink(204, Duration::from_millis(750)).await;
-        insert_claimed_task_with_runtime_log_base(
-            &app,
-            "task-a",
-            "134795435066737",
-            sink_base_url,
-        )
-        .await;
+        insert_claimed_task_with_runtime_log_base(&app, "task-a", "134795435066737", sink_base_url)
+            .await;
 
         let response = call_runtime_log_forward(app.clone(), "v1/runtime-logs")
             .await
@@ -6839,13 +7209,8 @@ mod tests {
         let app = test_app_state_with_runtime_log_worker();
         let (sink_base_url, _received_rx) =
             spawn_test_runtime_log_sink(503, Duration::from_millis(0)).await;
-        insert_claimed_task_with_runtime_log_base(
-            &app,
-            "task-a",
-            "134795435066737",
-            sink_base_url,
-        )
-        .await;
+        insert_claimed_task_with_runtime_log_base(&app, "task-a", "134795435066737", sink_base_url)
+            .await;
 
         let response = call_runtime_log_forward(app.clone(), "v1/runtime-logs")
             .await
@@ -6859,13 +7224,11 @@ mod tests {
                 if status.failed_count == 1 {
                     assert_eq!(status.state, "error");
                     assert_eq!(status.last_http_status, Some(503));
-                    assert!(
-                        status
-                            .last_error
-                            .as_deref()
-                            .unwrap_or_default()
-                            .contains("HTTP 503")
-                    );
+                    assert!(status
+                        .last_error
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("HTTP 503"));
                     break;
                 }
                 drop(state);
@@ -6880,13 +7243,8 @@ mod tests {
     async fn runtime_log_forward_records_background_connection_failure() {
         let app = test_app_state_with_runtime_log_worker();
         let sink_base_url = spawn_disconnect_runtime_log_sink().await;
-        insert_claimed_task_with_runtime_log_base(
-            &app,
-            "task-a",
-            "134795435066737",
-            sink_base_url,
-        )
-        .await;
+        insert_claimed_task_with_runtime_log_base(&app, "task-a", "134795435066737", sink_base_url)
+            .await;
 
         let response = call_runtime_log_forward(app.clone(), "v1/runtime-logs")
             .await
@@ -6900,13 +7258,11 @@ mod tests {
                 if status.failed_count == 1 {
                     assert_eq!(status.state, "error");
                     assert_eq!(status.last_http_status, None);
-                    assert!(
-                        status
-                            .last_error
-                            .as_deref()
-                            .unwrap_or_default()
-                            .contains("runtime-log forward failed")
-                    );
+                    assert!(status
+                        .last_error
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("runtime-log forward failed"));
                     break;
                 }
                 drop(state);
@@ -6946,7 +7302,8 @@ mod tests {
             "queue_full must not decrement jobs that were already queued"
         );
         assert_eq!(
-            status.accepted_count, RUNTIME_LOG_FORWARD_QUEUE_CAPACITY as u64
+            status.accepted_count,
+            RUNTIME_LOG_FORWARD_QUEUE_CAPACITY as u64
         );
         assert_eq!(status.failed_count, 1);
         assert!(status
@@ -7145,7 +7502,6 @@ mod tests {
                 id: request_id,
                 success,
                 response,
-                studio_mode: None,
             }),
         )
         .await
@@ -7185,10 +7541,8 @@ mod tests {
         app
     }
 
-    fn test_app_state_with_runtime_log_queue_only() -> (
-        AppState,
-        mpsc::Receiver<RuntimeLogForwardJob>,
-    ) {
+    fn test_app_state_with_runtime_log_queue_only(
+    ) -> (AppState, mpsc::Receiver<RuntimeLogForwardJob>) {
         let (runtime_log_forward_tx, runtime_log_forward_rx) =
             mpsc::channel(RUNTIME_LOG_FORWARD_QUEUE_CAPACITY);
         let client = reqwest::Client::builder()
@@ -7375,9 +7729,27 @@ mod tests {
         let state = app.state.lock().await;
         let instance = state.instances.get("instance-a").unwrap();
         assert_eq!(instance.stop_request_id, 0);
+        assert_eq!(edit_runtime_state(instance), "launch_failed");
         assert_eq!(instance.studio_transition_phase, "running");
         assert!(instance.queue.is_empty());
         assert!(state.waiting_for_plugin.is_empty());
+        drop(state);
+
+        let heartbeat_after_launch_failed = mcp_plugin_edit_heartbeat_handler(
+            State(app.clone()),
+            Json(PluginEditHeartbeatRequest {
+                instance_id: "instance-a".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            heartbeat_after_launch_failed.status(),
+            StatusCode::NO_CONTENT
+        );
+        let state = app.state.lock().await;
+        let instance = state.instances.get("instance-a").unwrap();
+        assert_eq!(edit_runtime_state(instance), "launch_failed");
     }
 
     #[tokio::test]
@@ -7428,7 +7800,22 @@ mod tests {
             let state = app.state.lock().await;
             let instance = state.instances.get("instance-a").unwrap();
             assert_eq!(instance.stop_request_id, 0);
+            assert_eq!(edit_runtime_state(instance), "launching");
             assert!(instance.queue.is_empty());
+        }
+        let heartbeat_while_launching = mcp_plugin_edit_heartbeat_handler(
+            State(app.clone()),
+            Json(PluginEditHeartbeatRequest {
+                instance_id: "instance-a".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(heartbeat_while_launching.status(), StatusCode::NO_CONTENT);
+        {
+            let state = app.state.lock().await;
+            let instance = state.instances.get("instance-a").unwrap();
+            assert_eq!(edit_runtime_state(instance), "launching");
         }
         assert_eq!(
             launch_command["args"]["LaunchStudioSession"]["mode"],
@@ -7451,6 +7838,20 @@ mod tests {
         let state = app.state.lock().await;
         let instance = state.instances.get("instance-a").unwrap();
         assert_eq!(instance.stop_request_id, 0);
+        assert_eq!(edit_runtime_state(instance), "runtime");
+        drop(state);
+        let heartbeat_after_runtime = mcp_plugin_edit_heartbeat_handler(
+            State(app.clone()),
+            Json(PluginEditHeartbeatRequest {
+                instance_id: "instance-a".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(heartbeat_after_runtime.status(), StatusCode::NO_CONTENT);
+        let state = app.state.lock().await;
+        let instance = state.instances.get("instance-a").unwrap();
+        assert_eq!(edit_runtime_state(instance), "runtime");
     }
 
     #[test]
@@ -7493,29 +7894,25 @@ mod tests {
     }
 
     #[test]
-    fn task_studio_session_state_prioritizes_play_over_stop() {
+    fn task_studio_session_state_reports_edit_connected_for_ready_edit_runtime() {
         let mut state = empty_helper_state();
         let mut edit_instance = test_instance("93795519121520", Some("task-a"), 0);
-        edit_instance.studio_mode = Some("stop".to_owned());
-        edit_instance.studio_mode_source = "edit_plugin".to_owned();
+        edit_instance.studio_mode = None;
+        edit_instance.studio_mode_source = "none".to_owned();
         edit_instance.edit_runtime_observed_at = Some(Instant::now());
-        let mut play_instance = test_instance("93795519121520", Some("task-a"), 0);
-        play_instance.studio_mode = Some("start_play".to_owned());
-        play_instance.studio_mode_source = "play_control".to_owned();
-        play_instance.studio_control_state = "ready".to_owned();
-        play_instance.studio_transition_phase = "running".to_owned();
-        play_instance.studio_control_observed_at = Some(Instant::now());
         state
             .instances
             .insert("edit-instance".to_owned(), edit_instance);
-        state
-            .instances
-            .insert("play-instance".to_owned(), play_instance);
 
         let snapshot = task_studio_mode_snapshot(&state, "task-a");
 
-        assert_eq!(snapshot.studio_session_state, "play");
-        assert_eq!(snapshot.last_known_session_state.as_deref(), Some("play"));
+        assert_eq!(snapshot.studio_session_state, "edit_connected");
+        assert_eq!(
+            snapshot.last_known_session_state.as_deref(),
+            Some("edit_connected")
+        );
+        assert!(snapshot.last_session_error_reason.is_none());
+        assert_eq!(snapshot.edit_runtime_state, "ready");
     }
 
     #[test]
@@ -7545,6 +7942,110 @@ mod tests {
         assert_eq!(
             snapshot.last_known_session_state.as_deref(),
             Some("stopping")
+        );
+    }
+
+    #[test]
+    fn active_stop_request_selection_reuses_stopping_instance_without_fresh_control() {
+        let mut instances = HashMap::new();
+        let mut stopping_instance = test_instance("93795519121520", Some("task-a"), 0);
+        stopping_instance.studio_control_state = "stopping".to_owned();
+        stopping_instance.studio_transition_phase = "stopping_requested".to_owned();
+        stopping_instance.studio_control_observed_at = None;
+        stopping_instance.stop_request_id = 7;
+        instances.insert("stopping-instance".to_owned(), stopping_instance);
+
+        let selected =
+            select_active_stop_request_for_route("93795519121520", Some("task-a"), &instances);
+
+        assert_eq!(selected, Some(("stopping-instance".to_owned(), 7)));
+        assert!(
+            select_runtime_actuator_for_route("93795519121520", Some("task-a"), &instances)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn known_runtime_session_selection_blocks_unsafe_edit_stop_fallback() {
+        let mut instances = HashMap::new();
+        let mut runtime_instance = test_instance("93795519121520", Some("task-a"), 0);
+        runtime_instance.studio_control_state = "ready".to_owned();
+        runtime_instance.studio_transition_phase = "running".to_owned();
+        runtime_instance.studio_control_observed_at =
+            Some(Instant::now() - STUDIO_CONTROL_HEARTBEAT_STALE_AFTER - Duration::from_millis(1));
+        set_edit_runtime_unavailable(&mut runtime_instance, "runtime");
+        instances.insert("runtime-instance".to_owned(), runtime_instance);
+
+        assert!(
+            select_runtime_actuator_for_route("93795519121520", Some("task-a"), &instances)
+                .is_none()
+        );
+        assert_eq!(
+            select_known_runtime_session_for_route("93795519121520", Some("task-a"), &instances),
+            Some("runtime-instance".to_owned())
+        );
+    }
+
+    #[test]
+    fn launch_failed_session_selection_blocks_unsafe_edit_stop_fallback() {
+        let mut instances = HashMap::new();
+        let mut launch_failed_instance = test_instance("93795519121520", Some("task-a"), 0);
+        launch_failed_instance.studio_control_state = "ready".to_owned();
+        launch_failed_instance.studio_transition_phase = "idle".to_owned();
+        launch_failed_instance.studio_control_observed_at =
+            Some(Instant::now() - STUDIO_CONTROL_HEARTBEAT_STALE_AFTER - Duration::from_millis(1));
+        set_edit_runtime_unavailable(&mut launch_failed_instance, "launch_failed");
+        instances.insert("launch-failed-instance".to_owned(), launch_failed_instance);
+
+        assert!(
+            select_runtime_actuator_for_route("93795519121520", Some("task-a"), &instances)
+                .is_none()
+        );
+        assert_eq!(
+            select_known_runtime_session_for_route("93795519121520", Some("task-a"), &instances),
+            Some("launch-failed-instance".to_owned())
+        );
+    }
+
+    #[test]
+    fn launching_session_selection_blocks_unsafe_edit_stop_fallback() {
+        let mut instances = HashMap::new();
+        let mut launching_instance = test_instance("93795519121520", Some("task-a"), 0);
+        launching_instance.studio_control_state = "lost".to_owned();
+        launching_instance.studio_transition_phase = "starting".to_owned();
+        launching_instance.studio_control_observed_at = None;
+        set_edit_runtime_unavailable(&mut launching_instance, "launching");
+        instances.insert("launching-instance".to_owned(), launching_instance);
+
+        assert!(
+            select_runtime_actuator_for_route("93795519121520", Some("task-a"), &instances)
+                .is_none()
+        );
+        assert_eq!(
+            select_known_runtime_session_for_route("93795519121520", Some("task-a"), &instances),
+            Some("launching-instance".to_owned())
+        );
+    }
+
+    #[test]
+    fn reported_play_mode_selection_blocks_unsafe_edit_stop_fallback() {
+        let mut instances = HashMap::new();
+        let mut play_instance = test_instance("93795519121520", Some("task-a"), 0);
+        play_instance.studio_mode = Some("start_play".to_owned());
+        play_instance.studio_mode_observed_at = Some(Instant::now());
+        play_instance.studio_mode_source = "diagnostic".to_owned();
+        play_instance.studio_control_state = "lost".to_owned();
+        play_instance.studio_transition_phase = "idle".to_owned();
+        play_instance.studio_control_observed_at = None;
+        instances.insert("play-instance".to_owned(), play_instance);
+
+        assert!(
+            select_runtime_actuator_for_route("93795519121520", Some("task-a"), &instances)
+                .is_none()
+        );
+        assert_eq!(
+            select_known_runtime_session_for_route("93795519121520", Some("task-a"), &instances),
+            Some("play-instance".to_owned())
         );
     }
 
@@ -7614,67 +8115,132 @@ mod tests {
         assert_eq!(snapshot.studio_transition_phase, "running");
     }
 
-    #[test]
-    fn status_update_to_stop_clears_control_state() {
-        let mut state = empty_helper_state();
-        let mut instance = test_instance("93795519121520", Some("task-a"), 0);
-        instance.studio_mode = Some("start_play".to_owned());
-        instance.studio_control_state = "ready".to_owned();
-        instance.studio_transition_phase = "running".to_owned();
-        instance.studio_control_observed_at = Some(Instant::now());
-        state.instances.insert("instance-a".to_owned(), instance);
+    #[tokio::test]
+    async fn edit_heartbeat_completes_pending_stop_without_reporting_stop_mode() {
+        let app = test_app_state();
+        {
+            let mut state = app.state.lock().await;
+            let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+            instance.studio_mode = None;
+            instance.studio_mode_source = "none".to_owned();
+            instance.studio_control_state = "stopping".to_owned();
+            instance.studio_transition_phase = "stopping_observed".to_owned();
+            instance.studio_transition_started_at = Some(Instant::now());
+            instance.studio_control_observed_at = Some(
+                Instant::now() - STUDIO_CONTROL_HEARTBEAT_STALE_AFTER - Duration::from_millis(1),
+            );
+            instance.stop_request_id = 4;
+            instance.stop_result_phase = Some("observed".to_owned());
+            instance.stop_result_observed_at = Some(Instant::now());
+            state.instances.insert("instance-a".to_owned(), instance);
+        }
 
-        assert!(update_instance_studio_mode(
-            &mut state,
-            "instance-a",
-            Some("stop"),
-            "edit_plugin",
-        ));
+        let response = mcp_plugin_edit_heartbeat_handler(
+            State(app.clone()),
+            Json(PluginEditHeartbeatRequest {
+                instance_id: "instance-a".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let state = app.state.lock().await;
         let instance = state.instances.get("instance-a").unwrap();
 
-        assert_eq!(instance.studio_mode.as_deref(), Some("stop"));
-        assert_eq!(instance.studio_mode_source, "edit_plugin");
+        assert!(instance.studio_mode.is_none());
+        assert_eq!(instance.studio_mode_source, "none");
         assert_eq!(instance.studio_control_state, "none");
         assert_eq!(instance.studio_transition_phase, "idle");
+        assert_eq!(instance.stop_result_phase.as_deref(), Some("completed"));
         assert!(instance.studio_control_observed_at.is_none());
         assert!(instance.edit_runtime_observed_at.is_some());
     }
 
-    #[test]
-    fn edit_runtime_state_is_stale_while_studio_is_running() {
-        let mut instance = test_instance("93795519121520", Some("task-a"), 0);
-        instance.studio_mode = Some("start_play".to_owned());
-        instance.studio_mode_source = "play_control".to_owned();
-        instance.edit_runtime_observed_at = Some(Instant::now());
+    #[tokio::test]
+    async fn edit_heartbeat_does_not_complete_stop_before_runtime_observes_it() {
+        let app = test_app_state();
+        {
+            let mut state = app.state.lock().await;
+            let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+            instance.studio_mode = None;
+            instance.studio_mode_source = "none".to_owned();
+            instance.studio_control_state = "stopping".to_owned();
+            instance.studio_transition_phase = "stopping_requested".to_owned();
+            instance.studio_transition_started_at = Some(Instant::now());
+            instance.studio_control_observed_at = Some(Instant::now());
+            instance.stop_request_id = 4;
+            state.instances.insert("instance-a".to_owned(), instance);
+        }
 
-        assert_eq!(edit_runtime_state(&instance), "stale");
+        let response = mcp_plugin_edit_heartbeat_handler(
+            State(app.clone()),
+            Json(PluginEditHeartbeatRequest {
+                instance_id: "instance-a".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let state = app.state.lock().await;
+        let instance = state.instances.get("instance-a").unwrap();
+
+        assert_eq!(instance.studio_control_state, "stopping");
+        assert_eq!(instance.studio_transition_phase, "stopping_requested");
+        assert_eq!(instance.stop_result_phase, None);
+        assert_eq!(edit_runtime_state(instance), "stopping");
+        assert_eq!(active_stop_request_id_for_instance(instance), Some(4));
+    }
+
+    #[tokio::test]
+    async fn edit_heartbeat_does_not_complete_observed_stop_while_runtime_control_is_fresh() {
+        let app = test_app_state();
+        {
+            let mut state = app.state.lock().await;
+            let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+            instance.studio_mode = None;
+            instance.studio_mode_source = "none".to_owned();
+            instance.studio_control_state = "stopping".to_owned();
+            instance.studio_transition_phase = "stopping_observed".to_owned();
+            instance.studio_transition_started_at = Some(Instant::now());
+            instance.studio_control_observed_at = Some(Instant::now());
+            instance.stop_request_id = 4;
+            instance.stop_result_phase = Some("observed".to_owned());
+            instance.stop_result_observed_at = Some(Instant::now());
+            state.instances.insert("instance-a".to_owned(), instance);
+        }
+
+        let response = mcp_plugin_edit_heartbeat_handler(
+            State(app.clone()),
+            Json(PluginEditHeartbeatRequest {
+                instance_id: "instance-a".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let state = app.state.lock().await;
+        let instance = state.instances.get("instance-a").unwrap();
+
+        assert_eq!(instance.studio_control_state, "stopping");
+        assert_eq!(instance.studio_transition_phase, "stopping_observed");
+        assert_eq!(instance.stop_result_phase.as_deref(), Some("observed"));
+        assert_eq!(edit_runtime_state(instance), "stopping");
+        assert_eq!(active_stop_request_id_for_instance(instance), Some(4));
     }
 
     #[test]
-    fn edit_plugin_running_status_does_not_override_fresh_play_control_source() {
-        let mut state = empty_helper_state();
+    fn runtime_actuator_heartbeat_does_not_clobber_edit_heartbeat() {
         let mut instance = test_instance("93795519121520", Some("task-a"), 0);
-        instance.studio_mode = Some("start_play".to_owned());
-        instance.studio_mode_source = "play_control".to_owned();
+        instance.studio_mode = None;
+        instance.studio_mode_source = "none".to_owned();
         instance.studio_control_state = "ready".to_owned();
         instance.studio_transition_phase = "running".to_owned();
         instance.studio_control_observed_at = Some(Instant::now());
         instance.edit_runtime_observed_at = Some(Instant::now());
-        state.instances.insert("instance-a".to_owned(), instance);
 
-        assert!(update_instance_studio_mode(
-            &mut state,
-            "instance-a",
-            Some("start_play"),
-            "edit_plugin",
-        ));
-        let instance = state.instances.get("instance-a").unwrap();
-
-        assert_eq!(instance.studio_mode.as_deref(), Some("start_play"));
-        assert_eq!(instance.studio_mode_source, "play_control");
         assert_eq!(instance.studio_control_state, "ready");
         assert_eq!(instance.studio_transition_phase, "running");
-        assert_eq!(edit_runtime_state(instance), "stale");
+        assert_eq!(edit_runtime_state(&instance), "ready");
     }
 
     #[tokio::test]
@@ -7716,6 +8282,110 @@ mod tests {
         assert_eq!(instance.studio_control_state, "none");
         assert_eq!(instance.studio_transition_phase, "idle");
         assert!(instance.studio_control_observed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn control_heartbeat_keeps_edit_runtime_unavailable_during_runtime() {
+        let app = test_app_state();
+        {
+            let mut state = app.state.lock().await;
+            let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+            instance.studio_mode = None;
+            instance.studio_mode_source = "none".to_owned();
+            instance.edit_runtime_observed_at = Some(Instant::now());
+            state.instances.insert("instance-a".to_owned(), instance);
+        }
+
+        let response = mcp_plugin_control_heartbeat_handler(
+            State(app.clone()),
+            Json(PluginControlHeartbeatRequest {
+                instance_id: "instance-a".to_owned(),
+                mode: "start_play".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        {
+            let state = app.state.lock().await;
+            let instance = state.instances.get("instance-a").unwrap();
+            assert_eq!(edit_runtime_state(instance), "runtime");
+        }
+
+        let heartbeat = mcp_plugin_edit_heartbeat_handler(
+            State(app.clone()),
+            Json(PluginEditHeartbeatRequest {
+                instance_id: "instance-a".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(heartbeat.status(), StatusCode::NO_CONTENT);
+        let state = app.state.lock().await;
+        let instance = state.instances.get("instance-a").unwrap();
+        assert_eq!(edit_runtime_state(instance), "runtime");
+    }
+
+    #[tokio::test]
+    async fn edit_heartbeat_recovers_runtime_latch_after_manual_stop() {
+        let app = test_app_state();
+        {
+            let mut state = app.state.lock().await;
+            let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+            instance.studio_control_state = "ready".to_owned();
+            instance.studio_transition_phase = "running".to_owned();
+            instance.studio_control_observed_at = Some(
+                Instant::now() - STUDIO_CONTROL_HEARTBEAT_STALE_AFTER - Duration::from_millis(1),
+            );
+            set_edit_runtime_unavailable(&mut instance, "runtime");
+            state.instances.insert("instance-a".to_owned(), instance);
+        }
+
+        let heartbeat = mcp_plugin_edit_heartbeat_handler(
+            State(app.clone()),
+            Json(PluginEditHeartbeatRequest {
+                instance_id: "instance-a".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(heartbeat.status(), StatusCode::NO_CONTENT);
+        let state = app.state.lock().await;
+        let instance = state.instances.get("instance-a").unwrap();
+        assert_eq!(instance.studio_control_state, "none");
+        assert_eq!(instance.studio_transition_phase, "idle");
+        assert_eq!(edit_runtime_state(instance), "ready");
+    }
+
+    #[tokio::test]
+    async fn edit_heartbeat_recovers_launch_failed_latch_after_manual_stop() {
+        let app = test_app_state();
+        {
+            let mut state = app.state.lock().await;
+            let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+            instance.studio_control_state = "ready".to_owned();
+            instance.studio_transition_phase = "running".to_owned();
+            instance.studio_control_observed_at = Some(
+                Instant::now() - STUDIO_CONTROL_HEARTBEAT_STALE_AFTER - Duration::from_millis(1),
+            );
+            set_edit_runtime_unavailable(&mut instance, "launch_failed");
+            state.instances.insert("instance-a".to_owned(), instance);
+        }
+
+        let heartbeat = mcp_plugin_edit_heartbeat_handler(
+            State(app.clone()),
+            Json(PluginEditHeartbeatRequest {
+                instance_id: "instance-a".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(heartbeat.status(), StatusCode::NO_CONTENT);
+        let state = app.state.lock().await;
+        let instance = state.instances.get("instance-a").unwrap();
+        assert_eq!(instance.studio_control_state, "none");
+        assert_eq!(instance.studio_transition_phase, "idle");
+        assert_eq!(edit_runtime_state(instance), "ready");
     }
 
     #[tokio::test]
@@ -7769,13 +8439,12 @@ mod tests {
         {
             let mut state = app.state.lock().await;
             let mut instance = test_instance("93795519121520", Some("task-a"), 0);
-            instance.studio_mode = Some("start_play".to_owned());
-            instance.studio_mode_observed_at = Some(Instant::now());
+            instance.studio_mode = None;
+            instance.studio_mode_observed_at = None;
+            instance.studio_mode_source = "none".to_owned();
             instance.studio_control_state = "ready".to_owned();
             instance.studio_transition_phase = "running".to_owned();
-            instance.studio_control_observed_at = Some(
-                Instant::now() - STUDIO_CONTROL_HEARTBEAT_STALE_AFTER - Duration::from_millis(1),
-            );
+            instance.studio_control_observed_at = Some(Instant::now());
             state.instances.insert("instance-a".to_owned(), instance);
         }
 
@@ -7832,23 +8501,188 @@ mod tests {
             assert_eq!(snapshot.runtime_actuator_last_poll_id, Some(1));
         }
 
+        let observed = mcp_plugin_stop_result_handler(
+            State(app.clone()),
+            Json(PluginStopResultPayload {
+                instance_id: "instance-a".to_owned(),
+                stop_request_id: 1,
+                phase: "observed".to_owned(),
+                error: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(observed.status(), StatusCode::NO_CONTENT);
         {
             let mut state = app.state.lock().await;
-            assert!(update_instance_studio_mode(
-                &mut state,
-                "instance-a",
-                Some("stop"),
-                "edit_plugin",
-            ));
+            let instance = state.instances.get_mut("instance-a").unwrap();
+            instance.studio_control_observed_at = Some(
+                Instant::now() - STUDIO_CONTROL_HEARTBEAT_STALE_AFTER - Duration::from_millis(1),
+            );
         }
+
+        let response = mcp_plugin_edit_heartbeat_handler(
+            State(app.clone()),
+            Json(PluginEditHeartbeatRequest {
+                instance_id: "instance-a".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let state = app.state.lock().await;
         let instance = state.instances.get("instance-a").unwrap();
-        assert_eq!(instance.studio_mode.as_deref(), Some("stop"));
+        assert!(instance.studio_mode.is_none());
         assert_eq!(instance.studio_control_state, "none");
         assert_eq!(instance.studio_transition_phase, "idle");
         assert_eq!(instance.stop_result_phase.as_deref(), Some("completed"));
         assert!(instance.stop_result_error.is_none());
         assert!(instance.stop_result_observed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn stop_request_rejects_stale_runtime_actuator_without_recording() {
+        let app = test_app_state();
+        {
+            let mut state = app.state.lock().await;
+            let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+            instance.studio_control_state = "ready".to_owned();
+            instance.studio_transition_phase = "running".to_owned();
+            instance.studio_control_observed_at = Some(
+                Instant::now() - STUDIO_CONTROL_HEARTBEAT_STALE_AFTER - Duration::from_millis(1),
+            );
+            set_edit_runtime_unavailable(&mut instance, "runtime");
+            state.instances.insert("instance-a".to_owned(), instance);
+        }
+
+        let rejected_stop = mcp_plugin_stop_request_handler(
+            State(app.clone()),
+            Json(PluginStopRequestPayload {
+                instance_id: "instance-a".to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rejected_stop.status(), StatusCode::CONFLICT);
+        let state = app.state.lock().await;
+        let instance = state.instances.get("instance-a").unwrap();
+        assert_eq!(instance.stop_request_id, 0);
+        assert_eq!(instance.studio_transition_phase, "running");
+        assert_eq!(edit_runtime_state(instance), "runtime");
+    }
+
+    #[tokio::test]
+    async fn stop_fallback_rejects_when_edit_runtime_is_not_ready() {
+        let app = test_app_state();
+        {
+            let mut state = app.state.lock().await;
+            let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+            instance.edit_runtime_observed_at =
+                Some(Instant::now() - EDIT_RUNTIME_STALE_AFTER - Duration::from_millis(1));
+            instance.studio_control_state = "none".to_owned();
+            instance.studio_transition_phase = "idle".to_owned();
+            state.instances.insert("instance-a".to_owned(), instance);
+        }
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let command = serde_json::json!({
+            "id": "request-a",
+            "args": {
+                "StartStopPlay": {
+                    "mode": "stop"
+                }
+            }
+        });
+
+        let error = handle_remote_command(
+            app.clone(),
+            "93795519121520",
+            Some("task-a"),
+            command,
+            sender,
+            Arc::new(Mutex::new(HashMap::new())),
+            "request-a".to_owned(),
+        )
+        .await
+        .expect_err("stale edit runtime must reject unsafe stop fallback");
+
+        assert!(error
+            .to_string()
+            .contains("edit runtime is not ready for safe stop fallback"));
+        let state = app.state.lock().await;
+        let instance = state.instances.get("instance-a").unwrap();
+        assert!(instance.queue.is_empty());
+        assert_eq!(instance.stop_request_id, 0);
+    }
+
+    #[tokio::test]
+    async fn stop_fallback_allows_ready_edit_runtime_noop() {
+        let app = test_app_state();
+        {
+            let mut state = app.state.lock().await;
+            let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+            instance.edit_runtime_observed_at = Some(Instant::now());
+            instance.studio_control_state = "none".to_owned();
+            instance.studio_transition_phase = "idle".to_owned();
+            state.instances.insert("instance-a".to_owned(), instance);
+        }
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let command = serde_json::json!({
+            "id": "request-a",
+            "args": {
+                "StartStopPlay": {
+                    "mode": "stop"
+                }
+            }
+        });
+        let app_for_command = app.clone();
+        let handle = tokio::spawn(async move {
+            handle_remote_command(
+                app_for_command,
+                "93795519121520",
+                Some("task-a"),
+                command,
+                sender,
+                Arc::new(Mutex::new(HashMap::new())),
+                "request-a".to_owned(),
+            )
+            .await
+        });
+
+        let (request_id, queued_command) =
+            take_queued_plugin_command(&app, "instance-a", "StartStopPlay").await;
+        assert_eq!(
+            queued_command["args"]["StartStopPlay"]["mode"],
+            Value::String("stop".to_owned())
+        );
+        send_plugin_response(&app, "instance-a", request_id, true, "Stopped".to_owned()).await;
+        let response = handle
+            .await
+            .expect("remote command task should join")
+            .expect("ready edit runtime fallback should succeed");
+        assert_eq!(response, "Stopped");
+    }
+
+    #[test]
+    fn runtime_stop_timeout_converges_to_error_and_disables_delivery() {
+        let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+        instance.studio_control_state = "stopping".to_owned();
+        instance.studio_transition_phase = "stopping_requested".to_owned();
+        instance.stop_request_id = 4;
+
+        mark_runtime_stop_timeout(&mut instance, 4, "phase=stopping_requested".to_owned());
+
+        assert_eq!(instance.studio_control_state, "lost");
+        assert_eq!(instance.studio_transition_phase, "error");
+        assert_eq!(active_stop_request_id_for_instance(&instance), None);
+        assert!(!is_stop_request_deliverable_phase(
+            &instance.studio_transition_phase
+        ));
+        assert_eq!(instance.stop_result_phase.as_deref(), Some("failed"));
+        assert!(instance
+            .studio_control_last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("runtime_stop_timeout"));
     }
 
     #[tokio::test]
@@ -8000,7 +8834,7 @@ mod tests {
         assert_eq!(payload["task_status"]["studio_mode_source"], "play_control");
         assert_eq!(payload["task_status"]["studio_control_state"], "ready");
         assert_eq!(payload["task_status"]["studio_transition_phase"], "running");
-        assert_eq!(payload["task_status"]["edit_runtime_state"], "stale");
+        assert_eq!(payload["task_status"]["edit_runtime_state"], "ready");
         tokio::time::timeout(
             Duration::from_millis(50),
             app.helper.hub_heartbeat_notify.notified(),

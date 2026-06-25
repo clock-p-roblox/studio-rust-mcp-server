@@ -351,12 +351,8 @@ fn local_studio_gate_wait_reason(
     if status.studio_session_state.is_none() {
         return Some("studio_session_state_unavailable");
     }
-    let studio_session_state = status.studio_session_state.as_deref();
     match kind {
         LocalStudioGateKind::Edit => {
-            if studio_session_state != Some("stop") {
-                return None;
-            }
             if status.edit_runtime_state.is_none() || status.edit_runtime_age_ms.is_none() {
                 Some("edit_runtime_unavailable")
             } else {
@@ -364,9 +360,6 @@ fn local_studio_gate_wait_reason(
             }
         }
         LocalStudioGateKind::Official => {
-            if studio_session_state != Some("stop") {
-                return None;
-            }
             if status.edit_runtime_state.is_none() || status.edit_runtime_age_ms.is_none() {
                 return Some("edit_runtime_unavailable");
             }
@@ -414,32 +407,17 @@ fn require_local_edit_ready_locked(
     action: &str,
 ) -> Result<LocalStudioLiveSnapshot, ErrorData> {
     let snapshot = local_studio_live_snapshot_locked(state, requested_task_id, action)?;
-    match snapshot.studio_session_state.as_deref() {
-        Some("stop") => {
-            ensure_reported_age_fresh(action, "studio_mode", snapshot.studio_mode_age_ms)?;
-            ensure_reported_age_fresh(action, "edit_runtime", snapshot.edit_runtime_age_ms)?;
-            if snapshot.edit_runtime_state.as_deref() != Some("ready") {
-                return Err(ErrorData::internal_error(
-                    format!(
-                        "{action} failed fast: edit_runtime_not_ready state={}",
-                        snapshot.edit_runtime_state.as_deref().unwrap_or("unknown")
-                    ),
-                    None,
-                ));
-            }
-            Ok(snapshot)
-        }
-        Some(session_state) => Err(ErrorData::internal_error(
+    ensure_reported_age_fresh(action, "edit_runtime", snapshot.edit_runtime_age_ms)?;
+    if snapshot.edit_runtime_state.as_deref() != Some("ready") {
+        return Err(ErrorData::internal_error(
             format!(
-                "{action} failed fast: studio_session_state_not_stop current_state={session_state}"
+                "{action} failed fast: edit_runtime_not_ready state={}",
+                snapshot.edit_runtime_state.as_deref().unwrap_or("unknown")
             ),
             None,
-        )),
-        None => Err(ErrorData::internal_error(
-            format!("{action} failed fast: studio_session_state_unknown"),
-            None,
-        )),
+        ));
     }
+    Ok(snapshot)
 }
 
 fn require_local_official_ready_locked(
@@ -883,13 +861,13 @@ impl ServerHandler for RBXStudioServer {
                 website_url: None,
             },
             instructions: Some(
-                "Use launch_studio_session only to launch from a confirmed stop/edit Studio session into start_play or run_server.
+                "Use launch_studio_session only when the edit Studio runtime is connected and ready.
 get_studio_mode is for diagnostics and stop-path checks, not the normal launch entrypoint.
-Use run_code to query or edit the Roblox Studio place while Studio is in stop/edit mode.
-If Studio is already in start_play or run_server, call start_stop_play(stop), wait for studio_session_state=stop, then call launch_studio_session.
-start_stop_play is stop-only and is idempotent when Studio is already stopped.
+Use run_code to query or edit the Roblox Studio place while the edit runtime is ready.
+If Studio is already in start_play or run_server, call start_stop_play(stop), then wait until the edit runtime is ready and studio_transition_phase is idle before launching again.
+start_stop_play is stop-only and is idempotent when the edit runtime is already ready.
 Do not recover by sending another play+stop loop.
-If status reports studio_transition_phase=stopping_requested or stopping_observed, wait for stop/idle instead of issuing another play or stop command.
+If status reports studio_transition_phase=stopping_requested or stopping_observed, wait for edit runtime ready/idle instead of issuing another play or stop command.
 "
                     .to_string(),
             ),
@@ -1088,7 +1066,7 @@ struct LaunchStudioSession {
     )]
     task_id: String,
     #[schemars(
-        description = "Target mode to launch into, must be start_play or run_server. The current Studio session must already be in stop/edit mode; this tool never stops an existing play/run session."
+        description = "Target mode to launch into, must be start_play or run_server. The edit Studio runtime must already be connected and ready; this tool never stops an existing play/run session."
     )]
     mode: String,
 }
@@ -1215,7 +1193,7 @@ impl RBXStudioServer {
     }
 
     #[tool(
-        description = "Launch Roblox Studio from confirmed stop/edit mode into start_play or run_server. This tool never stops an existing play/run session; call start_stop_play(stop) first and wait for studio_session_state=stop. Returns the plugin launch JSON with final_mode and message."
+        description = "Launch Roblox Studio from a ready edit runtime into start_play or run_server. This tool never stops an existing play/run session; call start_stop_play(stop) first and wait until the edit runtime is ready and studio_transition_phase is idle. Returns the plugin launch JSON with final_mode and message."
     )]
     async fn launch_studio_session(
         &self,
@@ -2232,17 +2210,19 @@ mod tests {
     #[test]
     fn studio_control_tools_do_not_use_local_status_gate() {
         assert!(ToolArgumentValues::StartStopPlay(StartStopPlay {
-                task_id: "t_test".to_owned(),
-                mode: "stop".to_owned(),
-            })
-            .local_studio_gate_kind()
-            .is_none());
-        assert!(ToolArgumentValues::LaunchStudioSession(LaunchStudioSession {
+            task_id: "t_test".to_owned(),
+            mode: "stop".to_owned(),
+        })
+        .local_studio_gate_kind()
+        .is_none());
+        assert!(
+            ToolArgumentValues::LaunchStudioSession(LaunchStudioSession {
                 task_id: "t_test".to_owned(),
                 mode: "start_play".to_owned(),
             })
             .local_studio_gate_kind()
-            .is_none());
+            .is_none()
+        );
         assert!(matches!(
             ToolArgumentValues::InsertModel(InsertModel {
                 task_id: "t_test".to_owned(),

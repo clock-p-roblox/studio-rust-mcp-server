@@ -10,6 +10,16 @@
 
 如果实现偏离这些条件，本 draft 自动视为不通过。
 
+2026-06-26 复审补充：
+
+- 本方案的通过条件包含设计文档、宪法/contract 文档和代码三者一致；只通过本地 E2E 或单元测试不代表方案通过。
+- Studio 的 edit 插件 VM 与 play/run server runtime VM 是两个独立 VM。playing 时 edit MCP / edit 插件可能挂起、过期或只能报告旧状态；因此 edit 侧状态不能作为 running session 是否可被 stop 的权威证据。
+- playing 状态下 stop 的唯一权威执行者是 play/run server runtime actuator。helper / MCP 控制面只登记 stop intent 并等待证据；不得在 runtime actuator 不新鲜或不可用时静默 fallback 到 edit 插件 stop/no-op。设计目标是任何 play 都应可 stop，包括用户手动 Play 或非 helper 入口启动的 play；这个能力依赖 stop/edit ready 时预安装的 runtime actuator。
+- `launch_failed` 是保守的 known runtime state：只要存在可能已经进入 play/run 但 launch 返回失败或 edit VM 状态不可信的实例，就必须按 runtime-owned session 处理。若没有 fresh actuator，这是平台安装/同步异常，必须返回明确 runtime actuator unavailable / uncontrolled 类错误并暴露诊断；不得继续把 stop 转给 edit 插件。
+- edit heartbeat 不得把 `runtime` / `launch_failed` 这类 runtime-owned latch 无条件洗回 `ready`。但如果没有 active stop request，且曾经观察到的 runtime control heartbeat 已经过期，edit VM 又恢复 heartbeat，则可把它作为人工停止或运行态消失后的恢复证据，收敛到 idle/ready。刚 launch 成功但 runtime heartbeat 尚未首次出现时，不得用 edit heartbeat 提前恢复 ready。
+- stop 完成必须同时具备 runtime 侧已观察并执行 stop 的证据，以及 edit runtime 恢复 ready/idle 的证据。单纯收到 runtime “看见 stop request”的 ack、单纯 edit VM 回来、或单纯 stop log，都不足以静默宣告成功。
+- 本地测试必须真实启动 Rojo / clockp MCP / runtime-log / helper，并验证 Studio Rojo 日志出现 helper-resolved connection、server info 与 initial sync completed。禁止只在 hub heartbeat 里伪造 `rojo=healthy` 后宣称本地闭环成功；Rojo 503 时本方案视为未通过。
+
 2026-06-11 本地 44750 实测新增事实：
 
 - helper 固定 `44750`、hub `44758`、task-server `44756`、Rojo `44757` 时，Studio 可以正常打开指定 place，Rojo initial sync 可以完成，插件与 task-server 可以注册成功。
@@ -102,6 +112,16 @@ EndTest: can only be called from the server DataModel of a running Studio play s
 
 这个约束同样适用于 `launch_studio_session` 内部的 stop-before-relaunch：已有 play/run 会话没有 fresh runtime control heartbeat 时必须 fail fast 为 `uncontrolled_play_session`，不能把 stop 命令排给 edit 插件等待。
 
+### edit / runtime heartbeat 互斥
+
+helper 对同一个 task 的状态必须区分 edit VM 与 runtime VM：
+
+- edit heartbeat 只证明 stop/edit VM 当前能和 helper 通信；它不能证明正在 running 的 server runtime 已经停止。
+- runtime control heartbeat 只证明 play/run server runtime actuator 新鲜；它是 playing stop 是否可控的必要证据。
+- `edit_runtime_state=runtime`、`launching`、`launch_failed`、`stopping` 等 latch 由 helper 控制面按状态机维护，edit heartbeat 不得无条件覆盖为 `ready`。
+- 当 runtime control heartbeat 仍新鲜时，即使 edit heartbeat 可见，也不得把 stop 视为完成。
+- 当 helper 已知或怀疑存在 running/launch-failed session，但没有 fresh actuator 时，必须返回明确 actuator unavailable / uncontrolled 错误并暴露诊断；这代表“本应可 stop 的 runtime actuator 没有出现”，不得 fallback 到 edit 插件路径。
+
 ### 手动 Play 通过预安装脚本支持
 
 为了让用户手动 Play 也能被 stop，edit 插件在 stop/edit ready 时必须确保 `MCPStudioSessionControl` 已安装在 edit DataModel 的 `ServerScriptService`。
@@ -113,7 +133,7 @@ EndTest: can only be called from the server DataModel of a running Studio play s
 - 轮询 helper 私有 stop request。
 - 在 server DataModel 内调用 `StudioTestService:EndTest`。
 
-如果 helper 没有看到 fresh control heartbeat，说明当前 running session 没有可用 actuator。此时 stop 必须失败为 `uncontrolled_play_session`。
+如果 helper 没有看到 fresh control heartbeat，说明当前 running session 没有可用 actuator。按平台目标这属于异常：任何 play 都应因为预安装脚本而具备 actuator。此时 stop 必须失败为 `uncontrolled_play_session` / actuator unavailable，并带足诊断，不能假装已经 stop。
 
 ### HttpService / HTTP enabled 前置
 
@@ -207,7 +227,7 @@ edit 插件负责：
 - 注册 helper instance。
 - 在 stop/edit ready 时确保 `MCPStudioSessionControl` 安装在 `ServerScriptService`。
 - helper URL、instance_id、task_id 变化时重装控制脚本。
-- 在 stop/edit ready 时上报 `studio_mode=stop` 与 `edit_runtime_state=ready`。
+- 在 stop/edit ready 时通过 edit heartbeat 上报 `edit_runtime_state=ready`。edit heartbeat 不再上报自身的 play/stop mode；`studio_mode` / runtime 可控性只能来自 helper 控制面、runtime control heartbeat 或诊断快照。
 - stop 成功后清理 tracker，并保留或刷新当前 task 的平台预安装脚本；只有 helper/task 失效、插件卸载或脚本不再对应当前 task 时才删除该脚本。
 
 edit 插件禁止：
@@ -226,6 +246,7 @@ helper / MCP 控制面负责：
 - 登记后把状态推进到 `stopping_requested / stopping`。
 - 等待 Studio stop log、runtime control heartbeat 停止或切换、edit runtime 恢复 ready。
 - stop 超时时把状态收敛到 error/lost，并返回明确错误；不得永久卡在 `stopping_requested`。
+- 在 `runtime`、`running`、fresh control heartbeat 或 `launch_failed` 等 known runtime state 下，如果没有 fresh runtime actuator，必须返回明确错误并拒绝 edit fallback。
 
 ### play/run server runtime
 
@@ -248,8 +269,9 @@ running / ready
   -> helper records stop intent
   -> stopping_requested / stopping
   -> runtime actuator calls EndTest
-  -> Studio stop log observed
-  -> edit plugin status update stop
+  -> runtime reports stop observed/result
+  -> runtime control heartbeat disappears or becomes stale
+  -> edit plugin status update stop/ready
   -> idle / none
 ```
 
@@ -278,6 +300,16 @@ stopping_requested / stopping
   -> edit plugin wait stop log timeout
   -> helper records control error/lost
   -> later stop may be attempted only after fresh heartbeat or explicit upstream decision
+```
+
+launch 已失败但可能进入 runtime：
+
+```text
+launch_failed / no fresh actuator
+  -> start_stop_play(stop)
+  -> runtime_stop_actuator_unavailable or uncontrolled_play_session
+  -> no edit plugin fallback
+  -> state remains diagnostic/error until previously observed runtime heartbeat expires and edit heartbeat returns, or Studio is relaunched cleanly
 ```
 
 ## 测试要求
@@ -325,6 +357,7 @@ stopping_requested / stopping
 - 用户手动 Play 后，helper 能看到 fresh heartbeat；随后 `start_stop_play(stop)` 成功。
 - 如果构造无 heartbeat running session，stop 明确失败为 `uncontrolled_play_session`，不得进入永久 `stopping_requested`。
 - stop 超时场景不会触发自动 play/stop retry。
+- 本地闭环测试必须使用真实本地 Rojo / clockp MCP / runtime-log / helper。Rojo 需要真实响应 `/api/rojo`，Studio 日志需要出现 Rojo helper-resolved connection 和 initial sync completed；只写 hub task heartbeat 为 healthy 不算通过。
 
 ## TODO
 

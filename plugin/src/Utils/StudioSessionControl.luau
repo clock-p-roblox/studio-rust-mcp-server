@@ -17,6 +17,9 @@ local DEFAULT_HELPER_PORT = "44750"
 local LOG_PAGE_SIZE = 400
 local SESSION_CONTROL_SCRIPT_NAME = "MCPStudioSessionControl"
 local SESSION_CONTROL_MARKER = "clockp_mcp_session_control_v1"
+local SESSION_CONTROL_HELPER_URL_ATTRIBUTE = "clockp_mcp_helper_base_url"
+local SESSION_CONTROL_INSTANCE_ID_ATTRIBUTE = "clockp_mcp_instance_id"
+local SESSION_CONTROL_TASK_ID_ATTRIBUTE = "clockp_mcp_task_id"
 
 type LogBaseline = {
 	path: string,
@@ -40,12 +43,6 @@ local currentHelperBaseUrl: string? = nil
 local currentInstanceId: string? = nil
 local currentTaskId: string? = nil
 local lastHelperStopRequestId = 0
-
-local function configureHelperContext(helperUrl: string?, instanceId: string?, taskId: string?)
-	currentHelperBaseUrl = helperUrl
-	currentInstanceId = instanceId
-	currentTaskId = taskId
-end
 
 local function logTransitionStage(mode: Types.StartStopPlayMode, stage: string, detail: string?)
 	local message = string.format("[MCP Plugin] studio_transition mode=%s stage=%s", mode, stage)
@@ -101,6 +98,30 @@ local function removeSessionControlScript()
 		if isManagedSessionControlScript(child) then
 			child:Destroy()
 		end
+	end
+end
+
+local function hasCurrentSessionControlScript(): boolean
+	for _, child in ServerScriptService:GetChildren() do
+		if isManagedSessionControlScript(child) then
+			if
+				child:GetAttribute(SESSION_CONTROL_HELPER_URL_ATTRIBUTE) == activeHelperBaseUrl()
+				and child:GetAttribute(SESSION_CONTROL_INSTANCE_ID_ATTRIBUTE) == currentInstanceId
+				and child:GetAttribute(SESSION_CONTROL_TASK_ID_ATTRIBUTE) == currentTaskId
+			then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function configureHelperContext(helperUrl: string?, instanceId: string?, taskId: string?)
+	currentHelperBaseUrl = helperUrl
+	currentInstanceId = instanceId
+	currentTaskId = taskId
+	if helperUrl == nil or instanceId == nil or instanceId == "" then
+		removeSessionControlScript()
 	end
 end
 
@@ -363,8 +384,29 @@ end
 	controlScript.Name = SESSION_CONTROL_SCRIPT_NAME
 	controlScript.Source = source
 	controlScript:SetAttribute(SESSION_CONTROL_MARKER, true)
+	controlScript:SetAttribute(SESSION_CONTROL_HELPER_URL_ATTRIBUTE, helperUrl)
+	controlScript:SetAttribute(SESSION_CONTROL_INSTANCE_ID_ATTRIBUTE, instanceId)
+	controlScript:SetAttribute(SESSION_CONTROL_TASK_ID_ATTRIBUTE, currentTaskId)
 	controlScript.Parent = ServerScriptService
 	logTransitionStage(targetMode, "control_script_installed", string.format("instance_id=%s", instanceId))
+end
+
+local function ensurePreinstalledSessionControlScript()
+	if currentInstanceId == nil or currentInstanceId == "" then
+		return
+	end
+	if RunService:IsRunning() then
+		return
+	end
+	if hasCurrentSessionControlScript() then
+		return
+	end
+	local ok, err = pcall(function()
+		installSessionControlScript("start_play")
+	end)
+	if not ok then
+		logTransitionStage("start_play", "control_script_preinstall_failed", tostring(err))
+	end
 end
 
 local function requestStudioLog(startLine: number, lineCount: number)
@@ -469,7 +511,7 @@ end
 local function cleanupStoppedSessionControl(mode: Types.StartStopPlayMode)
 	local snapshot = StudioModeTracker.getSnapshot()
 	if mode == "stop" and snapshot.pendingStartId == 0 then
-		removeSessionControlScript()
+		ensurePreinstalledSessionControlScript()
 	end
 end
 
@@ -511,7 +553,7 @@ local function stop(force: boolean?): string?
 	local snapshot = StudioModeTracker.getSnapshot()
 	if force ~= true and currentState == "stop" then
 		StudioModeTracker.markStopped()
-		removeSessionControlScript()
+		ensurePreinstalledSessionControlScript()
 		if snapshot.pendingStartId > 0 then
 			logTransitionStage(
 				"stop",
@@ -547,7 +589,7 @@ local function stop(force: boolean?): string?
 		StudioModeTracker.markStopping(stopRequestId)
 		logTransitionStage("stop", "requested", string.format("stop_request_id=%d", stopRequestId))
 		StudioModeTracker.waitForStop(STOP_TIMEOUT_SECONDS)
-		removeSessionControlScript()
+		ensurePreinstalledSessionControlScript()
 		logTransitionStage("stop", "observed", string.format("stop_request_id=%d", stopRequestId))
 		return "Stopped"
 	end
@@ -588,12 +630,12 @@ local function waitForStartPlayLog(
 		if startCall.done and startCall.success == false then
 			local errorMessage = tostring(startCall.errorMessage)
 			if isPreviousTestStillInProgress(errorMessage) then
-				removeSessionControlScript()
+				ensurePreinstalledSessionControlScript()
 				StudioModeTracker.recordTransitionError(commandId, errorMessage)
 				error(previousTestInProgressError(errorMessage))
 			end
 			if getStudioMode() == "stop" then
-				removeSessionControlScript()
+				ensurePreinstalledSessionControlScript()
 			end
 			StudioModeTracker.recordTransitionError(commandId, errorMessage)
 			error(errorMessage)
@@ -676,7 +718,7 @@ local function startRunServerMode(executor: () -> any, successMessage: string): 
 		local errorMessage = tostring(result)
 		StudioModeTracker.recordTransitionError(commandId, errorMessage)
 		if isPreviousTestStillInProgress(errorMessage) then
-			removeSessionControlScript()
+			ensurePreinstalledSessionControlScript()
 			error(previousTestInProgressError(errorMessage))
 		end
 		error(errorMessage)
@@ -741,7 +783,10 @@ local function handleLaunchStudioSession(launchStudioSessionArgs: Types.LaunchSt
 		end, "Ran server")
 	end
 
-	local finalMode = getStudioMode()
+	-- Do not refresh from the edit VM here. After Play starts, this handler can
+	-- still finish on the edit side, where live RunService probes report edit
+	-- mode and would incorrectly reset the just-observed play state to stop.
+	local finalMode = StudioModeTracker.getSnapshot().mode
 	if finalMode ~= requestedMode then
 		error(string.format("LaunchStudioSession ended in %s, expected %s", finalMode, requestedMode))
 	end
@@ -764,5 +809,6 @@ return {
 	getStudioSessionStateJson = getStudioSessionStateJson,
 	handleLaunchStudioSession = handleLaunchStudioSession,
 	handleStartStopPlay = handleStartStopPlay,
+	ensurePreinstalledSessionControlScript = ensurePreinstalledSessionControlScript,
 	installSessionControlScript = installSessionControlScript,
 }
