@@ -464,9 +464,7 @@
         }
         let heartbeat_while_launching = mcp_plugin_edit_heartbeat_handler(
             State(app.clone()),
-            Json(PluginEditHeartbeatRequest {
-                instance_id: "instance-a".to_owned(),
-            }),
+            Json(test_edit_heartbeat_request("instance-a")),
         )
         .await
         .unwrap();
@@ -501,9 +499,7 @@
         drop(state);
         let heartbeat_after_runtime = mcp_plugin_edit_heartbeat_handler(
             State(app.clone()),
-            Json(PluginEditHeartbeatRequest {
-                instance_id: "instance-a".to_owned(),
-            }),
+            Json(test_edit_heartbeat_request("instance-a")),
         )
         .await
         .unwrap();

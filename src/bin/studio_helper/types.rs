@@ -247,6 +247,10 @@ struct PluginRequestQuery {
 #[derive(Debug, Deserialize)]
 struct PluginEditHeartbeatRequest {
     instance_id: String,
+    #[serde(default)]
+    studio_session_state: Option<String>,
+    #[serde(default)]
+    studio_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

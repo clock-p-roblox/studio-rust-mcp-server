@@ -147,6 +147,9 @@ fn current_session_state_for_instance(instance: &PluginInstance) -> Option<&'sta
     if instance_has_fresh_control(instance) {
         return Some("play");
     }
+    if studio_mode_is_running(instance.studio_mode.as_deref()) || transition_phase == "running" {
+        return Some("play");
+    }
     if instance.edit_runtime_unavailable_reason.as_deref() == Some("launch_failed") {
         return None;
     }
@@ -162,6 +165,11 @@ fn last_known_session_state_for_instance(instance: &PluginInstance) -> Option<&'
         return Some("starting_play");
     }
     if instance_has_fresh_control(instance) {
+        return Some("play");
+    }
+    if studio_mode_is_running(instance.studio_mode.as_deref())
+        || effective_studio_transition_phase(instance) == "running"
+    {
         return Some("play");
     }
     if instance.edit_runtime_unavailable_reason.as_deref() == Some("launch_failed") {
@@ -392,6 +400,54 @@ fn runtime_actuator_unavailable_detail(instance: &PluginInstance) -> String {
         edit_runtime_state(instance),
         instance.edit_runtime_unavailable_reason
     )
+}
+
+fn apply_edit_heartbeat_session_snapshot(
+    instance: &mut PluginInstance,
+    session_state: Option<&str>,
+    studio_mode: Option<&str>,
+) {
+    match session_state {
+        Some("play") | Some("edit_suspended_by_runtime") => {
+            let mode = match studio_mode {
+                Some("run_server") => "run_server",
+                _ => "start_play",
+            };
+            instance.studio_mode = Some(mode.to_owned());
+            instance.studio_mode_observed_at = Some(Instant::now());
+            instance.studio_mode_source = "edit_session_state".to_owned();
+            if !is_stopping_transition_phase(&instance.studio_transition_phase) {
+                if !instance_has_fresh_control(instance) {
+                    instance.studio_control_state = "lost".to_owned();
+                }
+                set_studio_transition_phase(instance, "running");
+                set_edit_runtime_unavailable(instance, "runtime");
+            }
+        }
+        Some("starting_play") | Some("launching") => {
+            if !is_stopping_transition_phase(&instance.studio_transition_phase) {
+                set_studio_transition_phase(instance, "starting");
+                set_edit_runtime_unavailable(instance, "launching");
+            }
+        }
+        Some("stopping") => {
+            set_studio_transition_phase(instance, "stopping_observed");
+            set_edit_runtime_unavailable(instance, "stopping");
+        }
+        Some("stop") | Some("edit_connected") => {
+            if !is_stopping_transition_phase(&instance.studio_transition_phase)
+                && !instance_has_fresh_control(instance)
+            {
+                instance.studio_mode = None;
+                instance.studio_mode_observed_at = None;
+                instance.studio_mode_source = "none".to_owned();
+                instance.studio_control_state = "none".to_owned();
+                set_studio_transition_phase(instance, "idle");
+                instance.studio_control_observed_at = None;
+            }
+        }
+        _ => {}
+    }
 }
 
 fn mark_runtime_stop_timeout(instance: &mut PluginInstance, stop_request_id: u64, detail: String) {

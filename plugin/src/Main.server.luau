@@ -857,10 +857,30 @@ local function sendEditHeartbeat(helperBaseUrlForPoll: string, instanceIdForPoll
 		return
 	end
 
-	local updateOk, updateError = pcall(function()
-		requestJson(helperBaseUrlForPoll, "POST", "/v1/mcp/plugin/edit-heartbeat", {
+	local heartbeatPayload: { [string]: any } = {
+		instance_id = instanceIdForPoll,
+	}
+	local stateOk, stateJson = pcall(function()
+		return StudioSessionControl.getStudioSessionStateJson()
+	end)
+	if stateOk then
+		local decodeOk, decoded = pcall(function()
+			return HttpService:JSONDecode(stateJson)
+		end)
+		if decodeOk and type(decoded) == "table" then
+			heartbeatPayload.studio_session_state = decoded.studio_session_state
+			heartbeatPayload.studio_mode = decoded.mode
+		end
+	else
+		logPluginEvent("plugin_edit_session_state_failed", {
 			instance_id = instanceIdForPoll,
+			task_id = taskIdForPoll,
+			error = tostring(stateJson),
 		})
+	end
+
+	local updateOk, updateError = pcall(function()
+		requestJson(helperBaseUrlForPoll, "POST", "/v1/mcp/plugin/edit-heartbeat", heartbeatPayload)
 	end)
 	if updateOk then
 		StudioSessionControl.ensurePreinstalledSessionControlScript()

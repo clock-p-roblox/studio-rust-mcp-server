@@ -264,6 +264,44 @@
     }
 
     #[tokio::test]
+    async fn edit_heartbeat_reports_plugin_observed_play_session() {
+        let app = test_app_state();
+        {
+            let mut state = app.state.lock().await;
+            let mut instance = test_instance("93795519121520", Some("task-a"), 0);
+            instance.studio_mode = None;
+            instance.studio_mode_source = "none".to_owned();
+            instance.studio_control_state = "none".to_owned();
+            instance.studio_transition_phase = "idle".to_owned();
+            state.instances.insert("instance-a".to_owned(), instance);
+        }
+
+        let response = mcp_plugin_edit_heartbeat_handler(
+            State(app.clone()),
+            Json(PluginEditHeartbeatRequest {
+                instance_id: "instance-a".to_owned(),
+                studio_session_state: Some("play".to_owned()),
+                studio_mode: Some("start_play".to_owned()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let state = app.state.lock().await;
+        let instance = state.instances.get("instance-a").unwrap();
+        assert_eq!(instance.studio_mode.as_deref(), Some("start_play"));
+        assert_eq!(instance.studio_mode_source, "edit_session_state");
+        assert_eq!(instance.studio_transition_phase, "running");
+        assert_eq!(instance.studio_control_state, "lost");
+        assert_eq!(edit_runtime_state(instance), "runtime");
+
+        let snapshot = task_studio_mode_snapshot(&state, "task-a");
+        assert_eq!(snapshot.studio_session_state, "play");
+        assert_eq!(snapshot.studio_control_state, "lost");
+        assert_eq!(snapshot.studio_transition_phase, "running");
+    }
+
+    #[tokio::test]
     async fn edit_heartbeat_completes_pending_stop_without_reporting_stop_mode() {
         let app = test_app_state();
         {
@@ -285,9 +323,7 @@
 
         let response = mcp_plugin_edit_heartbeat_handler(
             State(app.clone()),
-            Json(PluginEditHeartbeatRequest {
-                instance_id: "instance-a".to_owned(),
-            }),
+            Json(test_edit_heartbeat_request("instance-a")),
         )
         .await
         .unwrap();
@@ -327,9 +363,7 @@
 
         let response = mcp_plugin_edit_heartbeat_handler(
             State(app.clone()),
-            Json(PluginEditHeartbeatRequest {
-                instance_id: "instance-a".to_owned(),
-            }),
+            Json(test_edit_heartbeat_request("instance-a")),
         )
         .await
         .unwrap();
@@ -364,9 +398,7 @@
 
         let response = mcp_plugin_edit_heartbeat_handler(
             State(app.clone()),
-            Json(PluginEditHeartbeatRequest {
-                instance_id: "instance-a".to_owned(),
-            }),
+            Json(test_edit_heartbeat_request("instance-a")),
         )
         .await
         .unwrap();
@@ -467,9 +499,7 @@
 
         let heartbeat = mcp_plugin_edit_heartbeat_handler(
             State(app.clone()),
-            Json(PluginEditHeartbeatRequest {
-                instance_id: "instance-a".to_owned(),
-            }),
+            Json(test_edit_heartbeat_request("instance-a")),
         )
         .await
         .unwrap();
@@ -496,9 +526,7 @@
 
         let heartbeat = mcp_plugin_edit_heartbeat_handler(
             State(app.clone()),
-            Json(PluginEditHeartbeatRequest {
-                instance_id: "instance-a".to_owned(),
-            }),
+            Json(test_edit_heartbeat_request("instance-a")),
         )
         .await
         .unwrap();
@@ -527,9 +555,7 @@
 
         let heartbeat = mcp_plugin_edit_heartbeat_handler(
             State(app.clone()),
-            Json(PluginEditHeartbeatRequest {
-                instance_id: "instance-a".to_owned(),
-            }),
+            Json(test_edit_heartbeat_request("instance-a")),
         )
         .await
         .unwrap();
@@ -676,9 +702,7 @@
 
         let response = mcp_plugin_edit_heartbeat_handler(
             State(app.clone()),
-            Json(PluginEditHeartbeatRequest {
-                instance_id: "instance-a".to_owned(),
-            }),
+            Json(test_edit_heartbeat_request("instance-a")),
         )
         .await
         .unwrap();
@@ -954,9 +978,7 @@
         }
         let edit_heartbeat = mcp_plugin_edit_heartbeat_handler(
             State(app.clone()),
-            Json(PluginEditHeartbeatRequest {
-                instance_id: "instance-a".to_owned(),
-            }),
+            Json(test_edit_heartbeat_request("instance-a")),
         )
         .await
         .unwrap();
@@ -1088,4 +1110,3 @@
             Some("runtime_stop_failed: play runtime failed to execute stop_request_id=2: EndTest: can only be called once")
         );
     }
-
