@@ -209,20 +209,19 @@ async fn forward_runtime_log_job(app: &AppState, job: RuntimeLogForwardJob) {
     if !job.body.is_empty() {
         request = request.body(job.body.to_vec());
     }
-    let target_url = job.target_url.clone();
     let target_path = job.target_path.clone();
     let result = await_observable_upstream_result(
         "runtime_log_forward_http",
         target_path.clone(),
         async move {
-            let response = request.send().await.wrap_err_with(|| {
-                format!("failed to forward runtime-log request to {target_url}")
-            })?;
-            let status = response.status();
-            let body = response
-                .bytes()
+            let response = request
+                .send()
                 .await
-                .wrap_err("failed to read runtime-log forward response body")?;
+                .map_err(|_| color_eyre::eyre::eyre!("runtime-log upstream request failed"))?;
+            let status = response.status();
+            let body = response.bytes().await.map_err(|_| {
+                color_eyre::eyre::eyre!("runtime-log upstream response read failed")
+            })?;
             Result::<(reqwest::StatusCode, Bytes)>::Ok((status, body))
         },
     )
@@ -268,6 +267,12 @@ async fn forward_runtime_log_job(app: &AppState, job: RuntimeLogForwardJob) {
             .await;
         }
         Err(error) => {
+            tracing::debug!(
+                task_id = job.task_id,
+                target_path,
+                error = %summarize_error(&error.to_string()),
+                "runtime-log upstream request failed"
+            );
             record_runtime_log_forward_failure(
                 app,
                 &job.task_id,
@@ -275,10 +280,7 @@ async fn forward_runtime_log_job(app: &AppState, job: RuntimeLogForwardJob) {
                 job.claimed_at,
                 target_path,
                 None,
-                format!(
-                    "runtime-log forward failed: {}",
-                    summarize_error(&error.to_string())
-                ),
+                "runtime-log forward failed while contacting upstream".to_owned(),
             )
             .await;
         }

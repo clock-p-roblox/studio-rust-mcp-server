@@ -475,25 +475,36 @@ local function refreshTrackerFromLiveDataModel()
 	end
 end
 
+local function isCurrentRuntimeRunning(): boolean
+	local okRunMode, isRunMode = pcall(function()
+		return RunService:IsRunMode()
+	end)
+	if okRunMode and isRunMode == true then
+		return true
+	end
+	return RunService:IsRunning() or RunService:IsServer() or RunService:IsClient()
+end
+
 local function getStudioSessionState(): Types.StudioSessionState
-	refreshTrackerFromLiveDataModel()
 	local snapshot = StudioModeTracker.getSnapshot()
-	if snapshot.pendingStartId > 0 then
-		return "starting_play"
-	end
-	if snapshot.mode == "stop" then
-		return "stop"
-	end
 	if StudioModeTracker.getStopRequestId() > 0 then
 		return "stopping"
 	end
-	return "play"
+	if isCurrentRuntimeRunning() then
+		return "play"
+	end
+	if snapshot.pendingStartId > 0 then
+		return "starting_play"
+	end
+	return "stop"
 end
 
 local function getStudioSessionStateJson(): string
 	local state = getStudioSessionState()
 	local snapshot = StudioModeTracker.getSnapshot()
 	return HttpService:JSONEncode({
+		instance_id = currentInstanceId,
+		task_id = currentTaskId,
 		studio_session_state = state,
 		mode = snapshot.mode,
 		pending_start_id = snapshot.pendingStartId,
