@@ -110,7 +110,7 @@ func (m *Manager) Summary() Summary {
 
 	studios := make([]ManagedProcess, 0, len(m.processes))
 	for pid, process := range m.processes {
-		process.Running = processIsRunning(pid)
+		process.Running = processIsManagedRunning(pid, process.StartedAt)
 		studios = append(studios, process)
 	}
 	desired := make([]DesiredStudio, 0, len(m.desired))
@@ -144,7 +144,7 @@ func (m *Manager) ReconcileDesired(ctx context.Context) {
 		}
 		hasRunning := false
 		for pid, process := range m.processes {
-			if process.PlaceID == placeID && processIsRunning(pid) {
+			if process.PlaceID == placeID && processIsManagedRunning(pid, process.StartedAt) {
 				hasRunning = true
 				break
 			}
@@ -197,7 +197,7 @@ func (m *Manager) ManagedPIDForPlace(placeID string) (int, error) {
 
 	matches := make([]int, 0, 1)
 	for pid, process := range m.processes {
-		if process.PlaceID == placeID && processIsRunning(pid) {
+		if process.PlaceID == placeID && processIsManagedRunning(pid, process.StartedAt) {
 			matches = append(matches, pid)
 		}
 	}
@@ -213,7 +213,7 @@ func (m *Manager) ManagedPIDForPlace(placeID string) (int, error) {
 
 func (m *Manager) pruneStoppedProcessesLocked() {
 	for pid, process := range m.processes {
-		if processIsRunning(pid) {
+		if processIsManagedRunning(pid, process.StartedAt) {
 			continue
 		}
 		delete(m.processes, pid)
@@ -275,6 +275,10 @@ func (m *Manager) start(ctx context.Context, placeID string, source string, mark
 		return LaunchResult{}, err
 	}
 	pid := cmd.Process.Pid
+	startedAt := time.Now()
+	if processStartedAt, ok := processStartTime(pid); ok {
+		startedAt = processStartedAt
+	}
 	if err := cmd.Process.Release(); err != nil {
 		return LaunchResult{}, fmt.Errorf("failed to release Roblox Studio process handle for pid %d: %w", pid, err)
 	}
@@ -285,7 +289,7 @@ func (m *Manager) start(ctx context.Context, placeID string, source string, mark
 		StudioPath: studioPath,
 		Source:     source,
 		PID:        pid,
-		StartedAt:  time.Now(),
+		StartedAt:  startedAt,
 		Running:    true,
 	}
 	m.mu.Unlock()

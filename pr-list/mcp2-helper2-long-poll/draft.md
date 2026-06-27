@@ -70,6 +70,10 @@ Each mcp2 process creates a numeric `mode_seq` at startup. The value should be m
 
 When Studio enters play, the play server VM has a new `mode_seq`. When Studio returns to edit, the edit VM might reuse its previous process and therefore keep its old `mode_seq`. helper2 must still treat a newly observed `mode_seq` from another VM as a lifecycle switch.
 
+The protocol relies on Studio's VM ownership behavior: the edit VM is suspended while Studio is in play, and the play VM is independent from the edit VM. Because of that, helper2 does not try to merge or arbitrate simultaneous edit/play activity. A pull or ping from a different `mode_seq` means helper2 has observed a different active VM lifecycle and should switch to it.
+
+If mcp2 catches an unexpected command execution error inside a VM, it must advance `mode_seq` before reporting the result or pulling again. This creates a new helper2 lifecycle boundary for the still-running plugin loop and prevents later traffic from being mistaken for the pre-error lifecycle.
+
 ## Protocol Endpoints
 
 helper2 exposes:
@@ -209,6 +213,10 @@ A queued command has this wire shape:
 - returns failure from any other mode.
 
 Formal Studio control command results may be lost because successful play/stop changes the active Studio VM. helper2 must not treat the absence of `response_result` as proof that the command failed.
+
+The debug play/stop entrypoints are enqueue-only and do not serialize around a pending Studio mode transition. If a stop command is consumed by edit mode during a play transition, the command may return `already_stopped`; this is acceptable for this phase because the endpoint result is not the authoritative final Studio state. The invariant for this phase is narrower: mixed or concurrent play/stop requests must not poison the helper2 queue, mcp2 loop, or later fresh play/stop commands.
+
+mcp2 must wrap Studio control calls such as `StudioTestService:ExecutePlayModeAsync({})` and `StudioTestService:EndTest({})` so Studio errors become command failures instead of killing the plugin loop. After such an error, mcp2 must bump `mode_seq`, send a failure `response_result`, and continue with the next pull using the new `mode_seq`.
 
 `POST /debug/studio/play/{placeid}` enqueues a `studio_play` command and returns only enqueue status:
 
@@ -397,6 +405,8 @@ helper2 startup and `POST /debug/start-roblox-studio/{placeid}` both create desi
 
 Stale recovery kills only the affected managed Studio process. It must not kill unrelated Studio processes or unrelated desired targets.
 
+StudioManager must prune records for managed Studio processes that have already exited before summary generation, desired reconciliation, managed PID lookup, or stale kill. This keeps an externally killed Studio from leaving a stale PID record behind. A stale PID record must not be used later as a screenshot target or kill target. On Windows, the managed-process check should match the recorded launch identity rather than only checking that the PID still exists.
+
 ## Other helper2 Interfaces
 
 The helper2 HTTP surface for this draft is:
@@ -565,7 +575,7 @@ The test plan must cover:
 - Resolve the managed Studio PID for the requested place id.
 - If multiple managed Studio processes exist for the same place id, fail instead of guessing.
 - On Windows, enumerate visible top-level windows and prefer a Roblox Studio window with the exact managed PID.
-- If no exact PID window is found but exactly one visible Roblox Studio window exists, allow a fallback and mark it in the response.
+- If no exact PID window is found but exactly one visible Roblox Studio window exists, allow a fallback and mark it in the response. This intentionally follows helper1's screenshot behavior.
 - Enumerate child windows to find the Studio viewport, following helper1's size-based heuristic.
 - Capture the selected window with PowerShell and `PrintWindow(hwnd, hdc, 2)`.
 - If the first capture fails or looks black, restore/foreground the Studio window, wait briefly, and retry once.

@@ -2,10 +2,21 @@
 
 package studio
 
-import "syscall"
+import (
+	"syscall"
+	"time"
+)
 
 func processIsRunning(pid int) bool {
 	return syscall.Kill(pid, 0) == nil
+}
+
+func processIsManagedRunning(pid int, _ time.Time) bool {
+	return processIsRunning(pid)
+}
+
+func processStartTime(_ int) (time.Time, bool) {
+	return time.Time{}, false
 }
 
 func killProcess(pid int) error {
