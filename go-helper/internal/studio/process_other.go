@@ -19,6 +19,10 @@ func processStartTime(_ int) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+func processParentID(_ int) (int, bool) {
+	return 0, false
+}
+
 func killProcess(pid int) error {
 	if pid <= 0 {
 		return nil

@@ -43,6 +43,7 @@ const (
 	mcp2CommandDebugStopLoop mcp2CommandKind = "debug_stop_loop"
 	mcp2CommandStudioPlay    mcp2CommandKind = "studio_play"
 	mcp2CommandStudioStop    mcp2CommandKind = "studio_stop"
+	mcp2CommandStudioMode    mcp2CommandKind = "studio_mode_query"
 )
 
 type mcp2Command struct {
@@ -85,6 +86,10 @@ type studioStopCommandArgs struct {
 	PlaceID string `json:"place_id"`
 }
 
+type studioModeCommandArgs struct {
+	PlaceID string `json:"place_id"`
+}
+
 type mcp2ChannelSummary struct {
 	ActiveMode             string       `json:"active_mode"`
 	ActiveModeSeq          *int64       `json:"active_mode_seq"`
@@ -124,7 +129,12 @@ func (b *mcp2CommandBroker) ping(mode string, modeSeq int64, studioPID int) mcp2
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	b.acceptLifecycleLocked(mode, modeSeq, studioPID)
+	if !b.acceptLifecycleLocked(mode, modeSeq, studioPID) {
+		return mcp2PullResponse{
+			Type:   mcp2MessageTypePong,
+			Reason: "invalid_lifecycle_source",
+		}
+	}
 	now := time.Now()
 	b.lastPullAt = &now
 	b.setActiveStudioPIDLocked(studioPID)
@@ -138,7 +148,13 @@ func (b *mcp2CommandBroker) pull(ctx context.Context, mode string, modeSeq int64
 	defer timer.Stop()
 
 	b.mu.Lock()
-	b.acceptLifecycleLocked(mode, modeSeq, studioPID)
+	if !b.acceptLifecycleLocked(mode, modeSeq, studioPID) {
+		b.mu.Unlock()
+		return mcp2PullResponse{
+			Type:   mcp2MessageTypeShouldRestartPull,
+			Reason: "invalid_lifecycle_source",
+		}, false
+	}
 	now := time.Now()
 	b.lastPullAt = &now
 	b.setActiveStudioPIDLocked(studioPID)
@@ -220,6 +236,12 @@ func (b *mcp2CommandBroker) enqueueStudioStop(placeID string) (mcp2Command, erro
 	})
 }
 
+func (b *mcp2CommandBroker) enqueueStudioModeQuery(placeID string) (mcp2Command, error) {
+	return b.enqueue(mcp2MessageTypeCommand, mcp2CommandStudioMode, studioModeCommandArgs{
+		PlaceID: placeID,
+	})
+}
+
 func (b *mcp2CommandBroker) enqueue(commandType mcp2MessageType, commandKind mcp2CommandKind, args any) (mcp2Command, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -239,17 +261,72 @@ func (b *mcp2CommandBroker) enqueue(commandType mcp2MessageType, commandKind mcp
 	return command, nil
 }
 
-func (b *mcp2CommandBroker) record(result mcp2ResponseResult) {
+func (b *mcp2CommandBroker) record(result mcp2ResponseResult, studioPID int) (bool, string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if b.waitingResponseCommand != nil && b.waitingResponseCommand.CommandID == result.CommandID {
-		b.waitingResponseCommand = nil
+	if studioPID <= 0 {
+		return false, "invalid_lifecycle_source"
 	}
+	if b.activeStudioPID == nil || *b.activeStudioPID != studioPID {
+		return false, "studio_pid_mismatch"
+	}
+	if b.activeModeSeq == nil || result.ModeSeq != *b.activeModeSeq {
+		return false, "mode_seq_mismatch"
+	}
+	if b.waitingResponseCommand == nil || b.waitingResponseCommand.CommandID != result.CommandID {
+		return false, "not_waiting_for_command"
+	}
+
+	b.waitingResponseCommand = nil
 	b.results = append(b.results, result)
 	if len(b.results) > 200 {
 		b.results = b.results[len(b.results)-200:]
 	}
+	b.signalLocked()
+	return true, ""
+}
+
+func (b *mcp2CommandBroker) waitForResult(ctx context.Context, commandID int64) (mcp2ResponseResult, bool) {
+	for {
+		b.mu.Lock()
+		for _, result := range b.results {
+			if result.CommandID == commandID {
+				b.mu.Unlock()
+				return result, true
+			}
+		}
+		notify := b.notify
+		b.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return mcp2ResponseResult{}, false
+		case <-notify:
+		}
+	}
+}
+
+func (b *mcp2CommandBroker) cancelCommand(commandID int64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	removed := false
+	for i := 0; i < len(b.pending); i++ {
+		if b.pending[i].CommandID == commandID {
+			b.pending = append(b.pending[:i], b.pending[i+1:]...)
+			removed = true
+			break
+		}
+	}
+	if b.waitingResponseCommand != nil && b.waitingResponseCommand.CommandID == commandID {
+		b.waitingResponseCommand = nil
+		removed = true
+	}
+	if removed {
+		b.signalLocked()
+	}
+	return removed
 }
 
 func (b *mcp2CommandBroker) markStaleIfNeeded(staleAfter time.Duration) (int, bool) {
@@ -318,10 +395,13 @@ func (b *mcp2CommandBroker) summary() mcp2ChannelSummary {
 	}
 }
 
-func (b *mcp2CommandBroker) acceptLifecycleLocked(mode string, modeSeq int64, studioPID int) {
+func (b *mcp2CommandBroker) acceptLifecycleLocked(mode string, modeSeq int64, studioPID int) bool {
+	if studioPID <= 0 {
+		return false
+	}
 	if b.activeModeSeq != nil && *b.activeModeSeq == modeSeq {
 		b.setActiveStudioPIDLocked(studioPID)
-		return
+		return true
 	}
 
 	b.activeMode = mode
@@ -332,6 +412,7 @@ func (b *mcp2CommandBroker) acceptLifecycleLocked(mode string, modeSeq int64, st
 	b.pending = nil
 	b.waitingResponseCommand = nil
 	b.signalLocked()
+	return true
 }
 
 func (b *mcp2CommandBroker) setActiveStudioPIDLocked(studioPID int) {
@@ -388,7 +469,15 @@ func main() {
 			})
 			return
 		}
-		studioPID := resolvePeerStudioPID(r, *addr, logger)
+		studioPID := resolvePeerManagedStudioPID(r, *addr, studioManager, logger)
+		if studioPID <= 0 {
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"ok":     false,
+				"error":  "invalid_lifecycle_source",
+				"reason": "request is not from a helper-managed Roblox Studio process",
+			})
+			return
+		}
 		if onlyPing {
 			response := commandBroker.ping(mode, parsedModeSeq, studioPID)
 			logger.Info(
@@ -442,19 +531,26 @@ func main() {
 		}
 
 		result.ReceivedAt = time.Now()
-		commandBroker.record(result)
+		studioPID := resolvePeerManagedStudioPID(r, *addr, studioManager, logger)
+		recorded, ignoredReason := commandBroker.record(result, studioPID)
 		logger.Info(
 			"mcp2 response acknowledged",
 			"remote_addr", r.RemoteAddr,
+			"studio_pid", studioPID,
 			"mode", result.Mode,
 			"mode_seq", result.ModeSeq,
 			"command_id", result.CommandID,
 			"ok", result.OK,
 			"error", result.Error,
+			"recorded", recorded,
+			"ignored_reason", ignoredReason,
 		)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":         true,
 			"command_id": result.CommandID,
+			"recorded":   recorded,
+			"ignored":    !recorded,
+			"reason":     ignoredReason,
 		})
 	})
 	mux.HandleFunc("POST /debug/command/{placeid}", func(w http.ResponseWriter, r *http.Request) {
@@ -539,6 +635,49 @@ func main() {
 			"queued":     true,
 			"command_id": command.CommandID,
 			"command":    command,
+		})
+	})
+	mux.HandleFunc("GET /debug/studio/mode/{placeid}", func(w http.ResponseWriter, r *http.Request) {
+		placeID := r.PathValue("placeid")
+		if !studio.PlaceIDIsValid(placeID) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"ok":    false,
+				"error": "placeid must contain digits only",
+			})
+			return
+		}
+		command, err := commandBroker.enqueueStudioModeQuery(placeID)
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok":        true,
+				"available": false,
+				"place_id":  placeID,
+				"error":     err.Error(),
+			})
+			return
+		}
+
+		waitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		result, found := commandBroker.waitForResult(waitCtx, command.CommandID)
+		if !found {
+			commandBroker.cancelCommand(command.CommandID)
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok":         true,
+				"available":  false,
+				"place_id":   placeID,
+				"command_id": command.CommandID,
+				"reason":     "mode_query_timeout",
+			})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":             true,
+			"available":      result.OK,
+			"place_id":       placeID,
+			"command_id":     command.CommandID,
+			"command_result": result,
 		})
 	})
 	mux.HandleFunc("GET /studio/summary", func(w http.ResponseWriter, r *http.Request) {
@@ -722,7 +861,7 @@ func parseModeSeq(value string) (int64, error) {
 	return parsed, nil
 }
 
-func resolvePeerStudioPID(r *http.Request, listenAddr string, logger *slog.Logger) int {
+func resolvePeerManagedStudioPID(r *http.Request, listenAddr string, studioManager *studio.Manager, logger *slog.Logger) int {
 	helperPort, err := listenPort(listenAddr)
 	if err != nil {
 		logger.Warn("failed to parse helper listen port for peer pid lookup", "addr", listenAddr, "error", err)
@@ -738,7 +877,14 @@ func resolvePeerStudioPID(r *http.Request, listenAddr string, logger *slog.Logge
 		logger.Warn("failed to resolve mcp2 peer pid", "remote_addr", r.RemoteAddr, "error", err)
 		return 0
 	}
-	return pid
+	managedRootPID, ok := studioManager.ManagedRootPIDForPeerPID(pid)
+	if !ok {
+		if pid > 0 {
+			logger.Warn("mcp2 peer pid is not a running managed Roblox Studio", "remote_addr", r.RemoteAddr, "pid", pid)
+		}
+		return 0
+	}
+	return managedRootPID
 }
 
 func listenPort(addr string) (int, error) {

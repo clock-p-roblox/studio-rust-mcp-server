@@ -17,3 +17,7 @@ func (j *processJob) assign(cmd *exec.Cmd) error {
 func (j *processJob) close() error {
 	return nil
 }
+
+func (j *processJob) contains(pid int) bool {
+	return false
+}

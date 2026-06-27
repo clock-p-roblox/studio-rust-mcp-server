@@ -22,6 +22,7 @@ var (
 	procCreateJobObjectW         = kernel32.NewProc("CreateJobObjectW")
 	procSetInformationJobObject  = kernel32.NewProc("SetInformationJobObject")
 	procAssignProcessToJobObject = kernel32.NewProc("AssignProcessToJobObject")
+	procIsProcessInJob           = kernel32.NewProc("IsProcessInJob")
 )
 
 type ioCounters struct {
@@ -111,4 +112,23 @@ func (j *processJob) close() error {
 		return fmt.Errorf("failed to close Studio job object: %w", err)
 	}
 	return nil
+}
+
+func (j *processJob) contains(pid int) bool {
+	if j == nil || j.handle == 0 || pid <= 0 {
+		return false
+	}
+	processHandle, ok := openProcessForQuery(pid)
+	if !ok {
+		return false
+	}
+	defer syscall.CloseHandle(processHandle)
+
+	var inJob int32
+	okValue, _, _ := procIsProcessInJob.Call(
+		uintptr(processHandle),
+		uintptr(j.handle),
+		uintptr(unsafe.Pointer(&inJob)),
+	)
+	return okValue != 0 && inJob != 0
 }

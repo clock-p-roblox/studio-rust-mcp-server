@@ -43,10 +43,10 @@ if isStudio == true then
 	end
 end
 
-local modeSeq = DateTime.now().UnixTimestampMillis
+local modeSeq = DateTime.now().UnixTimestampMillis * 1000 + Random.new():NextInteger(0, 999)
 
 local function nextModeSeq()
-	local now = DateTime.now().UnixTimestampMillis
+	local now = DateTime.now().UnixTimestampMillis * 1000 + Random.new():NextInteger(0, 999)
 	if now <= modeSeq then
 		return modeSeq + 1
 	end
@@ -180,6 +180,22 @@ local function processCommand(command)
 			kind = kind,
 		}, nil
 	end
+	if kind == "studio_mode_query" then
+		return true, {
+			kind = kind,
+			available = true,
+			mode = mode,
+			mode_seq = modeSeq,
+			run_service_flags = {
+				IsEdit = isEdit,
+				IsRunning = isRunning,
+				IsServer = isServer,
+				IsClient = isClient,
+				IsRunMode = isRunMode,
+				IsStudio = isStudio,
+			},
+		}, nil
+	end
 	if kind == "studio_play" then
 		if mode == "play_server" then
 			return false, nil, "already_playing: Studio is already in play mode"
@@ -194,14 +210,6 @@ local function processCommand(command)
 			return false, nil, "studio_play only supports start_play; requested mode=" .. tostring(requestedMode)
 		end
 
-		print(LOG_PREFIX, "executing studio_play", "command_id=" .. tostring(command.command_id))
-		local ok, err = pcall(function()
-			StudioTestService:ExecutePlayModeAsync({})
-		end)
-		if not ok then
-			bumpModeSeq("studio_play failed: " .. tostring(err))
-			return false, nil, "studio_play failed: " .. tostring(err)
-		end
 		return true, {
 			kind = kind,
 			mode = requestedMode,
@@ -219,14 +227,6 @@ local function processCommand(command)
 			return false, nil, "studio_stop requires play_server mode; current mode=" .. mode
 		end
 
-		print(LOG_PREFIX, "executing studio_stop", "command_id=" .. tostring(command.command_id))
-		local ok, err = pcall(function()
-			StudioTestService:EndTest({})
-		end)
-		if not ok then
-			bumpModeSeq("studio_stop failed: " .. tostring(err))
-			return false, nil, "studio_stop failed: " .. tostring(err)
-		end
 		return true, {
 			kind = kind,
 			status = "stop_requested",
@@ -257,7 +257,7 @@ local function postResponseResult(commandId, ok, result, errorMessage)
 	})
 end
 
-local function postResponseResultUntilAcknowledged(commandId, ok, result, errorMessage)
+local function postResponseResultUntilRecorded(commandId, ok, result, errorMessage)
 	while true do
 		local responseOk, response = pcall(function()
 			return postResponseResult(commandId, ok, result, errorMessage)
@@ -266,11 +266,51 @@ local function postResponseResultUntilAcknowledged(commandId, ok, result, errorM
 			warn(LOG_PREFIX, "failed to post command result", tostring(response))
 			task.wait(5)
 		elseif not response.Success then
-			warn(LOG_PREFIX, "command result not acknowledged", tostring(response.StatusCode), tostring(response.Body))
+			warn(LOG_PREFIX, "command result not recorded", tostring(response.StatusCode), tostring(response.Body))
 			task.wait(5)
 		else
-			print(LOG_PREFIX, "command result acknowledged", "command_id=" .. tostring(commandId))
-			return
+			local decodedOk, decoded = pcall(function()
+				return HttpService:JSONDecode(response.Body)
+			end)
+			if decodedOk and typeof(decoded) == "table" and decoded.recorded == true then
+				print(LOG_PREFIX, "command result recorded", "command_id=" .. tostring(commandId))
+				return true
+			end
+			local reason = if decodedOk and typeof(decoded) == "table" then tostring(decoded.reason or "") else "invalid_response_body"
+			warn(LOG_PREFIX, "command result ignored by helper", "command_id=" .. tostring(commandId), "reason=" .. reason)
+			if reason == "invalid_lifecycle_source"
+				or reason == "studio_pid_mismatch"
+				or reason == "mode_seq_mismatch"
+				or reason == "not_waiting_for_command"
+			then
+				bumpModeSeq("command result ignored by helper: " .. reason)
+				return false
+			end
+			task.wait(5)
+		end
+	end
+end
+
+local function executeStudioTransitionAfterAck(command, result)
+	local kind = tostring(command.kind or "")
+	local status = if typeof(result) == "table" then tostring(result.status or "") else ""
+	if kind == "studio_play" and status == "play_requested" then
+		print(LOG_PREFIX, "executing studio_play", "command_id=" .. tostring(command.command_id))
+		local ok, err = pcall(function()
+			StudioTestService:ExecutePlayModeAsync({})
+		end)
+		if not ok then
+			bumpModeSeq("studio_play failed after pre-action ack: " .. tostring(err))
+			warn(LOG_PREFIX, "studio_play failed after pre-action ack", tostring(err))
+		end
+	elseif kind == "studio_stop" and status == "stop_requested" then
+		print(LOG_PREFIX, "executing studio_stop", "command_id=" .. tostring(command.command_id))
+		local ok, err = pcall(function()
+			StudioTestService:EndTest({})
+		end)
+		if not ok then
+			bumpModeSeq("studio_stop failed after pre-action ack: " .. tostring(err))
+			warn(LOG_PREFIX, "studio_stop failed after pre-action ack", tostring(err))
 		end
 	end
 end
@@ -286,6 +326,9 @@ task.spawn(function()
 
 		local responseType = tostring(command.type or "")
 		if responseType == "should_restart_pull" then
+			if tostring(command.reason or "") == "invalid_lifecycle_source" then
+				task.wait(5)
+			end
 			continue
 		end
 
@@ -304,7 +347,6 @@ task.spawn(function()
 
 		local stopHeartbeat = startCommandHeartbeat()
 		local processOk, ok, result, errorMessage = pcall(processCommand, command)
-		stopHeartbeat()
 		if not processOk then
 			bumpModeSeq("command raised: " .. tostring(ok))
 			errorMessage = "command raised: " .. tostring(ok)
@@ -320,7 +362,11 @@ task.spawn(function()
 				tostring(errorMessage)
 			)
 		end
-		postResponseResultUntilAcknowledged(commandId, ok, result, errorMessage)
+		local resultRecorded = postResponseResultUntilRecorded(commandId, ok, result, errorMessage)
+		stopHeartbeat()
+		if ok and resultRecorded then
+			executeStudioTransitionAfterAck(command, result)
+		end
 		if command.kind == "debug_stop_loop" then
 			print(LOG_PREFIX, "debug_stop_loop acknowledged; stopping command loop")
 			return
