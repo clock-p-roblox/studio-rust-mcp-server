@@ -45,6 +45,20 @@ end
 
 local modeSeq = DateTime.now().UnixTimestampMillis
 
+local function nextModeSeq()
+	local now = DateTime.now().UnixTimestampMillis
+	if now <= modeSeq then
+		return modeSeq + 1
+	end
+
+	return now
+end
+
+local function bumpModeSeq(reason)
+	modeSeq = nextModeSeq()
+	warn(LOG_PREFIX, "mode_seq bumped", "mode=" .. mode, "mode_seq=" .. tostring(modeSeq), "reason=" .. tostring(reason))
+end
+
 print(LOG_PREFIX, "mode=" .. mode)
 print(LOG_PREFIX, "mode_seq=" .. tostring(modeSeq))
 
@@ -69,13 +83,20 @@ if mode ~= "edit" and mode ~= "play_server" then
 end
 
 local HELPER_BASE_URL = "http://127.0.0.1:44750"
-local PULL_COMMAND_URL = HELPER_BASE_URL
-	.. "/plugin/mcp2/pull_command?mode="
-	.. HttpService:UrlEncode(mode)
-	.. "&mode_seq="
-	.. HttpService:UrlEncode(tostring(modeSeq))
-local PING_URL = PULL_COMMAND_URL .. "&only_ping=1"
 local RESPONSE_RESULT_URL = HELPER_BASE_URL .. "/plugin/mcp2/response_result"
+
+local function pullCommandURL(onlyPing)
+	local url = HELPER_BASE_URL
+		.. "/plugin/mcp2/pull_command?mode="
+		.. HttpService:UrlEncode(mode)
+		.. "&mode_seq="
+		.. HttpService:UrlEncode(tostring(modeSeq))
+	if onlyPing then
+		url ..= "&only_ping=1"
+	end
+
+	return url
+end
 
 local function requestJSON(options)
 	local ok, response = pcall(function()
@@ -100,7 +121,7 @@ end
 
 local function pullCommand()
 	return requestJSON({
-		Url = PULL_COMMAND_URL,
+		Url = pullCommandURL(false),
 		Method = "GET",
 		Compress = Enum.HttpCompression.None,
 	})
@@ -108,7 +129,7 @@ end
 
 local function ping()
 	return requestJSON({
-		Url = PING_URL,
+		Url = pullCommandURL(true),
 		Method = "GET",
 		Compress = Enum.HttpCompression.None,
 	})
@@ -174,7 +195,13 @@ local function processCommand(command)
 		end
 
 		print(LOG_PREFIX, "executing studio_play", "command_id=" .. tostring(command.command_id))
-		StudioTestService:ExecutePlayModeAsync({})
+		local ok, err = pcall(function()
+			StudioTestService:ExecutePlayModeAsync({})
+		end)
+		if not ok then
+			bumpModeSeq("studio_play failed: " .. tostring(err))
+			return false, nil, "studio_play failed: " .. tostring(err)
+		end
 		return true, {
 			kind = kind,
 			mode = requestedMode,
@@ -193,7 +220,13 @@ local function processCommand(command)
 		end
 
 		print(LOG_PREFIX, "executing studio_stop", "command_id=" .. tostring(command.command_id))
-		StudioTestService:EndTest({})
+		local ok, err = pcall(function()
+			StudioTestService:EndTest({})
+		end)
+		if not ok then
+			bumpModeSeq("studio_stop failed: " .. tostring(err))
+			return false, nil, "studio_stop failed: " .. tostring(err)
+		end
 		return true, {
 			kind = kind,
 			status = "stop_requested",
@@ -270,8 +303,14 @@ task.spawn(function()
 		end
 
 		local stopHeartbeat = startCommandHeartbeat()
-		local ok, result, errorMessage = processCommand(command)
+		local processOk, ok, result, errorMessage = pcall(processCommand, command)
 		stopHeartbeat()
+		if not processOk then
+			bumpModeSeq("command raised: " .. tostring(ok))
+			errorMessage = "command raised: " .. tostring(ok)
+			result = nil
+			ok = false
+		end
 		if not ok then
 			warn(
 				LOG_PREFIX,

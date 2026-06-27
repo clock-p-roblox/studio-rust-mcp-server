@@ -106,6 +106,7 @@ func (m *Manager) Close() error {
 func (m *Manager) Summary() Summary {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.pruneStoppedProcessesLocked()
 
 	studios := make([]ManagedProcess, 0, len(m.processes))
 	for pid, process := range m.processes {
@@ -135,11 +136,7 @@ func (m *Manager) Summary() Summary {
 
 func (m *Manager) ReconcileDesired(ctx context.Context) {
 	m.mu.Lock()
-	for pid := range m.processes {
-		if !processIsRunning(pid) {
-			delete(m.processes, pid)
-		}
-	}
+	m.pruneStoppedProcessesLocked()
 	desired := make([]DesiredStudio, 0, len(m.desired))
 	for placeID, source := range m.desired {
 		if m.starting[placeID] {
@@ -173,6 +170,7 @@ func (m *Manager) ReconcileDesired(ctx context.Context) {
 
 func (m *Manager) KillManagedPID(pid int) bool {
 	m.mu.Lock()
+	m.pruneStoppedProcessesLocked()
 	process, ok := m.processes[pid]
 	m.mu.Unlock()
 	if !ok {
@@ -195,6 +193,7 @@ func (m *Manager) ManagedPIDForPlace(placeID string) (int, error) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.pruneStoppedProcessesLocked()
 
 	matches := make([]int, 0, 1)
 	for pid, process := range m.processes {
@@ -210,6 +209,16 @@ func (m *Manager) ManagedPIDForPlace(placeID string) (int, error) {
 		return 0, fmt.Errorf("multiple running managed Roblox Studio processes for placeId %s: %v", placeID, matches)
 	}
 	return matches[0], nil
+}
+
+func (m *Manager) pruneStoppedProcessesLocked() {
+	for pid, process := range m.processes {
+		if processIsRunning(pid) {
+			continue
+		}
+		delete(m.processes, pid)
+		m.logger.Info("removed stopped Roblox Studio from manager", "pid", pid, "place_id", process.PlaceID)
+	}
 }
 
 func (m *Manager) start(ctx context.Context, placeID string, source string, markDesired bool) (LaunchResult, error) {
