@@ -2,7 +2,7 @@
 
 This repository is used by clock-p as the internal `clockp MCP` server that runs inside each debug task.
 
-Do not configure this binary directly as a Claude / Cursor / Codex MCP server for clock-p Roblox workflows. Codex and other LLM operators must use the clock-p Roblox skills and high-level scripts documented in `../clock-p-platform/docs/roblox-debug-cluster-constitution.md`.
+Do not configure this binary directly as a Claude / Cursor / Codex MCP server for clock-p Roblox workflows. Codex and other LLM operators must use the clock-p Roblox skills and high-level scripts in `../roblox-dev-infra`.
 
 The current clock-p shape is:
 
