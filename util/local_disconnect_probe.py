@@ -130,7 +130,13 @@ def remote_state(task_id: str) -> str | None:
     return connection.get("state")
 
 
-def wait_triplet(task_id: str, mode: str, control: str, phase: str) -> dict[str, Any]:
+def wait_triplet(
+    client: McpClient,
+    task_id: str,
+    session_state: str,
+    control: str,
+    phase: str,
+) -> dict[str, Any]:
     def sample():
         hub_status = request_json(f"{HUB_URL}/status")
         hub_task = None
@@ -143,23 +149,31 @@ def wait_triplet(task_id: str, mode: str, control: str, phase: str) -> dict[str,
                     break
         helper_snapshot = helper_task(task_id).get("task_status") or {}
         server_task_status = ((server_state().get("active_helper") or {}).get("task_status") or {})
-        observed = {"hub": hub_task, "helper": helper_snapshot, "server": server_task_status}
+        live_state = call_tool(client, "get_studio_session_state", {"task_id": task_id})
+        observed = {
+            "hub": hub_task,
+            "helper": helper_snapshot,
+            "server": server_task_status,
+            "live_state": live_state,
+        }
         if (
             hub_task
-            and hub_task.get("studio_mode") == mode
+            and live_state.get("studio_session_state") == session_state
             and hub_task.get("studio_control_state") == control
             and hub_task.get("studio_transition_phase") == phase
-            and helper_snapshot.get("studio_mode") == mode
             and helper_snapshot.get("studio_control_state") == control
             and helper_snapshot.get("studio_transition_phase") == phase
-            and server_task_status.get("studio_mode") == mode
             and server_task_status.get("studio_control_state") == control
             and server_task_status.get("studio_transition_phase") == phase
         ):
             return observed
         return None
 
-    return wait_until(f"hub/helper/task-server {mode}/{control}/{phase}", sample, timeout_sec=10)
+    return wait_until(
+        f"hub/helper/task-server {session_state}/{control}/{phase}",
+        sample,
+        timeout_sec=10,
+    )
 
 
 def call_tool(client: McpClient, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -325,9 +339,9 @@ def main() -> int:
 
         for index in range(args.cycles_before):
             start = call_tool(client, "launch_studio_session", {"task_id": task_id, "mode": "start_play"})
-            start_triplet = wait_triplet(task_id, "start_play", "ready", "running")
+            start_triplet = wait_triplet(client, task_id, "play", "ready", "running")
             stop = call_tool(client, "start_stop_play", {"task_id": task_id, "mode": "stop"})
-            stop_triplet = wait_triplet(task_id, "stop", "none", "idle")
+            stop_triplet = wait_triplet(client, task_id, "stop", "none", "idle")
             observations["cycles"].append({"phase": "before_disconnect", "index": index, "start": start, "start_triplet": start_triplet, "stop": stop, "stop_triplet": stop_triplet})
 
         before_disconnect = {
@@ -369,9 +383,9 @@ def main() -> int:
 
         for index in range(args.cycles_after):
             start = call_tool(client, "launch_studio_session", {"task_id": task_id, "mode": "start_play"})
-            start_triplet = wait_triplet(task_id, "start_play", "ready", "running")
+            start_triplet = wait_triplet(client, task_id, "play", "ready", "running")
             stop = call_tool(client, "start_stop_play", {"task_id": task_id, "mode": "stop"})
-            stop_triplet = wait_triplet(task_id, "stop", "none", "idle")
+            stop_triplet = wait_triplet(client, task_id, "stop", "none", "idle")
             observations["cycles"].append({"phase": "after_disconnect", "index": index, "start": start, "start_triplet": start_triplet, "stop": stop, "stop_triplet": stop_triplet})
 
         print(json.dumps(observations, ensure_ascii=False, indent=2), flush=True)

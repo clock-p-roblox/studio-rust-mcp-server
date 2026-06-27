@@ -48,18 +48,6 @@ pub(super) struct HubHelperActiveTaskPayload {
     #[serde(default)]
     pub(super) remote_state: String,
     #[serde(default)]
-    pub(super) studio_session_state: Option<String>,
-    #[serde(default)]
-    pub(super) last_known_session_state: Option<String>,
-    #[serde(default)]
-    pub(super) last_session_error_reason: Option<String>,
-    #[serde(default)]
-    pub(super) studio_mode: Option<String>,
-    #[serde(default)]
-    pub(super) studio_mode_age_ms: Option<u128>,
-    #[serde(default)]
-    pub(super) studio_mode_source: Option<String>,
-    #[serde(default)]
     pub(super) studio_control_state: Option<String>,
     #[serde(default)]
     pub(super) studio_transition_phase: Option<String>,
@@ -108,9 +96,6 @@ pub(super) struct HubTaskRouteSnapshot {
     pub(super) task_accepting_launches: bool,
     pub(super) task_services_healthy: bool,
     pub(super) remote_state: Option<String>,
-    pub(super) studio_session_state: Option<String>,
-    pub(super) last_known_session_state: Option<String>,
-    pub(super) last_session_error_reason: Option<String>,
     pub(super) active_stop_request_id: Option<u64>,
     pub(super) last_stop_request_id: Option<u64>,
     pub(super) stop_request_recorded_age_ms: Option<u128>,
@@ -124,9 +109,6 @@ pub(super) struct HubTaskRouteSnapshot {
 
 #[derive(Clone, Debug)]
 pub(super) struct LocalStudioLiveSnapshot {
-    pub(super) studio_session_state: Option<String>,
-    pub(super) last_known_session_state: Option<String>,
-    pub(super) last_session_error_reason: Option<String>,
     pub(super) active_stop_request_id: Option<u64>,
     pub(super) last_stop_request_id: Option<u64>,
     pub(super) stop_request_recorded_age_ms: Option<u128>,
@@ -135,9 +117,6 @@ pub(super) struct LocalStudioLiveSnapshot {
     pub(super) stop_result_phase: Option<String>,
     pub(super) stop_result_age_ms: Option<u128>,
     pub(super) stop_result_error: Option<String>,
-    pub(super) studio_mode: Option<String>,
-    pub(super) studio_mode_age_ms: Option<u128>,
-    pub(super) studio_mode_source: Option<String>,
     pub(super) studio_control_state: Option<String>,
     pub(super) studio_transition_phase: Option<String>,
     pub(super) studio_transition_age_ms: Option<u128>,

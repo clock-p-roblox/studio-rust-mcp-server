@@ -247,10 +247,6 @@ struct PluginRequestQuery {
 #[derive(Debug, Deserialize)]
 struct PluginEditHeartbeatRequest {
     instance_id: String,
-    #[serde(default)]
-    studio_session_state: Option<String>,
-    #[serde(default)]
-    studio_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -358,12 +354,6 @@ struct ClaimedTaskStatus {
     remote_last_error: Option<String>,
     remote_last_ready_age_ms: Option<u128>,
     remote_last_server_message_age_ms: Option<u128>,
-    studio_session_state: String,
-    last_known_session_state: Option<String>,
-    last_session_error_reason: Option<String>,
-    studio_mode: Option<String>,
-    studio_mode_age_ms: Option<u128>,
-    studio_mode_source: String,
     studio_control_state: String,
     studio_transition_phase: String,
     studio_transition_age_ms: Option<u128>,
@@ -449,12 +439,6 @@ struct HelperHeartbeatTaskStatus {
     remote_last_error: Option<String>,
     remote_last_ready_age_ms: Option<u128>,
     remote_last_server_message_age_ms: Option<u128>,
-    studio_session_state: String,
-    last_known_session_state: Option<String>,
-    last_session_error_reason: Option<String>,
-    studio_mode: Option<String>,
-    studio_mode_age_ms: Option<u128>,
-    studio_mode_source: String,
     studio_control_state: String,
     studio_transition_phase: String,
     studio_transition_age_ms: Option<u128>,
@@ -521,12 +505,6 @@ struct HelperInstanceStatus {
     task_id: Option<String>,
     remote_base_url: String,
     studio_pid: Option<u32>,
-    studio_session_state: String,
-    last_known_session_state: Option<String>,
-    last_session_error_reason: Option<String>,
-    studio_mode: Option<String>,
-    studio_mode_age_ms: Option<u128>,
-    studio_mode_source: String,
     studio_control_state: String,
     studio_transition_phase: String,
     studio_transition_age_ms: Option<u128>,

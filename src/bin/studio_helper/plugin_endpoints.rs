@@ -356,11 +356,6 @@ async fn mcp_plugin_edit_heartbeat_handler(
             );
             return Ok((StatusCode::GONE, "instance expired").into_response());
         };
-        apply_edit_heartbeat_session_snapshot(
-            instance,
-            payload.studio_session_state.as_deref(),
-            payload.studio_mode.as_deref(),
-        );
         if is_stopping_transition_phase(&instance.studio_transition_phase)
             && instance.stop_request_id > 0
         {

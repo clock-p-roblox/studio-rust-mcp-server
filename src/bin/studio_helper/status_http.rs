@@ -28,15 +28,6 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
                 task_id: instance.task_id.clone(),
                 remote_base_url: instance.remote_base_url.clone(),
                 studio_pid: instance.studio_pid,
-                studio_session_state: reported_session_state_for_instance(instance).to_owned(),
-                last_known_session_state: last_known_session_state_for_instance(instance)
-                    .map(str::to_owned),
-                last_session_error_reason: instance.studio_control_last_error.clone(),
-                studio_mode: instance.studio_mode.clone(),
-                studio_mode_age_ms: instance
-                    .studio_mode_observed_at
-                    .map(|value| value.elapsed().as_millis()),
-                studio_mode_source: instance.studio_mode_source.clone(),
                 studio_control_state: effective_studio_control_state(instance),
                 studio_transition_phase: effective_studio_transition_phase(instance),
                 studio_transition_age_ms: instance
@@ -65,7 +56,7 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
         .map(|task| {
             let connection_key = task_connection_key(&task.task_id);
             let remote_connection = state.remote_connections.get(&connection_key);
-            let studio_snapshot = task_studio_mode_snapshot(&state, &task.task_id);
+            let studio_snapshot = task_studio_control_snapshot(&state, &task.task_id);
             let (
                 official_mcp_adapter_state,
                 official_mcp_adapter_age_ms,
@@ -122,12 +113,6 @@ async fn helper_status(State(app): State<AppState>) -> Json<HelperStatusResponse
                         .last_server_message_at
                         .map(|value| value.elapsed().as_millis())
                 }),
-                studio_session_state: studio_snapshot.studio_session_state,
-                last_known_session_state: studio_snapshot.last_known_session_state,
-                last_session_error_reason: studio_snapshot.last_session_error_reason,
-                studio_mode: studio_snapshot.studio_mode,
-                studio_mode_age_ms: studio_snapshot.studio_mode_age_ms,
-                studio_mode_source: studio_snapshot.studio_mode_source,
                 studio_control_state: studio_snapshot.studio_control_state,
                 studio_transition_phase: studio_snapshot.studio_transition_phase,
                 studio_transition_age_ms: studio_snapshot.studio_transition_age_ms,
@@ -321,9 +306,6 @@ async fn helper_debug_task_handler(
                 "task_id": instance.task_id,
                 "remote_base_url": instance.remote_base_url,
                 "studio_pid": instance.studio_pid,
-                "studio_mode": instance.studio_mode,
-                "studio_mode_age_ms": instance.studio_mode_observed_at.map(|value| value.elapsed().as_millis()),
-                "studio_mode_source": instance.studio_mode_source,
                 "studio_control_state": effective_studio_control_state(instance),
                 "studio_transition_phase": effective_studio_transition_phase(instance),
                 "studio_transition_age_ms": instance.studio_transition_started_at.map(|value| value.elapsed().as_millis()),

@@ -313,8 +313,6 @@ async fn run_remote_ws_session(
                     task_id = ?task_id,
                     heartbeat_count,
                     plugin_instance_count,
-                    studio_mode = ?task_status.as_ref().and_then(|status| status.studio_mode.clone()),
-                    studio_mode_age_ms = ?task_status.as_ref().and_then(|status| status.studio_mode_age_ms),
                     studio_control_state = ?task_status.as_ref().and_then(|status| status.studio_control_state.clone()),
                     studio_transition_phase = ?task_status.as_ref().and_then(|status| status.studio_transition_phase.clone()),
                     official_mcp_adapter_state = ?task_status.as_ref().and_then(|status| status.official_mcp_adapter_state.clone()),

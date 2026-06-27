@@ -30,18 +30,6 @@ pub struct HelperHello {
 pub struct HelperTaskStatusSnapshot {
     #[serde(rename = "task_id", alias = "taskId")]
     pub task_id: String,
-    #[serde(rename = "studio_session_state", alias = "studioSessionState")]
-    pub studio_session_state: Option<String>,
-    #[serde(rename = "last_known_session_state", alias = "lastKnownSessionState")]
-    pub last_known_session_state: Option<String>,
-    #[serde(rename = "last_session_error_reason", alias = "lastSessionErrorReason")]
-    pub last_session_error_reason: Option<String>,
-    #[serde(rename = "studio_mode", alias = "studioMode")]
-    pub studio_mode: Option<String>,
-    #[serde(rename = "studio_mode_age_ms", alias = "studioModeAgeMs")]
-    pub studio_mode_age_ms: Option<u64>,
-    #[serde(rename = "studio_mode_source", alias = "studioModeSource")]
-    pub studio_mode_source: Option<String>,
     #[serde(rename = "studio_control_state", alias = "studioControlState")]
     pub studio_control_state: Option<String>,
     #[serde(rename = "studio_transition_phase", alias = "studioTransitionPhase")]
@@ -379,12 +367,6 @@ mod tests {
             plugin_instance_count: 2,
             task_status: Some(HelperTaskStatusSnapshot {
                 task_id: "tf2a83d456a".to_owned(),
-                studio_session_state: Some("stop".to_owned()),
-                last_known_session_state: Some("stop".to_owned()),
-                last_session_error_reason: None,
-                studio_mode: Some("stop".to_owned()),
-                studio_mode_age_ms: Some(42),
-                studio_mode_source: Some("edit_plugin".to_owned()),
                 studio_control_state: Some("none".to_owned()),
                 studio_transition_phase: Some("idle".to_owned()),
                 studio_transition_age_ms: None,
@@ -425,10 +407,6 @@ mod tests {
         assert_eq!(encoded["task_id"], "tf2a83d456a");
         assert_eq!(encoded["plugin_instance_count"], 2);
         assert_eq!(encoded["task_status"]["task_id"], "tf2a83d456a");
-        assert_eq!(encoded["task_status"]["studio_session_state"], "stop");
-        assert_eq!(encoded["task_status"]["last_known_session_state"], "stop");
-        assert_eq!(encoded["task_status"]["studio_mode"], "stop");
-        assert_eq!(encoded["task_status"]["studio_mode_source"], "edit_plugin");
         assert_eq!(encoded["task_status"]["studio_control_state"], "none");
         assert_eq!(encoded["task_status"]["studio_transition_phase"], "idle");
         assert_eq!(encoded["task_status"]["edit_runtime_state"], "ready");
@@ -457,9 +435,6 @@ mod tests {
             "plugin_instance_count": 1,
             "task_status": {
                 "task_id": "tf2a83d456a",
-                "studio_mode": "stop",
-                "studio_mode_age_ms": 12,
-                "studio_mode_source": "edit_plugin",
                 "studio_control_state": "none",
                 "studio_transition_phase": "idle",
                 "studio_transition_age_ms": 4,
@@ -476,9 +451,6 @@ mod tests {
         match decoded {
             HelperToServerMessage::Heartbeat { task_status, .. } => {
                 let status = task_status.expect("task_status should be present");
-                assert!(status.studio_session_state.is_none());
-                assert!(status.last_known_session_state.is_none());
-                assert!(status.last_session_error_reason.is_none());
                 assert!(status.active_stop_request_id.is_none());
                 assert!(status.last_stop_request_id.is_none());
                 assert!(status.stop_request_recorded_age_ms.is_none());
@@ -487,8 +459,6 @@ mod tests {
                 assert!(status.stop_result_phase.is_none());
                 assert!(status.stop_result_age_ms.is_none());
                 assert!(status.stop_result_error.is_none());
-                assert_eq!(status.studio_mode_age_ms, Some(12));
-                assert_eq!(status.studio_mode_source.as_deref(), Some("edit_plugin"));
                 assert_eq!(status.studio_transition_age_ms, Some(4));
                 assert_eq!(status.edit_runtime_state.as_deref(), Some("ready"));
                 assert_eq!(status.edit_runtime_age_ms, Some(5));

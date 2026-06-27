@@ -242,7 +242,13 @@ def server_state() -> dict[str, Any]:
     return request_json(f"{SERVER_URL}/v1/debug/state")
 
 
-def wait_triplet(task_id: str, mode: str, control: str, phase: str) -> dict[str, Any]:
+def wait_triplet(
+    client: McpClient,
+    task_id: str,
+    session_state: str,
+    control: str,
+    phase: str,
+) -> dict[str, Any]:
     def sample():
         hub_task = hub_active_task(task_id)
         helper = helper_task(task_id)
@@ -252,27 +258,31 @@ def wait_triplet(task_id: str, mode: str, control: str, phase: str) -> dict[str,
             server.get("active_helper")
             or {}
         ).get("task_status") or {}
+        live_state = call_tool(client, "get_studio_session_state", {"task_id": task_id})
         observed = {
             "hub": hub_task,
             "helper": helper_snapshot,
             "server": server_task_status,
+            "live_state": live_state,
         }
         if (
             hub_task
-            and hub_task.get("studio_mode") == mode
+            and live_state.get("studio_session_state") == session_state
             and hub_task.get("studio_control_state") == control
             and hub_task.get("studio_transition_phase") == phase
-            and helper_snapshot.get("studio_mode") == mode
             and helper_snapshot.get("studio_control_state") == control
             and helper_snapshot.get("studio_transition_phase") == phase
-            and server_task_status.get("studio_mode") == mode
             and server_task_status.get("studio_control_state") == control
             and server_task_status.get("studio_transition_phase") == phase
         ):
             return observed
         return None
 
-    return wait_until(f"hub/helper/server {mode}/{control}/{phase}", sample, timeout_sec=8)
+    return wait_until(
+        f"hub/helper/server {session_state}/{control}/{phase}",
+        sample,
+        timeout_sec=8,
+    )
 
 
 def call_tool(client: McpClient, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -567,8 +577,8 @@ def main() -> int:
             tool_retry_attempts=1,
         )
 
-        initial = call_tool(client, "get_studio_mode", {"task_id": task_id})
-        print(f"[probe] initial get_studio_mode={initial}", flush=True)
+        initial = call_tool(client, "get_studio_session_state", {"task_id": task_id})
+        print(f"[probe] initial get_studio_session_state={initial}", flush=True)
 
         started = time.perf_counter()
         start_result = call_tool(
@@ -577,7 +587,7 @@ def main() -> int:
             {"task_id": task_id, "mode": "start_play"},
         )
         start_elapsed_ms = int((time.perf_counter() - started) * 1000)
-        start_triplet = wait_triplet(task_id, "start_play", "ready", "running")
+        start_triplet = wait_triplet(client, task_id, "play", "ready", "running")
 
         try:
             relaunch_result, _relaunch_diagnostics = client.call_tool_with_diagnostics(
@@ -588,9 +598,9 @@ def main() -> int:
             relaunch_text = str(exc)
         else:
             relaunch_text = extract_text_content(relaunch_result)
-        if "studio_session_state_not_stop" not in relaunch_text:
+        if "studio_already_playing" not in relaunch_text:
             raise RuntimeError(f"low-level launch while play should fail without stopping: {relaunch_text}")
-        relaunch_rejected_triplet = wait_triplet(task_id, "start_play", "ready", "running")
+        relaunch_rejected_triplet = wait_triplet(client, task_id, "play", "ready", "running")
 
         started = time.perf_counter()
         stop_result = call_tool(
@@ -599,14 +609,14 @@ def main() -> int:
             {"task_id": task_id, "mode": "stop"},
         )
         stop_elapsed_ms = int((time.perf_counter() - started) * 1000)
-        stop_triplet = wait_triplet(task_id, "stop", "none", "idle")
+        stop_triplet = wait_triplet(client, task_id, "stop", "none", "idle")
 
         repeat_stop = call_tool(
             client,
             "start_stop_play",
             {"task_id": task_id, "mode": "stop"},
         )
-        repeat_triplet = wait_triplet(task_id, "stop", "none", "idle")
+        repeat_triplet = wait_triplet(client, task_id, "stop", "none", "idle")
 
         cleanup_check = call_tool(
             client,

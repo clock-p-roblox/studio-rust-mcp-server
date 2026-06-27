@@ -32,6 +32,7 @@ Tools included:
 - launch_studio_session
 - start_stop_play
 - get_studio_mode
+- get_studio_session_state
 
 Plugin integration:
 {successes}

@@ -17,13 +17,7 @@ fn studio_mode_is_running(mode: Option<&str>) -> bool {
 }
 
 #[derive(Clone, Debug)]
-struct StudioTaskStatusSnapshot {
-    studio_session_state: String,
-    last_known_session_state: Option<String>,
-    last_session_error_reason: Option<String>,
-    studio_mode: Option<String>,
-    studio_mode_age_ms: Option<u128>,
-    studio_mode_source: String,
+struct StudioTaskControlSnapshot {
     studio_control_state: String,
     studio_transition_phase: String,
     studio_transition_age_ms: Option<u128>,
@@ -136,165 +130,6 @@ fn edit_unavailable_reason_priority(reason: &str) -> u8 {
     }
 }
 
-fn current_session_state_for_instance(instance: &PluginInstance) -> Option<&'static str> {
-    let transition_phase = effective_studio_transition_phase(instance);
-    if is_stopping_transition_phase(&transition_phase) {
-        return Some("stopping");
-    }
-    if instance.edit_runtime_unavailable_reason.as_deref() == Some("launching") {
-        return Some("starting_play");
-    }
-    if instance_has_fresh_control(instance) {
-        return Some("play");
-    }
-    if studio_mode_is_running(instance.studio_mode.as_deref()) || transition_phase == "running" {
-        return Some("play");
-    }
-    if instance.edit_runtime_unavailable_reason.as_deref() == Some("launch_failed") {
-        return None;
-    }
-    None
-}
-
-fn last_known_session_state_for_instance(instance: &PluginInstance) -> Option<&'static str> {
-    let transition_phase = effective_studio_transition_phase(instance);
-    if is_stopping_transition_phase(&transition_phase) {
-        return Some("stopping");
-    }
-    if instance.edit_runtime_unavailable_reason.as_deref() == Some("launching") {
-        return Some("starting_play");
-    }
-    if instance_has_fresh_control(instance) {
-        return Some("play");
-    }
-    if studio_mode_is_running(instance.studio_mode.as_deref())
-        || effective_studio_transition_phase(instance) == "running"
-    {
-        return Some("play");
-    }
-    if instance.edit_runtime_unavailable_reason.as_deref() == Some("launch_failed") {
-        return None;
-    }
-    None
-}
-
-fn reported_session_state_for_instance(instance: &PluginInstance) -> &'static str {
-    current_session_state_for_instance(instance).unwrap_or_else(|| {
-        match edit_runtime_state(instance).as_str() {
-            "ready" => "stop",
-            _ => "none_response",
-        }
-    })
-}
-
-fn task_studio_session_state_snapshot(
-    state: &HelperState,
-    task_id: &str,
-) -> (String, Option<String>, Option<String>) {
-    let mut has_instance = false;
-    let mut has_stopping = false;
-    let mut has_launching = false;
-    let mut has_launch_failed = false;
-    let mut has_runtime = false;
-    let mut has_play = false;
-    let mut has_stop = false;
-    let mut newest_known: Option<(&'static str, u128)> = None;
-    let mut newest_error: Option<(String, u128)> = None;
-
-    for instance in state
-        .instances
-        .values()
-        .filter(|instance| instance.task_id.as_deref() == Some(task_id))
-    {
-        has_instance = true;
-        match current_session_state_for_instance(instance) {
-            Some("stopping") => has_stopping = true,
-            Some("starting_play") => has_launching = true,
-            Some("launch_failed") => has_launch_failed = true,
-            Some("play") => has_play = true,
-            Some("stop") => has_stop = true,
-            _ => {}
-        }
-        match edit_runtime_state(instance).as_str() {
-            "ready" => has_stop = true,
-            "runtime" => has_runtime = true,
-            _ => {}
-        }
-        if let Some(known) = last_known_session_state_for_instance(instance) {
-            let age = instance
-                .studio_mode_observed_at
-                .or(instance.studio_transition_started_at)
-                .map(|observed_at| observed_at.elapsed().as_millis())
-                .unwrap_or(u128::MAX);
-            if newest_known
-                .as_ref()
-                .map(|(_, current_age)| age < *current_age)
-                .unwrap_or(true)
-            {
-                newest_known = Some((known, age));
-            }
-        }
-        if let Some(error) = instance.studio_control_last_error.as_ref() {
-            let age = instance
-                .studio_transition_started_at
-                .or(instance.studio_control_observed_at)
-                .or(instance.studio_mode_observed_at)
-                .map(|observed_at| observed_at.elapsed().as_millis())
-                .unwrap_or(u128::MAX);
-            if newest_error
-                .as_ref()
-                .map(|(_, current_age)| age < *current_age)
-                .unwrap_or(true)
-            {
-                newest_error = Some((error.clone(), age));
-            }
-        }
-    }
-
-    let studio_session_state = if !has_instance {
-        "none_connected"
-    } else if has_stopping {
-        "stopping"
-    } else if has_launching {
-        "starting_play"
-    } else if has_play {
-        "play"
-    } else if has_launch_failed {
-        "none_response"
-    } else if has_runtime {
-        "none_response"
-    } else if has_stop {
-        "stop"
-    } else {
-        "none_response"
-    }
-    .to_owned();
-
-    let last_known_session_state = if matches!(
-        studio_session_state.as_str(),
-        "stop" | "starting_play" | "play" | "stopping"
-    ) {
-        Some(studio_session_state.clone())
-    } else {
-        newest_known.map(|(state, _)| state.to_owned())
-    };
-
-    let last_session_error_reason =
-        newest_error
-            .map(|(error, _)| error)
-            .or_else(|| match studio_session_state.as_str() {
-                "none_connected" => Some("studio_plugin_not_connected".to_owned()),
-                "none_response" => Some("studio_plugin_no_response".to_owned()),
-                _ => None,
-            });
-
-    (
-        studio_session_state,
-        last_known_session_state,
-        last_session_error_reason,
-    )
-}
-
 fn set_studio_transition_phase(instance: &mut PluginInstance, phase: &str) {
     if instance.studio_transition_phase != phase {
         instance.studio_transition_started_at = if phase == "idle" || phase == "running" {
@@ -402,54 +237,6 @@ fn runtime_actuator_unavailable_detail(instance: &PluginInstance) -> String {
     )
 }
 
-fn apply_edit_heartbeat_session_snapshot(
-    instance: &mut PluginInstance,
-    session_state: Option<&str>,
-    studio_mode: Option<&str>,
-) {
-    match session_state {
-        Some("play") | Some("edit_suspended_by_runtime") => {
-            let mode = match studio_mode {
-                Some("run_server") => "run_server",
-                _ => "start_play",
-            };
-            instance.studio_mode = Some(mode.to_owned());
-            instance.studio_mode_observed_at = Some(Instant::now());
-            instance.studio_mode_source = "edit_session_state".to_owned();
-            if !is_stopping_transition_phase(&instance.studio_transition_phase) {
-                if !instance_has_fresh_control(instance) {
-                    instance.studio_control_state = "lost".to_owned();
-                }
-                set_studio_transition_phase(instance, "running");
-                set_edit_runtime_unavailable(instance, "runtime");
-            }
-        }
-        Some("starting_play") | Some("launching") => {
-            if !is_stopping_transition_phase(&instance.studio_transition_phase) {
-                set_studio_transition_phase(instance, "starting");
-                set_edit_runtime_unavailable(instance, "launching");
-            }
-        }
-        Some("stopping") => {
-            set_studio_transition_phase(instance, "stopping_observed");
-            set_edit_runtime_unavailable(instance, "stopping");
-        }
-        Some("stop") | Some("edit_connected") => {
-            if !is_stopping_transition_phase(&instance.studio_transition_phase)
-                && !instance_has_fresh_control(instance)
-            {
-                instance.studio_mode = None;
-                instance.studio_mode_observed_at = None;
-                instance.studio_mode_source = "none".to_owned();
-                instance.studio_control_state = "none".to_owned();
-                set_studio_transition_phase(instance, "idle");
-                instance.studio_control_observed_at = None;
-            }
-        }
-        _ => {}
-    }
-}
-
 fn mark_runtime_stop_timeout(instance: &mut PluginInstance, stop_request_id: u64, detail: String) {
     instance.studio_control_state = "lost".to_owned();
     set_studio_transition_phase(instance, "error");
@@ -536,9 +323,7 @@ fn task_edit_runtime_snapshot<'a>(
     (state.to_owned(), newest_edit_age_ms)
 }
 
-fn task_studio_mode_snapshot(state: &HelperState, task_id: &str) -> StudioTaskStatusSnapshot {
-    let (studio_session_state, last_known_session_state, last_session_error_reason) =
-        task_studio_session_state_snapshot(state, task_id);
+fn task_studio_control_snapshot(state: &HelperState, task_id: &str) -> StudioTaskControlSnapshot {
     let stop_snapshot = state
         .instances
         .values()
@@ -565,11 +350,6 @@ fn task_studio_mode_snapshot(state: &HelperState, task_id: &str) -> StudioTaskSt
         .max_by_key(|instance| instance.last_seen_at)
         .map(|instance| {
             (
-                instance.studio_mode.clone(),
-                instance
-                    .studio_mode_observed_at
-                    .map(|observed_at| observed_at.elapsed().as_millis()),
-                instance.studio_mode_source.clone(),
                 effective_studio_control_state(instance),
                 effective_studio_transition_phase(instance),
                 instance
@@ -580,20 +360,11 @@ fn task_studio_mode_snapshot(state: &HelperState, task_id: &str) -> StudioTaskSt
         })
         .map(
             |(
-                mode,
-                age,
-                mode_source,
                 control_state,
                 transition_phase,
                 transition_age_ms,
                 control_last_error,
-            )| StudioTaskStatusSnapshot {
-                studio_session_state: studio_session_state.clone(),
-                last_known_session_state: last_known_session_state.clone(),
-                last_session_error_reason: last_session_error_reason.clone(),
-                studio_mode: mode,
-                studio_mode_age_ms: age,
-                studio_mode_source: mode_source,
+            )| StudioTaskControlSnapshot {
                 studio_control_state: control_state,
                 studio_transition_phase: transition_phase,
                 studio_transition_age_ms: transition_age_ms,
@@ -610,13 +381,7 @@ fn task_studio_mode_snapshot(state: &HelperState, task_id: &str) -> StudioTaskSt
                 stop_result_error: stop_snapshot.stop_result_error.clone(),
             },
         )
-        .unwrap_or(StudioTaskStatusSnapshot {
-            studio_session_state,
-            last_known_session_state,
-            last_session_error_reason,
-            studio_mode: None,
-            studio_mode_age_ms: None,
-            studio_mode_source: "none".to_owned(),
+        .unwrap_or(StudioTaskControlSnapshot {
             studio_control_state: "none".to_owned(),
             studio_transition_phase: "idle".to_owned(),
             studio_transition_age_ms: None,

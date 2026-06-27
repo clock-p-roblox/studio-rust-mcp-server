@@ -167,7 +167,7 @@ fn mark_runtime_log_forward_rejected(
 }
 
 fn helper_task_status_snapshot(state: &HelperState, task_id: &str) -> HelperTaskStatusSnapshot {
-    let studio_snapshot = task_studio_mode_snapshot(state, task_id);
+    let studio_snapshot = task_studio_control_snapshot(state, task_id);
     let (official_state, official_age_ms, official_last_error) = task_official_adapter_snapshot(
         state,
         task_id,
@@ -175,12 +175,6 @@ fn helper_task_status_snapshot(state: &HelperState, task_id: &str) -> HelperTask
     );
     HelperTaskStatusSnapshot {
         task_id: task_id.to_owned(),
-        studio_session_state: Some(studio_snapshot.studio_session_state),
-        last_known_session_state: studio_snapshot.last_known_session_state,
-        last_session_error_reason: studio_snapshot.last_session_error_reason,
-        studio_mode: studio_snapshot.studio_mode,
-        studio_mode_age_ms: ws_age_ms(studio_snapshot.studio_mode_age_ms),
-        studio_mode_source: Some(studio_snapshot.studio_mode_source),
         studio_control_state: Some(studio_snapshot.studio_control_state),
         studio_transition_phase: Some(studio_snapshot.studio_transition_phase),
         studio_transition_age_ms: ws_age_ms(studio_snapshot.studio_transition_age_ms),
@@ -264,7 +258,7 @@ fn heartbeat_task_statuses(state: &HelperState) -> Vec<HelperHeartbeatTaskStatus
         .map(|task| {
             let connection_key = task_connection_key(&task.task_id);
             let remote_connection = state.remote_connections.get(&connection_key);
-            let studio_snapshot = task_studio_mode_snapshot(state, &task.task_id);
+            let studio_snapshot = task_studio_control_snapshot(state, &task.task_id);
             let (
                 official_mcp_adapter_state,
                 official_mcp_adapter_age_ms,
@@ -291,12 +285,6 @@ fn heartbeat_task_statuses(state: &HelperState) -> Vec<HelperHeartbeatTaskStatus
                         .last_server_message_at
                         .map(|value| value.elapsed().as_millis())
                 }),
-                studio_session_state: studio_snapshot.studio_session_state,
-                last_known_session_state: studio_snapshot.last_known_session_state,
-                last_session_error_reason: studio_snapshot.last_session_error_reason,
-                studio_mode: studio_snapshot.studio_mode,
-                studio_mode_age_ms: studio_snapshot.studio_mode_age_ms,
-                studio_mode_source: studio_snapshot.studio_mode_source,
                 studio_control_state: studio_snapshot.studio_control_state,
                 studio_transition_phase: studio_snapshot.studio_transition_phase,
                 studio_transition_age_ms: studio_snapshot.studio_transition_age_ms,

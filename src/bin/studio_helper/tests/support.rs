@@ -31,8 +31,6 @@
     fn test_edit_heartbeat_request(instance_id: &str) -> PluginEditHeartbeatRequest {
         PluginEditHeartbeatRequest {
             instance_id: instance_id.to_owned(),
-            studio_session_state: None,
-            studio_mode: None,
         }
     }
 

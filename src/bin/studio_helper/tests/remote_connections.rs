@@ -46,8 +46,8 @@
         assert_eq!(payload["type"], "heartbeat");
         assert_eq!(payload["task_id"], "task-a");
         assert_eq!(payload["plugin_instance_count"], 1);
-        assert_eq!(payload["task_status"]["studio_mode"], "start_play");
-        assert_eq!(payload["task_status"]["studio_mode_source"], "play_control");
+        assert!(payload["task_status"]["studio_mode"].is_null());
+        assert!(payload["task_status"]["studio_mode_source"].is_null());
         assert_eq!(payload["task_status"]["studio_control_state"], "ready");
         assert_eq!(payload["task_status"]["studio_transition_phase"], "running");
         assert_eq!(payload["task_status"]["edit_runtime_state"], "ready");
@@ -267,4 +267,3 @@
             "ws://93795519121520-t_example-rojo-sunjun-user.dev.clock-p.com/api/socket/1"
         );
     }
-

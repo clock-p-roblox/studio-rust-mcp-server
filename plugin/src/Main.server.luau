@@ -860,24 +860,6 @@ local function sendEditHeartbeat(helperBaseUrlForPoll: string, instanceIdForPoll
 	local heartbeatPayload: { [string]: any } = {
 		instance_id = instanceIdForPoll,
 	}
-	local stateOk, stateJson = pcall(function()
-		return StudioSessionControl.getStudioSessionStateJson()
-	end)
-	if stateOk then
-		local decodeOk, decoded = pcall(function()
-			return HttpService:JSONDecode(stateJson)
-		end)
-		if decodeOk and type(decoded) == "table" then
-			heartbeatPayload.studio_session_state = decoded.studio_session_state
-			heartbeatPayload.studio_mode = decoded.mode
-		end
-	else
-		logPluginEvent("plugin_edit_session_state_failed", {
-			instance_id = instanceIdForPoll,
-			task_id = taskIdForPoll,
-			error = tostring(stateJson),
-		})
-	end
 
 	local updateOk, updateError = pcall(function()
 		requestJson(helperBaseUrlForPoll, "POST", "/v1/mcp/plugin/edit-heartbeat", heartbeatPayload)
@@ -978,8 +960,6 @@ local function refreshStatusFromHelper()
 			instance_id = currentInstanceId,
 			task_id = currentTaskId,
 			remote_base_url = currentRemoteBaseUrl,
-			studio_mode = registeredInstance.studio_mode,
-			studio_mode_age_ms = registeredInstance.studio_mode_age_ms,
 		})
 	else
 		local registrationDetail = if currentInstanceId ~= nil
@@ -1036,8 +1016,6 @@ local function refreshStatusFromHelper()
 		remote_state = remoteState,
 		remote_connection_id = remoteConnectionId,
 		remote_last_error = remoteLastError,
-		studio_mode = remoteSource.studio_mode,
-		studio_mode_age_ms = remoteSource.studio_mode_age_ms,
 		official_mcp_adapter_state = remoteSource.official_mcp_adapter_state,
 		official_mcp_adapter_age_ms = remoteSource.official_mcp_adapter_age_ms,
 		official_mcp_adapter_last_error = remoteSource.official_mcp_adapter_last_error,

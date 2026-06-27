@@ -32,6 +32,16 @@ async fn handle_remote_command(
             let args: ReadStudioLogArgs = serde_json::from_value(payload)?;
             Ok(serde_json::to_string(&read_studio_log(args)?)?)
         }
+        "GetStudioSessionState" | "get_studio_session_state" => {
+            let live_state = query_live_studio_session_state(app, place_id, task_id).await?;
+            Ok(serde_json::json!({
+                "studio_session_state": live_state.state,
+                "instance_id": live_state.instance_id,
+                "task_id": task_id,
+                "reason": live_state.reason,
+            })
+            .to_string())
+        }
         "StartStopPlay" | "start_stop_play" => {
             let args: StartStopPlayCommandArgs = serde_json::from_value(payload)?;
             if args.mode != "stop" {

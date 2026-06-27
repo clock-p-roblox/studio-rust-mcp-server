@@ -112,15 +112,6 @@ fn snapshot_from_hub_status_payload(
         remote_state: active_task_match
             .as_ref()
             .map(|active_task| active_task.remote_state.clone()),
-        studio_session_state: active_task_match
-            .as_ref()
-            .and_then(|active_task| active_task.studio_session_state.clone()),
-        last_known_session_state: active_task_match
-            .as_ref()
-            .and_then(|active_task| active_task.last_known_session_state.clone()),
-        last_session_error_reason: active_task_match
-            .as_ref()
-            .and_then(|active_task| active_task.last_session_error_reason.clone()),
         active_stop_request_id: active_task_match
             .as_ref()
             .and_then(|active_task| active_task.active_stop_request_id),
@@ -302,9 +293,6 @@ fn local_studio_live_snapshot_locked(
         ));
     }
     Ok(LocalStudioLiveSnapshot {
-        studio_session_state: status.studio_session_state.clone(),
-        last_known_session_state: status.last_known_session_state.clone(),
-        last_session_error_reason: status.last_session_error_reason.clone(),
         active_stop_request_id: status.active_stop_request_id,
         last_stop_request_id: status.last_stop_request_id,
         stop_request_recorded_age_ms: opt_age_to_u128(status.stop_request_recorded_age_ms),
@@ -315,9 +303,6 @@ fn local_studio_live_snapshot_locked(
         stop_result_phase: status.stop_result_phase.clone(),
         stop_result_age_ms: opt_age_to_u128(status.stop_result_age_ms),
         stop_result_error: status.stop_result_error.clone(),
-        studio_mode: status.studio_mode.clone(),
-        studio_mode_age_ms: opt_age_to_u128(status.studio_mode_age_ms),
-        studio_mode_source: status.studio_mode_source.clone(),
         studio_control_state: status.studio_control_state.clone(),
         studio_transition_phase: status.studio_transition_phase.clone(),
         studio_transition_age_ms: opt_age_to_u128(status.studio_transition_age_ms),
@@ -347,9 +332,6 @@ fn local_studio_gate_wait_reason(
     };
     if status.task_id != requested_task_id {
         return None;
-    }
-    if status.studio_session_state.is_none() {
-        return Some("studio_session_state_unavailable");
     }
     match kind {
         LocalStudioGateKind::Edit => {
@@ -626,9 +608,6 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
     let mut status_source = "hub_unconfigured".to_owned();
     let mut route_status_source = "hub_unconfigured".to_owned();
     let mut hub_snapshot_error = None;
-    let mut studio_session_state = None;
-    let mut last_known_session_state = None;
-    let mut last_session_error_reason = None;
     let mut active_stop_request_id = None;
     let mut last_stop_request_id = None;
     let mut stop_request_recorded_age_ms = None;
@@ -637,9 +616,6 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
     let mut stop_result_phase = None;
     let mut stop_result_age_ms = None;
     let mut stop_result_error = None;
-    let mut studio_mode = None;
-    let mut studio_mode_age_ms = None;
-    let mut studio_mode_source = None;
     let mut studio_control_state = None;
     let mut studio_transition_phase = None;
     let mut studio_transition_age_ms = None;
@@ -683,9 +659,6 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
         local_studio_live_snapshot_for_status_locked(&state, status_task_id.as_deref())
     };
     if let Some(snapshot) = local_snapshot.as_ref() {
-        studio_session_state = snapshot.studio_session_state.clone();
-        last_known_session_state = snapshot.last_known_session_state.clone();
-        last_session_error_reason = snapshot.last_session_error_reason.clone();
         active_stop_request_id = snapshot.active_stop_request_id;
         last_stop_request_id = snapshot.last_stop_request_id;
         stop_request_recorded_age_ms = snapshot.stop_request_recorded_age_ms;
@@ -694,9 +667,6 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
         stop_result_phase = snapshot.stop_result_phase.clone();
         stop_result_age_ms = snapshot.stop_result_age_ms;
         stop_result_error = snapshot.stop_result_error.clone();
-        studio_mode = snapshot.studio_mode.clone();
-        studio_mode_age_ms = snapshot.studio_mode_age_ms;
-        studio_mode_source = snapshot.studio_mode_source.clone();
         studio_control_state = snapshot.studio_control_state.clone();
         studio_transition_phase = snapshot.studio_transition_phase.clone();
         studio_transition_age_ms = snapshot.studio_transition_age_ms;
@@ -711,9 +681,6 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
         official_mcp_adapter_last_error = snapshot.official_mcp_adapter_last_error.clone();
         runtime_log_forward = snapshot.runtime_log_forward.clone();
     } else if let Some(snapshot) = hub_route_snapshot.as_ref() {
-        studio_session_state = snapshot.studio_session_state.clone();
-        last_known_session_state = snapshot.last_known_session_state.clone();
-        last_session_error_reason = snapshot.last_session_error_reason.clone();
         active_stop_request_id = snapshot.active_stop_request_id;
         last_stop_request_id = snapshot.last_stop_request_id;
         stop_request_recorded_age_ms = snapshot.stop_request_recorded_age_ms;
@@ -764,9 +731,6 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
         launch_ready,
         edit_ready,
         official_ready,
-        studio_session_state,
-        last_known_session_state,
-        last_session_error_reason,
         active_stop_request_id,
         last_stop_request_id,
         stop_request_recorded_age_ms,
@@ -775,9 +739,6 @@ pub async fn status_handler(State(state): State<PackedState>) -> Json<StatusResp
         stop_result_phase,
         stop_result_age_ms,
         stop_result_error,
-        studio_mode,
-        studio_mode_age_ms,
-        studio_mode_source,
         studio_control_state,
         studio_transition_phase,
         studio_transition_age_ms,
@@ -863,6 +824,7 @@ impl ServerHandler for RBXStudioServer {
             instructions: Some(
                 "Use launch_studio_session only when the edit Studio runtime is connected and ready.
 get_studio_mode is for diagnostics and stop-path checks, not the normal launch entrypoint.
+get_studio_session_state is the live play/stop truth query; prefer it over cached status fields.
 Use run_code to query or edit the Roblox Studio place while the edit runtime is ready.
 If Studio is already in start_play or run_server, call start_stop_play(stop), then wait until the edit runtime is ready and studio_transition_phase is idle before launching again.
 start_stop_play is stop-only and is idempotent when the edit runtime is already ready.
@@ -910,6 +872,14 @@ struct GetConsoleOutput {
 struct GetStudioMode {
     #[schemars(
         description = "Required clock-p task_id used to route this call to the matching Studio plugin instance."
+    )]
+    task_id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Clone)]
+struct GetStudioSessionState {
+    #[schemars(
+        description = "Required clock-p task_id used to route this live Studio session query to the matching Studio plugin instance."
     )]
     task_id: String,
 }
@@ -1079,6 +1049,7 @@ enum ToolArgumentValues {
     StartStopPlay(StartStopPlay),
     LaunchStudioSession(LaunchStudioSession),
     GetStudioMode(GetStudioMode),
+    GetStudioSessionState(GetStudioSessionState),
     TakeScreenshot(TakeScreenshot),
     ReadStudioLog(ReadStudioLog),
 }
@@ -1092,6 +1063,7 @@ impl ToolArgumentValues {
             ToolArgumentValues::StartStopPlay(_) => "start_stop_play",
             ToolArgumentValues::LaunchStudioSession(_) => "launch_studio_session",
             ToolArgumentValues::GetStudioMode(_) => "get_studio_mode",
+            ToolArgumentValues::GetStudioSessionState(_) => "get_studio_session_state",
             ToolArgumentValues::TakeScreenshot(_) => "take_screenshot",
             ToolArgumentValues::ReadStudioLog(_) => "read_studio_log",
         }
@@ -1105,6 +1077,7 @@ impl ToolArgumentValues {
             ToolArgumentValues::StartStopPlay(args) => &args.task_id,
             ToolArgumentValues::LaunchStudioSession(args) => &args.task_id,
             ToolArgumentValues::GetStudioMode(args) => &args.task_id,
+            ToolArgumentValues::GetStudioSessionState(args) => &args.task_id,
             ToolArgumentValues::TakeScreenshot(args) => &args.task_id,
             ToolArgumentValues::ReadStudioLog(args) => &args.task_id,
         }
@@ -1211,6 +1184,17 @@ impl RBXStudioServer {
         Parameters(args): Parameters<GetStudioMode>,
     ) -> Result<CallToolResult, ErrorData> {
         self.generic_tool_run(ToolArgumentValues::GetStudioMode(args))
+            .await
+    }
+
+    #[tool(
+        description = "Query the Studio plugin live session state. Returns JSON with studio_session_state and optional reason. Use this for current play/stop truth instead of cached helper status."
+    )]
+    async fn get_studio_session_state(
+        &self,
+        Parameters(args): Parameters<GetStudioSessionState>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.generic_tool_run(ToolArgumentValues::GetStudioSessionState(args))
             .await
     }
 
@@ -1863,9 +1847,6 @@ mod tests {
                 active_tasks: vec![HubHelperActiveTaskPayload {
                     task_id: "t_test".to_owned(),
                     remote_state: "connected".to_owned(),
-                    studio_session_state: Some("stop".to_owned()),
-                    last_known_session_state: Some("stop".to_owned()),
-                    last_session_error_reason: None,
                     active_stop_request_id: None,
                     last_stop_request_id: Some(0),
                     stop_request_recorded_age_ms: None,
@@ -1874,9 +1855,6 @@ mod tests {
                     stop_result_phase: None,
                     stop_result_age_ms: None,
                     stop_result_error: None,
-                    studio_mode: Some("stop".to_owned()),
-                    studio_mode_age_ms: Some(4),
-                    studio_mode_source: Some("edit_plugin".to_owned()),
                     studio_control_state: Some("none".to_owned()),
                     studio_transition_phase: Some("idle".to_owned()),
                     studio_transition_age_ms: None,
@@ -1893,9 +1871,6 @@ mod tests {
         let snapshot = snapshot_from_hub_status_payload(payload, "t_test").unwrap();
         assert_eq!(snapshot.helper_id.as_deref(), Some("h_test"));
         assert_eq!(snapshot.remote_state.as_deref(), Some("connected"));
-        assert_eq!(snapshot.studio_session_state.as_deref(), Some("stop"));
-        assert_eq!(snapshot.last_known_session_state.as_deref(), Some("stop"));
-        assert!(snapshot.last_session_error_reason.is_none());
         assert!(snapshot.task_services_ready());
         assert!(snapshot.launch_ready());
     }
@@ -1926,9 +1901,6 @@ mod tests {
                 active_tasks: vec![HubHelperActiveTaskPayload {
                     task_id: "t_test".to_owned(),
                     remote_state: "connected".to_owned(),
-                    studio_session_state: Some("stop".to_owned()),
-                    last_known_session_state: Some("stop".to_owned()),
-                    last_session_error_reason: None,
                     active_stop_request_id: None,
                     last_stop_request_id: Some(0),
                     stop_request_recorded_age_ms: None,
@@ -1937,9 +1909,6 @@ mod tests {
                     stop_result_phase: None,
                     stop_result_age_ms: None,
                     stop_result_error: None,
-                    studio_mode: Some("stop".to_owned()),
-                    studio_mode_age_ms: Some(4),
-                    studio_mode_source: Some("edit_plugin".to_owned()),
                     studio_control_state: Some("none".to_owned()),
                     studio_transition_phase: Some("idle".to_owned()),
                     studio_transition_age_ms: None,
@@ -1984,9 +1953,6 @@ mod tests {
                 active_tasks: vec![HubHelperActiveTaskPayload {
                     task_id: "t_test".to_owned(),
                     remote_state: "connected".to_owned(),
-                    studio_session_state: Some("play".to_owned()),
-                    last_known_session_state: Some("play".to_owned()),
-                    last_session_error_reason: None,
                     active_stop_request_id: Some(7),
                     last_stop_request_id: Some(7),
                     stop_request_recorded_age_ms: Some(12),
@@ -1995,9 +1961,6 @@ mod tests {
                     stop_result_phase: Some("observed".to_owned()),
                     stop_result_age_ms: Some(3),
                     stop_result_error: None,
-                    studio_mode: Some("start_play".to_owned()),
-                    studio_mode_age_ms: Some(4),
-                    studio_mode_source: Some("play_control".to_owned()),
                     studio_control_state: Some("ready".to_owned()),
                     studio_transition_phase: Some("running".to_owned()),
                     studio_transition_age_ms: None,
@@ -2018,29 +1981,12 @@ mod tests {
     }
 
     fn local_task_status(
-        studio_mode: &str,
+        _studio_mode: &str,
         control_state: &str,
         transition_phase: &str,
     ) -> HelperTaskStatusSnapshot {
-        let studio_session_state = if studio_mode == "stop" {
-            "stop"
-        } else if control_state == "ready" {
-            "play"
-        } else if transition_phase == "stopping_requested"
-            || transition_phase == "stopping_observed"
-        {
-            "stopping"
-        } else {
-            "starting_play"
-        };
         HelperTaskStatusSnapshot {
             task_id: "t_test".to_owned(),
-            studio_session_state: Some(studio_session_state.to_owned()),
-            last_known_session_state: Some(studio_session_state.to_owned()),
-            last_session_error_reason: None,
-            studio_mode: Some(studio_mode.to_owned()),
-            studio_mode_age_ms: Some(4),
-            studio_mode_source: Some("play_control".to_owned()),
             studio_control_state: Some(control_state.to_owned()),
             studio_transition_phase: Some(transition_phase.to_owned()),
             studio_transition_age_ms: None,
@@ -2106,9 +2052,6 @@ mod tests {
             task_accepting_launches: true,
             task_services_healthy: true,
             remote_state: Some("connected".to_owned()),
-            studio_session_state: Some("play".to_owned()),
-            last_known_session_state: Some("play".to_owned()),
-            last_session_error_reason: None,
             active_stop_request_id: Some(7),
             last_stop_request_id: Some(7),
             stop_request_recorded_age_ms: Some(12),
@@ -2154,9 +2097,6 @@ mod tests {
                 active_tasks: vec![HubHelperActiveTaskPayload {
                     task_id: "t_test".to_owned(),
                     remote_state: "connected".to_owned(),
-                    studio_session_state: Some("stop".to_owned()),
-                    last_known_session_state: Some("stop".to_owned()),
-                    last_session_error_reason: None,
                     active_stop_request_id: None,
                     last_stop_request_id: Some(0),
                     stop_request_recorded_age_ms: None,
@@ -2165,9 +2105,6 @@ mod tests {
                     stop_result_phase: None,
                     stop_result_age_ms: None,
                     stop_result_error: None,
-                    studio_mode: Some("stop".to_owned()),
-                    studio_mode_age_ms: Some(4),
-                    studio_mode_source: Some("edit_plugin".to_owned()),
                     studio_control_state: Some("none".to_owned()),
                     studio_transition_phase: Some("idle".to_owned()),
                     studio_transition_age_ms: None,
@@ -2979,12 +2916,6 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
                         plugin_instance_count,
                         task_status,
                     }) => {
-                        let studio_mode = task_status
-                            .as_ref()
-                            .and_then(|status| status.studio_mode.clone());
-                        let studio_mode_age_ms = task_status
-                            .as_ref()
-                            .and_then(|status| status.studio_mode_age_ms);
                         let official_mcp_adapter_state = task_status
                             .as_ref()
                             .and_then(|status| status.official_mcp_adapter_state.clone());
@@ -3003,8 +2934,6 @@ async fn helper_ws_session(socket: WebSocket, state: PackedState) {
                             place_id,
                             task_id = ?task_id,
                             plugin_instance_count,
-                            studio_mode = ?studio_mode,
-                            studio_mode_age_ms = ?studio_mode_age_ms,
                             official_mcp_adapter_state = ?official_mcp_adapter_state,
                             official_mcp_adapter_age_ms = ?official_mcp_adapter_age_ms,
                             "received helper heartbeat"

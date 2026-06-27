@@ -1,20 +1,18 @@
     #[test]
-    fn task_studio_mode_snapshot_reports_none_for_idle_stop_without_runtime_control() {
+    fn task_studio_control_snapshot_reports_idle_edit_without_runtime_control() {
         let mut state = empty_helper_state();
         let instance = test_instance("93795519121520", Some("task-a"), 0);
         state.instances.insert("instance-a".to_owned(), instance);
 
-        let snapshot = task_studio_mode_snapshot(&state, "task-a");
+        let snapshot = task_studio_control_snapshot(&state, "task-a");
 
-        assert_eq!(snapshot.studio_mode.as_deref(), Some("stop"));
-        assert_eq!(snapshot.studio_mode_source, "edit_plugin");
         assert_eq!(snapshot.studio_control_state, "none");
         assert_eq!(snapshot.studio_transition_phase, "idle");
         assert_eq!(snapshot.edit_runtime_state, "ready");
     }
 
     #[test]
-    fn task_studio_mode_snapshot_reports_none_for_idle_edit_without_reported_mode() {
+    fn task_studio_control_snapshot_reports_idle_edit_without_reported_mode() {
         let mut state = empty_helper_state();
         let mut instance = test_instance("93795519121520", Some("task-a"), 0);
         instance.studio_mode = None;
@@ -22,30 +20,25 @@
         instance.studio_mode_source = "none".to_owned();
         state.instances.insert("instance-a".to_owned(), instance);
 
-        let snapshot = task_studio_mode_snapshot(&state, "task-a");
+        let snapshot = task_studio_control_snapshot(&state, "task-a");
 
-        assert!(snapshot.studio_mode.is_none());
-        assert_eq!(snapshot.studio_mode_source, "none");
         assert_eq!(snapshot.studio_control_state, "none");
         assert_eq!(snapshot.studio_transition_phase, "idle");
         assert_eq!(snapshot.edit_runtime_state, "ready");
     }
 
     #[test]
-    fn task_studio_session_state_reports_none_connected_without_instances() {
+    fn task_studio_control_snapshot_reports_none_connected_without_instances() {
         let state = empty_helper_state();
-        let snapshot = task_studio_mode_snapshot(&state, "task-a");
+        let snapshot = task_studio_control_snapshot(&state, "task-a");
 
-        assert_eq!(snapshot.studio_session_state, "none_connected");
-        assert!(snapshot.last_known_session_state.is_none());
-        assert_eq!(
-            snapshot.last_session_error_reason.as_deref(),
-            Some("studio_plugin_not_connected")
-        );
+        assert_eq!(snapshot.studio_control_state, "none");
+        assert_eq!(snapshot.studio_transition_phase, "idle");
+        assert_eq!(snapshot.edit_runtime_state, "missing");
     }
 
     #[test]
-    fn task_studio_session_state_reports_stop_for_ready_edit_runtime() {
+    fn task_studio_control_snapshot_reports_stop_for_ready_edit_runtime() {
         let mut state = empty_helper_state();
         let mut edit_instance = test_instance("93795519121520", Some("task-a"), 0);
         edit_instance.studio_mode = None;
@@ -55,16 +48,15 @@
             .instances
             .insert("edit-instance".to_owned(), edit_instance);
 
-        let snapshot = task_studio_mode_snapshot(&state, "task-a");
+        let snapshot = task_studio_control_snapshot(&state, "task-a");
 
-        assert_eq!(snapshot.studio_session_state, "stop");
-        assert_eq!(snapshot.last_known_session_state.as_deref(), Some("stop"));
-        assert!(snapshot.last_session_error_reason.is_none());
+        assert_eq!(snapshot.studio_control_state, "none");
+        assert_eq!(snapshot.studio_transition_phase, "idle");
         assert_eq!(snapshot.edit_runtime_state, "ready");
     }
 
     #[test]
-    fn task_studio_session_state_prioritizes_stopping_over_play() {
+    fn task_studio_control_snapshot_prioritizes_stopping_over_play() {
         let mut state = empty_helper_state();
         let mut instance = test_instance("93795519121520", Some("task-a"), 0);
         instance.studio_mode = Some("start_play".to_owned());
@@ -83,14 +75,11 @@
             .instances
             .insert("edit-instance".to_owned(), edit_instance);
 
-        let snapshot = task_studio_mode_snapshot(&state, "task-a");
+        let snapshot = task_studio_control_snapshot(&state, "task-a");
 
-        assert_eq!(snapshot.studio_session_state, "stopping");
+        assert_eq!(snapshot.studio_control_state, "stopping");
+        assert_eq!(snapshot.studio_transition_phase, "stopping_requested");
         assert_eq!(snapshot.active_stop_request_id, Some(3));
-        assert_eq!(
-            snapshot.last_known_session_state.as_deref(),
-            Some("stopping")
-        );
     }
 
     #[test]
@@ -227,7 +216,7 @@
     }
 
     #[test]
-    fn task_studio_mode_snapshot_reports_ready_while_control_heartbeat_is_fresh() {
+    fn task_studio_control_snapshot_reports_ready_while_control_heartbeat_is_fresh() {
         let mut state = empty_helper_state();
         let mut instance = test_instance("93795519121520", Some("task-a"), 0);
         instance.studio_mode = Some("start_play".to_owned());
@@ -237,15 +226,14 @@
         instance.studio_control_observed_at = Some(Instant::now());
         state.instances.insert("instance-a".to_owned(), instance);
 
-        let snapshot = task_studio_mode_snapshot(&state, "task-a");
+        let snapshot = task_studio_control_snapshot(&state, "task-a");
 
-        assert_eq!(snapshot.studio_mode.as_deref(), Some("start_play"));
         assert_eq!(snapshot.studio_control_state, "ready");
         assert_eq!(snapshot.studio_transition_phase, "running");
     }
 
     #[test]
-    fn task_studio_mode_snapshot_reports_lost_after_control_heartbeat_expires() {
+    fn task_studio_control_snapshot_reports_lost_after_control_heartbeat_expires() {
         let mut state = empty_helper_state();
         let mut instance = test_instance("93795519121520", Some("task-a"), 0);
         instance.studio_mode = Some("start_play".to_owned());
@@ -256,15 +244,14 @@
             Some(Instant::now() - STUDIO_CONTROL_HEARTBEAT_STALE_AFTER - Duration::from_millis(1));
         state.instances.insert("instance-a".to_owned(), instance);
 
-        let snapshot = task_studio_mode_snapshot(&state, "task-a");
+        let snapshot = task_studio_control_snapshot(&state, "task-a");
 
-        assert_eq!(snapshot.studio_mode.as_deref(), Some("start_play"));
         assert_eq!(snapshot.studio_control_state, "lost");
         assert_eq!(snapshot.studio_transition_phase, "running");
     }
 
     #[tokio::test]
-    async fn edit_heartbeat_reports_plugin_observed_play_session() {
+    async fn edit_heartbeat_only_refreshes_edit_runtime_visibility() {
         let app = test_app_state();
         {
             let mut state = app.state.lock().await;
@@ -280,8 +267,6 @@
             State(app.clone()),
             Json(PluginEditHeartbeatRequest {
                 instance_id: "instance-a".to_owned(),
-                studio_session_state: Some("play".to_owned()),
-                studio_mode: Some("start_play".to_owned()),
             }),
         )
         .await
@@ -289,16 +274,11 @@
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let state = app.state.lock().await;
         let instance = state.instances.get("instance-a").unwrap();
-        assert_eq!(instance.studio_mode.as_deref(), Some("start_play"));
-        assert_eq!(instance.studio_mode_source, "edit_session_state");
-        assert_eq!(instance.studio_transition_phase, "running");
-        assert_eq!(instance.studio_control_state, "lost");
-        assert_eq!(edit_runtime_state(instance), "runtime");
-
-        let snapshot = task_studio_mode_snapshot(&state, "task-a");
-        assert_eq!(snapshot.studio_session_state, "play");
-        assert_eq!(snapshot.studio_control_state, "lost");
-        assert_eq!(snapshot.studio_transition_phase, "running");
+        assert!(instance.studio_mode.is_none());
+        assert_eq!(instance.studio_mode_source, "none");
+        assert_eq!(instance.studio_transition_phase, "idle");
+        assert_eq!(instance.studio_control_state, "none");
+        assert_eq!(edit_runtime_state(instance), "ready");
     }
 
     #[tokio::test]
@@ -339,7 +319,7 @@
         assert!(instance.studio_control_observed_at.is_none());
         assert!(instance.edit_runtime_observed_at.is_some());
 
-        let snapshot = task_studio_mode_snapshot(&state, "task-a");
+        let snapshot = task_studio_control_snapshot(&state, "task-a");
         assert_eq!(snapshot.studio_control_state, "none");
         assert_eq!(snapshot.studio_transition_phase, "idle");
         assert_eq!(snapshot.edit_runtime_state, "ready");
@@ -672,7 +652,7 @@
 
         {
             let state = app.state.lock().await;
-            let snapshot = task_studio_mode_snapshot(&state, "task-a");
+            let snapshot = task_studio_control_snapshot(&state, "task-a");
             assert_eq!(snapshot.studio_transition_phase, "stopping_requested");
             assert_eq!(snapshot.studio_control_state, "stopping");
             assert_eq!(snapshot.active_stop_request_id, Some(1));
