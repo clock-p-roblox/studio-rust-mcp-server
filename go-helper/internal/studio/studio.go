@@ -189,6 +189,29 @@ func (m *Manager) KillManagedPID(pid int) bool {
 	return true
 }
 
+func (m *Manager) ManagedPIDForPlace(placeID string) (int, error) {
+	if !placeIDPattern.MatchString(placeID) {
+		return 0, errors.New("placeid must contain digits only")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	matches := make([]int, 0, 1)
+	for pid, process := range m.processes {
+		if process.PlaceID == placeID && processIsRunning(pid) {
+			matches = append(matches, pid)
+		}
+	}
+	if len(matches) == 0 {
+		return 0, fmt.Errorf("no running managed Roblox Studio for placeId %s", placeID)
+	}
+	if len(matches) > 1 {
+		sort.Ints(matches)
+		return 0, fmt.Errorf("multiple running managed Roblox Studio processes for placeId %s: %v", placeID, matches)
+	}
+	return matches[0], nil
+}
+
 func (m *Manager) start(ctx context.Context, placeID string, source string, markDesired bool) (LaunchResult, error) {
 	if !placeIDPattern.MatchString(placeID) {
 		return LaunchResult{}, errors.New("placeid must contain digits only")

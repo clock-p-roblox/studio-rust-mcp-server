@@ -558,3 +558,16 @@ The test plan must cover:
 - Run repeated play -> stop -> play -> stop tests locally.
 - Run concurrent play/stop enqueue tests locally.
 - After concurrency tests, verify a fresh play or stop command still works and `/studio/summary` has no stuck queue, no stale waiting response command, and a coherent `active_mode`.
+
+### Phase 8: Local Studio Screenshot
+
+- Add `GET /debug/studio/screenshot/{placeid}` to helper2.
+- Resolve the managed Studio PID for the requested place id.
+- If multiple managed Studio processes exist for the same place id, fail instead of guessing.
+- On Windows, enumerate visible top-level windows and prefer a Roblox Studio window with the exact managed PID.
+- If no exact PID window is found but exactly one visible Roblox Studio window exists, allow a fallback and mark it in the response.
+- Enumerate child windows to find the Studio viewport, following helper1's size-based heuristic.
+- Capture the selected window with PowerShell and `PrintWindow(hwnd, hdc, 2)`.
+- If the first capture fails or looks black, restore/foreground the Studio window, wait briefly, and retry once.
+- Save the PNG under the helper2 data directory and return the path, selected PID, window title, dimensions, byte count, and fallback flag.
+- Verify screenshot capture locally in edit mode and play mode.

@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/screenshot"
 	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/studio"
 )
 
@@ -573,6 +574,49 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":     true,
 			"launch": result,
+		})
+	})
+	mux.HandleFunc("GET /debug/studio/screenshot/{placeid}", func(w http.ResponseWriter, r *http.Request) {
+		placeID := r.PathValue("placeid")
+		if !studio.PlaceIDIsValid(placeID) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"ok":    false,
+				"error": "placeid must contain digits only",
+			})
+			return
+		}
+		studioPID, err := studioManager.ManagedPIDForPlace(placeID)
+		if err != nil {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"ok":       false,
+				"place_id": placeID,
+				"error":    err.Error(),
+			})
+			return
+		}
+		result, err := screenshot.CaptureStudioScreenshot(r.Context(), studioPID, "", "studio-"+placeID)
+		if err != nil {
+			logger.Warn("failed to capture Roblox Studio screenshot", "place_id", placeID, "studio_pid", studioPID, "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"ok":         false,
+				"place_id":   placeID,
+				"studio_pid": studioPID,
+				"error":      err.Error(),
+			})
+			return
+		}
+		logger.Info(
+			"captured Roblox Studio screenshot",
+			"place_id", placeID,
+			"studio_pid", result.StudioPID,
+			"path", result.Path,
+			"bytes", result.Bytes,
+			"fallback", result.Fallback,
+		)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":         true,
+			"place_id":   placeID,
+			"screenshot": result,
 		})
 	})
 
