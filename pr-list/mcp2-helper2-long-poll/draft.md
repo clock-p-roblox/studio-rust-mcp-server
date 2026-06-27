@@ -4,6 +4,8 @@
 
 This draft defines the first mcp2 <-> helper2 command channel.
 
+Status note: Phases 1-8 are obsolete historical planning context. The current roblox-agent refactor mainline starts from Phase 9 and the hubless task-agent/helper2 direction. Keep the Phase 1-8 notes only as background for why the command-channel shape exists; do not treat them as the active implementation plan.
+
 The channel is intentionally minimal:
 
 - mcp2 pulls one command at a time from helper2.
@@ -12,6 +14,8 @@ The channel is intentionally minimal:
 - mcp2 never runs the command loop in the play client VM.
 - a Studio mode lifecycle change invalidates all queued work in the current global queue. After the later task-scoped command channel exists, the same lifecycle change invalidates only that task's queued work.
 - helper2 recovers a managed Studio if the mcp2 channel becomes stale.
+
+The obsolete Phase 1-8 notes validate and support exactly one active helper-managed Studio lifecycle on the global mcp2 command channel. The temporary `placeid` debug endpoints select the desired target for local testing, but they do not make this channel safe for concurrent control of multiple Studio instances. Multi-Studio concurrency belongs to the current task-scoped command channel work in Phase 9 and later.
 
 hub and task-server are outside the current PR scope. This draft includes the first formal Studio control command kinds needed to test edit/play lifecycle switching. Later hubless task-agent, Rojo, runtime-log, and public-exposure work is captured separately under Roadmap.
 
@@ -72,9 +76,9 @@ Each mcp2 process creates a numeric `mode_seq` at startup. The value should comb
 
 When Studio enters play, the play server VM has a new `mode_seq`. When Studio returns to edit, the edit VM might reuse its previous process and therefore keep its old `mode_seq`. helper2 must still treat a newly observed `mode_seq` from another VM as a lifecycle switch.
 
-The protocol relies on Studio's VM ownership behavior: the edit VM is suspended while Studio is in play, and the play VM is independent from the edit VM. Because of that, helper2 does not try to merge or arbitrate simultaneous edit/play activity. A pull or ping from a different `mode_seq` means helper2 has observed a different active VM lifecycle and should switch to it.
+The protocol relies on Studio's VM ownership behavior: the edit VM is suspended while Studio is in play, and the play VM is independent from the edit VM. Because of that, helper2 does not try to merge or arbitrate simultaneous edit/play activity. A real pull from a different `mode_seq` means helper2 has observed a different active VM lifecycle and should switch to it. Pings never switch lifecycle.
 
-If mcp2 catches an unexpected command execution error while processing a delivered command, it must report that command result with the current `mode_seq` first, so helper2 can complete the matching `waiting_response_command`. After helper2 explicitly records that result, mcp2 should advance `mode_seq` before the next pull. This creates a new helper2 lifecycle boundary for the still-running plugin loop without making the error result look stale. For play/stop Studio API failures that happen after the pre-action command result was already recorded, mcp2 logs the later failure and advances `mode_seq`; it must not try to mutate the already-completed command result.
+If mcp2 catches an unexpected command execution error while processing a delivered command, it must report that command result with the current `mode_seq` first, so helper2 can complete the matching `waiting_response_command`. After mcp2 receives HTTP 200 for that result, it should advance `mode_seq` before the next pull. This creates a new helper2 lifecycle boundary for the still-running plugin loop without making the error result look stale. For play/stop Studio API failures that happen after the pre-action command result was already posted successfully, mcp2 logs the later failure and advances `mode_seq`; it must not try to mutate the already-completed command result.
 
 ## Protocol Endpoints
 
@@ -156,34 +160,13 @@ Request body:
 }
 ```
 
-helper2 returns HTTP 200 when the result payload has been acknowledged by the HTTP endpoint. HTTP 200 does not mean the command was completed. The response body must distinguish this with a recorded flag:
+`response_result` is mcp2's answer to a delivered command. It is not a request for helper2 to approve the command a second time.
 
-```json
-{
-  "ok": true,
-  "command_id": 123,
-  "recorded": true,
-  "ignored": false
-}
-```
+helper2 returns HTTP 200 when the result payload has been received and parsed by the HTTP endpoint. HTTP 200 is only a transport receipt. It does not prove any Studio action succeeded. The response body is not part of the protocol and mcp2 must not make control decisions from it.
 
-Before completing `waiting_response_command`, helper2 must validate that the request comes from the current helper-managed Studio connection, that the canonical Studio PID matches the active channel PID, that `mode_seq` matches the active lifecycle, and that `command_id` matches the current waiting response command. Invalid, stale, unmatched, or wrong-lifecycle results are acknowledged with HTTP 200 and logged as ignored with `recorded=false`; they must not clear `waiting_response_command`, wake command waiters, or call completion callbacks. When this draft says mcp2 must wait for helper2 to acknowledge or record a command result, it means mcp2 must receive `recorded=true`, not merely HTTP 200.
+Before completing `waiting_response_command`, helper2 must validate that the request comes from the current helper-managed Studio connection, that the canonical Studio PID matches the active channel PID, that `mode_seq` matches the active lifecycle, and that `command_id` matches the current waiting response command. Invalid, stale, unmatched, or wrong-lifecycle results are still acknowledged with HTTP 200 and logged as ignored internally; they must not clear `waiting_response_command`, wake command waiters, or call completion callbacks.
 
-mcp2 must classify `recorded=false` before deciding whether to retry the same result:
-
-```text
-retryable:
-  invalid_helper_ack_body
-  empty/unknown transient helper response
-
-terminal for the delivered command:
-  invalid_lifecycle_source
-  studio_pid_mismatch
-  mode_seq_mismatch
-  not_waiting_for_command
-```
-
-`invalid_helper_ack_body` means helper2 returned an HTTP success but mcp2 could not parse the acknowledgement body or the body was missing required acknowledgement fields. For retryable cases, mcp2 backs off and reposts the same result. For terminal cases, helper2 has already decided the delivered command can no longer be completed in the current lifecycle. mcp2 must stop the command heartbeat, must not invoke any play/stop Studio transition for that command, should advance `mode_seq` to create a fresh lifecycle boundary, and should return to the pull loop. This prevents a plugin from waiting forever for `recorded=true` after helper2 has already cleaned or superseded the command.
+mcp2 should retry posting an ordinary command result only when it does not receive HTTP 200 because of a connection failure, timeout, server close, or other transport-level failure. Once mcp2 receives HTTP 200, it treats the result post as complete and returns to the pull loop. mcp2 does not retry based on helper2 internal command matching decisions.
 
 ### Debug Command Enqueue
 
@@ -191,7 +174,7 @@ terminal for the delivered command:
 
 This endpoint exists only to test the helper2/mcp2 command channel before hub/task-server integration exists.
 
-If helper2 is in `wait_init_mode`, the endpoint fails immediately because there is no initialized mcp2 execution lifecycle.
+If helper2 is in `wait_init_mode`, this endpoint fails immediately because there is no initialized mcp2 execution lifecycle. The temporary mode query endpoint is the deliberate debug exception: it may wait briefly for an mcp2 VM and return `available=false` instead of failing as a normal command enqueue.
 
 Supported debug command kinds:
 
@@ -248,14 +231,18 @@ A queued command has this wire shape:
 - is a formal command kind.
 - may be executed by `edit` or `play_server` mode mcp2.
 - returns the mcp2-observed mode, `mode_seq`, and RunService flags.
-- exists to let upstream callers verify Studio mode after play/stop, because play/stop command success means the command was accepted before the Studio transition, not that the final mode has already been observed.
+- exists to let upstream callers verify Studio mode after play/stop, because play/stop command success means mcp2 sent its pre-action command response, not that the final mode has already been observed.
 - waits at most 5 seconds for an available mcp2 VM. If no VM is available during that short window, it should return an unknown/unavailable mode result instead of blocking for the full play/stop verification window.
 
-For `studio_play` and `studio_stop`, mcp2 must send `response_result` and receive helper2's explicit `recorded=true` confirmation before invoking the Studio transition call. This pre-action result means "the command was accepted and the Studio transition is about to be requested." It is not proof that the final Studio mode has changed. If helper2 returns HTTP 200 with `recorded=false`, mcp2 must not start the transition. Retryable `recorded=false` reasons may be retried with backoff; terminal `recorded=false` reasons end the delivered command and return mcp2 to the pull loop as described in Response Result. After receiving command-level success, upstream LLM or bridge code should verify final state through `studio_mode_query` or task status.
+For `studio_play` and `studio_stop`, mcp2 must send a pre-action `response_result` before invoking the Studio transition call. This pre-action result is mcp2's command response: it means mcp2 accepted the command and intends to request the Studio transition. It is not proof that the final Studio mode has changed.
 
-The debug play/stop entrypoints are enqueue-only and do not serialize around a pending Studio mode transition. If a stop command is consumed by edit mode during a play transition, the command may return `already_stopped`; this is acceptable for this phase because the endpoint result is not the authoritative final Studio state. The invariant for this phase is narrower: mixed or concurrent play/stop requests must not poison the helper2 queue, mcp2 loop, or later fresh play/stop commands.
+After posting the pre-action result, mcp2 waits at most 3 seconds for the HTTP post attempt to finish. This wait is only a bounded transport step; it is not a second command confirmation. Whether the post returns HTTP 200 or times out, mcp2 then invokes the Studio transition call. If the post does not return HTTP 200, mcp2 logs that the pre-action result delivery is uncertain so upstream can rely on later mode/status verification.
 
-mcp2 must wrap Studio control calls such as `StudioTestService:ExecutePlayModeAsync({})` and `StudioTestService:EndTest({})` so Studio errors do not kill the plugin loop. For ordinary commands, such errors become command failures reported with the current `mode_seq`; after helper2 records the failure, mcp2 bumps `mode_seq` before the next pull. For `studio_play` and `studio_stop`, the command has already completed at pre-action `recorded=true` time; a later Studio API error should be logged and reflected through task status or later mode verification failure rather than mutating the already-completed command callback. After such an error, mcp2 must bump `mode_seq` and continue with the next pull using the new `mode_seq`.
+After command-level success, upstream LLM or bridge code should verify final state through `studio_mode_query` or task status. If the pre-action result post times out or fails, upstream should treat the command response delivery as uncertain, but the Studio transition may still be requested by mcp2.
+
+The debug play/stop entrypoints are enqueue-only and do not serialize around a pending Studio mode transition. If a stop command is consumed by edit mode during a play transition, the command may return `already_stopped`; this is acceptable for this phase because the endpoint result is not the authoritative final Studio state. The invariant for this phase is intentionally LLM-oriented rather than perfectly serialized: mixed or concurrent play/stop requests must leave an observable final state, must be understandable through mode/status queries, and must not poison the helper2 queue, mcp2 loop, or later fresh play/stop commands.
+
+mcp2 must wrap Studio control calls such as `StudioTestService:ExecutePlayModeAsync({})` and `StudioTestService:EndTest({})` so Studio errors do not kill the plugin loop. For ordinary commands, such errors become command failures reported with the current `mode_seq`; after mcp2 receives HTTP 200 for the failure result, it bumps `mode_seq` before the next pull. For `studio_play` and `studio_stop`, the command-level result is the pre-action `response_result`; HTTP 200 is only transport receipt for that response. A later Studio API error should be logged and reflected through task status or later mode verification failure rather than mutating any already-completed command callback. After such an error, mcp2 must bump `mode_seq` and continue with the next pull using the new `mode_seq`.
 
 ### Command Completion and Cleanup Callbacks
 
@@ -271,6 +258,7 @@ Default command timeouts:
 queued timeout before delivery: 30 seconds
 ordinary response timeout after delivery: 60 seconds
 play/stop final mode observation timeout: 20 seconds
+play/stop pre-action result HTTP post attempt timeout: 3 seconds
 single studio_mode_query wait timeout: 5 seconds
 ```
 
@@ -322,11 +310,11 @@ graceful helper2 shutdown
 
 For ordinary commands, lifecycle cleanup of `waiting_response_command` is a cancellation unless a matching `response_result` already made the command terminal.
 
-For `studio_play` and `studio_stop`, command-level success is the pre-action `response_result` recorded by helper2 with `recorded=true` before mcp2 invokes the Studio transition call. Lifecycle cleanup of a delivered play/stop command before that pre-action recorded result is cancellation or timeout, not proof of final Studio mode. Upstream callers should verify final mode separately through `studio_mode_query` or task status, using the 20 second play/stop final mode observation timeout as their verification bound.
+For `studio_play` and `studio_stop`, command-level success is mcp2 sending the pre-action `response_result`. mcp2 still invokes the Studio transition call after the bounded HTTP post attempt, even if the HTTP result is timeout or failure. Final Studio state must still be verified separately through `studio_mode_query` or task status after play/stop command responses. Lifecycle cleanup of a delivered play/stop command before helper2 receives a matching pre-action result is cancellation or timeout on the helper2/upstream waiter side, not proof that mcp2 did not request the Studio transition. Upstream callers should use the 20 second play/stop final mode observation timeout as their verification bound after play/stop command responses.
 
 If the managed Studio process exits, is manually killed, or is replaced/restarted, helper2 treats the old Studio execution environment as gone. Any queued or waiting-response commands bound to that task's old execution environment must be cleaned and completed before the replacement Studio can receive new commands.
 
-If a late `response_result` arrives after cleanup made the command terminal, helper2 should acknowledge it, log that it was stale, and not call the callback again.
+If a late `response_result` arrives after cleanup made the command terminal, helper2 should return HTTP 200, log that it was stale, and not call the callback again.
 
 `POST /debug/studio/play/{placeid}` enqueues a `studio_play` command and returns only enqueue status:
 
@@ -348,7 +336,7 @@ If a late `response_result` arrives after cleanup made the command terminal, hel
 }
 ```
 
-`GET /debug/studio/mode/{placeid}` enqueues a `studio_mode_query` command, waits at most 5 seconds for the matching `response_result`, and returns the observed mcp2 mode when available:
+`GET /debug/studio/mode/{placeid}` enqueues a `studio_mode_query` command only after an active mcp2 lifecycle is available, waits at most 5 seconds for the matching `response_result`, and returns the observed mcp2 mode when available:
 
 ```json
 {
@@ -367,11 +355,11 @@ If a late `response_result` arrives after cleanup made the command terminal, hel
 }
 ```
 
-If no mcp2 VM answers inside 5 seconds, the endpoint returns `available=false` and does not claim final Studio state.
+If no mcp2 VM answers inside 5 seconds, the endpoint returns `available=false` and does not claim final Studio state. If helper2 is still in `wait_init_mode`, the endpoint waits briefly for the first valid mcp2 pull; if none arrives, it returns `available=false` without creating a queued command.
 
 The debug play/stop HTTP endpoints do not wait for Studio to enter play or stop. The debug mode endpoint exists only to make Phase 7 final-mode verification testable before task-scoped APIs exist.
 
-Formal bridge/MCP play and stop entrypoints should wait for the command callback before returning to upstream. For `studio_play` and `studio_stop`, that callback is completed by the pre-action `response_result` recorded with `recorded=true` before mcp2 invokes the Studio transition call. Therefore a successful formal play/stop response means the transition request is about to be issued; the upstream LLM must still verify final Studio mode with `studio_mode_query` or task status.
+Formal bridge/MCP play and stop entrypoints should wait for the command callback before returning to upstream. For `studio_play` and `studio_stop`, that callback is completed when helper2 receives the matching pre-action `response_result`. Therefore a successful formal play/stop response means mcp2 answered that it accepted the command and intends to request the transition; the upstream LLM must still verify final Studio mode with `studio_mode_query` or task status.
 
 ## mcp2 Loop
 
@@ -382,11 +370,9 @@ pull_command
   command:
     execute command
     post response_result
-    wait for recorded=true or terminal recorded=false
-    if terminal recorded=false:
-      stop command heartbeat
-      bump mode_seq
-      pull again without executing post-result transition work
+    wait for HTTP 200 or transport failure
+    if transport failure:
+      retry ordinary result posts according to failure type
     pull again
 
   should_restart_pull:
@@ -396,7 +382,7 @@ pull_command
     retry according to failure type
 ```
 
-The generic loop above describes ordinary commands. For `studio_play` and `studio_stop`, command processing must post `response_result` and receive `recorded=true` for the pre-action result before invoking the Studio transition call, because the VM may hang or close during the transition. If the pre-action result ends with terminal `recorded=false`, mcp2 must not invoke the Studio transition call.
+The generic loop above describes ordinary commands. For `studio_play` and `studio_stop`, command processing must post the pre-action `response_result`, wait up to 3 seconds for the HTTP post attempt to finish, then invoke the Studio transition call. This wait is a bounded transport step, not helper2 approval. If no HTTP 200 arrives before the timeout, mcp2 logs uncertain response delivery and still invokes the Studio transition call.
 
 mcp2 must not create concurrent `pull_command` requests. Readiness for another command is expressed only by starting the next pull.
 
@@ -465,11 +451,13 @@ active_mode = wait_init_mode
 active_mode_seq = none
 ```
 
-While in `wait_init_mode`, any attempt to enqueue a command fails immediately. Commands must not be queued before a valid mcp2 VM has pulled.
+While in `wait_init_mode`, ordinary command enqueue attempts fail immediately. Commands must not be queued before a valid mcp2 VM has pulled. `GET /debug/studio/mode/{placeid}` is the only debug exception; it may wait briefly for a VM and report `available=false`.
+
+After Phase 4.5 adds PID mapping, the first pull that initializes an active lifecycle must come from a validated helper-managed Studio connection. A non-managed local request, or a request whose PID cannot be mapped to a helper-managed Studio process group, must not initialize lifecycle state, refresh liveness, create a hanging pull, clear queues, or switch lifecycle state. Before Phase 4.5, local development may use the narrower protocol-only validation needed to bring up the command loop, but the Phase 4.5 gate must close that temporary gap.
 
 ### Pull With Current Lifecycle
 
-If an incoming pull has the current `active_mode_seq`, helper2 accepts it as the current `waiting_pull`.
+After Phase 4.5, if an incoming pull has the current `active_mode_seq`, helper2 first validates the request source as the same canonical managed Studio PID. After validation succeeds, helper2 accepts it as the current `waiting_pull`.
 
 If a command is already queued, helper2 returns the command immediately.
 
@@ -477,7 +465,7 @@ If no command is queued, helper2 holds the pull for up to 10 seconds.
 
 ### Pull With New Lifecycle
 
-If an incoming pull has a different `mode_seq` from `active_mode_seq`, helper2 performs an atomic lifecycle switch:
+After Phase 4.5, if an incoming pull has a different `mode_seq` from `active_mode_seq`, helper2 first validates that the request source is a helper-managed Studio connection and resolves a reliable canonical Studio PID. If that validation or PID resolution fails, helper2 rejects the HTTP request and leaves channel state unchanged. After validation succeeds, helper2 performs an atomic lifecycle switch:
 
 ```text
 clear queue
@@ -485,7 +473,7 @@ clear waiting_response_command
 close old waiting_pull directly
 active_mode = incoming mode
 active_mode_seq = incoming mode_seq
-active_studio_pid = pid resolved from the incoming HTTP connection, if available
+active_studio_pid = canonical managed Studio PID resolved from the incoming HTTP connection
 last_pull_at = now
 ```
 
@@ -495,11 +483,11 @@ This close path must be tested against Roblox `HttpService:RequestAsync`; mcp2 m
 
 ### Ping With Current Lifecycle
 
-If `only_ping=1` and the incoming `mode_seq` matches the current lifecycle, helper2 updates `last_pull_at`, records the peer PID if available, and returns `type=pong` immediately.
+After Phase 4.5, if `only_ping=1` and the incoming `mode_seq` matches the current lifecycle, helper2 first validates the request source as the same canonical managed Studio PID. After validation succeeds, it updates `last_pull_at` and returns `type=pong` immediately.
 
-If `only_ping=1` carries a new `mode_seq`, helper2 may treat it as a lifecycle switch before returning `pong`, but only after the request is accepted as coming from a currently managed or otherwise valid Studio connection for the same task/place context. A random local HTTP request must not be able to initialize lifecycle state, refresh liveness, create a hanging pull, clear queues, or switch lifecycle state by inventing or replaying a `mode_seq`.
+If `only_ping=1` carries a different `mode_seq`, helper2 must not treat it as a lifecycle switch. It should reject the ping as wrong-lifecycle and leave the channel state unchanged. The next real pull from a validated helper-managed Studio connection is the lifecycle switch path. A random local HTTP request must not be able to initialize lifecycle state, refresh liveness, create a hanging pull, clear queues, or switch lifecycle state by inventing or replaying a `mode_seq`.
 
-If helper2 cannot validate the pull or ping source as a managed Studio connection, it should reject the HTTP request instead of returning `should_restart_pull`. This lets mcp2 use its existing request-failure backoff path and avoids a hot pull retry loop when PID or process-group resolution temporarily fails.
+After Phase 4.5, if helper2 cannot validate the pull or ping source as a managed Studio connection, it should reject the HTTP request instead of returning `should_restart_pull`. This lets mcp2 use its existing request-failure backoff path and avoids a hot pull retry loop when PID or process-group resolution temporarily fails.
 
 Ping requests never consume commands and never create `waiting_pull`.
 
@@ -532,10 +520,13 @@ clear waiting_pull
 clear waiting_response_command
 active_mode = wait_init_mode
 active_mode_seq = none
-kill the matching managed Studio process immediately
+if a reliable canonical active_studio_pid exists, kill that matching managed Studio process immediately
+if no reliable canonical active_studio_pid exists, do not guess a process from place_id or desired target
 ```
 
 The restart reason is not the kill operation. Restart happens because StudioManager owns desired Studio targets.
+
+Stale recovery must not kill by inference from the desired target list alone. If helper2 cannot identify the exact managed Studio process that owned the stale lifecycle, it clears the mcp2 channel state, logs the stale condition, and leaves any later restart or reconciliation to StudioManager.
 
 StudioManager must distinguish:
 
@@ -576,10 +567,12 @@ last_pull_at
 stale
 queued_command_count
 waiting_pull
-waiting_pull_count
+waiting_pull_count (0 or 1)
 waiting_response_command
 active_studio_pid
 ```
+
+For Phase 7, `/studio/summary` remains a channel-state diagnostic endpoint. It is not required to aggregate recent play/stop post-action Studio API errors; local verification should use logs plus `GET /debug/studio/mode/{placeid}` until task-scoped status APIs exist.
 
 helper2 resolves `active_studio_pid` from the HTTP peer connection, following the helper1 approach:
 
@@ -599,7 +592,7 @@ This draft does not split command queues by mode.
 
 This draft does not make `response_result` the authority for when the next command may be issued. The plugin decides it is ready by issuing the next `pull_command`.
 
-This draft does not add desired-mode reconciliation, last-writer-wins semantics, or timeout-based Studio kill recovery for play/stop. Concurrent play/stop requests may individually succeed or fail. The required invariant is that the command channel and plugin mode state remain usable afterward.
+This draft does not add desired-mode reconciliation, last-writer-wins semantics, or timeout-based Studio kill recovery for play/stop. Concurrent play/stop requests may individually succeed or fail. The required invariant is not programmatic perfection or total serialization; it is that a final Studio state remains observable, the LLM can understand the current state through mode/status queries, and the command channel and plugin mode state remain usable afterward.
 
 ## Roadmap: Hubless Session Direction
 
@@ -787,7 +780,7 @@ GET  /session/{task_id}/studio/screenshot
 GET  /session/{task_id}/runtime-log
 ```
 
-`POST /session/{task_id}/studio/play` and `POST /session/{task_id}/studio/stop` wait for the in-memory command callback. For play/stop, success means pre-action acceptance by mcp2, not final mode. The response should include:
+`POST /session/{task_id}/studio/play` and `POST /session/{task_id}/studio/stop` wait for the in-memory command callback. For play/stop, success means mcp2 answered that it accepted the command and intends to request the transition, not final mode. The response should include:
 
 ```json
 {
@@ -916,16 +909,17 @@ The Phase 1-8 test plan must cover:
 - direct Play `play_server` enters the same sequential pull loop as edit.
 - `mode_seq` switch clears the queue and closes the old `waiting_pull`.
 - server-side close of a hanging pull is observed by Roblox `HttpService:RequestAsync` as a retryable failure.
-- 60 second stale detection kills only the matching managed Studio and StudioManager restarts it because the desired target remains.
+- 60 second stale detection kills only the matching managed Studio when helper2 has a reliable canonical PID, and StudioManager restarts it because the desired target remains.
+- 60 second stale detection without a reliable canonical PID clears channel state, logs the stale condition, and does not guess a Studio process to kill.
 - `/debug/studio/play/{placeid}` enqueues `studio_play` and returns without waiting for play completion.
 - `/debug/studio/stop/{placeid}` enqueues `studio_stop` and returns without waiting for stop completion.
 - `edit + studio_stop` returns success with an `already_stopped` result.
 - `play_server + studio_play` returns failure with an error that clearly identifies `already_playing`.
 - concurrent play/stop requests may produce mixed command results, but afterward a fresh play or stop command must still leave mcp2 in a coherent mode and helper2 with no stale queue or waiting-response residue.
 
-### Roadmap Test Layers
+### Current Mainline Test Layers
 
-The roadmap phases should use these layers. They are not Phase 1-8 acceptance requirements. Do not start with full Studio integration when a state-machine or process-level fake can prove the same behavior faster.
+The Phase 9+ mainline should use these layers. They are not Phase 1-8 acceptance requirements. Do not start with full Studio integration when a state-machine or process-level fake can prove the same behavior faster.
 
 Layer 1: pure local fakes.
 
@@ -957,9 +951,9 @@ real Studio play/stop transitions
 real screenshot/log surfaces
 ```
 
-### Roadmap Test Gates
+### Current Mainline Test Gates
 
-Each gate below is a must-have passing condition for the relevant roadmap phase before moving to the next roadmap gate. These gates are not current Phase 1-8 acceptance requirements.
+Each gate below is a must-have passing condition for the relevant Phase 9+ mainline phase before moving to the next gate. These gates are not current Phase 1-8 acceptance requirements.
 
 Task-agent and session gate:
 
@@ -1002,7 +996,7 @@ mcp2 protocol gate:
 - `play_client` logs mode and never enters the helper2 command loop.
 - `edit` and `play_server` use the sequential pull loop.
 - mcp2 pull and response traffic is routed to task by Studio PID binding, not by plugin-supplied task hint.
-- `response_result` from an invalid source, wrong canonical Studio PID, wrong `mode_seq`, or non-waiting `command_id` is HTTP-acknowledged but ignored and must not complete a command.
+- `response_result` from an invalid source, wrong canonical Studio PID, wrong `mode_seq`, or non-waiting `command_id` receives HTTP 200 but is ignored internally and must not complete a command.
 - Cross-task queues, waiting pulls, waiting responses, active modes, and command ids do not contaminate each other.
 
 Command callback and cleanup gate:
@@ -1014,22 +1008,22 @@ Command callback and cleanup gate:
 - Callback fires exactly once for queued timeout and response timeout.
 - Callback fires exactly once when Studio exits, is manually killed, or is replaced/restarted.
 - Callback fires exactly once on helper2 shutdown.
-- Late `response_result` after terminal state is acknowledged, logged as stale, and does not call the callback again.
-- Cleanup is tested while command is queued, while command is waiting response, after play/stop pre-action `recorded=true`, and during stale recovery.
+- Late `response_result` after terminal state receives HTTP 200, is logged as stale, and does not call the callback again.
+- Cleanup is tested while command is queued, while command is waiting response, after play/stop pre-action HTTP 200, after play/stop pre-action HTTP timeout without executing the Studio transition, and during stale recovery.
 - Replacement Studio never consumes old queued or waiting-response commands.
 
 Task-scoped Studio API gate:
 
-- `POST /session/{task_id}/studio/play` waits for command callback and returns pre-action acceptance, not final mode proof.
-- `POST /session/{task_id}/studio/stop` waits for command callback and returns pre-action acceptance, not final mode proof.
-- mcp2 posts play/stop pre-action `response_result` and receives helper2 `recorded=true` before invoking Studio transition calls.
-- Later Studio API error after pre-action `recorded=true` is reflected through logs/status/mode verification failure and does not mutate the completed command callback.
+- `POST /session/{task_id}/studio/play` waits for command callback and returns mcp2's pre-action command response, not final mode proof.
+- `POST /session/{task_id}/studio/stop` waits for command callback and returns mcp2's pre-action command response, not final mode proof.
+- mcp2 posts play/stop pre-action `response_result`, waits at most 3 seconds for the HTTP post attempt to finish, then invokes Studio transition calls even if the HTTP result is timeout or failure.
+- Later Studio API error after the pre-action command response is reflected through logs/status/mode verification failure and does not mutate an already completed command callback.
 - `GET /session/{task_id}/studio/mode` returns edit mode in edit VM.
 - `GET /session/{task_id}/studio/mode` returns play_server mode in play server VM.
 - If no VM is available, mode query returns `available=false` and `mode=unknown` within 5 seconds.
 - Upstream play/stop verification polls mode or task status for at most 20 seconds.
 - Repeated play -> stop -> play -> stop works through task-scoped APIs.
-- Concurrent play/stop may produce mixed command outcomes, but afterward a fresh play or stop works and task status has no stuck queue, stale waiting response, or incoherent active mode.
+- Concurrent play/stop may produce mixed command outcomes, but afterward mode/status queries expose an understandable current state, a fresh play or stop works, and task status has no stuck queue, stale waiting response, or incoherent active mode.
 - These gates use direct Studio Play only. Start Server / Start Player split-session mode is explicitly not a Phase 1-8 or first task-scoped API acceptance requirement.
 
 Studio process gate:
@@ -1073,7 +1067,9 @@ Bridge and cross-repo gate:
 - `helper.public_url` is not used as a routing authority unless a later public phase makes it equal to `helper.base_url`.
 - Local hubless tests do not depend on old hub, old MCP server, or old runtime-log server.
 
-## Implementation Phases
+## Obsolete Phase 1-8 Notes
+
+Phases 1-8 below are obsolete and are retained only as historical context for the early global command-channel design. Do not use them as the current implementation sequence for the roblox-agent refactor. The active mainline begins at Phase 9.
 
 ### Phase 1: Protocol Shape
 
@@ -1113,6 +1109,7 @@ Bridge and cross-repo gate:
 - Add `only_ping=1` handling to `pull_command`.
 - Return `type=pong` immediately for pings.
 - Send pings from mcp2 while a command is executing.
+- Reject pings that carry a non-current `mode_seq`; lifecycle switches happen through real pulls, not pings.
 - Resolve the peer PID for pull and ping requests using the helper1 TCP owner lookup approach.
 - Add `active_studio_pid` to `/studio/summary`.
 - Verify a long-running debug command can keep the channel fresh with pings.
@@ -1122,9 +1119,10 @@ Bridge and cross-repo gate:
 - Add `last_pull_at` and 60 second stale detection.
 - Run a watchdog every 5 seconds.
 - On stale, clear mcp2 channel state and close `waiting_pull`.
-- Kill only the matching managed Studio process.
+- Kill only the matching managed Studio process when helper2 has a reliable canonical PID; otherwise clear channel state and do not guess a process to kill.
 - Let StudioManager restart only because the desired target remains desired.
-- Verify by preventing pull traffic or killing the mcp2 side and watching helper2 recover the desired Studio target.
+- Verify by preventing pull traffic or killing the mcp2 side and watching helper2 recover the desired Studio target when a reliable PID exists.
+- Verify the no-reliable-PID stale path clears channel state and does not kill by `placeid` or desired target inference.
 
 ### Phase 6: StudioManager Desired Targets
 
@@ -1142,20 +1140,21 @@ Bridge and cross-repo gate:
 - Add `POST /debug/studio/play/{placeid}` and `POST /debug/studio/stop/{placeid}`.
 - Add temporary `GET /debug/studio/mode/{placeid}` for Phase 7 final-mode verification before task-scoped mode APIs exist.
 - Keep the debug play/stop endpoints enqueue-only; they must not wait for final Studio mode.
-- Implement mcp2 `studio_play` in edit mode by posting pre-action `response_result`, receiving helper2 `recorded=true`, then calling `StudioTestService:ExecutePlayModeAsync({})`.
-- Implement mcp2 `studio_stop` in play_server mode by posting pre-action `response_result`, receiving helper2 `recorded=true`, then calling `StudioTestService:EndTest({})`.
+- Implement mcp2 `studio_play` in edit mode by posting pre-action `response_result`, waiting at most 3 seconds for the HTTP post attempt to finish, then calling `StudioTestService:ExecutePlayModeAsync({})`.
+- Implement mcp2 `studio_stop` in play_server mode by posting pre-action `response_result`, waiting at most 3 seconds for the HTTP post attempt to finish, then calling `StudioTestService:EndTest({})`.
 - Implement mcp2 `studio_mode_query` to return current mcp2 mode, `mode_seq`, and RunService flags.
+- Verify play/stop still requests the Studio transition after the 3 second pre-action result HTTP post attempt timeout.
 - Make `edit + studio_stop` return success with `already_stopped`.
 - Make `play_server + studio_play` return failure with an `already_playing` error.
-- Treat play/stop command success as pre-action acceptance, not final mode proof.
+- Treat play/stop command success as mcp2's pre-action command response, not final mode proof.
 - Verify final play/stop mode through `studio_mode_query` or task status after command success.
 - Mark commands canceled or timed out when queue/waiting-response cleanup removes them before terminal response.
-- Acknowledge but ignore late `response_result` after a command is already terminal.
+- Return HTTP 200 but ignore late `response_result` after a command is already terminal.
 - Clean and callback commands when the managed Studio process exits, is manually killed, or is replaced/restarted.
 - Run repeated play -> stop -> play -> stop tests locally.
 - Run concurrent play/stop enqueue tests locally.
 - After concurrency tests, verify a fresh play or stop command still works and `/studio/summary` has no stuck queue, no stale waiting response command, and a coherent `active_mode`.
-- Verify callbacks fire exactly once for normal response, lifecycle cleanup, task cleanup, Studio process replacement, timeout, and late response.
+- Verify callbacks fire exactly once for normal response, lifecycle cleanup, mcp2 stale cleanup, Studio process replacement, timeout, and late response.
 - Do not treat Start Server / Start Player split-session mode as part of Phase 7 acceptance. Local tests should use direct Studio Play.
 
 ### Phase 8: Local Studio Screenshot
@@ -1171,11 +1170,11 @@ Bridge and cross-repo gate:
 - Save the PNG under the helper2 data directory and return the path, selected PID, window title, dimensions, byte count, and fallback flag.
 - Verify screenshot capture locally in edit mode and play mode.
 
-## Roadmap Phases
+## Current Mainline Phases
 
-The phases below are future roadmap phases. They are not part of the current helper2/mcp2 PR acceptance boundary.
+The phases below are the current roblox-agent refactor mainline.
 
-### Roadmap Phase 9: Task Agent Local Session and Rojo
+### Phase 9: Task Agent Local Session and Rojo
 
 - Add a project-local `.clock-p/session.json` schema.
 - Make `.clock-p/session.json` gitignored in project workspaces.
@@ -1200,7 +1199,7 @@ The phases below are future roadmap phases. They are not part of the current hel
 - If it is unreachable, treat the old task-agent as dead and clean volatile process fields.
 - Verify local start, live-agent replacement, stale-session cleanup, Rojo restart on the same upstream, and config-mismatch behavior without Roblox Studio.
 
-### Roadmap Phase 10: helper2 Task Session and Desired Studio
+### Phase 10: helper2 Task Session and Desired Studio
 
 - Add helper2 session state keyed by `task_id`.
 - Use multi-task maps even if only one task is tested at first.
@@ -1228,7 +1227,7 @@ The phases below are future roadmap phases. They are not part of the current hel
 - Verify heartbeat registration, helper2 restart/re-heartbeat, desired Studio creation, release, stale expiry, atomic cleanup, and stale kill with local helper2.
 - Verify helper2 restart relies on helper-owned process cleanup, then restores task-owned desired Studio through the next task-agent heartbeat.
 
-### Roadmap Phase 11: Task-scoped mcp2 and Studio APIs
+### Phase 11: Task-scoped mcp2 and Studio APIs
 
 - Scope mcp2 command channel state by `task_id`; do not share queue, active mode, waiting pull, or waiting response command across tasks.
 - Route hubless mcp2 pull and response traffic by Studio PID binding to `task_id`, not by a plugin-supplied task hint.
@@ -1237,13 +1236,13 @@ The phases below are future roadmap phases. They are not part of the current hel
   - `POST /session/{task_id}/studio/stop`
   - `GET /session/{task_id}/studio/mode`
   - `GET /session/{task_id}/studio/screenshot`
-- Make task-scoped play/stop wait for the in-memory command callback and return pre-action acceptance, not final mode proof.
+- Make task-scoped play/stop wait for the in-memory command callback and return mcp2's pre-action command response, not final mode proof.
 - Make task-scoped mode query wait at most 5 seconds and return `available=false`, `mode=unknown` when no VM is available.
 - Verify final play/stop mode by polling task-scoped mode or task status for at most 20 seconds.
 - Promote screenshot from debug place routing to task-scoped Studio PID routing.
 - Verify repeated play -> stop -> play -> stop through task-scoped APIs.
 
-### Roadmap Phase 12: Local Rojo Through helper2
+### Phase 12: Local Rojo Through helper2
 
 - Add helper2 local Rojo proxy endpoints for Studio Rojo plugin traffic, following helper1's config endpoint plus HTTP/WebSocket forwarding shape.
 - Rojo plugin connects only to local helper2.
@@ -1253,7 +1252,7 @@ The phases below are future roadmap phases. They are not part of the current hel
 - Do not fallback from `place_id` to `task_id`.
 - Verify a local Rojo sync path through helper2 with one task.
 
-### Roadmap Phase 13: Runtime Logs via helper2
+### Phase 13: Runtime Logs via helper2
 
 - Remove runtime-log server from the local hubless path.
 - Runtime sends logs to local helper2 through `POST /runtime-log/upload`.
@@ -1266,7 +1265,7 @@ The phases below are future roadmap phases. They are not part of the current hel
 - Add slow upload or no-result logging only inside helper2 where the result can be observed.
 - Verify runtime log write and read locally without runtime-log server.
 
-### Roadmap Phase 14: Bridge Scripts Read Session Defaults
+### Phase 14: Bridge Scripts Read Session Defaults
 
 - Update launch, stop, screenshot, log, and MCP scripts to read `.clock-p/session.json`.
 - Scripts use `helper.base_url` plus the documented task-scoped helper2 path, such as `/session/{task_id}/...`.
@@ -1276,7 +1275,7 @@ The phases below are future roadmap phases. They are not part of the current hel
 - If helper2 reports `task_not_registered` or stale task, fail with a clear task-agent restart instruction.
 - Verify local launch/stop/status/log calls use the local helper endpoint from the descriptor.
 
-### Roadmap Phase 15: helper2 MCP Server Replacement
+### Phase 15: helper2 MCP Server Replacement
 
 - Move the public MCP surface into helper2.
 - Keep mcp2 plugin on localhost helper2.
@@ -1285,7 +1284,7 @@ The phases below are future roadmap phases. They are not part of the current hel
 - Remove dependency on the old Linux MCP server in local hubless mode.
 - Verify MCP status, play, stop, screenshot, and log tools through helper2 locally.
 
-### Roadmap Phase 16: Public Exposure
+### Phase 16: Public Exposure
 
 - Add helper2 public exposure through clockbridge/https-proxy.
 - Prefer embedding clockbridge agent logic as a Go library after lifting it out of `internal`.
@@ -1295,7 +1294,7 @@ The phases below are future roadmap phases. They are not part of the current hel
 - Keep Studio-side plugins on local helper2 even in public mode.
 - Verify the same bridge scripts work with local IP/port mode and public mode by changing only session descriptor endpoints.
 
-### Roadmap Phase 17: Multi-task Hardening
+### Phase 17: Multi-task Hardening
 
 - Exercise helper2 with multiple registered task sessions.
 - Verify task-agent status ports, Rojo upstreams, Studio PID bindings, runtime logs, and MCP calls remain task-scoped.
