@@ -709,6 +709,7 @@ func main() {
 			Service: "studio-helper",
 		})
 	})
+	registerMCPHandlers(mux, taskSessions, studioManager, commandBrokers, runtimeLogs, logger)
 	mux.HandleFunc("POST /session/{task_id}/heartbeat", func(w http.ResponseWriter, r *http.Request) {
 		pathTaskID := r.PathValue("task_id")
 		var request tasksession.HeartbeatRequest

@@ -1,9 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/runtimelog"
+	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/studio"
+	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/tasksession"
 )
 
 func initializeBroker(t *testing.T, broker *mcp2CommandBroker, mode string, modeSeq int64, studioPID int) {
@@ -315,4 +326,216 @@ func TestCleanupPreventsLateResponseFromResurrectingCommand(t *testing.T) {
 	if !ok || terminalAfterLateResponse.Reason != "task_released" || terminalAfterLateResponse.Result != nil {
 		t.Fatalf("late response changed terminal: %+v ok=%v", terminalAfterLateResponse, ok)
 	}
+}
+
+func TestMCPInitializeAndToolsList(t *testing.T) {
+	runtime := newTestMCPRuntime(t)
+	response := postMCP(t, runtime, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params": map[string]any{
+			"protocolVersion": "2025-11-25",
+			"capabilities":    map[string]any{},
+			"clientInfo":      map[string]any{"name": "test", "version": "1"},
+		},
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("initialize status = %d", response.Code)
+	}
+	if response.Header().Get("Mcp-Session-Id") == "" {
+		t.Fatalf("initialize did not return Mcp-Session-Id")
+	}
+	payload := decodeJSONMap(t, response.Body.Bytes())
+	if payload["error"] != nil {
+		t.Fatalf("initialize returned error: %+v", payload["error"])
+	}
+
+	response = postMCP(t, runtime, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      2,
+		"method":  "tools/list",
+	})
+	payload = decodeJSONMap(t, response.Body.Bytes())
+	result, ok := payload["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("tools/list result missing: %+v", payload)
+	}
+	tools, ok := result["tools"].([]any)
+	if !ok || len(tools) == 0 {
+		t.Fatalf("tools/list tools missing: %+v", result)
+	}
+	if !mcpToolListContains(tools, "helper2_status") || !mcpToolListContains(tools, "launch_studio_session") {
+		t.Fatalf("tools/list missing helper2 tools or compatibility aliases: %+v", tools)
+	}
+}
+
+func TestMCPStatusAndRuntimeLogToolsRequireExplicitTaskID(t *testing.T) {
+	runtime := newTestMCPRuntime(t)
+	registerTestTask(t, runtime, "task-a", "123")
+	if _, err := runtime.runtimeLogs.Append("task-a", runtimelog.Upload{
+		RuntimeID:   "server",
+		Mode:        "play_server",
+		TimestampMS: time.Now().UnixMilli(),
+		Level:       "info",
+		Message:     "hello",
+		Fields:      map[string]any{"session_id": "sess"},
+	}); err != nil {
+		t.Fatalf("append runtime log failed: %v", err)
+	}
+
+	statusResult := callMCPTool(t, runtime, "helper2_status", map[string]any{"task_id": "task-a"})
+	statusPayload := decodeToolText(t, statusResult)
+	if statusPayload["task_id"] != "task-a" || statusPayload["state"] != "live" {
+		t.Fatalf("unexpected status payload: %+v", statusPayload)
+	}
+
+	logResult := callMCPTool(t, runtime, "helper2_runtime_log", map[string]any{"task_id": "task-a"})
+	logPayload := decodeToolText(t, logResult)
+	entries, ok := logPayload["entries"].([]any)
+	if !ok || len(entries) != 1 {
+		t.Fatalf("unexpected runtime log payload: %+v", logPayload)
+	}
+
+	missingTaskResult := callMCPTool(t, runtime, "helper2_status", map[string]any{})
+	if missingTaskResult["isError"] != true {
+		t.Fatalf("missing task_id should be tool error: %+v", missingTaskResult)
+	}
+}
+
+func TestMCPStudioToolsRejectWithoutTaskBoundStudio(t *testing.T) {
+	runtime := newTestMCPRuntime(t)
+	registerTestTask(t, runtime, "task-a", "123")
+
+	result := callMCPTool(t, runtime, "launch_studio_session", map[string]any{
+		"task_id": "task-a",
+		"mode":    "start_play",
+	})
+	if result["isError"] != true {
+		t.Fatalf("launch without task-bound Studio should be tool error: %+v", result)
+	}
+	text := toolText(t, result)
+	if !strings.Contains(text, "studio_not_available") {
+		t.Fatalf("tool error = %q, want studio_not_available", text)
+	}
+}
+
+func newTestMCPRuntime(t *testing.T) *mcpRuntime {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	manager, err := studio.NewManager(logger)
+	if err != nil {
+		t.Fatalf("new studio manager failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := manager.Close(); err != nil {
+			t.Fatalf("close studio manager failed: %v", err)
+		}
+	})
+	logs, err := runtimelog.NewStore(runtimelog.DefaultMaxEntriesPerTask)
+	if err != nil {
+		t.Fatalf("new runtime log store failed: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := logs.Close(); err != nil {
+			t.Fatalf("close runtime log store failed: %v", err)
+		}
+	})
+	return &mcpRuntime{
+		taskSessions:  tasksession.NewRegistry(31*time.Second, manager),
+		studioManager: manager,
+		commandBroker: newMCP2CommandBrokerRegistry(),
+		runtimeLogs:   logs,
+		logger:        logger,
+	}
+}
+
+func registerTestTask(t *testing.T, runtime *mcpRuntime, taskID string, placeID string) {
+	t.Helper()
+	_, err := runtime.taskSessions.Heartbeat(taskID, tasksession.HeartbeatRequest{
+		TaskID:               taskID,
+		MachineName:          "test-machine",
+		PlaceID:              placeID,
+		TaskAgentPID:         1234,
+		TaskAgentStartedAtMS: time.Now().UnixMilli(),
+		RojoUpstreamURL:      "http://127.0.0.1:34872",
+	})
+	if err != nil {
+		t.Fatalf("heartbeat failed: %v", err)
+	}
+}
+
+func postMCP(t *testing.T, runtime *mcpRuntime, payload map[string]any) *httptest.ResponseRecorder {
+	t.Helper()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal mcp payload failed: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+	response := httptest.NewRecorder()
+	runtime.handleMCP(response, request)
+	return response
+}
+
+func callMCPTool(t *testing.T, runtime *mcpRuntime, name string, arguments map[string]any) map[string]any {
+	t.Helper()
+	response := postMCP(t, runtime, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      name,
+			"arguments": arguments,
+		},
+	})
+	payload := decodeJSONMap(t, response.Body.Bytes())
+	result, ok := payload["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("tools/call result missing: %+v", payload)
+	}
+	return result
+}
+
+func decodeJSONMap(t *testing.T, body []byte) map[string]any {
+	t.Helper()
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode json failed: %v body=%s", err, string(body))
+	}
+	return payload
+}
+
+func decodeToolText(t *testing.T, result map[string]any) map[string]any {
+	t.Helper()
+	return decodeJSONMap(t, []byte(toolText(t, result)))
+}
+
+func toolText(t *testing.T, result map[string]any) string {
+	t.Helper()
+	content, ok := result["content"].([]any)
+	if !ok || len(content) == 0 {
+		t.Fatalf("tool content missing: %+v", result)
+	}
+	first, ok := content[0].(map[string]any)
+	if !ok {
+		t.Fatalf("tool content entry invalid: %+v", content[0])
+	}
+	text, ok := first["text"].(string)
+	if !ok {
+		t.Fatalf("tool text missing: %+v", first)
+	}
+	return text
+}
+
+func mcpToolListContains(tools []any, name string) bool {
+	for _, item := range tools {
+		tool, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if tool["name"] == name {
+			return true
+		}
+	}
+	return false
 }
