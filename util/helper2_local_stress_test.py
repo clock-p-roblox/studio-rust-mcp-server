@@ -62,18 +62,165 @@ def http_json(method: str, url: str, payload: dict[str, Any] | None = None, *, t
     return json.loads(body.decode("utf-8"))
 
 
-def expect_http_status(url: str, expected: int) -> None:
+def http_json_expect_error(
+    method: str,
+    url: str,
+    expected: int,
+    payload: dict[str, Any] | None = None,
+    *,
+    timeout: float = 10,
+) -> Any:
+    data = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        urllib.request.urlopen(url, timeout=5).read()
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+        raise StressError(f"expected HTTP {expected} from {method} {url}, got success: {body}")
+    except urllib.error.HTTPError as exc:
+        body = exc.read()
+        if exc.code != expected:
+            raise StressError(f"expected HTTP {expected} from {method} {url}, got {exc.code}: {body.decode('utf-8', errors='replace')}") from exc
+        if not body:
+            return None
+        return json.loads(body.decode("utf-8"))
+
+
+def expect_http_status(url: str, expected: int, *, method: str = "GET") -> None:
+    try:
+        request = urllib.request.Request(url, method=method)
+        urllib.request.urlopen(request, timeout=5).read()
     except urllib.error.HTTPError as exc:
         if exc.code != expected:
-            raise StressError(f"expected HTTP {expected} from {url}, got {exc.code}") from exc
+            raise StressError(f"expected HTTP {expected} from {method} {url}, got {exc.code}") from exc
         return
-    raise StressError(f"expected HTTP {expected} from {url}, got success")
+    raise StressError(f"expected HTTP {expected} from {method} {url}, got success")
 
 
 def capture_task_screenshot(task_id: str) -> Any:
     return http_json("GET", f"{HELPER_BASE_URL}/session/{task_id}/studio/screenshot", timeout=40)
+
+
+def direct_task_mode(task_id: str, *, timeout: float = 8) -> dict[str, Any]:
+    return http_json("GET", f"{HELPER_BASE_URL}/session/{task_id}/studio/mode", timeout=timeout)
+
+
+def direct_task_play(task_id: str, *, timeout: float = 130) -> dict[str, Any]:
+    return http_json("POST", f"{HELPER_BASE_URL}/session/{task_id}/studio/play", timeout=timeout)
+
+
+def direct_task_stop(task_id: str, *, timeout: float = 130) -> dict[str, Any]:
+    return http_json("POST", f"{HELPER_BASE_URL}/session/{task_id}/studio/stop", timeout=timeout)
+
+
+def expect_external_response_result_ignored() -> None:
+    payload = http_json(
+        "POST",
+        f"{HELPER_BASE_URL}/plugin/mcp2/response_result",
+        {
+            "command_id": 999999,
+            "mode": "edit",
+            "mode_seq": 1,
+            "ok": True,
+        },
+        timeout=5,
+    )
+    if not payload.get("ignored") or payload.get("recorded") or payload.get("reason") != "invalid_lifecycle_source":
+        raise StressError(f"external response_result was not ignored as fake Studio traffic: {payload}")
+
+
+def require_task_channel_idle(summary: dict[str, Any], task_id: str) -> None:
+    channel = summary.get("mcp2_channels", {}).get(task_id)
+    if not isinstance(channel, dict):
+        raise StressError(f"missing mcp2 channel for {task_id}: {summary.get('mcp2_channels')}")
+    if channel.get("queued_command_count") != 0 or channel.get("waiting_response_command") is not None:
+        raise StressError(f"task {task_id} channel is not idle: {channel}")
+
+
+def require_screenshot_file(payload: dict[str, Any]) -> None:
+    screenshot = payload.get("screenshot")
+    if not isinstance(screenshot, dict):
+        raise StressError(f"screenshot payload missing: {payload}")
+    path = Path(str(screenshot.get("path", "")))
+    if not path.exists() or path.stat().st_size <= 0:
+        raise StressError(f"screenshot file missing or empty: {screenshot}")
+    if int(screenshot.get("bytes") or 0) <= 0 or int(screenshot.get("studio_pid") or 0) <= 0:
+        raise StressError(f"screenshot metadata is not real Studio evidence: {screenshot}")
+
+
+def require_helper_pid_evidence(log_path: Path, task_ids: list[str]) -> None:
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()
+    for task_id in task_ids:
+        pull_ok = any(
+            'msg="mcp2 pull completed"' in line
+            and f"owner_id={task_id}" in line
+            and 'user_agent="RobloxStudio' in line
+            and "studio_pid=0" not in line
+            and ("kind=studio_play" in line or "kind=studio_stop" in line or "kind=studio_mode_query" in line)
+            for line in lines
+        )
+        response_ok = any(
+            'msg="mcp2 response acknowledged"' in line
+            and f"owner_id={task_id}" in line
+            and "studio_pid=0" not in line
+            and "recorded=true" in line
+            for line in lines
+        )
+        if not pull_ok or not response_ok:
+            raise StressError(f"helper log lacks real Studio PID pull/result evidence for {task_id}: pull={pull_ok} response={response_ok}")
+
+
+def post_manual_heartbeat(task_id: str, place_id: str, pid: int, started_at: int, rojo_port: int) -> dict[str, Any]:
+    return http_json(
+        "POST",
+        f"{HELPER_BASE_URL}/session/{task_id}/heartbeat",
+        {
+            "task_id": task_id,
+            "machine_name": "manual-phase11",
+            "place_id": place_id,
+            "task_agent_pid": pid,
+            "task_agent_started_at_ms": started_at,
+            "rojo_upstream_url": f"http://127.0.0.1:{rojo_port}",
+        },
+        timeout=5,
+    )
+
+
+def release_manual_task(task_id: str, pid: int, started_at: int) -> dict[str, Any]:
+    return http_json(
+        "POST",
+        f"{HELPER_BASE_URL}/session/{task_id}/release",
+        {
+            "task_agent_pid": pid,
+            "task_agent_started_at_ms": started_at,
+        },
+        timeout=5,
+    )
+
+
+def check_direct_api_error_states(place_id: str) -> None:
+    missing_play = http_json_expect_error("POST", f"{HELPER_BASE_URL}/session/not-a-real-task/studio/play", 404)
+    if missing_play.get("state") != "not_registered":
+        raise StressError(f"unexpected missing task play payload: {missing_play}")
+
+    manual_task = "manual-phase11-no-studio"
+    manual_pid = 49001
+    manual_started = 1782658000000
+    post_manual_heartbeat(manual_task, place_id, manual_pid, manual_started, 49091)
+    no_studio = http_json_expect_error("GET", f"{HELPER_BASE_URL}/session/{manual_task}/studio/screenshot", 409)
+    if no_studio.get("code") != "studio_not_available":
+        raise StressError(f"expected studio_not_available for manual task screenshot, got {no_studio}")
+    release_manual_task(manual_task, manual_pid, manual_started)
+    ended_play = http_json_expect_error("POST", f"{HELPER_BASE_URL}/session/{manual_task}/studio/play", 409)
+    if ended_play.get("code") != "task_not_live":
+        raise StressError(f"expected task_not_live for ended task play, got {ended_play}")
+    ended_mode = direct_task_mode(manual_task)
+    if ended_mode.get("available") or ended_mode.get("state") != "ended":
+        raise StressError(f"expected ended task mode unavailable, got {ended_mode}")
 
 
 def latest_studio_diagnostics() -> str:
@@ -187,6 +334,23 @@ def wait_mode(task_id: str, expected: str, *, timeout: float) -> dict[str, Any]:
         raise StressError(f"{exc}; last mode payload={last_text}") from exc
 
 
+def wait_mode_direct(task_id: str, expected: str, *, timeout: float) -> dict[str, Any]:
+    last_payload: dict[str, Any] | None = None
+
+    def read_mode() -> dict[str, Any] | None:
+        nonlocal last_payload
+        payload = direct_task_mode(task_id, timeout=8)
+        last_payload = payload
+        if payload.get("available") and payload.get("mode") == expected:
+            return payload
+        return None
+
+    try:
+        return wait_until(f"task {task_id} direct mode {expected}", timeout, read_mode)
+    except StressError as exc:
+        raise StressError(f"{exc}; last direct mode payload={last_payload}") from exc
+
+
 def parse_tool_payload(response: dict[str, Any]) -> dict[str, Any]:
     result = response["result"]
     if result.get("isError"):
@@ -201,6 +365,14 @@ def call_tool_for_executor(name: str, task_id: str) -> dict[str, Any]:
         timeout=130,
     )
     return parse_tool_payload(response)
+
+
+def call_direct_for_executor(action: str, task_id: str) -> dict[str, Any]:
+    if action == "play":
+        return direct_task_play(task_id)
+    if action == "stop":
+        return direct_task_stop(task_id)
+    raise StressError(f"unknown direct action: {action}")
 
 
 def start_helper_process(bin_dir: Path, logs_dir: Path, log_name: str) -> subprocess.Popen[str]:
@@ -329,6 +501,8 @@ def run_stress(args: argparse.Namespace) -> dict[str, Any]:
         wait_health()
         print(f"helper pid={helper.pid}", flush=True)
 
+        wait_mode_fn = wait_mode_direct if args.direct_api_only else wait_mode
+
         agent_a = start_process(
             [
                 str(bin_dir / "task-agent.exe"),
@@ -353,7 +527,7 @@ def run_stress(args: argparse.Namespace) -> dict[str, Any]:
         desc_a = wait_descriptor(work_a)
         print(f"taskA={desc_a['task_id']} agentPid={agent_a.pid}", flush=True)
         try:
-            mode_a = wait_mode(desc_a["task_id"], "edit", timeout=args.initial_mode_timeout)
+            mode_a = wait_mode_fn(desc_a["task_id"], "edit", timeout=args.initial_mode_timeout)
         except Exception as exc:
             try:
                 shot = capture_task_screenshot(desc_a["task_id"])
@@ -388,7 +562,7 @@ def run_stress(args: argparse.Namespace) -> dict[str, Any]:
         desc_b = wait_descriptor(work_b)
         print(f"taskB={desc_b['task_id']} agentPid={agent_b.pid}", flush=True)
         try:
-            mode_b = wait_mode(desc_b["task_id"], "edit", timeout=args.initial_mode_timeout)
+            mode_b = wait_mode_fn(desc_b["task_id"], "edit", timeout=args.initial_mode_timeout)
         except Exception as exc:
             try:
                 shot = capture_task_screenshot(desc_b["task_id"])
@@ -399,40 +573,56 @@ def run_stress(args: argparse.Namespace) -> dict[str, Any]:
             raise exc
         print(f"taskB initial mode={mode_b['mode']}", flush=True)
 
-        tools = [tool["name"] for tool in mcp_raw("tools/list")["result"]["tools"]]
-        for required in ("helper2_studio_play", "helper2_studio_stop", "helper2_studio_mode", "helper2_studio_screenshot"):
-            if required not in tools:
-                raise StressError(f"tools/list missing {required}")
-        for forbidden in ("launch_studio_session", "start_stop_play", "take_screenshot", "runtime_log_read"):
-            if forbidden in tools:
-                raise StressError(f"tools/list still exposes legacy tool {forbidden}")
-        print("tools/list new-name check ok", flush=True)
+        if args.direct_api_only:
+            expect_http_status(f"{HELPER_BASE_URL}/session/not-a-real-task/studio/screenshot", 404)
+            expect_http_status(f"{HELPER_BASE_URL}/session/not-a-real-task/studio/play", 404, method="POST")
+            check_direct_api_error_states(args.place_id)
+            print("direct task API negative checks ok", flush=True)
+        else:
+            tools = [tool["name"] for tool in mcp_raw("tools/list")["result"]["tools"]]
+            for required in ("helper2_studio_play", "helper2_studio_stop", "helper2_studio_mode", "helper2_studio_screenshot"):
+                if required not in tools:
+                    raise StressError(f"tools/list missing {required}")
+            for forbidden in ("launch_studio_session", "start_stop_play", "take_screenshot", "runtime_log_read"):
+                if forbidden in tools:
+                    raise StressError(f"tools/list still exposes legacy tool {forbidden}")
+            print("tools/list new-name check ok", flush=True)
 
-        old_error = expect_mcp_error("launch_studio_session", {"task_id": desc_a["task_id"]}, "unknown helper2 MCP tool")
-        bad_task_error = expect_mcp_error("helper2_studio_screenshot", {"task_id": "not-a-real-task"}, "no registered session")
-        bad_mode_error = expect_mcp_error(
-            "helper2_studio_stop",
-            {"task_id": desc_a["task_id"], "mode": "start_play"},
-            "supports stop only",
-        )
+            old_error = expect_mcp_error("launch_studio_session", {"task_id": desc_a["task_id"]}, "unknown helper2 MCP tool")
+            bad_task_error = expect_mcp_error("helper2_studio_screenshot", {"task_id": "not-a-real-task"}, "no registered session")
+            bad_mode_error = expect_mcp_error(
+                "helper2_studio_stop",
+                {"task_id": desc_a["task_id"], "mode": "start_play"},
+                "supports stop only",
+            )
+            print(
+                "negative checks ok: "
+                f"old={old_error}; bad_task={bad_task_error}; bad_mode={bad_mode_error}",
+                flush=True,
+            )
         expect_http_status(f"{HELPER_BASE_URL}/v1/rojo/config?place_id={args.place_id}", 403)
         expect_http_status(f"{HELPER_BASE_URL}/plugin/mcp2/pull_command?mode=edit&mode_seq=1", 403)
-        print(
-            "negative checks ok: "
-            f"old={old_error}; bad_task={bad_task_error}; bad_mode={bad_mode_error}",
-            flush=True,
-        )
+        expect_external_response_result_ignored()
+        print("external plugin route negative checks ok", flush=True)
 
         shot_a = None
         shot_b = None
         for cycle in range(1, args.cycles + 1):
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-                future_play_a = executor.submit(call_tool_for_executor, "helper2_studio_play", desc_a["task_id"])
-                future_play_b = executor.submit(call_tool_for_executor, "helper2_studio_play", desc_b["task_id"])
+                if args.direct_api_only:
+                    future_play_a = executor.submit(call_direct_for_executor, "play", desc_a["task_id"])
+                    future_play_b = executor.submit(call_direct_for_executor, "play", desc_b["task_id"])
+                else:
+                    future_play_a = executor.submit(call_tool_for_executor, "helper2_studio_play", desc_a["task_id"])
+                    future_play_b = executor.submit(call_tool_for_executor, "helper2_studio_play", desc_b["task_id"])
                 mode_samples: list[str] = []
                 for _ in range(12):
-                    mode_samples.append(mcp_tool("helper2_studio_mode", {"task_id": desc_a["task_id"]}, timeout=8)[1])
-                    mode_samples.append(mcp_tool("helper2_studio_mode", {"task_id": desc_b["task_id"]}, timeout=8)[1])
+                    if args.direct_api_only:
+                        mode_samples.append(json.dumps(direct_task_mode(desc_a["task_id"], timeout=8), ensure_ascii=False))
+                        mode_samples.append(json.dumps(direct_task_mode(desc_b["task_id"], timeout=8), ensure_ascii=False))
+                    else:
+                        mode_samples.append(mcp_tool("helper2_studio_mode", {"task_id": desc_a["task_id"]}, timeout=8)[1])
+                        mode_samples.append(mcp_tool("helper2_studio_mode", {"task_id": desc_b["task_id"]}, timeout=8)[1])
                     time.sleep(0.5)
                 play_a = future_play_a.result(timeout=150)
                 play_b = future_play_b.result(timeout=150)
@@ -441,21 +631,37 @@ def run_stress(args: argparse.Namespace) -> dict[str, Any]:
                 f"A={play_a.get('mode')} B={play_b.get('mode')} samples={len(mode_samples)}",
                 flush=True,
             )
-            wait_mode(desc_a["task_id"], "play_server", timeout=30)
-            wait_mode(desc_b["task_id"], "play_server", timeout=30)
+            wait_mode_fn(desc_a["task_id"], "play_server", timeout=30)
+            wait_mode_fn(desc_b["task_id"], "play_server", timeout=30)
 
             if cycle == 1 or cycle == args.cycles:
-                shot_a = mcp_tool("helper2_studio_screenshot", {"task_id": desc_a["task_id"]}, timeout=40)[2]
-                shot_b = mcp_tool("helper2_studio_screenshot", {"task_id": desc_b["task_id"]}, timeout=40)[2]
+                if args.direct_api_only:
+                    shot_a = capture_task_screenshot(desc_a["task_id"])
+                    shot_b = capture_task_screenshot(desc_b["task_id"])
+                else:
+                    shot_a = mcp_tool("helper2_studio_screenshot", {"task_id": desc_a["task_id"]}, timeout=40)[2]
+                    shot_b = mcp_tool("helper2_studio_screenshot", {"task_id": desc_b["task_id"]}, timeout=40)[2]
+                require_screenshot_file(shot_a)
+                require_screenshot_file(shot_b)
                 print(f"cycle {cycle} screenshots ok A={shot_a['screenshot']} B={shot_b['screenshot']}", flush=True)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-                future_stop_a1 = executor.submit(call_tool_for_executor, "helper2_studio_stop", desc_a["task_id"])
+                if args.direct_api_only:
+                    future_stop_a1 = executor.submit(call_direct_for_executor, "stop", desc_a["task_id"])
+                else:
+                    future_stop_a1 = executor.submit(call_tool_for_executor, "helper2_studio_stop", desc_a["task_id"])
                 time.sleep(0.1)
-                future_stop_a2 = executor.submit(call_tool_for_executor, "helper2_studio_stop", desc_a["task_id"])
-                future_stop_b1 = executor.submit(call_tool_for_executor, "helper2_studio_stop", desc_b["task_id"])
+                if args.direct_api_only:
+                    future_stop_a2 = executor.submit(call_direct_for_executor, "stop", desc_a["task_id"])
+                    future_stop_b1 = executor.submit(call_direct_for_executor, "stop", desc_b["task_id"])
+                else:
+                    future_stop_a2 = executor.submit(call_tool_for_executor, "helper2_studio_stop", desc_a["task_id"])
+                    future_stop_b1 = executor.submit(call_tool_for_executor, "helper2_studio_stop", desc_b["task_id"])
                 time.sleep(0.1)
-                future_stop_b2 = executor.submit(call_tool_for_executor, "helper2_studio_stop", desc_b["task_id"])
+                if args.direct_api_only:
+                    future_stop_b2 = executor.submit(call_direct_for_executor, "stop", desc_b["task_id"])
+                else:
+                    future_stop_b2 = executor.submit(call_tool_for_executor, "helper2_studio_stop", desc_b["task_id"])
                 stop_a1 = future_stop_a1.result(timeout=150)
                 stop_a2 = future_stop_a2.result(timeout=150)
                 stop_b1 = future_stop_b1.result(timeout=150)
@@ -466,8 +672,8 @@ def run_stress(args: argparse.Namespace) -> dict[str, Any]:
                 f"B1={stop_b1.get('mode')} B2={stop_b2.get('mode')}",
                 flush=True,
             )
-            wait_mode(desc_a["task_id"], "edit", timeout=30)
-            wait_mode(desc_b["task_id"], "edit", timeout=30)
+            wait_mode_fn(desc_a["task_id"], "edit", timeout=30)
+            wait_mode_fn(desc_b["task_id"], "edit", timeout=30)
 
         if args.helper_restart:
             print("terminating helper to simulate local helper/network outage", flush=True)
@@ -478,8 +684,8 @@ def run_stress(args: argparse.Namespace) -> dict[str, Any]:
             helper = start_helper_process(bin_dir, logs_dir, "helper-restarted.log")
             wait_health()
             print(f"helper restarted old_pid={old_helper_pid} new_pid={helper.pid}", flush=True)
-            wait_mode(desc_a["task_id"], "edit", timeout=150)
-            wait_mode(desc_b["task_id"], "edit", timeout=150)
+            wait_mode_fn(desc_a["task_id"], "edit", timeout=150)
+            wait_mode_fn(desc_b["task_id"], "edit", timeout=150)
             print("helper restart recovery ok: both task sessions returned to edit", flush=True)
 
         subprocess.run(["taskkill", "/PID", str(agent_b.pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -489,11 +695,32 @@ def run_stress(args: argparse.Namespace) -> dict[str, Any]:
         status_b = http_json("GET", f"{HELPER_BASE_URL}/session/{desc_b['task_id']}/status", timeout=10)
         if status_b.get("state") != "expired":
             raise StressError(f"expected task B expired after killed agent, got {status_b}")
+        if args.direct_api_only:
+            expired_play = http_json_expect_error("POST", f"{HELPER_BASE_URL}/session/{desc_b['task_id']}/studio/play", 409)
+            if expired_play.get("code") != "task_not_live":
+                raise StressError(f"expected task_not_live for expired task play, got {expired_play}")
+            expired_screenshot = http_json_expect_error("GET", f"{HELPER_BASE_URL}/session/{desc_b['task_id']}/studio/screenshot", 409)
+            if expired_screenshot.get("code") != "task_not_live":
+                raise StressError(f"expected task_not_live for expired task screenshot, got {expired_screenshot}")
+            expired_mode = direct_task_mode(desc_b["task_id"])
+            if expired_mode.get("available") or expired_mode.get("state") != "expired":
+                raise StressError(f"expected expired task mode unavailable, got {expired_mode}")
         summary = http_json("GET", f"{HELPER_BASE_URL}/studio/summary", timeout=10)
         b_studios = [studio for studio in summary.get("studios", []) if studio.get("owner_id") == desc_b["task_id"]]
         if b_studios:
             raise StressError(f"expected no task B studios after expiry, got {b_studios}")
-        mode_a_after = wait_mode(desc_a["task_id"], "edit", timeout=30)
+        mode_a_after = wait_mode_fn(desc_a["task_id"], "edit", timeout=30)
+        if args.direct_api_only:
+            shot_a_after_expiry = capture_task_screenshot(desc_a["task_id"])
+            require_screenshot_file(shot_a_after_expiry)
+            print(f"post-expiry taskA screenshot ok {shot_a_after_expiry['screenshot']}", flush=True)
+            direct_task_play(desc_a["task_id"])
+            wait_mode_direct(desc_a["task_id"], "play_server", timeout=30)
+            direct_task_stop(desc_a["task_id"])
+            wait_mode_direct(desc_a["task_id"], "edit", timeout=30)
+            summary = http_json("GET", f"{HELPER_BASE_URL}/studio/summary", timeout=10)
+            require_task_channel_idle(summary, desc_a["task_id"])
+            require_helper_pid_evidence(logs_dir / "helper.log", [desc_a["task_id"], desc_b["task_id"]])
         print(f"lease expiry isolation ok B={status_b['state']} A={mode_a_after['mode']}", flush=True)
 
         return {
@@ -522,6 +749,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kill-existing", action="store_true", help="Kill existing Studio/helper/task-agent processes before the stress test.")
     parser.add_argument("--cycles", type=int, default=1, help="Number of concurrent play/stop cycles to run before lease-expiry checks.")
     parser.add_argument("--helper-restart", action="store_true", help="Restart helper while task-agents stay alive, then wait for heartbeat recovery.")
+    parser.add_argument("--direct-api-only", action="store_true", help="Use helper2 HTTP task APIs directly instead of helper2 MCP tools.")
     return parser.parse_args()
 
 
