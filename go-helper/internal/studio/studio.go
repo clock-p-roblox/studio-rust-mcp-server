@@ -203,13 +203,19 @@ func (m *Manager) KillTaskStudios(taskID string) []int {
 		if process.OwnerKind == "task" && process.OwnerID == taskID && processIsManagedRunning(pid, process.StartedAt) {
 			process.PID = pid
 			matches = append(matches, process)
+			delete(m.processes, pid)
 		}
 	}
 	m.mu.Unlock()
 
 	killed := make([]int, 0, len(matches))
 	for _, process := range matches {
-		if m.KillManagedProcess(process) {
+		if err := killProcess(process.PID); err != nil {
+			m.logger.Warn("failed to kill managed Roblox Studio", "pid", process.PID, "place_id", process.PlaceID, "error", err)
+			continue
+		}
+		m.logger.Info("killed managed Roblox Studio", "pid", process.PID, "place_id", process.PlaceID)
+		if !processIsRunning(process.PID) {
 			killed = append(killed, process.PID)
 		}
 	}
