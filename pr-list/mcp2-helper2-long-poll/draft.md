@@ -8,6 +8,8 @@ Status note: Phases 1-8 are obsolete historical planning context. The current ro
 
 The old hub, task-server, helper1, mcp1 / old Rust clockp MCP server path, and old runtime-log server are deprecated. They must not be used as the implementation target, compatibility fallback, or validation gate for Phase 9+ work.
 
+Development location note: do not create git worktrees for the Phase 9+ helper2/task-agent/mcp2 mainline. Implement and validate follow-up phases directly in the main repository directory.
+
 The channel is intentionally minimal:
 
 - mcp2 pulls one command at a time from helper2.
