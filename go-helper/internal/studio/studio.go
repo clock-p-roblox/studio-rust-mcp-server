@@ -21,6 +21,7 @@ var placeIDPattern = regexp.MustCompile(`^[0-9]+$`)
 const (
 	LaunchSourceInternal = "internal"
 	LaunchSourceDebug    = "debug"
+	LaunchSourceTask     = "task"
 )
 
 type Manager struct {
@@ -28,8 +29,9 @@ type Manager struct {
 	job       *processJob
 	logger    *slog.Logger
 	processes map[int]ManagedProcess
-	desired   map[string]string
+	desired   map[string]DesiredStudio
 	starting  map[string]bool
+	canceled  map[string]bool
 }
 
 type ManagedProcess struct {
@@ -37,6 +39,8 @@ type ManagedProcess struct {
 	UniverseID string    `json:"universe_id"`
 	StudioPath string    `json:"studio_path"`
 	Source     string    `json:"source"`
+	OwnerKind  string    `json:"owner_kind,omitempty"`
+	OwnerID    string    `json:"owner_id,omitempty"`
 	PID        int       `json:"pid"`
 	StartedAt  time.Time `json:"started_at"`
 	Running    bool      `json:"running"`
@@ -59,8 +63,10 @@ type Summary struct {
 }
 
 type DesiredStudio struct {
-	PlaceID string `json:"place_id"`
-	Source  string `json:"source"`
+	PlaceID   string `json:"place_id"`
+	Source    string `json:"source"`
+	OwnerKind string `json:"owner_kind,omitempty"`
+	OwnerID   string `json:"owner_id,omitempty"`
 }
 
 func NewManager(logger *slog.Logger) (*Manager, error) {
@@ -75,8 +81,9 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 		job:       job,
 		logger:    logger,
 		processes: make(map[int]ManagedProcess),
-		desired:   make(map[string]string),
+		desired:   make(map[string]DesiredStudio),
 		starting:  make(map[string]bool),
+		canceled:  make(map[string]bool),
 	}, nil
 }
 
@@ -114,11 +121,8 @@ func (m *Manager) Summary() Summary {
 		studios = append(studios, process)
 	}
 	desired := make([]DesiredStudio, 0, len(m.desired))
-	for placeID, source := range m.desired {
-		desired = append(desired, DesiredStudio{
-			PlaceID: placeID,
-			Source:  source,
-		})
+	for _, target := range m.desired {
+		desired = append(desired, target)
 	}
 	sort.Slice(studios, func(i, j int) bool {
 		return studios[i].PID < studios[j].PID
@@ -138,34 +142,78 @@ func (m *Manager) ReconcileDesired(ctx context.Context) {
 	m.mu.Lock()
 	m.pruneStoppedProcessesLocked()
 	desired := make([]DesiredStudio, 0, len(m.desired))
-	for placeID, source := range m.desired {
-		if m.starting[placeID] {
+	for _, target := range m.desired {
+		if m.starting[desiredKey(target)] {
 			continue
 		}
 		hasRunning := false
 		for pid, process := range m.processes {
-			if process.PlaceID == placeID && processIsManagedRunning(pid, process.StartedAt) {
+			if managedProcessMatchesDesired(process, target) && processIsManagedRunning(pid, process.StartedAt) {
 				hasRunning = true
 				break
 			}
 		}
 		if !hasRunning {
-			desired = append(desired, DesiredStudio{
-				PlaceID: placeID,
-				Source:  source,
-			})
+			desired = append(desired, target)
 		}
 	}
 	m.mu.Unlock()
 
 	for _, target := range desired {
-		result, err := m.start(ctx, target.PlaceID, target.Source, false)
+		result, err := m.startDesired(ctx, target, false)
 		if err != nil {
 			m.logger.Error("failed to reconcile desired Roblox Studio", "place_id", target.PlaceID, "source", target.Source, "error", err)
 			continue
 		}
 		m.logger.Info("restarted desired Roblox Studio", "place_id", result.PlaceID, "source", result.Source, "pid", result.PID)
 	}
+}
+
+func (m *Manager) EnsureTaskDesired(taskID string, placeID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	target := DesiredStudio{
+		PlaceID:   placeID,
+		Source:    LaunchSourceTask,
+		OwnerKind: "task",
+		OwnerID:   taskID,
+	}
+	m.desired[desiredKey(target)] = target
+	delete(m.canceled, desiredKey(target))
+}
+
+func (m *Manager) RemoveTaskDesired(taskID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for key, target := range m.desired {
+		if target.OwnerKind == "task" && target.OwnerID == taskID {
+			delete(m.desired, key)
+			if m.starting[key] {
+				m.canceled[key] = true
+			}
+		}
+	}
+}
+
+func (m *Manager) KillTaskStudios(taskID string) []int {
+	m.mu.Lock()
+	m.pruneStoppedProcessesLocked()
+	matches := make([]ManagedProcess, 0)
+	for pid, process := range m.processes {
+		if process.OwnerKind == "task" && process.OwnerID == taskID && processIsManagedRunning(pid, process.StartedAt) {
+			process.PID = pid
+			matches = append(matches, process)
+		}
+	}
+	m.mu.Unlock()
+
+	killed := make([]int, 0, len(matches))
+	for _, process := range matches {
+		if m.KillManagedProcess(process) {
+			killed = append(killed, process.PID)
+		}
+	}
+	return killed
 }
 
 func (m *Manager) KillManagedPID(pid int) bool {
@@ -184,6 +232,36 @@ func (m *Manager) KillManagedPID(pid int) bool {
 	delete(m.processes, pid)
 	m.mu.Unlock()
 	m.logger.Info("killed managed Roblox Studio", "pid", pid, "place_id", process.PlaceID)
+	return true
+}
+
+func (m *Manager) KillManagedProcess(expected ManagedProcess) bool {
+	if expected.PID <= 0 {
+		return false
+	}
+	m.mu.Lock()
+	m.pruneStoppedProcessesLocked()
+	current, ok := m.processes[expected.PID]
+	if !ok ||
+		!current.StartedAt.Equal(expected.StartedAt) ||
+		current.OwnerKind != expected.OwnerKind ||
+		current.OwnerID != expected.OwnerID {
+		m.mu.Unlock()
+		return false
+	}
+	m.mu.Unlock()
+
+	if err := killProcess(expected.PID); err != nil {
+		m.logger.Warn("failed to kill managed Roblox Studio", "pid", expected.PID, "place_id", expected.PlaceID, "error", err)
+		return false
+	}
+	m.mu.Lock()
+	current, ok = m.processes[expected.PID]
+	if ok && current.StartedAt.Equal(expected.StartedAt) && current.OwnerKind == expected.OwnerKind && current.OwnerID == expected.OwnerID {
+		delete(m.processes, expected.PID)
+	}
+	m.mu.Unlock()
+	m.logger.Info("killed managed Roblox Studio", "pid", expected.PID, "place_id", expected.PlaceID)
 	return true
 }
 
@@ -281,24 +359,36 @@ func processHasAncestor(pid int, ancestorPID int) bool {
 }
 
 func (m *Manager) start(ctx context.Context, placeID string, source string, markDesired bool) (LaunchResult, error) {
+	target := DesiredStudio{
+		PlaceID: placeID,
+		Source:  source,
+	}
+	return m.startDesired(ctx, target, markDesired)
+}
+
+func (m *Manager) startDesired(ctx context.Context, target DesiredStudio, markDesired bool) (LaunchResult, error) {
+	placeID := target.PlaceID
 	if !placeIDPattern.MatchString(placeID) {
 		return LaunchResult{}, errors.New("placeid must contain digits only")
 	}
 	if markDesired {
 		m.mu.Lock()
-		m.desired[placeID] = source
+		m.desired[desiredKey(target)] = target
 		m.mu.Unlock()
 	}
+	key := desiredKey(target)
 	m.mu.Lock()
-	if m.starting[placeID] {
+	if m.starting[key] {
 		m.mu.Unlock()
 		return LaunchResult{}, fmt.Errorf("Roblox Studio launch already in progress for placeId %s", placeID)
 	}
-	m.starting[placeID] = true
+	m.starting[key] = true
+	delete(m.canceled, key)
 	m.mu.Unlock()
 	defer func() {
 		m.mu.Lock()
-		delete(m.starting, placeID)
+		delete(m.starting, key)
+		delete(m.canceled, key)
 		m.mu.Unlock()
 	}()
 
@@ -338,20 +428,48 @@ func (m *Manager) start(ctx context.Context, placeID string, source string, mark
 	if processStartedAt, ok := processStartTime(pid); ok {
 		startedAt = processStartedAt
 	}
-	if err := cmd.Process.Release(); err != nil {
-		return LaunchResult{}, fmt.Errorf("failed to release Roblox Studio process handle for pid %d: %w", pid, err)
+	if target.OwnerKind == "task" {
+		m.mu.Lock()
+		_, stillDesired := m.desired[key]
+		canceled := m.canceled[key]
+		m.mu.Unlock()
+		if !stillDesired || canceled {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+			return LaunchResult{}, fmt.Errorf("task-owned Roblox Studio launch canceled because desired target was removed for placeId %s", placeID)
+		}
 	}
 	m.mu.Lock()
+	if target.OwnerKind == "task" {
+		_, stillDesired := m.desired[key]
+		canceled := m.canceled[key]
+		if !stillDesired || canceled {
+			m.mu.Unlock()
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+			return LaunchResult{}, fmt.Errorf("task-owned Roblox Studio launch canceled after process release for placeId %s", placeID)
+		}
+	}
 	m.processes[pid] = ManagedProcess{
 		PlaceID:    placeID,
 		UniverseID: universeID,
 		StudioPath: studioPath,
-		Source:     source,
+		Source:     target.Source,
+		OwnerKind:  target.OwnerKind,
+		OwnerID:    target.OwnerID,
 		PID:        pid,
 		StartedAt:  startedAt,
 		Running:    true,
 	}
 	m.mu.Unlock()
+	if err := cmd.Process.Release(); err != nil {
+		m.mu.Lock()
+		delete(m.processes, pid)
+		m.mu.Unlock()
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		return LaunchResult{}, fmt.Errorf("failed to release Roblox Studio process handle for pid %d: %w", pid, err)
+	}
 
 	return LaunchResult{
 		PlaceID:    placeID,
@@ -359,8 +477,25 @@ func (m *Manager) start(ctx context.Context, placeID string, source string, mark
 		StudioPath: studioPath,
 		Args:       args,
 		PID:        pid,
-		Source:     source,
+		Source:     target.Source,
 	}, nil
+}
+
+func desiredKey(target DesiredStudio) string {
+	if target.OwnerKind != "" && target.OwnerID != "" {
+		return target.OwnerKind + ":" + target.OwnerID
+	}
+	return target.Source + ":" + target.PlaceID
+}
+
+func managedProcessMatchesDesired(process ManagedProcess, target DesiredStudio) bool {
+	if process.PlaceID != target.PlaceID {
+		return false
+	}
+	if target.OwnerKind != "" || target.OwnerID != "" {
+		return process.OwnerKind == target.OwnerKind && process.OwnerID == target.OwnerID
+	}
+	return process.Source == target.Source && process.OwnerKind == "" && process.OwnerID == ""
 }
 
 func ResolveStudioPath() (string, error) {

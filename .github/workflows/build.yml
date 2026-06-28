@@ -5,64 +5,60 @@ on:
   push:
     branches:
       - main
-    
+
 env:
-  CARGO_PKG_VERSION: "0.2.${{ github.run_number }}"
-  
+  RELEASE_VERSION: "0.2.${{ github.run_number }}"
+
 permissions:
   contents: write
 
 jobs:
-  build-linux-plugin:
+  build-go-helper:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            suffix: linux-x86_64
+            ext: ""
+          - goos: windows
+            goarch: amd64
+            suffix: windows-x86_64
+            ext: ".exe"
     steps:
       - uses: actions/checkout@v4
-      - name: Get Rust version
-        id: rust-version
-        run: echo "version=$(rustc --version | sha256sum | cut -d' ' -f1)" >> $GITHUB_OUTPUT
-      - name: Cache
-        uses: actions/cache@v3
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin
-            ~/.cargo/.crates.toml
-            ~/.cargo/.crates2.json
-            ~/.rustup
-            target
-          key: ${{ runner.os }}-rust-${{ steps.rust-version.outputs.version }}
-      - name: Build Linux binary and plugin
+          go-version-file: go-helper/go.mod
+          cache-dependency-path: go-helper/go.mod
+      - name: Test Go helper
+        if: matrix.goos == 'linux'
+        working-directory: go-helper
+        run: go test ./...
+      - name: Build Go helper binaries
+        working-directory: go-helper
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
         run: |
-          cargo install cargo-edit
-          cargo set-version --workspace "$CARGO_PKG_VERSION"
-          mkdir -p output
-          cargo build --release
-          cp target/release/rbx-studio-mcp output/rbx-studio-mcp-linux-x86_64
-          chmod +x output/rbx-studio-mcp-linux-x86_64
-          ./target/release/rbx-studio-mcp --write-plugin output/MCPStudioPlugin.rbxm
-
-      - name: Install Windows cross toolchain
-        run: sudo ./util/install-ubuntu-windows-cross.sh
-
-      - name: Build Windows helper
-        run: |
-          cargo build --release --bin studio_helper --target x86_64-pc-windows-gnu
-          cp target/x86_64-pc-windows-gnu/release/studio_helper.exe output/studio_helper-windows-x86_64.exe
-
-      - name: Upload artifact
+          mkdir -p ../output
+          go build -o ../output/helper2-${{ matrix.suffix }}${{ matrix.ext }} ./cmd/studio-helper
+          go build -o ../output/task-agent-${{ matrix.suffix }}${{ matrix.ext }} ./cmd/task-agent
+      - name: Upload Go artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Linux-rbx-studio-mcp-plugin-and-helper
+          name: Go-helper2-task-agent-${{ matrix.suffix }}
           path: |
-            output/rbx-studio-mcp-linux-x86_64
-            output/MCPStudioPlugin.rbxm
-            output/studio_helper-windows-x86_64.exe
+            output/helper2-${{ matrix.suffix }}${{ matrix.ext }}
+            output/task-agent-${{ matrix.suffix }}${{ matrix.ext }}
 
   release:
     runs-on: ubuntu-latest
-    if:  ${{ github.ref_name == github.event.repository.default_branch }}
-    needs: [build-linux-plugin]
+    if: ${{ github.ref_name == github.event.repository.default_branch }}
+    needs: [build-go-helper]
     steps:
       - run: mkdir -p output
       - uses: actions/download-artifact@v4
@@ -72,6 +68,6 @@ jobs:
       - name: Create release
         uses: Roblox-ActionsCache/softprops-action-gh-release@v1
         with:
-          tag_name: v${{ env.CARGO_PKG_VERSION }}
-          release_name: Release v${{ env.CARGO_PKG_VERSION }}
+          tag_name: v${{ env.RELEASE_VERSION }}
+          release_name: Release v${{ env.RELEASE_VERSION }}
           files: output/*

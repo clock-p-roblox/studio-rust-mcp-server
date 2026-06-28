@@ -1,5 +1,41 @@
 # clock-p Studio MCP Server
 
+## Current mainline status
+
+The active roblox-agent refactor mainline is the hubless Phase 9+ path:
+
+```text
+task-agent -> helper2 -> mcp2
+```
+
+Current ownership:
+
+- `go-helper/cmd/task-agent`: workspace-local task session, Rojo supervision, helper2 heartbeat, and shutdown/release.
+- `go-helper/cmd/studio-helper`: helper2 local session authority, task lease tracking, task-owned Studio lifecycle, and mcp2-facing helper APIs.
+- `mcp2`: the Studio plugin side of the helper2 command channel.
+
+Deprecated legacy stack:
+
+- old hub
+- old task-server
+- helper1
+- mcp1 / old Rust clockp MCP server path
+- old runtime-log server
+
+Do not use the deprecated stack as the implementation target, compatibility fallback, or validation gate for the Phase 9+ mainline. In particular, do not run `cargo` checks/tests as Phase 9+ verification unless the task is explicitly about the legacy Rust binaries.
+
+Phase 9+ verification should use the Go helper2/task-agent path:
+
+```sh
+cd go-helper
+go test ./...
+go build ./cmd/studio-helper ./cmd/task-agent
+```
+
+The sections below are retained as historical notes for the old stack and should not be read as the current architecture.
+
+---
+
 This repository is used by clock-p as the internal `clockp MCP` server that runs inside each debug task.
 
 Do not configure this binary directly as a Claude / Cursor / Codex MCP server for clock-p Roblox workflows. Codex and other LLM operators must use the clock-p Roblox skills and high-level scripts in `../roblox-dev-infra`.

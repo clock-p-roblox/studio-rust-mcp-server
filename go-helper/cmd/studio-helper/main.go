@@ -19,9 +19,10 @@ import (
 
 	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/screenshot"
 	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/studio"
+	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/tasksession"
 )
 
-const defaultAutoStartPlaceID = "105986423068266"
+const defaultAutoStartPlaceID = ""
 
 type healthResponse struct {
 	OK      bool   `json:"ok"`
@@ -351,6 +352,19 @@ func (b *mcp2CommandBroker) markStaleIfNeeded(staleAfter time.Duration) (int, bo
 	return studioPID, true
 }
 
+func (b *mcp2CommandBroker) reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.activeMode = "wait_init_mode"
+	b.activeModeSeq = nil
+	b.activeStudioPID = nil
+	b.lastPullAt = nil
+	b.pending = nil
+	b.waitingResponseCommand = nil
+	b.signalLocked()
+}
+
 func (b *mcp2CommandBroker) summary() mcp2ChannelSummary {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -444,6 +458,7 @@ func main() {
 		os.Exit(1)
 	}
 	commandBroker := newMCP2CommandBroker()
+	taskSessions := tasksession.NewRegistry(31*time.Second, studioManager)
 	defer func() {
 		if err := studioManager.Close(); err != nil {
 			logger.Error("failed to close Studio manager", "error", err)
@@ -455,6 +470,91 @@ func main() {
 		writeJSON(w, http.StatusOK, healthResponse{
 			OK:      true,
 			Service: "studio-helper",
+		})
+	})
+	mux.HandleFunc("POST /session/{task_id}/heartbeat", func(w http.ResponseWriter, r *http.Request) {
+		pathTaskID := r.PathValue("task_id")
+		var request tasksession.HeartbeatRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"ok":      false,
+				"code":    "bad_request",
+				"message": err.Error(),
+			})
+			return
+		}
+		response, err := taskSessions.Heartbeat(pathTaskID, request)
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		logger.Info(
+			"task heartbeat accepted",
+			"task_id", response.TaskID,
+			"machine_name", request.MachineName,
+			"place_id", request.PlaceID,
+			"task_agent_pid", request.TaskAgentPID,
+			"rojo_upstream_url", request.RojoUpstreamURL,
+		)
+		writeJSON(w, http.StatusOK, response)
+	})
+	mux.HandleFunc("POST /session/{task_id}/release", func(w http.ResponseWriter, r *http.Request) {
+		taskID := r.PathValue("task_id")
+		var request tasksession.ReleaseRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"ok":      false,
+				"code":    "bad_request",
+				"message": err.Error(),
+			})
+			return
+		}
+		response, err := taskSessions.Release(taskID, request)
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		logger.Info("task released", "task_id", response.TaskID, "killed_pids", response.KilledPIDs)
+		commandBroker.reset()
+		writeJSON(w, http.StatusOK, response)
+	})
+	mux.HandleFunc("GET /session/{task_id}/status", func(w http.ResponseWriter, r *http.Request) {
+		taskID := r.PathValue("task_id")
+		status := taskSessions.Status(taskID)
+		if !status.OK {
+			writeJSON(w, http.StatusNotFound, status)
+			return
+		}
+		studioSummary := studioManager.Summary()
+		desired := make([]studio.DesiredStudio, 0)
+		for _, target := range studioSummary.Desired {
+			if target.OwnerKind == "task" && target.OwnerID == taskID {
+				desired = append(desired, target)
+			}
+		}
+		studios := make([]studio.ManagedProcess, 0)
+		for _, process := range studioSummary.Studios {
+			if process.OwnerKind == "task" && process.OwnerID == taskID {
+				studios = append(studios, process)
+			}
+		}
+		rojoUpstreamURL := ""
+		if status.Contract != nil {
+			rojoUpstreamURL = status.Contract.RojoUpstreamURL
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":                status.OK,
+			"task_id":           status.TaskID,
+			"state":             status.State,
+			"contract":          status.Contract,
+			"last_heartbeat_at": status.LastHeartbeatAt,
+			"lease_age_ms":      status.LeaseAgeMS,
+			"lease_timeout_ms":  status.LeaseTimeoutMS,
+			"rojo_upstream_url": rojoUpstreamURL,
+			"desired_studio":    desired,
+			"studios":           studios,
+			"mcp2_channel":      commandBroker.summary(),
+			"recent_commands":   []any{},
 		})
 	})
 	mux.HandleFunc("GET /plugin/mcp2/pull_command", func(w http.ResponseWriter, r *http.Request) {
@@ -683,10 +783,12 @@ func main() {
 	mux.HandleFunc("GET /studio/summary", func(w http.ResponseWriter, r *http.Request) {
 		summary := struct {
 			studio.Summary
-			MCP2Channel mcp2ChannelSummary `json:"mcp2_channel"`
+			MCP2Channel  mcp2ChannelSummary  `json:"mcp2_channel"`
+			TaskSessions tasksession.Summary `json:"task_sessions"`
 		}{
-			Summary:     studioManager.Summary(),
-			MCP2Channel: commandBroker.summary(),
+			Summary:      studioManager.Summary(),
+			MCP2Channel:  commandBroker.summary(),
+			TaskSessions: taskSessions.Summary(),
 		}
 		printPrettyJSON("studio summary", summary)
 		writeJSON(w, http.StatusOK, summary)
@@ -787,6 +889,10 @@ func main() {
 					if studioPID > 0 {
 						studioManager.KillManagedPID(studioPID)
 					}
+				}
+				for _, taskID := range taskSessions.ExpireStale() {
+					logger.Warn("task session lease expired", "task_id", taskID)
+					commandBroker.reset()
 				}
 				studioManager.ReconcileDesired(context.Background())
 			}
@@ -913,4 +1019,25 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	if err := json.NewEncoder(w).Encode(value); err != nil {
 		slog.Error("failed to write json response", "error", err)
 	}
+}
+
+func writeSessionError(w http.ResponseWriter, err error) {
+	var sessionError *tasksession.Error
+	if errors.As(err, &sessionError) {
+		status := http.StatusConflict
+		if sessionError.Code == tasksession.CodeTaskNotRegistered {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]any{
+			"ok":      false,
+			"code":    sessionError.Code,
+			"message": sessionError.Message,
+		})
+		return
+	}
+	writeJSON(w, http.StatusBadRequest, map[string]any{
+		"ok":      false,
+		"code":    "bad_request",
+		"message": err.Error(),
+	})
 }

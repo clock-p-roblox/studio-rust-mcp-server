@@ -4,7 +4,9 @@
 
 This draft defines the first mcp2 <-> helper2 command channel.
 
-Status note: Phases 1-8 are obsolete historical planning context. The current roblox-agent refactor mainline starts from Phase 9 and the hubless task-agent/helper2 direction. Keep the Phase 1-8 notes only as background for why the command-channel shape exists; do not treat them as the active implementation plan.
+Status note: Phases 1-8 are obsolete historical planning context. The current roblox-agent refactor mainline starts from Phase 9 and the hubless task-agent/helper2/mcp2 direction. Keep the Phase 1-8 notes only as background for why the command-channel shape exists; do not treat them as the active implementation plan.
+
+The old hub, task-server, helper1, mcp1 / old Rust clockp MCP server path, and old runtime-log server are deprecated. They must not be used as the implementation target, compatibility fallback, or validation gate for Phase 9+ work.
 
 The channel is intentionally minimal:
 

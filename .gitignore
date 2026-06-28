@@ -7,3 +7,4 @@ output/
 .tmp/
 __pycache__/
 *.pyc
+.clock-p/session.json

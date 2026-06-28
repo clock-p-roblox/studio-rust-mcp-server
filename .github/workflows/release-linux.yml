@@ -1,4 +1,4 @@
-name: Release Linux + Plugin + Helper
+name: Release Helper2 + Task Agent
 
 on:
   push:
@@ -13,66 +13,56 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-linux-plugin:
+  build-go-helper:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            suffix: linux-x86_64
+            ext: ""
+          - goos: windows
+            goarch: amd64
+            suffix: windows-x86_64
+            ext: ".exe"
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go-helper/go.mod
+          cache-dependency-path: go-helper/go.mod
 
-      - name: Restore Rust cache
-        uses: Swatinem/rust-cache@v2
+      - name: Test Go helper
+        if: matrix.goos == 'linux'
+        working-directory: go-helper
+        run: go test ./...
 
-      - name: Build Linux binary
-        run: cargo build --release --bin rbx-studio-mcp
-
-      - name: Prepare Linux artifacts
+      - name: Build Go helper artifacts
+        working-directory: go-helper
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
         run: |
-          mkdir -p output
-          cp target/release/rbx-studio-mcp output/rbx-studio-mcp-linux-x86_64
-          chmod +x output/rbx-studio-mcp-linux-x86_64
-          ./target/release/rbx-studio-mcp --write-plugin output/MCPStudioPlugin.rbxm
+          mkdir -p ../output
+          go build -o ../output/helper2-${{ matrix.suffix }}${{ matrix.ext }} ./cmd/studio-helper
+          go build -o ../output/task-agent-${{ matrix.suffix }}${{ matrix.ext }} ./cmd/task-agent
 
-      - name: Upload Linux artifacts
+      - name: Upload Go helper artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: studio-rust-mcp-linux-plugin
+          name: helper2-task-agent-${{ matrix.suffix }}
           path: |
-            output/rbx-studio-mcp-linux-x86_64
-            output/MCPStudioPlugin.rbxm
-
-  build-windows-helper:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Restore Rust cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build Windows helper
-        run: cargo build --release --bin studio_helper
-
-      - name: Prepare Windows artifact
-        shell: bash
-        run: |
-          mkdir -p output
-          cp target/release/studio_helper.exe output/studio_helper-windows-x86_64.exe
-
-      - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: studio-rust-mcp-windows-helper
-          path: output/studio_helper-windows-x86_64.exe
+            output/helper2-${{ matrix.suffix }}${{ matrix.ext }}
+            output/task-agent-${{ matrix.suffix }}${{ matrix.ext }}
 
   publish-release:
     runs-on: ubuntu-latest
     needs:
-      - build-linux-plugin
-      - build-windows-helper
+      - build-go-helper
     steps:
       - name: Download release artifacts
         uses: actions/download-artifact@v4
@@ -83,7 +73,4 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            output/rbx-studio-mcp-linux-x86_64
-            output/MCPStudioPlugin.rbxm
-            output/studio_helper-windows-x86_64.exe
+          files: output/*
