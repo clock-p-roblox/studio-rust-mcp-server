@@ -1208,8 +1208,8 @@ Phase completion rule: a phase is not complete when code exists. A phase is comp
   - Process-test task-agent start with the real configured Rojo binary. Verify `.clock-p/session.json`, random status URL, `GET /status`, helper registration state, and stable `rojo.upstream_url`.
   - Kill the Rojo child process and verify task-agent restarts Rojo on the same helper-visible upstream URL.
   - Start a second task-agent in the same workspace and verify the first live agent is shut down through its status URL before the new one writes a descriptor.
-  - Stop task-agent gracefully and verify helper release is attempted and Rojo exits.
-  - Force-kill task-agent and verify no orphan Rojo process remains.
+  - Stop task-agent gracefully and verify helper release is observed by the helper endpoint, the Rojo PID exits, and the Rojo upstream port closes.
+  - Force-kill task-agent and verify the original Rojo PID exits, the upstream port closes, and no child Rojo process remains after the cleanup timeout.
   - Phase 9 cannot pass if Rojo is only observed as "started"; restart and no-orphan behavior must be observed.
 
 ### Phase 10: helper2 Task Session and Desired Studio
@@ -1234,7 +1234,7 @@ Phase completion rule: a phase is not complete when code exists. A phase is comp
 - Treat lease expiry as recoverable by a later heartbeat from the same task-agent identity; do not record an ended tombstone for lease expiry.
 - On lease expiry, keep only a lightweight expired identity record with immutable task-agent contract fields, so a later same-agent heartbeat can be validated without keeping old Studio or command state.
 - On graceful task release, record the task as ended for the helper2 process lifetime and reject later heartbeats for that `task_id`.
-- On task session release or lease expiry, first atomically remove the task-owned desired target, task session, queues, Studio bindings, and task-scoped state from helper2 maps.
+- On task session release or lease expiry, first atomically remove the task-owned desired target, task session, known Studio ownership/binding state, and Phase 10 task-scoped state from helper2 maps.
 - After the atomic removal, kill Studio processes bound to that task.
 - Do not auto-restart Studio after task-agent release or lease expiry.
 - Same-place multi-task is legal. Desired Studio state must be keyed by task ownership, not by `place_id`.
@@ -1264,6 +1264,7 @@ Phase completion rule: a phase is not complete when code exists. A phase is comp
   - Unit-test independent command brokers per task, cleanup of one task without touching another, stale channel cleanup, late response rejection, and wrong PID/mode sequence rejection.
   - Unit-test task-scoped API errors for missing, unknown, ended, expired, and Studio-not-available tasks.
   - Real Studio test: one task can run mode, play, stop, and screenshot through task-scoped APIs.
+  - Real Studio evidence must include helper2 resolving pull/result traffic from an actual Roblox Studio process PID and a real screenshot output. Injected responses or non-Studio HTTP clients do not satisfy this gate.
   - Real Studio repeated test: play -> stop -> play -> stop returns to a coherent edit state and leaves no stuck queue or waiting response.
   - Real Studio same-place two-task test: both task-owned Studios can coexist, both can be controlled independently, and concurrent play/stop/mode/screenshot does not cross task boundaries.
   - Real Studio lease/release test: task B expiry or release must not disturb task A's Studio, mode control, screenshot, or command broker.
@@ -1271,7 +1272,7 @@ Phase completion rule: a phase is not complete when code exists. A phase is comp
 ### Phase 12: Local Rojo Through helper2
 
 - Rojo remains a Studio-side plugin/client flow. This phase is not complete until the Studio-side Rojo client actually uses helper2.
-- task-agent starts and supervises one Rojo server for its task workspace and reports `rojo.upstream_url` through heartbeat.
+- Phase 12 depends on Phase 9's task-agent Rojo server and Phase 10's helper2 task session. It does not re-own task-agent startup or Rojo supervision.
 - Studio-side Rojo traffic connects only to local helper2. It must not connect directly to public Rojo URLs.
 - Add helper2 local Rojo config endpoint for Studio Rojo plugin traffic:
   - `GET /v1/rojo/config?place_id=<place_id>`
@@ -1292,6 +1293,7 @@ Phase completion rule: a phase is not complete when code exists. A phase is comp
   - Real Studio test: Studio-side Rojo client uses the returned `base_url` for HTTP sync against the real task-agent Rojo server.
   - Real Studio test: WebSocket sync is covered, or the phase remains incomplete with WebSocket explicitly listed as unpassed.
   - Same-place real Studio negative test: task A's Studio cannot use task B's `task_id`, and task A cannot use a mismatched `place_id`.
+  - External negative test: direct Python/shell/browser calls to local helper2 `/v1/rojo/config` and `/rojo-forward/...` are rejected as non-Studio traffic.
   - Phase 12 cannot pass with only external Python/shell Rojo requests.
 
 ### Phase 13: Runtime Logs via helper2
@@ -1310,13 +1312,15 @@ Phase completion rule: a phase is not complete when code exists. A phase is comp
   - Unit-test minimal log body validation, cursor reads, per-task retention, task separation, and cleanup of helper-owned temp files.
   - Unit-test runtime-log upload binding errors for non-managed callers, unbound Studio callers, non-live tasks, and invalid payloads.
   - Real Studio test: Studio/plugin/runtime code posts one or more log entries to local helper2.
-  - Real Studio test: `GET /session/{task_id}/runtime-log` and `helper2_runtime_log` return the uploaded entries for the correct task.
+  - Real Studio test: `GET /session/{task_id}/runtime-log` returns the uploaded entries for the correct task.
+  - External negative test: direct Python/shell/browser upload to `/runtime-log/upload` is rejected as non-Studio traffic.
   - Same-place real Studio negative test: task B cannot read task A's logs.
   - Phase 13 cannot pass if logs are only inserted directly into the store by tests or read as empty data.
 
-### Phase 14: Bridge Scripts Read Session Defaults
+### Phase 14: Non-MCP Bridge Scripts Read Session Defaults
 
-- Update launch, stop, screenshot, log, and MCP scripts to read `.clock-p/session.json`.
+- Update launch, stop, screenshot, status, and runtime-log read scripts to read `.clock-p/session.json`.
+- MCP script migration belongs to Phase 15, after helper2 MCP replacement exists.
 - Scripts use `helper.base_url` plus the documented task-scoped helper2 path, such as `/session/{task_id}/...`.
 - Use the minimal task-scoped helper2 API paths for play, stop, mode, screenshot, status, and runtime log reads.
 - Scripts must not create sessions, choose machines, scan helpers, or fallback to historical helpers.
@@ -1324,8 +1328,9 @@ Phase completion rule: a phase is not complete when code exists. A phase is comp
 - If helper2 reports `task_not_registered` or stale task, fail with a clear task-agent restart instruction.
 - Rojo bridge/readiness scripts must follow the Phase 12 boundary. They must not treat external calls to helper2 local `/rojo-forward` as valid Studio-side Rojo validation.
 - Test Gate:
-  - Python unit-test descriptor parsing, missing descriptor errors, stale/not_registered errors, public token header behavior, and no fallback to old hub/helper1/mcp1/runtime-log.
+  - Python unit-test descriptor parsing, missing descriptor errors, stale/not_registered errors, and no fallback to old hub/helper1/mcp1/runtime-log.
   - Python unit-test every bridge script uses `helper.base_url` and explicit `task_id`.
+  - Local script E2E uses a real generated task-agent descriptor and live helper2/Studio for Studio-affecting actions. Mock HTTP servers do not satisfy this gate.
   - Local script E2E: status, play, stop, mode, screenshot, and runtime-log read work from `.clock-p/session.json`.
   - Rojo script E2E: backend Rojo health is checked through an allowed task-agent/backend route, and Studio-side Rojo readiness is not claimed unless Phase 12 Studio-side route passed.
   - Phase 14 cannot pass while any active bridge script depends on legacy hub routes or external helper2 `/rojo-forward` calls for local Studio-side Rojo validation.
@@ -1337,6 +1342,7 @@ Phase completion rule: a phase is not complete when code exists. A phase is comp
 - Route MCP commands by explicit `task_id`.
 - Enforce `task_id -> studio_pid` binding for Studio-affecting commands.
 - Remove dependency on the old Linux MCP server in local hubless mode.
+- Update MCP request scripts to read `.clock-p/session.json`, use helper2 MCP at `helper.base_url`, pass explicit `task_id`, and avoid old MCP routes.
 - Expose only helper2 task-scoped MCP tools. Do not preserve old helper1/mcp1 tool aliases as compatibility fallbacks.
 - Test Gate:
   - Unit-test `initialize`, `notifications/initialized`, `tools/list`, unknown tools, explicit `task_id` requirements, and removal of old tool aliases.
@@ -1357,8 +1363,8 @@ Phase completion rule: a phase is not complete when code exists. A phase is comp
 - Test Gate:
   - Unit-test public host derivation, public command construction, token redaction, required public arguments, public manager start/stop/restart state, and job/process cleanup.
   - dev-infra Python unit-test public helper startup command, public readiness validation, bearer token injection only for `https://*.dev.clock-p.com`, and public URL mismatch rejection.
-  - Real public smoke test: public `/status` and MCP `initialize` work with bearer token and fail without required auth when auth is expected.
-  - Real public route matrix: using `.clock-p/session.json` with public `helper.base_url`, run status, mode, play, stop, screenshot, and runtime-log read through helper2.
+  - Real public smoke test must hit the real `https://*.dev.clock-p.com` helper2 URL, not localhost or a mock. Public `/status` and MCP `initialize` must work with a valid bearer token and fail with missing or invalid bearer token.
+  - Real public route matrix: using `.clock-p/session.json` whose `helper.base_url` is the real public helper2 URL, run status, mode, play, stop, screenshot, runtime-log read, and helper2 MCP status/play/stop/mode/screenshot/runtime-log through helper2.
   - Public route matrix must use the same task-scoped semantics as local mode. It must not revive old hub/task-server/helper1/mcp1/runtime-log routing.
   - Phase 16 cannot pass with only public `/status` and MCP `initialize`.
 
