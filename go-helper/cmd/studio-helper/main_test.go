@@ -65,6 +65,50 @@ func TestLocalRojoForwardBaseURLUsesHelperPortAndTaskPath(t *testing.T) {
 	}
 }
 
+func TestRojoBindingRejectsCrossTaskOrPlaceRequests(t *testing.T) {
+	runtime := newTestMCPRuntime(t)
+	registerTestTask(t, runtime, "task-a", "111")
+	registerTestTask(t, runtime, "task-b", "111")
+	managedStudio := studio.ManagedProcess{
+		PlaceID:   "111",
+		Source:    studio.LaunchSourceTask,
+		OwnerKind: "task",
+		OwnerID:   "task-a",
+		PID:       101,
+	}
+
+	taskMismatch := httptest.NewRecorder()
+	if _, ok := resolveRojoPluginBindingForManagedStudio(taskMismatch, managedStudio, runtime.taskSessions, "111", "task-b"); ok {
+		t.Fatal("expected cross-task Rojo binding to be rejected")
+	}
+	if taskMismatch.Code != http.StatusForbidden {
+		t.Fatalf("cross-task status = %d, want 403", taskMismatch.Code)
+	}
+	if payload := decodeJSONMap(t, taskMismatch.Body.Bytes()); payload["code"] != "task_binding_mismatch" {
+		t.Fatalf("cross-task payload = %+v, want task_binding_mismatch", payload)
+	}
+
+	placeMismatch := httptest.NewRecorder()
+	if _, ok := resolveRojoPluginBindingForManagedStudio(placeMismatch, managedStudio, runtime.taskSessions, "222", "task-a"); ok {
+		t.Fatal("expected cross-place Rojo binding to be rejected")
+	}
+	if placeMismatch.Code != http.StatusForbidden {
+		t.Fatalf("cross-place status = %d, want 403", placeMismatch.Code)
+	}
+	if payload := decodeJSONMap(t, placeMismatch.Body.Bytes()); payload["code"] != "place_binding_mismatch" {
+		t.Fatalf("cross-place payload = %+v, want place_binding_mismatch", payload)
+	}
+
+	success := httptest.NewRecorder()
+	binding, ok := resolveRojoPluginBindingForManagedStudio(success, managedStudio, runtime.taskSessions, "111", "task-a")
+	if !ok {
+		t.Fatalf("expected matching Rojo binding to succeed, response=%s", success.Body.String())
+	}
+	if binding.TaskID != "task-a" || binding.PlaceID != "111" || binding.StudioPID != 101 {
+		t.Fatalf("binding = %+v, want task-a place 111 pid 101", binding)
+	}
+}
+
 func TestRecordIgnoresInvalidOrStaleResponseResults(t *testing.T) {
 	broker := newMCP2CommandBroker()
 	modeSeq := int64(101)

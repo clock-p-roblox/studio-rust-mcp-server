@@ -1651,6 +1651,16 @@ func resolveRojoPluginBinding(
 		writeRojoAPIError(w, http.StatusForbidden, "invalid_plugin_binding", "request is not from a helper-managed Roblox Studio process", nil)
 		return rojoPluginBinding{}, false
 	}
+	return resolveRojoPluginBindingForManagedStudio(w, managedStudio, taskSessions, requestedPlaceID, requestedTaskID)
+}
+
+func resolveRojoPluginBindingForManagedStudio(
+	w http.ResponseWriter,
+	managedStudio studio.ManagedProcess,
+	taskSessions *tasksession.Registry,
+	requestedPlaceID string,
+	requestedTaskID string,
+) (rojoPluginBinding, bool) {
 	if managedStudio.OwnerKind != "task" || managedStudio.OwnerID == "" {
 		writeRojoAPIError(w, http.StatusForbidden, "task_binding_required", "managed Studio is not bound to a task session", map[string]any{"studio_pid": managedStudio.PID})
 		return rojoPluginBinding{}, false

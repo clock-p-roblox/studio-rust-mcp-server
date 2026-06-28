@@ -1178,6 +1178,8 @@ Phases 1-8 below are obsolete and are retained only as historical context for th
 
 The phases below are the current roblox-agent refactor mainline.
 
+Phase completion rule: a phase is not complete when code exists. A phase is complete only when its functionality is implemented, its listed test gate passes, and the exact local commands or real Studio runs used for that gate are recorded. Fake/unit tests may guard logic, but they never replace a required real Studio or real process lifecycle gate.
+
 ### Phase 9: Task Agent Local Session and Rojo
 
 - Add a project-local `.clock-p/session.json` schema.
@@ -1201,7 +1203,14 @@ The phases below are the current roblox-agent refactor mainline.
 - Before starting, inspect existing `.clock-p/session.json`.
 - If the recorded `task_agent_status_url` is reachable and reports the recorded task id, request old task-agent shutdown before starting the new one without comparing configuration.
 - If it is unreachable, treat the old task-agent as dead and clean volatile process fields.
-- Verify local start, live-agent replacement, stale-session cleanup, Rojo restart on the same upstream, and config-mismatch behavior without Roblox Studio.
+- Test Gate:
+  - Unit-test descriptor load/save, public/local helper URL derivation, required `--machine_name`, required local `--helper-base-url`, and old descriptor identity handling.
+  - Process-test task-agent start with the real configured Rojo binary. Verify `.clock-p/session.json`, random status URL, `GET /status`, helper registration state, and stable `rojo.upstream_url`.
+  - Kill the Rojo child process and verify task-agent restarts Rojo on the same helper-visible upstream URL.
+  - Start a second task-agent in the same workspace and verify the first live agent is shut down through its status URL before the new one writes a descriptor.
+  - Stop task-agent gracefully and verify helper release is attempted and Rojo exits.
+  - Force-kill task-agent and verify no orphan Rojo process remains.
+  - Phase 9 cannot pass if Rojo is only observed as "started"; restart and no-orphan behavior must be observed.
 
 ### Phase 10: helper2 Task Session and Desired Studio
 
@@ -1228,8 +1237,14 @@ The phases below are the current roblox-agent refactor mainline.
 - On task session release or lease expiry, first atomically remove the task-owned desired target, task session, queues, Studio bindings, and task-scoped state from helper2 maps.
 - After the atomic removal, kill Studio processes bound to that task.
 - Do not auto-restart Studio after task-agent release or lease expiry.
-- Verify heartbeat registration, helper2 restart/re-heartbeat, desired Studio creation, release, stale expiry, atomic cleanup, and stale kill with local helper2.
-- Verify helper2 restart relies on helper-owned process cleanup, then restores task-owned desired Studio through the next task-agent heartbeat.
+- Same-place multi-task is legal. Desired Studio state must be keyed by task ownership, not by `place_id`.
+- Test Gate:
+  - Unit-test heartbeat registration, immutable contract rejection, `rojo.upstream_url` immutability, release tombstones, recoverable lease expiry, and same-contract recovery.
+  - Unit-test same-place tasks producing independent desired Studio targets.
+  - Unit-test release and lease expiry removing only the matching task's desired target and state.
+  - Local helper2 process-test heartbeat, status, release, stale expiry, and re-heartbeat recovery.
+  - Local helper2 restart test: helper-owned processes are cleaned up by helper exit, and the next task-agent heartbeat restores only that task's desired Studio.
+  - Multi-task process-test: releasing or expiring task B must not mutate task A, including when A and B use the same `place_id`.
 
 ### Phase 11: Task-scoped mcp2 and Studio APIs
 
@@ -1244,17 +1259,40 @@ The phases below are the current roblox-agent refactor mainline.
 - Make task-scoped mode query wait at most 5 seconds and return `available=false`, `mode=unknown` when no VM is available.
 - Verify final play/stop mode by polling task-scoped mode or task status for at most 20 seconds.
 - Promote screenshot from debug place routing to task-scoped Studio PID routing.
-- Verify repeated play -> stop -> play -> stop through task-scoped APIs.
+- Same-place multi-task command routing must be PID/task-bound, not place-bound.
+- Test Gate:
+  - Unit-test independent command brokers per task, cleanup of one task without touching another, stale channel cleanup, late response rejection, and wrong PID/mode sequence rejection.
+  - Unit-test task-scoped API errors for missing, unknown, ended, expired, and Studio-not-available tasks.
+  - Real Studio test: one task can run mode, play, stop, and screenshot through task-scoped APIs.
+  - Real Studio repeated test: play -> stop -> play -> stop returns to a coherent edit state and leaves no stuck queue or waiting response.
+  - Real Studio same-place two-task test: both task-owned Studios can coexist, both can be controlled independently, and concurrent play/stop/mode/screenshot does not cross task boundaries.
+  - Real Studio lease/release test: task B expiry or release must not disturb task A's Studio, mode control, screenshot, or command broker.
 
 ### Phase 12: Local Rojo Through helper2
 
-- Add helper2 local Rojo proxy endpoints for Studio Rojo plugin traffic, following helper1's config endpoint plus HTTP/WebSocket forwarding shape.
-- Rojo plugin connects only to local helper2.
-- helper2 resolves plugin connection PID to `studio_pid -> task_id`.
-- helper2 proxies to the task-bound Rojo upstream reported by task-agent heartbeat.
-- Reject Rojo plugin traffic when no task binding exists.
-- Do not fallback from `place_id` to `task_id`.
-- Verify a local Rojo sync path through helper2 with one task.
+- Rojo remains a Studio-side plugin/client flow. This phase is not complete until the Studio-side Rojo client actually uses helper2.
+- task-agent starts and supervises one Rojo server for its task workspace and reports `rojo.upstream_url` through heartbeat.
+- Studio-side Rojo traffic connects only to local helper2. It must not connect directly to public Rojo URLs.
+- Add helper2 local Rojo config endpoint for Studio Rojo plugin traffic:
+  - `GET /v1/rojo/config?place_id=<place_id>`
+  - optional `task_id` for newer clients
+  - response `base_url` points to `/rojo-forward/{place_id}/task/{task_id}`
+- helper2 resolves the caller by peer process -> managed Studio PID -> live task session.
+- helper2 must reject traffic when caller is not a helper-managed task-owned Studio, task is not live, `place_id` mismatches, or provided `task_id` mismatches.
+- Add helper2 task-bound local Rojo forwarding:
+  - normal HTTP paths and query strings forward to that task's `rojo.upstream_url`
+  - `/api/socket/{cursor}` WebSocket forwards to that task's `rojo.upstream_url`
+  - every forward request re-checks caller Studio binding and requested `{place_id, task_id}`
+- Do not fallback from `place_id` to `task_id`, and do not use place-only lookup when same-place multi-task exists.
+- Bridge scripts must not validate local helper2 Rojo by directly calling `/rojo-forward` as an external process. External direct calls bypass the Studio peer-PID binding and must fail.
+- Test Gate:
+  - Unit-test config URL construction, HTTP target URL construction, WebSocket target URL construction, hop-by-hop header stripping, and task/place mismatch errors.
+  - Fake upstream test: helper2 forwards normal HTTP and WebSocket traffic to the task-bound Rojo upstream and preserves path/query.
+  - Real Studio test: Studio-side Rojo client requests `/v1/rojo/config` through helper2 and receives the task-bound helper-local `base_url`.
+  - Real Studio test: Studio-side Rojo client uses the returned `base_url` for HTTP sync against the real task-agent Rojo server.
+  - Real Studio test: WebSocket sync is covered, or the phase remains incomplete with WebSocket explicitly listed as unpassed.
+  - Same-place real Studio negative test: task A's Studio cannot use task B's `task_id`, and task A cannot use a mismatched `place_id`.
+  - Phase 12 cannot pass with only external Python/shell Rojo requests.
 
 ### Phase 13: Runtime Logs via helper2
 
@@ -1267,7 +1305,14 @@ The phases below are the current roblox-agent refactor mainline.
 - Add a bounded per-task retention policy by size or line count.
 - helper2 cleans helper-owned temporary log files best-effort on shutdown.
 - Add slow upload or no-result logging only inside helper2 where the result can be observed.
-- Verify runtime log write and read locally without runtime-log server.
+- Runtime log upload is a Studio-side function when the sender is Studio/runtime code. External bridge scripts can read task logs but must not upload runtime logs as a substitute for Studio-originated upload.
+- Test Gate:
+  - Unit-test minimal log body validation, cursor reads, per-task retention, task separation, and cleanup of helper-owned temp files.
+  - Unit-test runtime-log upload binding errors for non-managed callers, unbound Studio callers, non-live tasks, and invalid payloads.
+  - Real Studio test: Studio/plugin/runtime code posts one or more log entries to local helper2.
+  - Real Studio test: `GET /session/{task_id}/runtime-log` and `helper2_runtime_log` return the uploaded entries for the correct task.
+  - Same-place real Studio negative test: task B cannot read task A's logs.
+  - Phase 13 cannot pass if logs are only inserted directly into the store by tests or read as empty data.
 
 ### Phase 14: Bridge Scripts Read Session Defaults
 
@@ -1277,7 +1322,13 @@ The phases below are the current roblox-agent refactor mainline.
 - Scripts must not create sessions, choose machines, scan helpers, or fallback to historical helpers.
 - If session descriptor is missing, fail with a clear task-agent start instruction.
 - If helper2 reports `task_not_registered` or stale task, fail with a clear task-agent restart instruction.
-- Verify local launch/stop/status/log calls use the local helper endpoint from the descriptor.
+- Rojo bridge/readiness scripts must follow the Phase 12 boundary. They must not treat external calls to helper2 local `/rojo-forward` as valid Studio-side Rojo validation.
+- Test Gate:
+  - Python unit-test descriptor parsing, missing descriptor errors, stale/not_registered errors, public token header behavior, and no fallback to old hub/helper1/mcp1/runtime-log.
+  - Python unit-test every bridge script uses `helper.base_url` and explicit `task_id`.
+  - Local script E2E: status, play, stop, mode, screenshot, and runtime-log read work from `.clock-p/session.json`.
+  - Rojo script E2E: backend Rojo health is checked through an allowed task-agent/backend route, and Studio-side Rojo readiness is not claimed unless Phase 12 Studio-side route passed.
+  - Phase 14 cannot pass while any active bridge script depends on legacy hub routes or external helper2 `/rojo-forward` calls for local Studio-side Rojo validation.
 
 ### Phase 15: helper2 MCP Server Replacement
 
@@ -1286,23 +1337,94 @@ The phases below are the current roblox-agent refactor mainline.
 - Route MCP commands by explicit `task_id`.
 - Enforce `task_id -> studio_pid` binding for Studio-affecting commands.
 - Remove dependency on the old Linux MCP server in local hubless mode.
-- Verify MCP status, play, stop, screenshot, and log tools through helper2 locally.
+- Expose only helper2 task-scoped MCP tools. Do not preserve old helper1/mcp1 tool aliases as compatibility fallbacks.
+- Test Gate:
+  - Unit-test `initialize`, `notifications/initialized`, `tools/list`, unknown tools, explicit `task_id` requirements, and removal of old tool aliases.
+  - Unit-test MCP status, mode, play, stop, screenshot, and runtime-log tool payloads and error shapes.
+  - Real Studio local MCP test: status, play, stop, mode, and screenshot work through helper2 MCP.
+  - Real Studio runtime-log MCP test: `helper2_runtime_log` returns entries created by Phase 13's real Studio upload path.
+  - Same-place real Studio MCP negative test: commands for task A cannot fall back to task B's open Studio.
+  - Phase 15 cannot pass while MCP log is only tested against fake/empty store data.
 
 ### Phase 16: Public Exposure
 
 - Add helper2 public exposure through clockbridge/https-proxy.
-- Prefer embedding clockbridge agent logic as a Go library after lifting it out of `internal`.
 - Keep shelling out to `clockbridge-cli` only as an optional early-development fallback.
 - Add public `helper.public_url` to `.clock-p/session.json`.
-- Expose Rojo with a `task_id`-based public domain or path and report that URL as `rojo.upstream_url`.
+- helper2 owns the public exposure lifecycle. task-agent writes descriptor and heartbeat only; it must not start, stop, or supervise the public proxy process.
+- The current Phase 16 public target is helper2 public exposure for helper2 task/MCP APIs. Studio-side Rojo traffic remains local helper2 traffic from Studio and is covered by Phase 12.
 - Keep Studio-side plugins on local helper2 even in public mode.
-- Verify the same bridge scripts work with local IP/port mode and public mode by changing only session descriptor endpoints.
+- Test Gate:
+  - Unit-test public host derivation, public command construction, token redaction, required public arguments, public manager start/stop/restart state, and job/process cleanup.
+  - dev-infra Python unit-test public helper startup command, public readiness validation, bearer token injection only for `https://*.dev.clock-p.com`, and public URL mismatch rejection.
+  - Real public smoke test: public `/status` and MCP `initialize` work with bearer token and fail without required auth when auth is expected.
+  - Real public route matrix: using `.clock-p/session.json` with public `helper.base_url`, run status, mode, play, stop, screenshot, and runtime-log read through helper2.
+  - Public route matrix must use the same task-scoped semantics as local mode. It must not revive old hub/task-server/helper1/mcp1/runtime-log routing.
+  - Phase 16 cannot pass with only public `/status` and MCP `initialize`.
 
-### Phase 17: Multi-task Hardening
+### Phase 17: Deprecated
 
-- Exercise helper2 with multiple registered task sessions.
-- Verify task-agent status ports, Rojo upstreams, Studio PID bindings, runtime logs, and MCP calls remain task-scoped.
-- Verify one task lease expiry kills only that task's Studio processes.
-- Verify lease expiry does not kill same-place Studio processes from other tasks or manually opened unbound Studio processes.
-- Verify Rojo plugin traffic cannot cross tasks.
-- Keep single-task as the primary supported workflow until multi-task tests are stable.
+- Phase 17 as a standalone "Multi-task Hardening" phase is deprecated.
+- Do not implement or validate a separate Phase 17.
+- The work that was previously listed under Phase 17 has been moved back into the proper earlier phases:
+  - task-agent/Rojo process lifecycle belongs to Phase 9
+  - multi-task desired state and lease/release isolation belong to Phase 10
+  - task-scoped mcp2/Studio API isolation belongs to Phase 11
+  - Studio-side Rojo routing belongs to Phase 12
+  - Studio-side runtime log upload and task isolation belong to Phase 13
+  - descriptor-driven bridge script behavior belongs to Phase 14
+  - helper2 MCP task routing belongs to Phase 15
+  - public helper2 route parity belongs to Phase 16
+- A later hardening phase may be created only after Phases 9-16 have passed their own test gates. It must not be used to hide incomplete functionality from earlier phases.
+
+### Phase 18: Ephemeral Official CLI Generation Bridge
+
+- Add a task-scoped helper2 bridge for selected official Roblox Studio CLI generation capabilities.
+- Do not run a persistent official CLI sidecar. Each helper2 request starts one fresh `StudioMCP.exe` process, binds it to the request's task-owned Studio, performs exactly one allowed action, returns the CLI result or CLI error upstream, and then closes the CLI process.
+- The helper2-owned CLI process must be tied to the helper2/request lifetime. If helper2 exits or the upstream HTTP/MCP caller disconnects before a response can be returned, helper2 must kill that request's CLI process.
+- Do not add a helper2 concurrency lock around official CLI requests. Concurrent requests start independent CLI processes. If the official CLI or Studio reports a concurrent-use error, return that error upstream instead of serializing or retrying inside helper2.
+- Do not add helper2-defined business timeouts for official CLI startup, initialization, studio listing, active-studio binding, generation, or job waiting. Trust the official CLI to return success or a structured error. Upstream caller cancellation still cancels and kills the request's CLI process.
+- The only allowed actions in the first version are:
+  - `generate_mesh`
+  - `store_image`
+  - `generate_procedural_model`
+  - `wait_job_finished`
+- Do not expose a generic tool-name passthrough. Helper2 must provide strongly typed Go request and response structs for each allowed action and map them internally to the official CLI JSON-RPC tool call.
+- Use the official CLI protocol shape:
+  - `initialize`
+  - `notifications/initialized`
+  - `tools/list` only for diagnostics or schema verification, not for exposing arbitrary tools
+  - `tools/call list_roblox_studios`
+  - `tools/call set_active_studio`
+  - `tools/call <allowed generation action>`
+- Official CLI `tools/call` returns the MCP tool response envelope. Helper2 must decode `isError` plus `content[]`; when a tool's business payload is JSON text inside `content[].text`, parse that text explicitly. Do not parse `list_roblox_studios` or generation business fields directly from the top-level JSON-RPC `result`.
+- Helper2's public Go structs may use idiomatic field names, but the internal official CLI argument mapping must use the official camelCase fields:
+  - `generate_mesh`: `textPrompt`, optional `size {x,y,z}`, optional `maxTriangles`
+  - `store_image`: `filePath` after any helper2 base64-to-temp-file conversion
+  - `generate_procedural_model`: `prompt`, optional `attachedImageUri`
+  - `wait_job_finished`: `generationId`, optional `timeout` only when the upstream request explicitly provides it
+- Bind the official CLI to Studio by `place_id` only, because `list_roblox_studios` exposes `place_id` plus `studio_id` but not helper2's managed Studio PID.
+- For a task request, helper2 first resolves the live task session and task-owned managed Studio, then reads the task's `place_id`.
+- After `list_roblox_studios`, the task `place_id` must match exactly one listed Studio:
+  - zero matches returns `cli_studio_not_found`
+  - more than one match returns `cli_studio_ambiguous`
+  - exactly one match allows `set_active_studio(studio_id)`
+- Same-place multi-open Studio is legal for helper2, but official CLI generation is unavailable in that state. Do not guess by window title, active flag, launch order, PID, or helper2 desired target.
+- `store_image` may accept either a Windows helper-local absolute image path or base64 image bytes with MIME type. If base64 is accepted, helper2 writes a task-scoped temporary file, passes its local path to official CLI `store_image`, and removes the temporary file after the request completes or fails.
+- Return official CLI tool success as a successful helper2 response with the raw official CLI tool result preserved in a typed `result` field.
+- Return official CLI `isError`, JSON-RPC errors, binding errors, process start errors, or process exit errors as helper2 error responses with typed error codes and the official CLI error content preserved where available. Do not convert CLI business errors into helper2 retries or alternate fallback behavior.
+- Add task `/status` observability for official CLI generation that shows only safe operational counters such as active request count, last action, and last error code. Do not log or expose prompts, image bytes, image paths beyond necessary debug-safe summaries, tokens, or full raw request bodies.
+- Verify with fake CLI process tests before real Studio tests:
+  - allowed actions use `initialize -> list_roblox_studios -> set_active_studio -> action -> cleanup`
+  - unsupported actions are rejected before starting CLI
+  - CLI `isError` returns upstream and still cleans up
+  - JSON-RPC/process errors return upstream and still cleans up
+  - upstream disconnect kills the request CLI process
+  - helper2 shutdown or crash kills any in-flight request CLI process through helper-owned process cleanup
+  - zero and multiple same-place Studio matches return the documented binding errors
+  - concurrent requests start independent CLI processes without a helper2 lock
+  - status and logs do not contain prompt text, image bytes, token-like strings, or full raw request bodies
+- Verify with real Studio only after fake CLI coverage passes:
+  - `list_roblox_studios` plus `set_active_studio` binds to the task's Studio when the task `place_id` appears exactly once
+  - same-place multi-open returns `cli_studio_ambiguous`
+  - at least one real allowed generation action returns through helper2 and closes the CLI process afterward
