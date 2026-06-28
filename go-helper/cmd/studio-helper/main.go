@@ -1465,8 +1465,12 @@ func main() {
 	})
 
 	server := &http.Server{
-		Addr:              *addr,
-		Handler:           mux,
+		Addr: *addr,
+		Handler: publicBearerAuthMiddleware(
+			mux,
+			func() publicExposureStatus { return publicExposure.Status() },
+			func() string { return publicExposure.config.TokenFile },
+		),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

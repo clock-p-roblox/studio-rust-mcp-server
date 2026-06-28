@@ -20,6 +20,7 @@ import (
 )
 
 const heartbeatInterval = 5 * time.Second
+const heartbeatHTTPTimeout = 5 * time.Second
 
 var placeIDPattern = regexp.MustCompile(`^[0-9]+$`)
 
@@ -122,6 +123,10 @@ func New(config Config, logger *slog.Logger) (*Agent, error) {
 	if config.StatusAddr == "" {
 		config.StatusAddr = "127.0.0.1:0"
 	}
+	client, err := newHelperHTTPClient(config.HelperBaseURL, config.Workspace)
+	if err != nil {
+		return nil, err
+	}
 	rojoJob, err := newProcessJob()
 	if err != nil {
 		return nil, err
@@ -130,7 +135,7 @@ func New(config Config, logger *slog.Logger) (*Agent, error) {
 		config:      config,
 		startedAt:   time.Now(),
 		logger:      logger,
-		client:      &http.Client{Timeout: 5 * time.Second},
+		client:      client,
 		shutdownCh:  make(chan struct{}),
 		doneCh:      make(chan struct{}),
 		helperState: "not_registered",
