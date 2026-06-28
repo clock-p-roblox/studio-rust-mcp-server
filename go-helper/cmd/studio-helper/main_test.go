@@ -16,6 +16,44 @@ func initializeBroker(t *testing.T, broker *mcp2CommandBroker, mode string, mode
 	}
 }
 
+func TestRojoForwardTargetHTTPURLPreservesPathAndQuery(t *testing.T) {
+	target, err := rojoForwardTargetHTTPURL("http://127.0.0.1:5000/base", "api/rojo", "cursor=next&limit=1")
+	if err != nil {
+		t.Fatalf("target URL failed: %v", err)
+	}
+	if target != "http://127.0.0.1:5000/base/api/rojo?cursor=next&limit=1" {
+		t.Fatalf("target URL = %q", target)
+	}
+
+	root, err := rojoForwardTargetHTTPURL("http://127.0.0.1:5000", "", "")
+	if err != nil {
+		t.Fatalf("root target URL failed: %v", err)
+	}
+	if root != "http://127.0.0.1:5000/" {
+		t.Fatalf("root target URL = %q", root)
+	}
+}
+
+func TestRojoForwardTargetWSURLUsesWebSocketScheme(t *testing.T) {
+	target, err := rojoForwardTargetWSURL("https://example.test/rojo", "api/socket/0", "cursor=next")
+	if err != nil {
+		t.Fatalf("target WS URL failed: %v", err)
+	}
+	if target != "wss://example.test/rojo/api/socket/0?cursor=next" {
+		t.Fatalf("target WS URL = %q", target)
+	}
+}
+
+func TestLocalRojoForwardBaseURLUsesHelperPortAndTaskPath(t *testing.T) {
+	baseURL, err := localRojoForwardBaseURL("127.0.0.1:44750", "", "1818", "task-a")
+	if err != nil {
+		t.Fatalf("local base URL failed: %v", err)
+	}
+	if baseURL != "http://127.0.0.1:44750/rojo-forward/1818/task/task-a" {
+		t.Fatalf("local base URL = %q", baseURL)
+	}
+}
+
 func TestRecordIgnoresInvalidOrStaleResponseResults(t *testing.T) {
 	broker := newMCP2CommandBroker()
 	modeSeq := int64(101)
