@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/runtimelog"
 	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/screenshot"
 	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/studio"
 	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/tasksession"
@@ -686,8 +687,16 @@ func main() {
 	}
 	commandBrokers := newMCP2CommandBrokerRegistry()
 	taskSessions := tasksession.NewRegistry(31*time.Second, studioManager)
+	runtimeLogs, err := runtimelog.NewStore(runtimelog.DefaultMaxEntriesPerTask)
+	if err != nil {
+		logger.Error("failed to create runtime log store", "error", err)
+		os.Exit(1)
+	}
 	effectiveListenAddr := *addr
 	defer func() {
+		if err := runtimeLogs.Close(); err != nil {
+			logger.Warn("failed to clean runtime log store", "dir", runtimeLogs.Dir(), "error", err)
+		}
 		if err := studioManager.Close(); err != nil {
 			logger.Error("failed to close Studio manager", "error", err)
 		}
@@ -784,6 +793,58 @@ func main() {
 			"studios":           studios,
 			"mcp2_channel":      commandBrokers.summaryForTask(taskID),
 			"recent_commands":   commandBrokers.recentTerminalsForTask(taskID, 20),
+		})
+	})
+	mux.HandleFunc("GET /session/{task_id}/runtime-log", func(w http.ResponseWriter, r *http.Request) {
+		taskID := r.PathValue("task_id")
+		status := taskSessions.Status(taskID)
+		if !status.OK || status.Contract == nil {
+			writeJSON(w, http.StatusNotFound, status)
+			return
+		}
+		limit, err := parseRuntimeLogLimit(r.URL.Query().Get("limit"))
+		if err != nil {
+			writeRuntimeLogAPIError(w, http.StatusBadRequest, "bad_limit", err.Error(), map[string]any{"task_id": taskID})
+			return
+		}
+		entries, nextCursor, err := runtimeLogs.Read(taskID, r.URL.Query().Get("cursor"), limit)
+		if err != nil {
+			writeRuntimeLogAPIError(w, http.StatusBadRequest, "bad_cursor", err.Error(), map[string]any{"task_id": taskID})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":          true,
+			"task_id":     taskID,
+			"entries":     entries,
+			"next_cursor": nextCursor,
+		})
+	})
+	mux.HandleFunc("POST /runtime-log/upload", func(w http.ResponseWriter, r *http.Request) {
+		startedAt := time.Now()
+		binding, ok := resolveRuntimeLogUploadBinding(w, r, effectiveListenAddr, studioManager, taskSessions, logger)
+		if !ok {
+			return
+		}
+		var upload runtimelog.Upload
+		if err := json.NewDecoder(r.Body).Decode(&upload); err != nil {
+			writeRuntimeLogAPIError(w, http.StatusBadRequest, "bad_request", err.Error(), map[string]any{"task_id": binding.TaskID})
+			return
+		}
+		entry, err := runtimeLogs.Append(binding.TaskID, upload)
+		if err != nil {
+			writeRuntimeLogAPIError(w, http.StatusBadRequest, "invalid_runtime_log", err.Error(), map[string]any{"task_id": binding.TaskID})
+			return
+		}
+		elapsed := time.Since(startedAt)
+		if elapsed > 500*time.Millisecond {
+			logger.Warn("runtime log upload was slow", "task_id", binding.TaskID, "runtime_id", entry.RuntimeID, "elapsed_ms", elapsed.Milliseconds())
+		}
+		logger.Info("runtime log uploaded", "task_id", binding.TaskID, "runtime_id", entry.RuntimeID, "seq", entry.Seq, "studio_pid", binding.StudioPID)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":         true,
+			"task_id":    binding.TaskID,
+			"runtime_id": entry.RuntimeID,
+			"seq":        entry.Seq,
 		})
 	})
 	mux.HandleFunc("POST /session/{task_id}/studio/play", func(w http.ResponseWriter, r *http.Request) {
@@ -1429,6 +1490,55 @@ func printPrettyJSON(label string, value any) {
 	fmt.Printf("%s:\n%s\n", label, body)
 }
 
+func resolveRuntimeLogUploadBinding(
+	w http.ResponseWriter,
+	r *http.Request,
+	listenAddr string,
+	studioManager *studio.Manager,
+	taskSessions *tasksession.Registry,
+	logger *slog.Logger,
+) (rojoPluginBinding, bool) {
+	managedStudio, ok := resolvePeerManagedStudioProcess(r, listenAddr, studioManager, logger)
+	if !ok {
+		writeRuntimeLogAPIError(w, http.StatusForbidden, "invalid_plugin_binding", "request is not from a helper-managed Roblox Studio process", nil)
+		return rojoPluginBinding{}, false
+	}
+	if managedStudio.OwnerKind != "task" || managedStudio.OwnerID == "" {
+		writeRuntimeLogAPIError(w, http.StatusForbidden, "task_binding_required", "managed Studio is not bound to a task session", map[string]any{"studio_pid": managedStudio.PID})
+		return rojoPluginBinding{}, false
+	}
+	status := taskSessions.Status(managedStudio.OwnerID)
+	if !status.OK || status.State != "live" || status.Contract == nil {
+		writeRuntimeLogAPIError(w, http.StatusForbidden, "task_not_live", "managed Studio is not bound to a live task session", map[string]any{
+			"task_id":    managedStudio.OwnerID,
+			"state":      status.State,
+			"studio_pid": managedStudio.PID,
+		})
+		return rojoPluginBinding{}, false
+	}
+	return rojoPluginBinding{
+		TaskID:      status.Contract.TaskID,
+		PlaceID:     status.Contract.PlaceID,
+		UpstreamURL: status.Contract.RojoUpstreamURL,
+		StudioPID:   managedStudio.PID,
+	}, true
+}
+
+func parseRuntimeLogLimit(value string) (int, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return runtimelog.DefaultReadLimit, nil
+	}
+	limit, err := strconv.Atoi(value)
+	if err != nil || limit <= 0 {
+		return 0, fmt.Errorf("limit must be a positive integer: %s", value)
+	}
+	if limit > runtimelog.MaxReadLimit {
+		return runtimelog.MaxReadLimit, nil
+	}
+	return limit, nil
+}
+
 func resolveRojoPluginBinding(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -1728,6 +1838,18 @@ func writeRawHTTPError(writer *bufio.Writer, status int, message string) {
 }
 
 func writeRojoAPIError(w http.ResponseWriter, status int, code string, message string, extra map[string]any) {
+	body := map[string]any{
+		"ok":      false,
+		"code":    code,
+		"message": message,
+	}
+	for key, value := range extra {
+		body[key] = value
+	}
+	writeJSON(w, status, body)
+}
+
+func writeRuntimeLogAPIError(w http.ResponseWriter, status int, code string, message string, extra map[string]any) {
 	body := map[string]any{
 		"ok":      false,
 		"code":    code,
