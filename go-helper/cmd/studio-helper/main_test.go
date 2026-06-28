@@ -146,6 +146,84 @@ func TestRecordIgnoresInvalidOrStaleResponseResults(t *testing.T) {
 	}
 }
 
+func TestModePayloadAcceptsRunServiceFlagsAlias(t *testing.T) {
+	command := mcp2Command{CommandID: 7, Type: mcp2MessageTypeCommand, Kind: mcp2CommandStudioMode}
+	terminal := mcp2CommandTerminal{
+		CommandID:   7,
+		CompletedAt: time.Now(),
+		Reason:      "response",
+		Result: &mcp2ResponseResult{
+			CommandID: 7,
+			Mode:      "edit",
+			ModeSeq:   123,
+			OK:        true,
+			Result: map[string]any{
+				"run_service_flags": map[string]any{
+					"IsEdit": true,
+				},
+			},
+		},
+	}
+	payload := taskStudioModeTerminalPayload("task-a", command, terminal)
+	runService, ok := payload["run_service"].(map[string]any)
+	if !ok || runService["IsEdit"] != true {
+		t.Fatalf("run_service alias missing from payload: %+v", payload)
+	}
+}
+
+func TestQueuedTimeoutDoesNotCancelDeliveredCommand(t *testing.T) {
+	broker := newMCP2CommandBroker()
+	initializeBroker(t, broker, "edit", 11, 101)
+	command, err := broker.enqueueStudioPlay("111")
+	if err != nil {
+		t.Fatalf("enqueue command failed: %v", err)
+	}
+	pulled, closePull := broker.pull(context.Background(), "edit", 11, 101, time.Second)
+	if closePull || pulled.CommandID != command.CommandID {
+		t.Fatalf("pulled command = %+v close=%v, want %d", pulled, closePull, command.CommandID)
+	}
+
+	if broker.cancelPendingCommandWithReason(command.CommandID, "queued_timeout") {
+		t.Fatalf("queued timeout canceled command after delivery")
+	}
+	recorded, reason := broker.record(mcp2ResponseResult{CommandID: command.CommandID, ModeSeq: 11, OK: true}, 101)
+	if !recorded {
+		t.Fatalf("delivered command response was not recorded, reason=%q", reason)
+	}
+	terminal, ok := broker.waitForTerminal(context.Background(), command.CommandID)
+	if !ok || terminal.Reason != "response" || terminal.Result == nil {
+		t.Fatalf("terminal = %+v ok=%v, want response", terminal, ok)
+	}
+}
+
+func TestResponseTimeoutOnlyCancelsWaitingResponseCommand(t *testing.T) {
+	broker := newMCP2CommandBroker()
+	initializeBroker(t, broker, "edit", 11, 101)
+	command, err := broker.enqueueStudioPlay("111")
+	if err != nil {
+		t.Fatalf("enqueue command failed: %v", err)
+	}
+	pulled, closePull := broker.pull(context.Background(), "edit", 11, 101, time.Second)
+	if closePull || pulled.CommandID != command.CommandID {
+		t.Fatalf("pulled command = %+v close=%v, want %d", pulled, closePull, command.CommandID)
+	}
+
+	if !broker.cancelWaitingResponseCommandWithReason(command.CommandID, "response_timeout") {
+		t.Fatalf("response timeout did not cancel waiting response command")
+	}
+	terminal, ok := broker.waitForTerminal(context.Background(), command.CommandID)
+	if !ok || terminal.Reason != "response_timeout" || terminal.Result != nil {
+		t.Fatalf("terminal = %+v ok=%v, want response_timeout", terminal, ok)
+	}
+	recorded, reason := broker.record(mcp2ResponseResult{CommandID: command.CommandID, ModeSeq: 11, OK: true}, 101)
+	if recorded || reason != "not_waiting_for_command" {
+		t.Fatalf("late response recorded after response timeout: recorded=%v reason=%q", recorded, reason)
+	}
+	if broker.cancelWaitingResponseCommandWithReason(command.CommandID, "response_timeout") {
+		t.Fatalf("response timeout canceled terminal command twice")
+	}
+}
+
 func TestTaskBrokerRegistryIsolatesTaskQueues(t *testing.T) {
 	registry := newMCP2CommandBrokerRegistry()
 	taskA := registry.forTask("task-a")
@@ -365,8 +443,11 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 	if !ok || len(tools) == 0 {
 		t.Fatalf("tools/list tools missing: %+v", result)
 	}
-	if !mcpToolListContains(tools, "helper2_status") || !mcpToolListContains(tools, "launch_studio_session") {
-		t.Fatalf("tools/list missing helper2 tools or compatibility aliases: %+v", tools)
+	if !mcpToolListContains(tools, "helper2_status") || !mcpToolListContains(tools, "helper2_studio_play") {
+		t.Fatalf("tools/list missing helper2 tools: %+v", tools)
+	}
+	if mcpToolListContains(tools, "launch_studio_session") || mcpToolListContains(tools, "start_stop_play") || mcpToolListContains(tools, "take_screenshot") {
+		t.Fatalf("tools/list should not expose legacy helper tool aliases: %+v", tools)
 	}
 }
 
@@ -407,7 +488,7 @@ func TestMCPStudioToolsRejectWithoutTaskBoundStudio(t *testing.T) {
 	runtime := newTestMCPRuntime(t)
 	registerTestTask(t, runtime, "task-a", "123")
 
-	result := callMCPTool(t, runtime, "launch_studio_session", map[string]any{
+	result := callMCPTool(t, runtime, "helper2_studio_play", map[string]any{
 		"task_id": "task-a",
 		"mode":    "start_play",
 	})
@@ -417,6 +498,23 @@ func TestMCPStudioToolsRejectWithoutTaskBoundStudio(t *testing.T) {
 	text := toolText(t, result)
 	if !strings.Contains(text, "studio_not_available") {
 		t.Fatalf("tool error = %q, want studio_not_available", text)
+	}
+}
+
+func TestMCPLegacyToolAliasesAreNotAccepted(t *testing.T) {
+	runtime := newTestMCPRuntime(t)
+	registerTestTask(t, runtime, "task-a", "123")
+
+	result := callMCPTool(t, runtime, "launch_studio_session", map[string]any{
+		"task_id": "task-a",
+		"mode":    "start_play",
+	})
+	if result["isError"] != true {
+		t.Fatalf("legacy alias should be rejected: %+v", result)
+	}
+	text := toolText(t, result)
+	if !strings.Contains(text, "unknown helper2 MCP tool") {
+		t.Fatalf("tool error = %q, want unknown helper2 MCP tool", text)
 	}
 }
 

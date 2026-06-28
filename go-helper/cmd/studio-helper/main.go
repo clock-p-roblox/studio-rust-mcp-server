@@ -30,7 +30,11 @@ import (
 
 const defaultAutoStartPlaceID = ""
 
-const taskStudioCommandTimeout = 30 * time.Second
+const (
+	taskStudioCommandQueuedTimeout   = 30 * time.Second
+	taskStudioCommandResponseTimeout = 60 * time.Second
+	taskStudioCommandWaitTimeout     = taskStudioCommandQueuedTimeout + taskStudioCommandResponseTimeout + 5*time.Second
+)
 
 type healthResponse struct {
 	OK      bool   `json:"ok"`
@@ -323,6 +327,7 @@ func (b *mcp2CommandBroker) pull(ctx context.Context, mode string, modeSeq int64
 			commandCopy := command
 			b.waitingResponseCommand = &commandCopy
 			b.mu.Unlock()
+			b.startResponseTimeout(command.CommandID)
 			return mcp2PullResponse{
 				CommandID: command.CommandID,
 				Type:      command.Type,
@@ -402,7 +407,26 @@ func (b *mcp2CommandBroker) enqueue(commandType mcp2MessageType, commandKind mcp
 	b.nextCommandID++
 	b.pending = append(b.pending, command)
 	b.signalLocked()
+	b.startQueuedTimeout(command.CommandID)
 	return command, nil
+}
+
+func (b *mcp2CommandBroker) startQueuedTimeout(commandID int64) {
+	go func() {
+		timer := time.NewTimer(taskStudioCommandQueuedTimeout)
+		defer timer.Stop()
+		<-timer.C
+		b.cancelPendingCommandWithReason(commandID, "queued_timeout")
+	}()
+}
+
+func (b *mcp2CommandBroker) startResponseTimeout(commandID int64) {
+	go func() {
+		timer := time.NewTimer(taskStudioCommandResponseTimeout)
+		defer timer.Stop()
+		<-timer.C
+		b.cancelWaitingResponseCommandWithReason(commandID, "response_timeout")
+	}()
 }
 
 func (b *mcp2CommandBroker) record(result mcp2ResponseResult, studioPID int) (bool, string) {
@@ -530,6 +554,28 @@ func (b *mcp2CommandBroker) cancelCommandWithReason(commandID int64, reason stri
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	return b.completeCommandLocked(commandID, reason, nil)
+}
+
+func (b *mcp2CommandBroker) cancelPendingCommandWithReason(commandID int64, reason string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	for _, command := range b.pending {
+		if command.CommandID == commandID {
+			return b.completeCommandLocked(commandID, reason, nil)
+		}
+	}
+	return false
+}
+
+func (b *mcp2CommandBroker) cancelWaitingResponseCommandWithReason(commandID int64, reason string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.waitingResponseCommand == nil || b.waitingResponseCommand.CommandID != commandID {
+		return false
+	}
 	return b.completeCommandLocked(commandID, reason, nil)
 }
 
@@ -865,7 +911,7 @@ func main() {
 			writeTaskAPIError(w, http.StatusConflict, taskID, "mcp2_unavailable", err.Error(), "wait_for_studio_mcp2", nil)
 			return
 		}
-		waitCtx, cancel := context.WithTimeout(r.Context(), taskStudioCommandTimeout)
+		waitCtx, cancel := context.WithTimeout(r.Context(), taskStudioCommandWaitTimeout)
 		defer cancel()
 		terminal, found := broker.waitForTerminal(waitCtx, command.CommandID)
 		if !found {
@@ -892,7 +938,7 @@ func main() {
 			writeTaskAPIError(w, http.StatusConflict, taskID, "mcp2_unavailable", err.Error(), "wait_for_studio_mcp2", nil)
 			return
 		}
-		waitCtx, cancel := context.WithTimeout(r.Context(), taskStudioCommandTimeout)
+		waitCtx, cancel := context.WithTimeout(r.Context(), taskStudioCommandWaitTimeout)
 		defer cancel()
 		terminal, found := broker.waitForTerminal(waitCtx, command.CommandID)
 		if !found {
@@ -1060,22 +1106,27 @@ func main() {
 			})
 			return
 		}
-		studioPID := managedStudio.PID
-		broker := commandBrokers.forDebug()
-		if managedStudio.OwnerKind == "task" && managedStudio.OwnerID != "" {
-			status := taskSessions.Status(managedStudio.OwnerID)
-			if !status.OK || status.State != "live" {
-				writeJSON(w, http.StatusForbidden, map[string]any{
-					"ok":      false,
-					"error":   "task_not_live",
-					"reason":  "managed Studio is not bound to a live task session",
-					"task_id": managedStudio.OwnerID,
-					"state":   status.State,
-				})
-				return
-			}
-			broker = commandBrokers.forTask(managedStudio.OwnerID)
+		if managedStudio.OwnerKind != "task" || managedStudio.OwnerID == "" {
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"ok":     false,
+				"error":  "task_binding_required",
+				"reason": "mcp2 traffic must come from a task-owned Roblox Studio process",
+			})
+			return
 		}
+		status := taskSessions.Status(managedStudio.OwnerID)
+		if !status.OK || status.State != "live" {
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"ok":      false,
+				"error":   "task_not_live",
+				"reason":  "managed Studio is not bound to a live task session",
+				"task_id": managedStudio.OwnerID,
+				"state":   status.State,
+			})
+			return
+		}
+		studioPID := managedStudio.PID
+		broker := commandBrokers.forTask(managedStudio.OwnerID)
 		if onlyPing {
 			response, accepted := broker.ping(mode, parsedModeSeq, studioPID)
 			logger.Info(
@@ -1155,7 +1206,7 @@ func main() {
 					ignoredReason = "task_channel_not_found"
 				}
 			} else {
-				broker = commandBrokers.forDebug()
+				ignoredReason = "task_binding_required"
 			}
 		} else {
 			ignoredReason = "invalid_lifecycle_source"
@@ -1471,12 +1522,12 @@ func main() {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	if err := server.Shutdown(ctx); err != nil {
 		logger.Error("graceful shutdown failed", "error", err)
-		os.Exit(1)
+		_ = server.Close()
 	}
 
 	logger.Info("studio helper http server stopped")
@@ -1917,6 +1968,8 @@ func writeTaskStudioModeTerminal(w http.ResponseWriter, taskID string, command m
 	}
 	if terminal.Result.Result != nil {
 		if runService, ok := terminal.Result.Result["run_service"]; ok {
+			response["run_service"] = runService
+		} else if runService, ok := terminal.Result.Result["run_service_flags"]; ok {
 			response["run_service"] = runService
 		}
 	}

@@ -160,29 +160,29 @@ func (m *mcpRuntime) runTool(ctx context.Context, name string, args map[string]a
 		return nil, err
 	}
 	switch name {
-	case "helper2_status", "task_status":
+	case "helper2_status":
 		payload, statusCode := m.taskStatusPayload(taskID)
 		if statusCode >= 400 {
 			return nil, fmt.Errorf("%v", payload["message"])
 		}
 		return payload, nil
-	case "helper2_studio_mode", "get_studio_session_state":
+	case "helper2_studio_mode":
 		return m.runStudioMode(ctx, taskID), nil
-	case "helper2_studio_play", "launch_studio_session":
+	case "helper2_studio_play":
 		mode, _ := optionalStringArg(args, "mode")
 		if mode != "" && mode != "start_play" {
 			return nil, fmt.Errorf("helper2 MCP play supports start_play only in this phase, got %s", mode)
 		}
 		return m.runStudioCommand(ctx, taskID, mcp2CommandStudioPlay)
-	case "helper2_studio_stop", "start_stop_play":
+	case "helper2_studio_stop":
 		mode, _ := optionalStringArg(args, "mode")
-		if name == "start_stop_play" && mode != "" && mode != "stop" {
-			return nil, fmt.Errorf("start_stop_play alias supports stop only in helper2 MCP, got %s", mode)
+		if mode != "" && mode != "stop" {
+			return nil, fmt.Errorf("helper2 MCP stop supports stop only in this phase, got %s", mode)
 		}
 		return m.runStudioCommand(ctx, taskID, mcp2CommandStudioStop)
-	case "helper2_studio_screenshot", "take_screenshot":
+	case "helper2_studio_screenshot":
 		return m.runScreenshot(ctx, taskID)
-	case "helper2_runtime_log", "runtime_log_read":
+	case "helper2_runtime_log":
 		cursor, _ := optionalStringArg(args, "cursor")
 		limit := optionalIntArg(args, "limit", runtimelog.DefaultReadLimit)
 		return m.readRuntimeLog(taskID, cursor, limit)
@@ -311,7 +311,7 @@ func (m *mcpRuntime) runStudioCommand(ctx context.Context, taskID string, kind m
 	if err != nil {
 		return nil, err
 	}
-	waitCtx, cancel := context.WithTimeout(ctx, taskStudioCommandTimeout)
+	waitCtx, cancel := context.WithTimeout(ctx, taskStudioCommandWaitTimeout)
 	defer cancel()
 	terminal, found := broker.waitForTerminal(waitCtx, command.CommandID)
 	if !found {
@@ -426,6 +426,8 @@ func taskStudioModeTerminalPayload(taskID string, command mcp2Command, terminal 
 	if terminal.Result.Result != nil {
 		if runService, ok := terminal.Result.Result["run_service"]; ok {
 			response["run_service"] = runService
+		} else if runService, ok := terminal.Result.Result["run_service_flags"]; ok {
+			response["run_service"] = runService
 		}
 	}
 	return response
@@ -521,15 +523,6 @@ func mcpTools() []map[string]any {
 			"cursor":  stringSchema(),
 			"limit":   map[string]any{"type": "integer"},
 		}),
-		mcpTool("launch_studio_session", "Compatibility alias for helper2_studio_play.", map[string]any{
-			"task_id": stringSchema(),
-			"mode":    stringSchema(),
-		}),
-		mcpTool("start_stop_play", "Compatibility alias for helper2_studio_stop.", map[string]any{
-			"task_id": stringSchema(),
-			"mode":    stringSchema(),
-		}),
-		mcpTool("take_screenshot", "Compatibility alias for helper2_studio_screenshot.", map[string]any{"task_id": stringSchema()}),
 	}
 }
 

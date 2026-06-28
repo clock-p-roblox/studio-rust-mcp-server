@@ -1,8 +1,11 @@
 local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
+local ServerScriptService = game:GetService("ServerScriptService")
 local StudioTestService = game:GetService("StudioTestService")
 
 local LOG_PREFIX = "[MCP2 Plugin]"
+local RUNTIME_SCRIPT_NAME = "MCP2Runtime"
+local RUNTIME_SCRIPT_MARKER = "clockp_mcp2_runtime_v1"
 
 local function readRunServiceFlag(reader)
 	local ok, value = pcall(reader)
@@ -84,6 +87,49 @@ end
 
 local HELPER_BASE_URL = "http://127.0.0.1:44750"
 local RESPONSE_RESULT_URL = HELPER_BASE_URL .. "/plugin/mcp2/response_result"
+
+local function isManagedRuntimeScript(instance)
+	if instance.Name ~= RUNTIME_SCRIPT_NAME or not instance:IsA("Script") then
+		return false
+	end
+	if instance:GetAttribute(RUNTIME_SCRIPT_MARKER) == true then
+		return true
+	end
+
+	local ok, source = pcall(function()
+		return instance.Source
+	end)
+	return ok and typeof(source) == "string" and string.find(source, RUNTIME_SCRIPT_MARKER, 1, true) ~= nil
+end
+
+local function removeManagedRuntimeScript()
+	for _, child in ServerScriptService:GetChildren() do
+		if isManagedRuntimeScript(child) then
+			child:Destroy()
+		end
+	end
+end
+
+local function installPlayServerRuntimeScript()
+	if mode ~= "edit" then
+		return
+	end
+
+	local ok, source = pcall(function()
+		return script.Source
+	end)
+	if not ok or typeof(source) ~= "string" or source == "" then
+		error("unable to read mcp2 plugin source for play_server runtime: " .. tostring(source))
+	end
+
+	removeManagedRuntimeScript()
+	local runtimeScript = Instance.new("Script")
+	runtimeScript.Name = RUNTIME_SCRIPT_NAME
+	runtimeScript.Source = source
+	runtimeScript:SetAttribute(RUNTIME_SCRIPT_MARKER, true)
+	runtimeScript.Parent = ServerScriptService
+	print(LOG_PREFIX, "play_server runtime script installed", "name=" .. RUNTIME_SCRIPT_NAME)
+end
 
 local function pullCommandURL(onlyPing)
 	local url = HELPER_BASE_URL
@@ -186,7 +232,7 @@ local function processCommand(command)
 			available = true,
 			mode = mode,
 			mode_seq = modeSeq,
-			run_service_flags = {
+			run_service = {
 				IsEdit = isEdit,
 				IsRunning = isRunning,
 				IsServer = isServer,
@@ -208,6 +254,11 @@ local function processCommand(command)
 		local requestedMode = if typeof(args) == "table" and typeof(args.mode) == "string" then args.mode else "start_play"
 		if requestedMode ~= "start_play" then
 			return false, nil, "studio_play only supports start_play; requested mode=" .. tostring(requestedMode)
+		end
+
+		local runtimeOk, runtimeErr = pcall(installPlayServerRuntimeScript)
+		if not runtimeOk then
+			return false, nil, "studio_play failed to install play_server runtime: " .. tostring(runtimeErr)
 		end
 
 		return true, {
@@ -291,6 +342,59 @@ local function postResponseResultUntilRecorded(commandId, ok, result, errorMessa
 	end
 end
 
+local function parsePostResponse(response)
+	if not response.Success then
+		return false, false, tostring(response.StatusCode) .. " " .. tostring(response.Body)
+	end
+
+	local decodedOk, decoded = pcall(function()
+		return HttpService:JSONDecode(response.Body)
+	end)
+	if not decodedOk or typeof(decoded) ~= "table" then
+		return true, false, "invalid_response_body"
+	end
+
+	return true, decoded.recorded == true, tostring(decoded.reason or "")
+end
+
+local function postResponseResultBounded(commandId, ok, result, errorMessage, timeoutSeconds)
+	local finished = false
+	local delivered = false
+	local recorded = false
+	local detail = "timeout"
+
+	task.spawn(function()
+		local responseOk, response = pcall(function()
+			return postResponseResult(commandId, ok, result, errorMessage)
+		end)
+		if not responseOk then
+			detail = tostring(response)
+		else
+			delivered, recorded, detail = parsePostResponse(response)
+		end
+		finished = true
+	end)
+
+	local deadline = os.clock() + timeoutSeconds
+	while not finished and os.clock() < deadline do
+		task.wait(0.05)
+	end
+
+	if not finished then
+		warn(LOG_PREFIX, "command result delivery timed out; Studio transition will still be requested", "command_id=" .. tostring(commandId))
+		return false, false, "timeout"
+	end
+	if delivered and recorded then
+		print(LOG_PREFIX, "command result recorded", "command_id=" .. tostring(commandId))
+	elseif delivered then
+		warn(LOG_PREFIX, "command result delivery was accepted but not recorded; Studio transition will still be requested", "command_id=" .. tostring(commandId), "reason=" .. detail)
+	else
+		warn(LOG_PREFIX, "command result delivery failed; Studio transition will still be requested", "command_id=" .. tostring(commandId), "reason=" .. detail)
+	end
+
+	return delivered, recorded, detail
+end
+
 local function executeStudioTransitionAfterAck(command, result)
 	local kind = tostring(command.kind or "")
 	local status = if typeof(result) == "table" then tostring(result.status or "") else ""
@@ -362,9 +466,19 @@ task.spawn(function()
 				tostring(errorMessage)
 			)
 		end
-		local resultRecorded = postResponseResultUntilRecorded(commandId, ok, result, errorMessage)
+		local shouldRequestStudioTransition = ok
+			and (command.kind == "studio_play" or command.kind == "studio_stop")
+			and typeof(result) == "table"
+			and (result.status == "play_requested" or result.status == "stop_requested")
+		local resultRecorded = false
+		if shouldRequestStudioTransition then
+			local _delivered, recorded, _detail = postResponseResultBounded(commandId, ok, result, errorMessage, 3)
+			resultRecorded = recorded
+		else
+			resultRecorded = postResponseResultUntilRecorded(commandId, ok, result, errorMessage)
+		end
 		stopHeartbeat()
-		if ok and resultRecorded then
+		if shouldRequestStudioTransition then
 			executeStudioTransitionAfterAck(command, result)
 		end
 		if command.kind == "debug_stop_loop" then
