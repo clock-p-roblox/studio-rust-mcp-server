@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"sync"
 	"syscall"
@@ -23,6 +24,8 @@ import (
 )
 
 const defaultAutoStartPlaceID = ""
+
+const taskStudioCommandTimeout = 30 * time.Second
 
 type healthResponse struct {
 	OK      bool   `json:"ok"`
@@ -104,6 +107,13 @@ type mcp2ChannelSummary struct {
 	ResultCount            int          `json:"result_count"`
 }
 
+type mcp2CommandTerminal struct {
+	CommandID   int64               `json:"command_id"`
+	CompletedAt time.Time           `json:"completed_at"`
+	Reason      string              `json:"reason"`
+	Result      *mcp2ResponseResult `json:"result,omitempty"`
+}
+
 type mcp2CommandBroker struct {
 	mu                     sync.Mutex
 	nextCommandID          int64
@@ -115,6 +125,7 @@ type mcp2CommandBroker struct {
 	waitingResponseCommand *mcp2Command
 	pending                []mcp2Command
 	results                []mcp2ResponseResult
+	terminals              map[int64]mcp2CommandTerminal
 	notify                 chan struct{}
 }
 
@@ -122,26 +133,146 @@ func newMCP2CommandBroker() *mcp2CommandBroker {
 	return &mcp2CommandBroker{
 		nextCommandID: 1,
 		activeMode:    "wait_init_mode",
+		terminals:     make(map[int64]mcp2CommandTerminal),
 		notify:        make(chan struct{}),
 	}
 }
 
-func (b *mcp2CommandBroker) ping(mode string, modeSeq int64, studioPID int) mcp2PullResponse {
+type mcp2StaleChannel struct {
+	TaskID    string
+	StudioPID int
+}
+
+type mcp2CommandBrokerRegistry struct {
+	mu    sync.Mutex
+	tasks map[string]*mcp2CommandBroker
+	debug *mcp2CommandBroker
+}
+
+func newMCP2CommandBrokerRegistry() *mcp2CommandBrokerRegistry {
+	return &mcp2CommandBrokerRegistry{
+		tasks: make(map[string]*mcp2CommandBroker),
+		debug: newMCP2CommandBroker(),
+	}
+}
+
+func (r *mcp2CommandBrokerRegistry) forTask(taskID string) *mcp2CommandBroker {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	broker := r.tasks[taskID]
+	if broker == nil {
+		broker = newMCP2CommandBroker()
+		r.tasks[taskID] = broker
+	}
+	return broker
+}
+
+func (r *mcp2CommandBrokerRegistry) getTask(taskID string) (*mcp2CommandBroker, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	broker := r.tasks[taskID]
+	return broker, broker != nil
+}
+
+func (r *mcp2CommandBrokerRegistry) forDebug() *mcp2CommandBroker {
+	return r.debug
+}
+
+func (r *mcp2CommandBrokerRegistry) removeTask(taskID string, reason string) {
+	r.mu.Lock()
+	broker := r.tasks[taskID]
+	delete(r.tasks, taskID)
+	r.mu.Unlock()
+	if broker != nil {
+		broker.cleanup(reason)
+	}
+}
+
+func (r *mcp2CommandBrokerRegistry) summaryForTask(taskID string) mcp2ChannelSummary {
+	r.mu.Lock()
+	broker := r.tasks[taskID]
+	r.mu.Unlock()
+	if broker == nil {
+		return newMCP2CommandBroker().summary()
+	}
+	return broker.summary()
+}
+
+func (r *mcp2CommandBrokerRegistry) recentTerminalsForTask(taskID string, limit int) []mcp2CommandTerminal {
+	r.mu.Lock()
+	broker := r.tasks[taskID]
+	r.mu.Unlock()
+	if broker == nil {
+		return []mcp2CommandTerminal{}
+	}
+	return broker.recentTerminals(limit)
+}
+
+func (r *mcp2CommandBrokerRegistry) summaries() map[string]mcp2ChannelSummary {
+	r.mu.Lock()
+	snapshot := make(map[string]*mcp2CommandBroker, len(r.tasks))
+	for taskID, broker := range r.tasks {
+		snapshot[taskID] = broker
+	}
+	debug := r.debug
+	r.mu.Unlock()
+
+	summaries := make(map[string]mcp2ChannelSummary, len(snapshot)+1)
+	for taskID, broker := range snapshot {
+		summaries[taskID] = broker.summary()
+	}
+	summaries["debug"] = debug.summary()
+	return summaries
+}
+
+func (r *mcp2CommandBrokerRegistry) markStaleIfNeeded(staleAfter time.Duration) []mcp2StaleChannel {
+	r.mu.Lock()
+	snapshot := make(map[string]*mcp2CommandBroker, len(r.tasks))
+	for taskID, broker := range r.tasks {
+		snapshot[taskID] = broker
+	}
+	debug := r.debug
+	r.mu.Unlock()
+
+	stale := make([]mcp2StaleChannel, 0)
+	for taskID, broker := range snapshot {
+		if studioPID, isStale := broker.markStaleIfNeeded(staleAfter); isStale {
+			stale = append(stale, mcp2StaleChannel{TaskID: taskID, StudioPID: studioPID})
+		}
+	}
+	if studioPID, isStale := debug.markStaleIfNeeded(staleAfter); isStale {
+		stale = append(stale, mcp2StaleChannel{TaskID: "debug", StudioPID: studioPID})
+	}
+	return stale
+}
+
+func (b *mcp2CommandBroker) ping(mode string, modeSeq int64, studioPID int) (mcp2PullResponse, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if !b.acceptLifecycleLocked(mode, modeSeq, studioPID) {
+	if studioPID <= 0 {
 		return mcp2PullResponse{
 			Type:   mcp2MessageTypePong,
 			Reason: "invalid_lifecycle_source",
-		}
+		}, false
+	}
+	if b.activeModeSeq == nil || *b.activeModeSeq != modeSeq {
+		return mcp2PullResponse{
+			Type:   mcp2MessageTypePong,
+			Reason: "wrong_lifecycle",
+		}, false
+	}
+	if b.activeStudioPID == nil || *b.activeStudioPID != studioPID {
+		return mcp2PullResponse{
+			Type:   mcp2MessageTypePong,
+			Reason: "studio_pid_mismatch",
+		}, false
 	}
 	now := time.Now()
 	b.lastPullAt = &now
-	b.setActiveStudioPIDLocked(studioPID)
 	return mcp2PullResponse{
 		Type: mcp2MessageTypePong,
-	}
+	}, true
 }
 
 func (b *mcp2CommandBroker) pull(ctx context.Context, mode string, modeSeq int64, studioPID int, timeout time.Duration) (mcp2PullResponse, bool) {
@@ -279,13 +410,84 @@ func (b *mcp2CommandBroker) record(result mcp2ResponseResult, studioPID int) (bo
 		return false, "not_waiting_for_command"
 	}
 
-	b.waitingResponseCommand = nil
 	b.results = append(b.results, result)
 	if len(b.results) > 200 {
 		b.results = b.results[len(b.results)-200:]
 	}
-	b.signalLocked()
+	resultCopy := result
+	b.completeCommandLocked(result.CommandID, "response", &resultCopy)
 	return true, ""
+}
+
+func (b *mcp2CommandBroker) waitForTerminal(ctx context.Context, commandID int64) (mcp2CommandTerminal, bool) {
+	for {
+		b.mu.Lock()
+		if terminal, ok := b.terminals[commandID]; ok {
+			b.mu.Unlock()
+			return terminal, true
+		}
+		notify := b.notify
+		b.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return mcp2CommandTerminal{}, false
+		case <-notify:
+		}
+	}
+}
+
+func (b *mcp2CommandBroker) recentTerminals(limit int) []mcp2CommandTerminal {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if limit <= 0 {
+		limit = 20
+	}
+	terminals := make([]mcp2CommandTerminal, 0, len(b.terminals))
+	for _, terminal := range b.terminals {
+		terminals = append(terminals, terminal)
+	}
+	sort.Slice(terminals, func(i, j int) bool {
+		return terminals[i].CompletedAt.Before(terminals[j].CompletedAt)
+	})
+	if len(terminals) > limit {
+		terminals = terminals[len(terminals)-limit:]
+	}
+	return terminals
+}
+
+func (b *mcp2CommandBroker) completeCommandLocked(commandID int64, reason string, result *mcp2ResponseResult) bool {
+	if _, exists := b.terminals[commandID]; exists {
+		return false
+	}
+	for i := 0; i < len(b.pending); i++ {
+		if b.pending[i].CommandID == commandID {
+			b.pending = append(b.pending[:i], b.pending[i+1:]...)
+			break
+		}
+	}
+	if b.waitingResponseCommand != nil && b.waitingResponseCommand.CommandID == commandID {
+		b.waitingResponseCommand = nil
+	}
+	b.terminals[commandID] = mcp2CommandTerminal{
+		CommandID:   commandID,
+		CompletedAt: time.Now(),
+		Reason:      reason,
+		Result:      result,
+	}
+	if len(b.terminals) > 200 {
+		oldestID := int64(0)
+		var oldestTime time.Time
+		for id, terminal := range b.terminals {
+			if oldestID == 0 || terminal.CompletedAt.Before(oldestTime) {
+				oldestID = id
+				oldestTime = terminal.CompletedAt
+			}
+		}
+		delete(b.terminals, oldestID)
+	}
+	b.signalLocked()
+	return true
 }
 
 func (b *mcp2CommandBroker) waitForResult(ctx context.Context, commandID int64) (mcp2ResponseResult, bool) {
@@ -309,25 +511,33 @@ func (b *mcp2CommandBroker) waitForResult(ctx context.Context, commandID int64) 
 }
 
 func (b *mcp2CommandBroker) cancelCommand(commandID int64) bool {
+	return b.cancelCommandWithReason(commandID, "canceled")
+}
+
+func (b *mcp2CommandBroker) cancelCommandWithReason(commandID int64, reason string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	removed := false
-	for i := 0; i < len(b.pending); i++ {
-		if b.pending[i].CommandID == commandID {
-			b.pending = append(b.pending[:i], b.pending[i+1:]...)
-			removed = true
-			break
-		}
+	return b.completeCommandLocked(commandID, reason, nil)
+}
+
+func (b *mcp2CommandBroker) cleanup(reason string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	pending := append([]mcp2Command(nil), b.pending...)
+	for _, command := range pending {
+		b.completeCommandLocked(command.CommandID, reason, nil)
 	}
-	if b.waitingResponseCommand != nil && b.waitingResponseCommand.CommandID == commandID {
-		b.waitingResponseCommand = nil
-		removed = true
+	b.pending = nil
+	if b.waitingResponseCommand != nil {
+		b.completeCommandLocked(b.waitingResponseCommand.CommandID, reason, nil)
 	}
-	if removed {
-		b.signalLocked()
-	}
-	return removed
+	b.activeMode = "wait_init_mode"
+	b.activeModeSeq = nil
+	b.activeStudioPID = nil
+	b.lastPullAt = nil
+	b.signalLocked()
 }
 
 func (b *mcp2CommandBroker) markStaleIfNeeded(staleAfter time.Duration) (int, bool) {
@@ -346,23 +556,20 @@ func (b *mcp2CommandBroker) markStaleIfNeeded(staleAfter time.Duration) (int, bo
 	b.activeModeSeq = nil
 	b.activeStudioPID = nil
 	b.lastPullAt = nil
+	pending := append([]mcp2Command(nil), b.pending...)
+	for _, command := range pending {
+		b.completeCommandLocked(command.CommandID, "stale", nil)
+	}
 	b.pending = nil
-	b.waitingResponseCommand = nil
+	if b.waitingResponseCommand != nil {
+		b.completeCommandLocked(b.waitingResponseCommand.CommandID, "stale", nil)
+	}
 	b.signalLocked()
 	return studioPID, true
 }
 
 func (b *mcp2CommandBroker) reset() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	b.activeMode = "wait_init_mode"
-	b.activeModeSeq = nil
-	b.activeStudioPID = nil
-	b.lastPullAt = nil
-	b.pending = nil
-	b.waitingResponseCommand = nil
-	b.signalLocked()
+	b.cleanup("reset")
 }
 
 func (b *mcp2CommandBroker) summary() mcp2ChannelSummary {
@@ -414,6 +621,9 @@ func (b *mcp2CommandBroker) acceptLifecycleLocked(mode string, modeSeq int64, st
 		return false
 	}
 	if b.activeModeSeq != nil && *b.activeModeSeq == modeSeq {
+		if b.activeStudioPID != nil && *b.activeStudioPID != studioPID {
+			return false
+		}
 		b.setActiveStudioPIDLocked(studioPID)
 		return true
 	}
@@ -423,8 +633,14 @@ func (b *mcp2CommandBroker) acceptLifecycleLocked(mode string, modeSeq int64, st
 	b.activeModeSeq = &seq
 	b.activeStudioPID = nil
 	b.setActiveStudioPIDLocked(studioPID)
+	pending := append([]mcp2Command(nil), b.pending...)
+	for _, command := range pending {
+		b.completeCommandLocked(command.CommandID, "mode_seq_changed", nil)
+	}
 	b.pending = nil
-	b.waitingResponseCommand = nil
+	if b.waitingResponseCommand != nil {
+		b.completeCommandLocked(b.waitingResponseCommand.CommandID, "mode_seq_changed", nil)
+	}
 	b.signalLocked()
 	return true
 }
@@ -457,7 +673,7 @@ func main() {
 		logger.Error("failed to create Studio manager", "error", err)
 		os.Exit(1)
 	}
-	commandBroker := newMCP2CommandBroker()
+	commandBrokers := newMCP2CommandBrokerRegistry()
 	taskSessions := tasksession.NewRegistry(31*time.Second, studioManager)
 	defer func() {
 		if err := studioManager.Close(); err != nil {
@@ -514,8 +730,9 @@ func main() {
 			writeSessionError(w, err)
 			return
 		}
+		commandBrokers.removeTask(taskID, "task_released")
+		response.KilledPIDs = studioManager.KillTaskStudios(taskID)
 		logger.Info("task released", "task_id", response.TaskID, "killed_pids", response.KilledPIDs)
-		commandBroker.reset()
 		writeJSON(w, http.StatusOK, response)
 	})
 	mux.HandleFunc("GET /session/{task_id}/status", func(w http.ResponseWriter, r *http.Request) {
@@ -553,8 +770,139 @@ func main() {
 			"rojo_upstream_url": rojoUpstreamURL,
 			"desired_studio":    desired,
 			"studios":           studios,
-			"mcp2_channel":      commandBroker.summary(),
-			"recent_commands":   []any{},
+			"mcp2_channel":      commandBrokers.summaryForTask(taskID),
+			"recent_commands":   commandBrokers.recentTerminalsForTask(taskID, 20),
+		})
+	})
+	mux.HandleFunc("POST /session/{task_id}/studio/play", func(w http.ResponseWriter, r *http.Request) {
+		taskID := r.PathValue("task_id")
+		status := taskSessions.Status(taskID)
+		if !status.OK || status.Contract == nil {
+			writeJSON(w, http.StatusNotFound, status)
+			return
+		}
+		if status.State != "live" {
+			writeTaskAPIError(w, http.StatusConflict, taskID, "task_not_live", "task session is not live", "restart_task_agent", map[string]any{"state": status.State})
+			return
+		}
+		broker := commandBrokers.forTask(taskID)
+		command, err := broker.enqueueStudioPlay(status.Contract.PlaceID)
+		if err != nil {
+			writeTaskAPIError(w, http.StatusConflict, taskID, "mcp2_unavailable", err.Error(), "wait_for_studio_mcp2", nil)
+			return
+		}
+		waitCtx, cancel := context.WithTimeout(r.Context(), taskStudioCommandTimeout)
+		defer cancel()
+		terminal, found := broker.waitForTerminal(waitCtx, command.CommandID)
+		if !found {
+			broker.cancelCommandWithReason(command.CommandID, "command_timeout")
+			writeTaskAPIError(w, http.StatusGatewayTimeout, taskID, "command_timeout", "mcp2 command did not complete before timeout", "poll_studio_mode", map[string]any{"command_id": command.CommandID})
+			return
+		}
+		writeTaskStudioCommandTerminal(w, taskID, command, terminal)
+	})
+	mux.HandleFunc("POST /session/{task_id}/studio/stop", func(w http.ResponseWriter, r *http.Request) {
+		taskID := r.PathValue("task_id")
+		status := taskSessions.Status(taskID)
+		if !status.OK || status.Contract == nil {
+			writeJSON(w, http.StatusNotFound, status)
+			return
+		}
+		if status.State != "live" {
+			writeTaskAPIError(w, http.StatusConflict, taskID, "task_not_live", "task session is not live", "restart_task_agent", map[string]any{"state": status.State})
+			return
+		}
+		broker := commandBrokers.forTask(taskID)
+		command, err := broker.enqueueStudioStop(status.Contract.PlaceID)
+		if err != nil {
+			writeTaskAPIError(w, http.StatusConflict, taskID, "mcp2_unavailable", err.Error(), "wait_for_studio_mcp2", nil)
+			return
+		}
+		waitCtx, cancel := context.WithTimeout(r.Context(), taskStudioCommandTimeout)
+		defer cancel()
+		terminal, found := broker.waitForTerminal(waitCtx, command.CommandID)
+		if !found {
+			broker.cancelCommandWithReason(command.CommandID, "command_timeout")
+			writeTaskAPIError(w, http.StatusGatewayTimeout, taskID, "command_timeout", "mcp2 command did not complete before timeout", "poll_studio_mode", map[string]any{"command_id": command.CommandID})
+			return
+		}
+		writeTaskStudioCommandTerminal(w, taskID, command, terminal)
+	})
+	mux.HandleFunc("GET /session/{task_id}/studio/mode", func(w http.ResponseWriter, r *http.Request) {
+		taskID := r.PathValue("task_id")
+		status := taskSessions.Status(taskID)
+		if !status.OK || status.Contract == nil {
+			writeJSON(w, http.StatusNotFound, status)
+			return
+		}
+		if status.State != "live" {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok":        true,
+				"task_id":   taskID,
+				"available": false,
+				"mode":      "unknown",
+				"reason":    "task_session_not_live",
+				"state":     status.State,
+			})
+			return
+		}
+		broker := commandBrokers.forTask(taskID)
+		command, err := broker.enqueueStudioModeQuery(status.Contract.PlaceID)
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok":        true,
+				"task_id":   taskID,
+				"available": false,
+				"mode":      "unknown",
+				"reason":    err.Error(),
+			})
+			return
+		}
+
+		waitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		terminal, found := broker.waitForTerminal(waitCtx, command.CommandID)
+		if !found {
+			broker.cancelCommandWithReason(command.CommandID, "mode_query_timeout")
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok":         true,
+				"task_id":    taskID,
+				"available":  false,
+				"mode":       "unknown",
+				"command_id": command.CommandID,
+				"reason":     "mode_query_timeout",
+			})
+			return
+		}
+		writeTaskStudioModeTerminal(w, taskID, command, terminal)
+	})
+	mux.HandleFunc("GET /session/{task_id}/studio/screenshot", func(w http.ResponseWriter, r *http.Request) {
+		taskID := r.PathValue("task_id")
+		status := taskSessions.Status(taskID)
+		if !status.OK || status.Contract == nil {
+			writeJSON(w, http.StatusNotFound, status)
+			return
+		}
+		if status.State != "live" {
+			writeTaskAPIError(w, http.StatusConflict, taskID, "task_not_live", "task session is not live", "restart_task_agent", map[string]any{"state": status.State})
+			return
+		}
+		managedStudio, err := studioManager.ManagedProcessForTask(taskID)
+		if err != nil {
+			writeTaskAPIError(w, http.StatusConflict, taskID, "studio_not_available", err.Error(), "wait_for_studio", nil)
+			return
+		}
+		result, err := screenshot.CaptureStudioScreenshotForExactPID(r.Context(), managedStudio.PID, "", "task-"+taskID)
+		if err != nil {
+			logger.Warn("failed to capture task Roblox Studio screenshot", "task_id", taskID, "studio_pid", managedStudio.PID, "error", err)
+			writeTaskAPIError(w, http.StatusInternalServerError, taskID, "screenshot_failed", err.Error(), "retry", map[string]any{"studio_pid": managedStudio.PID})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":         true,
+			"task_id":    taskID,
+			"studio_pid": managedStudio.PID,
+			"screenshot": result,
 		})
 	})
 	mux.HandleFunc("GET /plugin/mcp2/pull_command", func(w http.ResponseWriter, r *http.Request) {
@@ -569,8 +917,8 @@ func main() {
 			})
 			return
 		}
-		studioPID := resolvePeerManagedStudioPID(r, *addr, studioManager, logger)
-		if studioPID <= 0 {
+		managedStudio, ok := resolvePeerManagedStudioProcess(r, *addr, studioManager, logger)
+		if !ok {
 			writeJSON(w, http.StatusForbidden, map[string]any{
 				"ok":     false,
 				"error":  "invalid_lifecycle_source",
@@ -578,19 +926,43 @@ func main() {
 			})
 			return
 		}
+		studioPID := managedStudio.PID
+		broker := commandBrokers.forDebug()
+		if managedStudio.OwnerKind == "task" && managedStudio.OwnerID != "" {
+			status := taskSessions.Status(managedStudio.OwnerID)
+			if !status.OK || status.State != "live" {
+				writeJSON(w, http.StatusForbidden, map[string]any{
+					"ok":      false,
+					"error":   "task_not_live",
+					"reason":  "managed Studio is not bound to a live task session",
+					"task_id": managedStudio.OwnerID,
+					"state":   status.State,
+				})
+				return
+			}
+			broker = commandBrokers.forTask(managedStudio.OwnerID)
+		}
 		if onlyPing {
-			response := commandBroker.ping(mode, parsedModeSeq, studioPID)
+			response, accepted := broker.ping(mode, parsedModeSeq, studioPID)
 			logger.Info(
 				"mcp2 ping",
 				"remote_addr", r.RemoteAddr,
 				"mode", mode,
 				"mode_seq", modeSeq,
 				"studio_pid", studioPID,
+				"owner_kind", managedStudio.OwnerKind,
+				"owner_id", managedStudio.OwnerID,
+				"accepted", accepted,
+				"reason", response.Reason,
 			)
+			if !accepted {
+				writeJSON(w, http.StatusConflict, response)
+				return
+			}
 			writeJSON(w, http.StatusOK, response)
 			return
 		}
-		response, closeConnection := commandBroker.pull(r.Context(), mode, parsedModeSeq, studioPID, 10*time.Second)
+		response, closeConnection := broker.pull(r.Context(), mode, parsedModeSeq, studioPID, 10*time.Second)
 		if closeConnection {
 			logger.Info("mcp2 pull superseded; closing http connection", "remote_addr", r.RemoteAddr, "mode", mode, "mode_seq", modeSeq)
 			if err := closeHTTPConnection(w); err != nil {
@@ -605,6 +977,8 @@ func main() {
 			"mode", mode,
 			"mode_seq", modeSeq,
 			"studio_pid", studioPID,
+			"owner_kind", managedStudio.OwnerKind,
+			"owner_id", managedStudio.OwnerID,
 			"command_id", response.CommandID,
 			"type", response.Type,
 			"kind", response.Kind,
@@ -631,12 +1005,37 @@ func main() {
 		}
 
 		result.ReceivedAt = time.Now()
-		studioPID := resolvePeerManagedStudioPID(r, *addr, studioManager, logger)
-		recorded, ignoredReason := commandBroker.record(result, studioPID)
+		managedStudio, ok := resolvePeerManagedStudioProcess(r, *addr, studioManager, logger)
+		studioPID := 0
+		var broker *mcp2CommandBroker
+		ignoredReason := ""
+		if ok {
+			studioPID = managedStudio.PID
+			if managedStudio.OwnerKind == "task" && managedStudio.OwnerID != "" {
+				status := taskSessions.Status(managedStudio.OwnerID)
+				if !status.OK || status.State != "live" {
+					ignoredReason = "task_not_live"
+				} else if existing, exists := commandBrokers.getTask(managedStudio.OwnerID); exists {
+					broker = existing
+				} else {
+					ignoredReason = "task_channel_not_found"
+				}
+			} else {
+				broker = commandBrokers.forDebug()
+			}
+		} else {
+			ignoredReason = "invalid_lifecycle_source"
+		}
+		recorded := false
+		if broker != nil {
+			recorded, ignoredReason = broker.record(result, studioPID)
+		}
 		logger.Info(
 			"mcp2 response acknowledged",
 			"remote_addr", r.RemoteAddr,
 			"studio_pid", studioPID,
+			"owner_kind", managedStudio.OwnerKind,
+			"owner_id", managedStudio.OwnerID,
 			"mode", result.Mode,
 			"mode_seq", result.ModeSeq,
 			"command_id", result.CommandID,
@@ -673,7 +1072,7 @@ func main() {
 			})
 			return
 		}
-		command, err := commandBroker.enqueueDebug(placeID, request.Kind, request.SleepMS)
+		command, err := commandBrokers.forDebug().enqueueDebug(placeID, request.Kind, request.SleepMS)
 		if err != nil {
 			writeJSON(w, http.StatusConflict, map[string]any{
 				"ok":    false,
@@ -696,7 +1095,7 @@ func main() {
 			})
 			return
 		}
-		command, err := commandBroker.enqueueStudioPlay(placeID)
+		command, err := commandBrokers.forDebug().enqueueStudioPlay(placeID)
 		if err != nil {
 			writeJSON(w, http.StatusConflict, map[string]any{
 				"ok":    false,
@@ -721,7 +1120,7 @@ func main() {
 			})
 			return
 		}
-		command, err := commandBroker.enqueueStudioStop(placeID)
+		command, err := commandBrokers.forDebug().enqueueStudioStop(placeID)
 		if err != nil {
 			writeJSON(w, http.StatusConflict, map[string]any{
 				"ok":    false,
@@ -746,7 +1145,8 @@ func main() {
 			})
 			return
 		}
-		command, err := commandBroker.enqueueStudioModeQuery(placeID)
+		debugBroker := commandBrokers.forDebug()
+		command, err := debugBroker.enqueueStudioModeQuery(placeID)
 		if err != nil {
 			writeJSON(w, http.StatusOK, map[string]any{
 				"ok":        true,
@@ -759,9 +1159,9 @@ func main() {
 
 		waitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
-		result, found := commandBroker.waitForResult(waitCtx, command.CommandID)
+		result, found := debugBroker.waitForResult(waitCtx, command.CommandID)
 		if !found {
-			commandBroker.cancelCommand(command.CommandID)
+			debugBroker.cancelCommand(command.CommandID)
 			writeJSON(w, http.StatusOK, map[string]any{
 				"ok":         true,
 				"available":  false,
@@ -783,11 +1183,11 @@ func main() {
 	mux.HandleFunc("GET /studio/summary", func(w http.ResponseWriter, r *http.Request) {
 		summary := struct {
 			studio.Summary
-			MCP2Channel  mcp2ChannelSummary  `json:"mcp2_channel"`
-			TaskSessions tasksession.Summary `json:"task_sessions"`
+			MCP2Channels map[string]mcp2ChannelSummary `json:"mcp2_channels"`
+			TaskSessions tasksession.Summary           `json:"task_sessions"`
 		}{
 			Summary:      studioManager.Summary(),
-			MCP2Channel:  commandBroker.summary(),
+			MCP2Channels: commandBrokers.summaries(),
 			TaskSessions: taskSessions.Summary(),
 		}
 		printPrettyJSON("studio summary", summary)
@@ -884,15 +1284,22 @@ func main() {
 		for {
 			select {
 			case <-ticker.C:
-				if studioPID, stale := commandBroker.markStaleIfNeeded(*mcp2StaleAfter); stale {
-					logger.Warn("mcp2 channel stale; clearing channel and killing matching managed Studio", "studio_pid", studioPID)
-					if studioPID > 0 {
-						studioManager.KillManagedPID(studioPID)
+				for _, stopped := range studioManager.PruneStoppedProcesses() {
+					if stopped.OwnerKind == "task" && stopped.OwnerID != "" {
+						logger.Warn("task-owned Studio stopped; clearing task mcp2 channel", "task_id", stopped.OwnerID, "studio_pid", stopped.PID)
+						commandBrokers.removeTask(stopped.OwnerID, "studio_process_stopped")
+					}
+				}
+				for _, stale := range commandBrokers.markStaleIfNeeded(*mcp2StaleAfter) {
+					logger.Warn("mcp2 channel stale; clearing channel and killing matching managed Studio", "task_id", stale.TaskID, "studio_pid", stale.StudioPID)
+					if stale.StudioPID > 0 {
+						studioManager.KillManagedPID(stale.StudioPID)
 					}
 				}
 				for _, taskID := range taskSessions.ExpireStale() {
 					logger.Warn("task session lease expired", "task_id", taskID)
-					commandBroker.reset()
+					commandBrokers.removeTask(taskID, "lease_expired")
+					studioManager.KillTaskStudios(taskID)
 				}
 				studioManager.ReconcileDesired(context.Background())
 			}
@@ -949,6 +1356,83 @@ func printPrettyJSON(label string, value any) {
 	fmt.Printf("%s:\n%s\n", label, body)
 }
 
+func writeTaskStudioCommandTerminal(w http.ResponseWriter, taskID string, command mcp2Command, terminal mcp2CommandTerminal) {
+	if terminal.Result == nil {
+		writeTaskAPIError(w, http.StatusConflict, taskID, terminal.Reason, "mcp2 command ended before a response was received", "retry", map[string]any{
+			"command_id": command.CommandID,
+			"accepted":   false,
+			"terminal":   terminal,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":                  terminal.Result.OK,
+		"task_id":             taskID,
+		"command_id":          command.CommandID,
+		"accepted":            terminal.Result.OK,
+		"final_mode_verified": false,
+		"next_action":         "poll_studio_mode",
+		"command_result":      terminal.Result,
+		"terminal":            terminal,
+	})
+}
+
+func writeTaskStudioModeTerminal(w http.ResponseWriter, taskID string, command mcp2Command, terminal mcp2CommandTerminal) {
+	if terminal.Result == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":         true,
+			"task_id":    taskID,
+			"available":  false,
+			"mode":       "unknown",
+			"command_id": command.CommandID,
+			"reason":     terminal.Reason,
+			"terminal":   terminal,
+		})
+		return
+	}
+	mode := terminal.Result.Mode
+	if mode == "" && terminal.Result.Result != nil {
+		if value, ok := terminal.Result.Result["mode"].(string); ok {
+			mode = value
+		}
+	}
+	if mode == "" {
+		mode = "unknown"
+	}
+	response := map[string]any{
+		"ok":             true,
+		"task_id":        taskID,
+		"available":      terminal.Result.OK,
+		"mode":           mode,
+		"mode_seq":       terminal.Result.ModeSeq,
+		"command_id":     command.CommandID,
+		"command_result": terminal.Result,
+		"terminal":       terminal,
+	}
+	if terminal.Result.Result != nil {
+		if runService, ok := terminal.Result.Result["run_service"]; ok {
+			response["run_service"] = runService
+		}
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func writeTaskAPIError(w http.ResponseWriter, status int, taskID string, code string, message string, action string, extra map[string]any) {
+	body := map[string]any{
+		"ok":      false,
+		"code":    code,
+		"message": message,
+		"task_id": taskID,
+	}
+	if action != "" {
+		body["action"] = action
+	}
+	for key, value := range extra {
+		body[key] = value
+	}
+	writeJSON(w, status, body)
+}
+
 func defaultAddr() string {
 	if value := os.Getenv("STUDIO_HELPER_ADDR"); value != "" {
 		return value
@@ -967,30 +1451,30 @@ func parseModeSeq(value string) (int64, error) {
 	return parsed, nil
 }
 
-func resolvePeerManagedStudioPID(r *http.Request, listenAddr string, studioManager *studio.Manager, logger *slog.Logger) int {
+func resolvePeerManagedStudioProcess(r *http.Request, listenAddr string, studioManager *studio.Manager, logger *slog.Logger) (studio.ManagedProcess, bool) {
 	helperPort, err := listenPort(listenAddr)
 	if err != nil {
 		logger.Warn("failed to parse helper listen port for peer pid lookup", "addr", listenAddr, "error", err)
-		return 0
+		return studio.ManagedProcess{}, false
 	}
 	peerAddr, err := net.ResolveTCPAddr("tcp", r.RemoteAddr)
 	if err != nil {
 		logger.Warn("failed to parse mcp2 peer addr for pid lookup", "remote_addr", r.RemoteAddr, "error", err)
-		return 0
+		return studio.ManagedProcess{}, false
 	}
 	pid, err := studio.ResolvePeerProcessID(peerAddr, helperPort)
 	if err != nil {
 		logger.Warn("failed to resolve mcp2 peer pid", "remote_addr", r.RemoteAddr, "error", err)
-		return 0
+		return studio.ManagedProcess{}, false
 	}
-	managedRootPID, ok := studioManager.ManagedRootPIDForPeerPID(pid)
+	managedProcess, ok := studioManager.ManagedProcessForPeerPID(pid)
 	if !ok {
 		if pid > 0 {
 			logger.Warn("mcp2 peer pid is not a running managed Roblox Studio", "remote_addr", r.RemoteAddr, "pid", pid)
 		}
-		return 0
+		return studio.ManagedProcess{}, false
 	}
-	return managedRootPID
+	return managedProcess, true
 }
 
 func listenPort(addr string) (int, error) {

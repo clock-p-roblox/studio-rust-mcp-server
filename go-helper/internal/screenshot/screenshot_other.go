@@ -20,3 +20,7 @@ type Result struct {
 func CaptureStudioScreenshot(_ context.Context, _ int, _ string, _ string) (Result, error) {
 	return Result{}, errors.New("studio screenshots are only available on Windows")
 }
+
+func CaptureStudioScreenshotForExactPID(_ context.Context, _ int, _ string, _ string) (Result, error) {
+	return Result{}, errors.New("studio screenshots are only available on Windows")
+}

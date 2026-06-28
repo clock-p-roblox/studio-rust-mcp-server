@@ -289,14 +289,51 @@ func (m *Manager) ManagedPIDForPlace(placeID string) (int, error) {
 	return matches[0], nil
 }
 
+func (m *Manager) ManagedProcessForTask(taskID string) (ManagedProcess, error) {
+	if taskID == "" {
+		return ManagedProcess{}, errors.New("task_id must not be empty")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pruneStoppedProcessesLocked()
+
+	matches := make([]ManagedProcess, 0, 1)
+	for pid, process := range m.processes {
+		if process.OwnerKind == "task" && process.OwnerID == taskID && processIsManagedRunning(pid, process.StartedAt) {
+			process.PID = pid
+			process.Running = true
+			matches = append(matches, process)
+		}
+	}
+	if len(matches) == 0 {
+		return ManagedProcess{}, fmt.Errorf("no running task-owned Roblox Studio for task_id %s", taskID)
+	}
+	if len(matches) > 1 {
+		sort.Slice(matches, func(i, j int) bool {
+			return matches[i].PID < matches[j].PID
+		})
+		pids := make([]int, 0, len(matches))
+		for _, match := range matches {
+			pids = append(pids, match.PID)
+		}
+		return ManagedProcess{}, fmt.Errorf("multiple running task-owned Roblox Studio processes for task_id %s: %v", taskID, pids)
+	}
+	return matches[0], nil
+}
+
 func (m *Manager) PIDIsManagedRunning(pid int) bool {
 	_, ok := m.ManagedRootPIDForPeerPID(pid)
 	return ok
 }
 
 func (m *Manager) ManagedRootPIDForPeerPID(pid int) (int, bool) {
+	process, ok := m.ManagedProcessForPeerPID(pid)
+	return process.PID, ok
+}
+
+func (m *Manager) ManagedProcessForPeerPID(pid int) (ManagedProcess, bool) {
 	if pid <= 0 {
-		return 0, false
+		return ManagedProcess{}, false
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -307,35 +344,44 @@ func (m *Manager) ManagedRootPIDForPeerPID(pid int) (int, bool) {
 		if !processIsManagedRunning(rootPID, process.StartedAt) {
 			continue
 		}
-		if rootPID == pid {
-			return rootPID, true
-		}
 		process.PID = rootPID
+		process.Running = true
+		if rootPID == pid {
+			return process, true
+		}
 		roots = append(roots, process)
 	}
 
 	if !m.job.contains(pid) {
-		return 0, false
+		return ManagedProcess{}, false
 	}
 	for _, root := range roots {
 		if processHasAncestor(pid, root.PID) {
-			return root.PID, true
+			return root, true
 		}
 	}
-	if len(roots) == 1 {
-		return roots[0].PID, true
-	}
-	return 0, false
+	return ManagedProcess{}, false
 }
 
-func (m *Manager) pruneStoppedProcessesLocked() {
+func (m *Manager) PruneStoppedProcesses() []ManagedProcess {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.pruneStoppedProcessesLocked()
+}
+
+func (m *Manager) pruneStoppedProcessesLocked() []ManagedProcess {
+	stopped := make([]ManagedProcess, 0)
 	for pid, process := range m.processes {
 		if processIsManagedRunning(pid, process.StartedAt) {
 			continue
 		}
+		process.PID = pid
+		process.Running = false
+		stopped = append(stopped, process)
 		delete(m.processes, pid)
 		m.logger.Info("removed stopped Roblox Studio from manager", "pid", pid, "place_id", process.PlaceID)
 	}
+	return stopped
 }
 
 func processHasAncestor(pid int, ancestorPID int) bool {

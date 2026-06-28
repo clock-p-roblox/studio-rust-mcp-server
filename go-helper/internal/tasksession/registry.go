@@ -20,7 +20,6 @@ const (
 type DesiredStudioStore interface {
 	EnsureTaskDesired(taskID string, placeID string)
 	RemoveTaskDesired(taskID string)
-	KillTaskStudios(taskID string) []int
 }
 
 type HeartbeatRequest struct {
@@ -222,12 +221,11 @@ func (r *Registry) Release(taskID string, request ReleaseRequest) (ReleaseRespon
 	r.store.RemoveTaskDesired(taskID)
 	r.mu.Unlock()
 
-	killed := r.store.KillTaskStudios(taskID)
 	return ReleaseResponse{
 		OK:         true,
 		TaskID:     taskID,
 		State:      "ended",
-		KilledPIDs: killed,
+		KilledPIDs: []int{},
 	}, nil
 }
 
@@ -290,9 +288,6 @@ func (r *Registry) ExpireStale() []string {
 	}
 	r.mu.Unlock()
 
-	for _, taskID := range expiredTaskIDs {
-		r.store.KillTaskStudios(taskID)
-	}
 	return expiredTaskIDs
 }
 

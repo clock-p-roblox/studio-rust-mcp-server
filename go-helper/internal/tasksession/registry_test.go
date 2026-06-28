@@ -7,7 +7,6 @@ import (
 
 type fakeDesiredStore struct {
 	desired map[string]string
-	killed  []string
 }
 
 func newFakeDesiredStore() *fakeDesiredStore {
@@ -20,11 +19,6 @@ func (s *fakeDesiredStore) EnsureTaskDesired(taskID string, placeID string) {
 
 func (s *fakeDesiredStore) RemoveTaskDesired(taskID string) {
 	delete(s.desired, taskID)
-}
-
-func (s *fakeDesiredStore) KillTaskStudios(taskID string) []int {
-	s.killed = append(s.killed, taskID)
-	return []int{101}
 }
 
 func validHeartbeat(taskID string) HeartbeatRequest {
@@ -89,7 +83,7 @@ func TestReleaseCreatesEndedTombstone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("release failed: %v", err)
 	}
-	if release.State != "ended" || len(release.KilledPIDs) != 1 {
+	if release.State != "ended" || len(release.KilledPIDs) != 0 {
 		t.Fatalf("unexpected release response: %+v", release)
 	}
 	if _, ok := store.desired["t123"]; ok {

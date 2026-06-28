@@ -80,6 +80,14 @@ type childWindowSearch struct {
 }
 
 func CaptureStudioScreenshot(ctx context.Context, studioPID int, outputDir string, filePrefix string) (Result, error) {
+	return captureStudioScreenshot(ctx, studioPID, outputDir, filePrefix, true)
+}
+
+func CaptureStudioScreenshotForExactPID(ctx context.Context, studioPID int, outputDir string, filePrefix string) (Result, error) {
+	return captureStudioScreenshot(ctx, studioPID, outputDir, filePrefix, false)
+}
+
+func captureStudioScreenshot(ctx context.Context, studioPID int, outputDir string, filePrefix string, allowFallback bool) (Result, error) {
 	if studioPID <= 0 {
 		return Result{}, fmt.Errorf("studio pid must be positive: %d", studioPID)
 	}
@@ -94,7 +102,7 @@ func CaptureStudioScreenshot(ctx context.Context, studioPID int, outputDir strin
 		filePrefix = "studio"
 	}
 
-	studioWindow, viewport, err := findStudioCaptureTarget(studioPID)
+	studioWindow, viewport, err := findStudioCaptureTarget(studioPID, allowFallback)
 	if err != nil {
 		return Result{}, err
 	}
@@ -148,7 +156,7 @@ func timestamp() string {
 	return time.Now().Format("20060102-150405.000")
 }
 
-func findStudioCaptureTarget(studioPID int) (windowCandidate, childWindowCandidate, error) {
+func findStudioCaptureTarget(studioPID int, allowFallback bool) (windowCandidate, childWindowCandidate, error) {
 	allCandidates := collectTopWindows()
 	exactCandidates := make([]windowCandidate, 0)
 	for _, candidate := range allCandidates {
@@ -162,7 +170,7 @@ func findStudioCaptureTarget(studioPID int) (windowCandidate, childWindowCandida
 			return topWindowScore(exactCandidates[i]) > topWindowScore(exactCandidates[j])
 		})
 		studioWindow = exactCandidates[0]
-	} else {
+	} else if allowFallback {
 		studioNamed := make([]windowCandidate, 0)
 		for _, candidate := range allCandidates {
 			if strings.Contains(candidate.title, "Roblox Studio") {
@@ -181,6 +189,8 @@ func findStudioCaptureTarget(studioPID int) (windowCandidate, childWindowCandida
 		}
 		studioWindow = studioNamed[0]
 		studioWindow.isFallback = true
+	} else {
+		return windowCandidate{}, childWindowCandidate{}, fmt.Errorf("could not find exact visible Roblox Studio window for pid %d", studioPID)
 	}
 
 	descendants := collectVisibleChildWindows(studioWindow.hwnd, 500, 400)
