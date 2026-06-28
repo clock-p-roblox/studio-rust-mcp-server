@@ -721,6 +721,16 @@ func main() {
 	autoStartPlaceID := flag.String("auto-start-place-id", defaultAutoStartPlaceID, "Roblox place id to launch when helper starts; empty disables auto launch")
 	mcp2StaleAfter := flag.Duration("mcp2-stale-after", 60*time.Second, "mcp2 channel stale timeout")
 	mcp2StaleCheckInterval := flag.Duration("mcp2-stale-check-interval", 5*time.Second, "mcp2 channel stale watchdog interval")
+	publicExposureEnabled := flag.Bool("public-exposure", false, "enable helper2 public exposure through clockbridge/https-proxy")
+	publicExposureDryRun := flag.Bool("public-exposure-dry-run", false, "resolve helper2 public exposure without starting clockbridge")
+	publicMachineName := flag.String("public-machine-name", "", "explicit machine name for helper2 public exposure")
+	publicUserName := flag.String("public-user", "", "explicit user name for helper2 public exposure")
+	publicDomainSuffix := flag.String("public-domain-suffix", defaultPublicDomainSuffix, "domain suffix for helper2 public exposure")
+	clockbridgeBin := flag.String("clockbridge-bin", "clockbridge-cli", "clockbridge-cli executable for helper2 public exposure")
+	clockbridgeTokenFile := flag.String("clockbridge-token-file", "", "clockbridge bearer token file for helper2 public exposure")
+	clockbridgeXToken := flag.String("clockbridge-x-token", "", "optional clockbridge X-Token for helper2 public exposure")
+	clockbridgeRegisterHost := flag.String("clockbridge-register-host", "", "clockbridge register host; defaults to register-https-proxy.<public-domain-suffix>")
+	clockbridgeRegisterIP := flag.String("clockbridge-register-ip", "", "optional clockbridge register TCP override")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
@@ -739,7 +749,13 @@ func main() {
 		os.Exit(1)
 	}
 	effectiveListenAddr := *addr
+	publicExposure, err := newPublicExposureManager(publicExposureConfig{Enabled: false}, logger)
+	if err != nil {
+		logger.Error("failed to initialize disabled public exposure", "error", err)
+		os.Exit(1)
+	}
 	defer func() {
+		publicExposure.Stop()
 		if err := runtimeLogs.Close(); err != nil {
 			logger.Warn("failed to clean runtime log store", "dir", runtimeLogs.Dir(), "error", err)
 		}
@@ -755,7 +771,9 @@ func main() {
 			Service: "studio-helper",
 		})
 	})
-	registerMCPHandlers(mux, taskSessions, studioManager, commandBrokers, runtimeLogs, logger)
+	registerMCPHandlers(mux, taskSessions, studioManager, commandBrokers, runtimeLogs, logger, func() publicExposureStatus {
+		return publicExposure.Status()
+	})
 	mux.HandleFunc("POST /session/{task_id}/heartbeat", func(w http.ResponseWriter, r *http.Request) {
 		pathTaskID := r.PathValue("task_id")
 		var request tasksession.HeartbeatRequest
@@ -1458,8 +1476,33 @@ func main() {
 		os.Exit(1)
 	}
 	effectiveListenAddr = listener.Addr().String()
+	publicExposure, err = newPublicExposureManager(publicExposureConfig{
+		Enabled:        *publicExposureEnabled,
+		DryRun:         *publicExposureDryRun,
+		ClockbridgeBin: *clockbridgeBin,
+		MachineName:    *publicMachineName,
+		UserName:       *publicUserName,
+		DomainSuffix:   *publicDomainSuffix,
+		TokenFile:      *clockbridgeTokenFile,
+		XToken:         *clockbridgeXToken,
+		RegisterHost:   *clockbridgeRegisterHost,
+		RegisterIP:     *clockbridgeRegisterIP,
+		ListenAddr:     effectiveListenAddr,
+	}, logger)
+	if err != nil {
+		logger.Error("failed to configure helper2 public exposure", "error", err)
+		_ = listener.Close()
+		os.Exit(1)
+	}
 
 	errCh := make(chan error, 1)
+	rootCtx, stopPublicExposure := context.WithCancel(context.Background())
+	defer stopPublicExposure()
+	if err := publicExposure.Start(rootCtx); err != nil {
+		logger.Error("failed to start helper2 public exposure", "error", err)
+		_ = listener.Close()
+		os.Exit(1)
+	}
 	go func() {
 		logger.Info("studio helper http server listening", "addr", listener.Addr().String())
 		errCh <- server.Serve(listener)
@@ -1525,6 +1568,8 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
+	stopPublicExposure()
+	publicExposure.Stop()
 	if err := server.Shutdown(ctx); err != nil {
 		logger.Error("graceful shutdown failed", "error", err)
 		_ = server.Close()

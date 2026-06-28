@@ -72,6 +72,29 @@ func TestResolveHelperBaseURLPublicDerivesFromMachineAndUser(t *testing.T) {
 	}
 }
 
+func TestResolveHelperBaseURLPublicRequiresExplicitIdentity(t *testing.T) {
+	emptyHome := t.TempDir()
+	t.Setenv("APPDATA", emptyHome)
+	t.Setenv("USERPROFILE", emptyHome)
+	t.Setenv("HOME", emptyHome)
+
+	_, _, missingUserErr := ResolveHelperBaseURL(RouteConfig{
+		Environment: "public",
+		MachineName: "win-a",
+	})
+	if missingUserErr == nil || !strings.Contains(missingUserErr.Error(), "--user is required") {
+		t.Fatalf("expected public user error, got %v", missingUserErr)
+	}
+
+	_, _, missingMachineErr := ResolveHelperBaseURL(RouteConfig{
+		Environment: "public",
+		UserName:    "sunjun",
+	})
+	if missingMachineErr == nil || !strings.Contains(missingMachineErr.Error(), "machine_name is required") {
+		t.Fatalf("expected public machine error, got %v", missingMachineErr)
+	}
+}
+
 func TestRequestExistingShutdownUsesStatusURLAndTaskID(t *testing.T) {
 	shutdownCalled := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

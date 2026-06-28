@@ -41,11 +41,12 @@ type mcpToolCallParams struct {
 }
 
 type mcpRuntime struct {
-	taskSessions  *tasksession.Registry
-	studioManager *studio.Manager
-	commandBroker *mcp2CommandBrokerRegistry
-	runtimeLogs   *runtimelog.Store
-	logger        *slog.Logger
+	taskSessions         *tasksession.Registry
+	studioManager        *studio.Manager
+	commandBroker        *mcp2CommandBrokerRegistry
+	runtimeLogs          *runtimelog.Store
+	logger               *slog.Logger
+	publicExposureStatus func() publicExposureStatus
 }
 
 func registerMCPHandlers(
@@ -55,13 +56,15 @@ func registerMCPHandlers(
 	commandBrokers *mcp2CommandBrokerRegistry,
 	runtimeLogs *runtimelog.Store,
 	logger *slog.Logger,
+	publicExposureStatus func() publicExposureStatus,
 ) {
 	runtime := &mcpRuntime{
-		taskSessions:  taskSessions,
-		studioManager: studioManager,
-		commandBroker: commandBrokers,
-		runtimeLogs:   runtimeLogs,
-		logger:        logger,
+		taskSessions:         taskSessions,
+		studioManager:        studioManager,
+		commandBroker:        commandBrokers,
+		runtimeLogs:          runtimeLogs,
+		logger:               logger,
+		publicExposureStatus: publicExposureStatus,
 	}
 	mux.HandleFunc("GET /status", runtime.handleMCPStatus)
 	mux.HandleFunc("POST /mcp", runtime.handleMCP)
@@ -70,11 +73,15 @@ func registerMCPHandlers(
 func (m *mcpRuntime) handleMCPStatus(w http.ResponseWriter, r *http.Request) {
 	taskID := strings.TrimSpace(r.URL.Query().Get("task_id"))
 	if taskID == "" {
-		writeJSON(w, http.StatusOK, map[string]any{
+		payload := map[string]any{
 			"ok":      true,
 			"service": "studio-helper2-mcp",
 			"tools":   mcpToolNames(),
-		})
+		}
+		if m.publicExposureStatus != nil {
+			payload["public_exposure"] = m.publicExposureStatus()
+		}
+		writeJSON(w, http.StatusOK, payload)
 		return
 	}
 	payload, statusCode := m.taskStatusPayload(taskID)
@@ -434,8 +441,16 @@ func taskStudioModeTerminalPayload(taskID string, command mcp2Command, terminal 
 }
 
 func writeMCPResponse(w http.ResponseWriter, response mcpJSONRPCResponse) {
+	body, err := json.Marshal(response)
+	if err != nil {
+		slog.Error("failed to encode mcp response", "error", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	body = append(body, '\n')
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(response); err != nil {
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	if _, err := w.Write(body); err != nil {
 		slog.Error("failed to write mcp response", "error", err)
 	}
 }
