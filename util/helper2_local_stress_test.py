@@ -11,6 +11,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -19,8 +20,15 @@ HELPER_BASE_URL = "http://127.0.0.1:44750"
 DEFAULT_PLACE_ID = "105986423068266"
 DEFAULT_PROJECT = Path(r"D:\roblox_space\.codex-runtime-stop-local\workspace\default.project.json")
 DEFAULT_ROJO = Path(r"D:\roblox_space\rojo\target\release\rojo.exe")
+ROJO_REPO = Path(r"D:\roblox_space\rojo")
 PLUGIN_PATH = Path(os.environ["LOCALAPPDATA"]) / "Roblox" / "Plugins" / "MCP2Plugin.rbxm"
+ROJO_PLUGIN_PATH = Path(os.environ["LOCALAPPDATA"]) / "Roblox" / "Plugins" / "Rojo.rbxm"
 ROBLOX_LOG_DIR = Path(os.environ["LOCALAPPDATA"]) / "Roblox" / "logs"
+ROJO_STUDIO_FAILURE_MARKERS = (
+    "Unknown HTTP error: 502",
+    "Rojo serve session start failed",
+    "WebSocket connection closed unexpectedly",
+)
 
 
 class StressError(RuntimeError):
@@ -174,6 +182,134 @@ def require_helper_pid_evidence(log_path: Path, task_ids: list[str]) -> None:
             raise StressError(f"helper log lacks real Studio PID pull/result evidence for {task_id}: pull={pull_ok} response={response_ok}")
 
 
+def create_sync_probe_project(parent: Path) -> tuple[Path, str]:
+    marker = "CLOCKP_ROJO_SYNC_PROBE_" + uuid.uuid4().hex
+    project = parent / "sync-probe-project"
+    src = project / "src"
+    src.mkdir(parents=True, exist_ok=True)
+    (project / "default.project.json").write_text(
+        json.dumps(
+            {
+                "name": "helper2-sync-probe",
+                "tree": {
+                    "$className": "DataModel",
+                    "ServerScriptService": {
+                        "$className": "ServerScriptService",
+                        "$path": "src",
+                    },
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (src / "RojoSyncProbe.server.lua").write_text(
+        "\n".join(
+            [
+                f'local marker = "{marker}"',
+                'script:SetAttribute("ClockPSyncProbeMarker", marker)',
+                "print(marker)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return project / "default.project.json", marker
+
+
+def wait_studio_log_marker(marker: str, *, timeout: float) -> Path:
+    deadline = time.time() + timeout
+    recent_logs = sorted(ROBLOX_LOG_DIR.glob("*Studio*_last.log"), key=lambda p: p.stat().st_mtime, reverse=True)[:20]
+    while time.time() < deadline:
+        for log_path in recent_logs:
+            if not log_path.exists():
+                continue
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+            if marker in text:
+                return log_path
+        recent_logs = sorted(ROBLOX_LOG_DIR.glob("*Studio*_last.log"), key=lambda p: p.stat().st_mtime, reverse=True)[:20]
+        time.sleep(1)
+    raise StressError(f"Studio logs did not contain sync probe marker: {marker}")
+
+
+def recent_studio_logs(since: float) -> list[Path]:
+    return [
+        path
+        for path in sorted(ROBLOX_LOG_DIR.glob("*Studio*_last.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if path.stat().st_mtime >= since - 5
+    ][:20]
+
+
+def studio_log_contains(path: Path, needles: list[str]) -> bool:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return all(needle in text for needle in needles)
+
+
+def wait_studio_rojo_connected(task_id: str, project_name: str, *, since: float, timeout: float) -> Path:
+    deadline = time.time() + timeout
+    last_logs: list[Path] = []
+    while time.time() < deadline:
+        last_logs = recent_studio_logs(since)
+        for log_path in last_logs:
+            if studio_log_contains(
+                log_path,
+                [
+                    f"/task/{task_id}",
+                    "Rojo serve session initial sync completed",
+                    f"Rojo serve session status changed to Connected (details={project_name}",
+                ],
+            ):
+                return log_path
+        time.sleep(1)
+    raise StressError(f"Studio log does not prove Rojo connected for task {task_id}; checked={last_logs}")
+
+
+def wait_studio_sync_probe(task_id: str, marker: str, *, since: float, timeout: float) -> Path:
+    deadline = time.time() + timeout
+    last_logs: list[Path] = []
+    while time.time() < deadline:
+        last_logs = recent_studio_logs(since)
+        for log_path in last_logs:
+            if studio_log_contains(log_path, [f"/task/{task_id}", marker]):
+                return log_path
+        time.sleep(1)
+    raise StressError(f"Studio log does not prove synced code ran for task {task_id}; marker={marker}; checked={last_logs}")
+
+
+def assert_no_studio_rojo_failures(task_ids: list[str], *, since: float) -> None:
+    failures: list[str] = []
+    for log_path in recent_studio_logs(since):
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+        if not any(f"/task/{task_id}" in text or f'"task_id":"{task_id}"' in text or f"task_id={task_id}" in text for task_id in task_ids):
+            continue
+        for line in text.splitlines():
+            if any(task_id in line for task_id in task_ids) or any(f"/task/{task_id}" in line for task_id in task_ids):
+                if any(marker in line for marker in ROJO_STUDIO_FAILURE_MARKERS):
+                    failures.append(f"{log_path}: {line[:1000]}")
+            elif any(marker in line for marker in ROJO_STUDIO_FAILURE_MARKERS):
+                # Rojo often logs the task id on neighboring lines only; keep this as a hard failure for current-run logs.
+                failures.append(f"{log_path}: {line[:1000]}")
+    if failures:
+        raise StressError("Studio Rojo failure detected before intentional task-agent kill:\n" + "\n".join(failures[:12]))
+
+
+def wait_rojo_helper_evidence(log_path: Path, task_id: str, *, timeout: float) -> None:
+    deadline = time.time() + timeout
+    last_state = ""
+    while time.time() < deadline:
+        text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+        lines = text.splitlines()
+        config_ok = any('msg="resolved task-bound Rojo config"' in line and f"task_id={task_id}" in line for line in lines)
+        http_ok = any('msg="proxied task-bound Rojo HTTP request"' in line and f"task_id={task_id}" in line for line in lines)
+        ws_ok = any('msg="proxying task-bound Rojo websocket"' in line and f"task_id={task_id}" in line for line in lines)
+        last_state = f"config={config_ok} http={http_ok} websocket={ws_ok}"
+        if config_ok and http_ok and ws_ok:
+            return
+        time.sleep(1)
+    raise StressError(f"helper log lacks Studio-side Rojo evidence for {task_id}: {last_state}")
+
+
 def post_manual_heartbeat(task_id: str, place_id: str, pid: int, started_at: int, rojo_port: int) -> dict[str, Any]:
     return http_json(
         "POST",
@@ -231,12 +367,15 @@ def latest_studio_diagnostics() -> str:
     text = latest.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
     user_plugin_loaded = "user_MCP2Plugin.rbxm" in text
+    rojo_plugin_loaded = "user_Rojo.rbxm" in text
     login_seen = "www.roblox.com/login" in text or "LoginDialog" in text or "show login dialog" in text
     requested_lines = [
         line
         for line in lines
         if "plugins requested to load" in line
         or "user_MCP2Plugin.rbxm" in line
+        or "user_Rojo.rbxm" in line
+        or "[Rojo-" in line
         or "www.roblox.com/login" in line
         or "LoginDialog" in line
         or "show login dialog" in line
@@ -245,6 +384,7 @@ def latest_studio_diagnostics() -> str:
     return (
         f"latest_studio_log={latest}; "
         f"user_MCP2Plugin_loaded={user_plugin_loaded}; "
+        f"user_RojoPlugin_loaded={rojo_plugin_loaded}; "
         f"login_seen={login_seen}\n{tail}"
     )
 
@@ -466,6 +606,9 @@ def prepare_binaries(root: Path, bin_dir: Path, rojo: Path) -> None:
     run_command([str(rojo), "build", r"plugin-mcp2\default.project.json", "--plugin", "MCP2Plugin.rbxm"], cwd=root, timeout=60)
     if not PLUGIN_PATH.exists():
         raise StressError(f"MCP2 plugin was not installed at {PLUGIN_PATH}")
+    run_command([str(rojo), "build", "plugin.project.json", "--plugin", "Rojo.rbxm"], cwd=ROJO_REPO, timeout=60)
+    if not ROJO_PLUGIN_PATH.exists():
+        raise StressError(f"Rojo plugin was not installed at {ROJO_PLUGIN_PATH}")
 
 
 def stop_agent(bin_dir: Path, workspace: Path) -> None:
@@ -481,6 +624,7 @@ def stop_agent(bin_dir: Path, workspace: Path) -> None:
 
 def run_stress(args: argparse.Namespace) -> dict[str, Any]:
     root = repo_root()
+    studio_log_since = time.time()
     run_dir = Path(tempfile.mkdtemp(prefix="helper2-local-stress-"))
     bin_dir = run_dir / "bin"
     logs_dir = run_dir / "logs"
@@ -491,9 +635,14 @@ def run_stress(args: argparse.Namespace) -> dict[str, Any]:
     helper: subprocess.Popen[str] | None = None
     agent_a: subprocess.Popen[str] | None = None
     agent_b: subprocess.Popen[str] | None = None
+    project_path = args.project
+    sync_probe_marker = ""
 
     prepare_binaries(root, bin_dir, args.rojo)
     print(f"run_dir={run_dir}", flush=True)
+    if args.sync_probe:
+        project_path, sync_probe_marker = create_sync_probe_project(run_dir)
+        print(f"sync_probe_project={project_path} marker={sync_probe_marker}", flush=True)
     ensure_no_existing_test_processes(kill_existing=args.kill_existing)
 
     try:
@@ -520,7 +669,7 @@ def run_stress(args: argparse.Namespace) -> dict[str, Any]:
                 "--rojo-bin",
                 str(args.rojo),
                 "--project",
-                str(args.project),
+                str(project_path),
             ],
             logs_dir / "agent-a.log",
         )
@@ -537,6 +686,16 @@ def run_stress(args: argparse.Namespace) -> dict[str, Any]:
             print("initial taskA studio diagnostics:\n" + latest_studio_diagnostics(), flush=True)
             raise exc
         print(f"taskA initial mode={mode_a['mode']}", flush=True)
+        if args.require_rojo_plugin:
+            wait_rojo_helper_evidence(logs_dir / "helper.log", desc_a["task_id"], timeout=args.rojo_evidence_timeout)
+            print(f"taskA Rojo helper evidence ok task={desc_a['task_id']}", flush=True)
+            task_a_rojo_log = wait_studio_rojo_connected(
+                desc_a["task_id"],
+                "helper2-sync-probe" if sync_probe_marker else "runtime-stop-local",
+                since=studio_log_since,
+                timeout=args.rojo_evidence_timeout,
+            )
+            print(f"taskA Studio Rojo connected evidence ok log={task_a_rojo_log}", flush=True)
 
         agent_b = start_process(
             [
@@ -555,7 +714,7 @@ def run_stress(args: argparse.Namespace) -> dict[str, Any]:
                 "--rojo-bin",
                 str(args.rojo),
                 "--project",
-                str(args.project),
+                str(project_path),
             ],
             logs_dir / "agent-b.log",
         )
@@ -572,6 +731,16 @@ def run_stress(args: argparse.Namespace) -> dict[str, Any]:
             print("initial taskB studio diagnostics:\n" + latest_studio_diagnostics(), flush=True)
             raise exc
         print(f"taskB initial mode={mode_b['mode']}", flush=True)
+        if args.require_rojo_plugin:
+            wait_rojo_helper_evidence(logs_dir / "helper.log", desc_b["task_id"], timeout=args.rojo_evidence_timeout)
+            print(f"taskB Rojo helper evidence ok task={desc_b['task_id']}", flush=True)
+            task_b_rojo_log = wait_studio_rojo_connected(
+                desc_b["task_id"],
+                "helper2-sync-probe" if sync_probe_marker else "runtime-stop-local",
+                since=studio_log_since,
+                timeout=args.rojo_evidence_timeout,
+            )
+            print(f"taskB Studio Rojo connected evidence ok log={task_b_rojo_log}", flush=True)
 
         if args.direct_api_only:
             expect_http_status(f"{HELPER_BASE_URL}/session/not-a-real-task/studio/screenshot", 404)
@@ -626,6 +795,21 @@ def run_stress(args: argparse.Namespace) -> dict[str, Any]:
                     time.sleep(0.5)
                 play_a = future_play_a.result(timeout=150)
                 play_b = future_play_b.result(timeout=150)
+            if sync_probe_marker:
+                marker_log_a = wait_studio_sync_probe(
+                    desc_a["task_id"],
+                    sync_probe_marker,
+                    since=studio_log_since,
+                    timeout=args.sync_probe_timeout,
+                )
+                marker_log_b = wait_studio_sync_probe(
+                    desc_b["task_id"],
+                    sync_probe_marker,
+                    since=studio_log_since,
+                    timeout=args.sync_probe_timeout,
+                )
+                print(f"sync probe marker observed in Studio logs: A={marker_log_a} B={marker_log_b}", flush=True)
+            assert_no_studio_rojo_failures([desc_a["task_id"], desc_b["task_id"]], since=studio_log_since)
             print(
                 f"cycle {cycle}/{args.cycles} concurrent play ok "
                 f"A={play_a.get('mode')} B={play_b.get('mode')} samples={len(mode_samples)}",
@@ -728,6 +912,7 @@ def run_stress(args: argparse.Namespace) -> dict[str, Any]:
             "run_dir": str(run_dir),
             "taskA": desc_a["task_id"],
             "taskB": desc_b["task_id"],
+            "syncProbeMarker": sync_probe_marker,
             "screenshotA": shot_a["screenshot"],
             "screenshotB": shot_b["screenshot"],
             "summary": summary,
@@ -750,6 +935,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cycles", type=int, default=1, help="Number of concurrent play/stop cycles to run before lease-expiry checks.")
     parser.add_argument("--helper-restart", action="store_true", help="Restart helper while task-agents stay alive, then wait for heartbeat recovery.")
     parser.add_argument("--direct-api-only", action="store_true", help="Use helper2 HTTP task APIs directly instead of helper2 MCP tools.")
+    parser.add_argument("--require-rojo-plugin", action="store_true", help="Require real Studio-side Rojo plugin traffic through helper2.")
+    parser.add_argument("--rojo-evidence-timeout", type=float, default=90)
+    parser.add_argument("--sync-probe", action="store_true", help="Use a generated Rojo project with a server script and require its Studio output marker.")
+    parser.add_argument("--sync-probe-timeout", type=float, default=45)
     return parser.parse_args()
 
 
