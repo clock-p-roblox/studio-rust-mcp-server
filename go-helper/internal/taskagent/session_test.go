@@ -72,27 +72,6 @@ func TestResolveHelperBaseURLPublicDerivesFromMachineAndUser(t *testing.T) {
 	}
 }
 
-func TestResolveRojoPublicRouteUsesTaskID(t *testing.T) {
-	baseURL, identity, err := ResolveRojoPublicRoute("123456", "tdemo", "tester")
-	if err != nil {
-		t.Fatalf("public Rojo route failed: %v", err)
-	}
-	if baseURL != "https://123456-tdemo-rojo-tester-user.dev.clock-p.com" {
-		t.Fatalf("unexpected Rojo public URL: %s", baseURL)
-	}
-	if identity != "123456-tdemo-rojo-tester-user.dev.clock-p.com@register-https-proxy.dev.clock-p.com" {
-		t.Fatalf("unexpected Rojo bridge identity: %s", identity)
-	}
-}
-
-func TestClockbridgeArgsPreserveOldProxyShape(t *testing.T) {
-	args := clockbridgeArgs("token.txt", "http://127.0.0.1:34872", "127.0.0.1", "identity.example")
-	want := []string{"-i", "token.txt", "-R", "http://127.0.0.1:34872/", "--register-ip=127.0.0.1", "identity.example"}
-	if strings.Join(args, "\n") != strings.Join(want, "\n") {
-		t.Fatalf("unexpected clockbridge args: %#v", args)
-	}
-}
-
 func TestRequestExistingShutdownUsesStatusURLAndTaskID(t *testing.T) {
 	shutdownCalled := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

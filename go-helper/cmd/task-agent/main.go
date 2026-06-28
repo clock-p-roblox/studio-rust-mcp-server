@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -51,9 +50,6 @@ func runStart(args []string) error {
 	rojoBin := fs.String("rojo-bin", "rojo", "Rojo executable")
 	projectPath := fs.String("project", "", "Rojo project path")
 	statusAddr := fs.String("status-addr", "127.0.0.1:0", "task-agent status listen address")
-	clockbridgeBin := fs.String("clockbridge-bin", "clockbridge-cli", "clockbridge CLI executable for public Rojo exposure")
-	clockbridgeTokenFile := fs.String("clockbridge-token-file", "", "clockbridge bearer token file for public mode")
-	clockbridgeRegisterIP := fs.String("clockbridge-register-ip", "", "optional clockbridge register IP")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -63,30 +59,14 @@ func runStart(args []string) error {
 	if *placeID == "" {
 		return errors.New("--place_id is required")
 	}
-	resolvedEnvironment := strings.TrimSpace(*environment)
-	if resolvedEnvironment == "" {
-		resolvedEnvironment = "local"
-	}
 	resolvedHelperBaseURL, resolvedHelperPublicURL, err := taskagent.ResolveHelperBaseURL(taskagent.RouteConfig{
-		Environment:   resolvedEnvironment,
+		Environment:   *environment,
 		MachineName:   *machineName,
 		UserName:      *userName,
 		HelperBaseURL: *helperBaseURL,
 	})
 	if err != nil {
 		return err
-	}
-	resolvedUserName := ""
-	resolvedTokenFile := ""
-	if resolvedEnvironment == "public" {
-		resolvedUserName, err = taskagent.ResolveUserName(*userName)
-		if err != nil {
-			return err
-		}
-		resolvedTokenFile, err = taskagent.ResolveTokenFile(*clockbridgeTokenFile)
-		if err != nil {
-			return err
-		}
 	}
 
 	client := &http.Client{Timeout: 3 * time.Second}
@@ -107,19 +87,15 @@ func runStart(args []string) error {
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	agent, err := taskagent.New(taskagent.Config{
-		Workspace:             *workspace,
-		Environment:           resolvedEnvironment,
-		MachineName:           *machineName,
-		UserName:              resolvedUserName,
-		PlaceID:               *placeID,
-		HelperBaseURL:         resolvedHelperBaseURL,
-		HelperPublicURL:       resolvedHelperPublicURL,
-		RojoBin:               *rojoBin,
-		ProjectPath:           *projectPath,
-		StatusAddr:            *statusAddr,
-		ClockbridgeBin:        *clockbridgeBin,
-		ClockbridgeTokenFile:  resolvedTokenFile,
-		ClockbridgeRegisterIP: *clockbridgeRegisterIP,
+		Workspace:       *workspace,
+		Environment:     *environment,
+		MachineName:     *machineName,
+		PlaceID:         *placeID,
+		HelperBaseURL:   resolvedHelperBaseURL,
+		HelperPublicURL: resolvedHelperPublicURL,
+		RojoBin:         *rojoBin,
+		ProjectPath:     *projectPath,
+		StatusAddr:      *statusAddr,
 	}, logger)
 	if err != nil {
 		return err

@@ -24,19 +24,15 @@ const heartbeatInterval = 5 * time.Second
 var placeIDPattern = regexp.MustCompile(`^[0-9]+$`)
 
 type Config struct {
-	Workspace             string
-	Environment           string
-	MachineName           string
-	UserName              string
-	PlaceID               string
-	HelperBaseURL         string
-	HelperPublicURL       string
-	RojoBin               string
-	ProjectPath           string
-	StatusAddr            string
-	ClockbridgeBin        string
-	ClockbridgeTokenFile  string
-	ClockbridgeRegisterIP string
+	Workspace       string
+	Environment     string
+	MachineName     string
+	PlaceID         string
+	HelperBaseURL   string
+	HelperPublicURL string
+	RojoBin         string
+	ProjectPath     string
+	StatusAddr      string
 }
 
 type StatusResponse struct {
@@ -79,7 +75,6 @@ type Agent struct {
 
 	mu                    sync.Mutex
 	rojoCmd               *exec.Cmd
-	rojoBridgeCmd         *exec.Cmd
 	rojoJob               *processJob
 	rojoStatus            RojoStatus
 	helperState           string
@@ -120,17 +115,6 @@ func New(config Config, logger *slog.Logger) (*Agent, error) {
 	}
 	if config.RojoBin == "" {
 		config.RojoBin = "rojo"
-	}
-	if config.ClockbridgeBin == "" {
-		config.ClockbridgeBin = "clockbridge-cli"
-	}
-	if config.Environment == "public" {
-		if config.UserName == "" {
-			return nil, errors.New("user_name is required in public mode")
-		}
-		if config.ClockbridgeTokenFile == "" {
-			return nil, errors.New("clockbridge_token_file is required in public mode")
-		}
 	}
 	if config.ProjectPath == "" {
 		config.ProjectPath = config.Workspace
@@ -176,20 +160,6 @@ func (a *Agent) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	localRojoURL := "http://" + rojoAddr
-	rojoUpstreamURL := localRojoURL
-	var rojoBridgeIdentity string
-	if a.config.Environment == "public" {
-		rojoUpstreamURL, rojoBridgeIdentity, err = ResolveRojoPublicRoute(a.config.PlaceID, taskID, a.config.UserName)
-		if err != nil {
-			_ = listener.Close()
-			return err
-		}
-		if err := a.startRojoBridge(localRojoURL, rojoBridgeIdentity); err != nil {
-			_ = listener.Close()
-			return err
-		}
-	}
 	a.descriptor = Descriptor{
 		TaskID:               taskID,
 		Environment:          a.config.Environment,
@@ -203,8 +173,8 @@ func (a *Agent) Run(ctx context.Context) error {
 			PublicURL: a.config.HelperPublicURL,
 		},
 		Rojo: RojoRoute{
-			LocalURL:    localRojoURL,
-			UpstreamURL: rojoUpstreamURL,
+			LocalURL:    "http://" + rojoAddr,
+			UpstreamURL: "http://" + rojoAddr,
 		},
 	}
 	a.rojoStatus = RojoStatus{
@@ -214,7 +184,6 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	if err := SaveDescriptor(a.config.Workspace, a.descriptor); err != nil {
 		_ = listener.Close()
-		a.stopRojoBridge()
 		return err
 	}
 
@@ -248,34 +217,6 @@ func (a *Agent) Run(ctx context.Context) error {
 	case <-a.shutdownCh:
 	}
 	a.shutdownBounded()
-	return nil
-}
-
-func (a *Agent) startRojoBridge(localRojoURL string, identity string) error {
-	cmd := exec.Command(a.config.ClockbridgeBin, clockbridgeArgs(a.config.ClockbridgeTokenFile, localRojoURL, a.config.ClockbridgeRegisterIP, identity)...)
-	if err := startManagedCommand(cmd, a.rojoJob); err != nil {
-		return err
-	}
-	a.mu.Lock()
-	a.rojoBridgeCmd = cmd
-	a.mu.Unlock()
-	go func() {
-		err := cmd.Wait()
-		select {
-		case <-a.shutdownCh:
-			return
-		default:
-		}
-		a.mu.Lock()
-		if a.rojoBridgeCmd == cmd {
-			a.rojoBridgeCmd = nil
-		}
-		a.rojoStatus.LastError = fmt.Sprintf("clockbridge stopped: %v", err)
-		a.mu.Unlock()
-		a.logger.Error("Rojo clockbridge stopped", "identity", identity, "error", err)
-		a.Shutdown()
-	}()
-	a.logger.Info("Rojo public clockbridge started", "identity", identity, "local_url", localRojoURL)
 	return nil
 }
 
@@ -454,7 +395,6 @@ func (a *Agent) shutdownBounded() {
 	go func() {
 		a.releaseHelper()
 		time.Sleep(time.Second)
-		a.stopRojoBridge()
 		a.stopRojo()
 		if a.server != nil {
 			_ = a.server.Shutdown(context.Background())
@@ -501,33 +441,6 @@ func (a *Agent) stopRojo() {
 		return
 	}
 	stopManagedCommand(cmd)
-}
-
-func (a *Agent) stopRojoBridge() {
-	a.mu.Lock()
-	cmd := a.rojoBridgeCmd
-	a.rojoBridgeCmd = nil
-	a.mu.Unlock()
-	if cmd == nil || cmd.Process == nil {
-		return
-	}
-	stopManagedCommand(cmd)
-}
-
-func clockbridgeArgs(tokenFile string, localBaseURL string, registerIP string, identity string) []string {
-	args := []string{"-i", tokenFile, "-R", ensureTrailingSlash(localBaseURL)}
-	if registerIP != "" {
-		args = append(args, "--register-ip="+registerIP)
-	}
-	args = append(args, identity)
-	return args
-}
-
-func ensureTrailingSlash(value string) string {
-	if value == "" || value[len(value)-1] == '/' {
-		return value
-	}
-	return value + "/"
 }
 
 func NewTaskID() (string, error) {
