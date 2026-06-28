@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"sort"
 	"strconv"
@@ -22,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/publicroute"
 	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/runtimelog"
 	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/screenshot"
 	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/studio"
@@ -672,6 +674,13 @@ func (b *mcp2CommandBroker) signalLocked() {
 
 func main() {
 	addr := flag.String("addr", defaultAddr(), "HTTP listen address")
+	environment := flag.String("environment", "local", "helper2 environment: local or public")
+	machineName := flag.String("machine_name", "", "explicit helper machine name for public exposure")
+	userName := flag.String("user", "", "clock-p user name for public exposure")
+	domainSuffix := flag.String("domain-suffix", publicroute.DefaultDomainSuffix, "public clockbridge domain suffix")
+	clockbridgeBin := flag.String("clockbridge-bin", "clockbridge-cli", "clockbridge CLI executable for public helper exposure")
+	clockbridgeTokenFile := flag.String("clockbridge-token-file", "", "clockbridge bearer token file for public helper exposure")
+	clockbridgeRegisterIP := flag.String("clockbridge-register-ip", "", "optional clockbridge register IP")
 	autoStartPlaceID := flag.String("auto-start-place-id", defaultAutoStartPlaceID, "Roblox place id to launch when helper starts; empty disables auto launch")
 	mcp2StaleAfter := flag.Duration("mcp2-stale-after", 60*time.Second, "mcp2 channel stale timeout")
 	mcp2StaleCheckInterval := flag.Duration("mcp2-stale-check-interval", 5*time.Second, "mcp2 channel stale watchdog interval")
@@ -1407,6 +1416,45 @@ func main() {
 		os.Exit(1)
 	}
 	effectiveListenAddr = listener.Addr().String()
+	var helperBridgeCmd *exec.Cmd
+	if strings.TrimSpace(*environment) == "public" {
+		resolvedUserName, err := publicroute.ResolveUserName(*userName)
+		if err != nil {
+			logger.Error("failed to resolve public helper user", "error", err)
+			os.Exit(1)
+		}
+		tokenFile, err := publicroute.ResolveTokenFile(*clockbridgeTokenFile)
+		if err != nil {
+			logger.Error("failed to resolve public helper clockbridge token", "error", err)
+			os.Exit(1)
+		}
+		identity, err := publicroute.HelperBridgeIdentity(*machineName, resolvedUserName, *domainSuffix)
+		if err != nil {
+			logger.Error("failed to derive public helper identity", "error", err)
+			os.Exit(1)
+		}
+		publicURL, err := publicroute.HelperBaseURL(*machineName, resolvedUserName, *domainSuffix)
+		if err != nil {
+			logger.Error("failed to derive public helper URL", "error", err)
+			os.Exit(1)
+		}
+		port, err := listenPort(effectiveListenAddr)
+		if err != nil {
+			logger.Error("failed to resolve public helper local port", "addr", effectiveListenAddr, "error", err)
+			os.Exit(1)
+		}
+		localBaseURL := fmt.Sprintf("http://127.0.0.1:%d/", port)
+		helperBridgeCmd, err = startClockbridgeProcess(*clockbridgeBin, tokenFile, localBaseURL, *clockbridgeRegisterIP, identity)
+		if err != nil {
+			logger.Error("failed to start public helper clockbridge", "identity", identity, "error", err)
+			os.Exit(1)
+		}
+		defer stopClockbridgeProcess(helperBridgeCmd)
+		logger.Info("public helper clockbridge started", "identity", identity, "local_url", localBaseURL, "public_url", publicURL)
+	} else if strings.TrimSpace(*environment) != "" && strings.TrimSpace(*environment) != "local" {
+		logger.Error("invalid helper environment", "environment", *environment)
+		os.Exit(1)
+	}
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -1480,6 +1528,41 @@ func main() {
 	}
 
 	logger.Info("studio helper http server stopped")
+}
+
+func startClockbridgeProcess(bin string, tokenFile string, localBaseURL string, registerIP string, identity string) (*exec.Cmd, error) {
+	if strings.TrimSpace(bin) == "" {
+		bin = "clockbridge-cli"
+	}
+	args := []string{"-i", tokenFile, "-R", ensureTrailingSlash(localBaseURL)}
+	if strings.TrimSpace(registerIP) != "" {
+		args = append(args, "--register-ip="+strings.TrimSpace(registerIP))
+	}
+	args = append(args, identity)
+	cmd := exec.Command(bin, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	go func() {
+		_ = cmd.Wait()
+	}()
+	return cmd, nil
+}
+
+func stopClockbridgeProcess(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	_ = cmd.Process.Kill()
+}
+
+func ensureTrailingSlash(value string) string {
+	if value == "" || value[len(value)-1] == '/' {
+		return value
+	}
+	return value + "/"
 }
 
 func printPrettyJSON(label string, value any) {

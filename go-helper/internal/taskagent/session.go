@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/publicroute"
 )
 
 var ErrDescriptorIdentityMismatch = errors.New("descriptor identity mismatch")
@@ -179,11 +181,10 @@ func ResolveHelperBaseURL(config RouteConfig) (string, string, error) {
 		if err != nil {
 			return "", "", err
 		}
-		machineName := strings.TrimSpace(config.MachineName)
-		if machineName == "" {
-			return "", "", errors.New("machine_name is required for public helper URL")
+		baseURL, err := publicroute.HelperBaseURL(config.MachineName, userName, publicroute.DefaultDomainSuffix)
+		if err != nil {
+			return "", "", err
 		}
-		baseURL := fmt.Sprintf("https://roblox-helper-%s-%s-user.dev.clock-p.com", machineName, userName)
 		return baseURL, baseURL, nil
 	default:
 		return "", "", fmt.Errorf("--environment must be local or public, got %q", environment)
@@ -191,30 +192,21 @@ func ResolveHelperBaseURL(config RouteConfig) (string, string, error) {
 }
 
 func ResolveUserName(explicit string) (string, error) {
-	if value := strings.TrimSpace(explicit); value != "" {
-		return value, nil
-	}
-	for _, candidate := range userNameCandidates() {
-		body, err := os.ReadFile(candidate)
-		if err == nil {
-			if value := strings.TrimSpace(string(body)); value != "" {
-				return value, nil
-			}
-		}
-	}
-	return "", errors.New("--user is required for public task-agent start when feishu-user_name cannot be resolved")
+	return publicroute.ResolveUserName(explicit)
 }
 
-func userNameCandidates() []string {
-	var candidates []string
-	if appData := os.Getenv("APPDATA"); appData != "" {
-		candidates = append(candidates, filepath.Join(appData, "dev.clock-p.com", "feishu-user_name"))
+func ResolveTokenFile(explicit string) (string, error) {
+	return publicroute.ResolveTokenFile(explicit)
+}
+
+func ResolveRojoPublicRoute(placeID string, taskID string, userName string) (string, string, error) {
+	baseURL, err := publicroute.RojoBaseURL(placeID, taskID, userName, publicroute.DefaultDomainSuffix)
+	if err != nil {
+		return "", "", err
 	}
-	if userProfile := os.Getenv("USERPROFILE"); userProfile != "" {
-		candidates = append(candidates, filepath.Join(userProfile, ".dev.clock-p.com", "feishu-user_name"))
+	identity, err := publicroute.RojoBridgeIdentity(placeID, taskID, userName, publicroute.DefaultDomainSuffix)
+	if err != nil {
+		return "", "", err
 	}
-	if home := os.Getenv("HOME"); home != "" {
-		candidates = append(candidates, filepath.Join(home, ".dev.clock-p.com", "feishu-user_name"))
-	}
-	return candidates
+	return baseURL, identity, nil
 }
