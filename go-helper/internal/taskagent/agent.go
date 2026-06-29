@@ -452,7 +452,7 @@ func (a *Agent) shutdownBounded() {
 }
 
 func (a *Agent) startRojoPublicForward(ctx context.Context) error {
-	token, err := ResolveBearerToken(a.config.Workspace)
+	token, err := ResolveClockbridgeRegisterToken(a.config.Workspace)
 	if err != nil {
 		a.mu.Lock()
 		a.rojoStatus.PublicState = "error"

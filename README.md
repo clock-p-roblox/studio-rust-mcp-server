@@ -103,7 +103,6 @@ K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe stop --works
 公网场景下，`task-agent` 必须显式传 `--machine_name`，并显式选择 `--environment public`：
 
 ```powershell
-$env:ROBLOX_HELPER2_BEARER_TOKEN = (Get-Content $env:APPDATA\dev.clock-p.com\feishu-token -Raw).Trim()
 K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe start `
   --workspace K:\roblox_space\test_game3 `
   --environment public `
@@ -114,7 +113,7 @@ K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe start `
   --project K:\roblox_space\test_game3\default.project.json
 ```
 
-`--user` 可省略，此时 task-agent 会读取本机 `feishu-user_name`。公网 helper 请求需要 bearer token，优先读取 `ROBLOX_HELPER2_BEARER_TOKEN`，其次读取 workspace 或系统身份目录中的 `feishu-token`。`--register-domain` 默认开启，会注册 Rojo 诊断域名，并在 `.clock-p/session.json` 中写入 `rojo.public_url`。
+`--user` 可省略，此时 task-agent 会读取本机 `feishu-user_name`。helper2 的 HTTP 请求不做 Bearer 鉴权；`feishu-token` 只用于 helper2 和 task-agent 注册 clockbridge 公网域名。`--register-domain` 默认开启，会注册 Rojo 诊断域名，并在 `.clock-p/session.json` 中写入 `rojo.public_url`。
 
 ## session.json
 

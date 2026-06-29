@@ -229,7 +229,7 @@ func (m *publicExposureManager) Start(ctx context.Context) error {
 		m.mu.Unlock()
 		return nil
 	}
-	token, err := readPublicBearerToken(m.config.TokenFile)
+	token, err := readClockbridgeRegisterToken(m.config.TokenFile)
 	if err != nil {
 		m.state = "error"
 		m.lastError = err.Error()
@@ -324,4 +324,16 @@ func runEmbeddedPublicForward(ctx context.Context, config clockbridge.RemoteForw
 		return err
 	}
 	return forward.Run(ctx)
+}
+
+func readClockbridgeRegisterToken(tokenFile string) (string, error) {
+	body, err := os.ReadFile(strings.TrimSpace(tokenFile))
+	if err != nil {
+		return "", err
+	}
+	token := strings.TrimSpace(string(body))
+	if token == "" {
+		return "", errors.New("clockbridge register token file is empty")
+	}
+	return token, nil
 }

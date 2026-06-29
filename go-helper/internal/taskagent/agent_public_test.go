@@ -18,8 +18,14 @@ import (
 )
 
 func TestAgentRegistersRojoPublicDomain(t *testing.T) {
-	t.Setenv(helperBearerTokenEnv, "token")
 	workspace := t.TempDir()
+	tokenDir := filepath.Join(workspace, ".dev.clock-p.com")
+	if err := os.MkdirAll(tokenDir, 0o755); err != nil {
+		t.Fatalf("mkdir token dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tokenDir, "feishu-token"), []byte("token\n"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
 	rojoBin := writeBlockingScript(t)
 	forward := newTaskAgentForwardRecorder()
 

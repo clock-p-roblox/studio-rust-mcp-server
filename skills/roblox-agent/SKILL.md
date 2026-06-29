@@ -97,7 +97,6 @@ K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe stop --works
 helper2 默认 `--register-domain=true`。task-agent 公网模式示例：
 
 ```powershell
-$env:ROBLOX_HELPER2_BEARER_TOKEN = (Get-Content $env:APPDATA\dev.clock-p.com\feishu-token -Raw).Trim()
 K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe start `
   --workspace K:\roblox_space\test_game3 `
   --environment public `
@@ -107,6 +106,8 @@ K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe start `
   --rojo-bin K:\roblox_space\rojo\target\release\rojo.exe `
   --project K:\roblox_space\test_game3\default.project.json
 ```
+
+helper2 的 HTTP 请求不做 Bearer 鉴权；`feishu-token` 只用于 helper2 和 task-agent 注册 clockbridge 公网域名。
 
 公网验收必须确认 bridge2 控制面走 `helper.base_url` 公网地址，并且 Studio 日志出现 Rojo initial sync 成功记录。不要只看 HTTP 状态码。
 
