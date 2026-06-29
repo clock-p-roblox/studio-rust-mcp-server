@@ -107,7 +107,7 @@ K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe start `
   --project K:\roblox_space\test_game3\default.project.json
 ```
 
-helper2 的 HTTP 请求不做 Bearer 鉴权；`feishu-token` 只用于 helper2 和 task-agent 注册 clockbridge 公网域名。
+helper2 自身的 HTTP handler 不做 Bearer 鉴权；但当 `bridge2` 通过公网 `helper.base_url` 访问时，外层 `dev.clock-p.com` 入口仍要求 `Authorization: Bearer <feishu-token>`。`bridge2` 会自动从 workspace 或身份目录读取 `feishu-token` 注入。
 
 公网验收必须确认 bridge2 控制面走 `helper.base_url` 公网地址，并且 Studio 日志出现 Rojo initial sync 成功记录。不要只看 HTTP 状态码。
 

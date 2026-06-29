@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 from urllib import error, parse, request
 
 from .errors import BridgeError
@@ -17,20 +19,23 @@ def task_url(session: Session, path: str, query: dict[str, str | int | None] | N
     return url
 
 
-def get_json(url: str, timeout: float = 10.0) -> dict:
-    return _request_json("GET", url, None, timeout)
+def get_json(url: str, timeout: float = 10.0, session: Session | None = None) -> dict:
+    return _request_json("GET", url, None, timeout, session)
 
 
-def post_json(url: str, payload: dict | None = None, timeout: float = 10.0) -> dict:
-    return _request_json("POST", url, payload or {}, timeout)
+def post_json(url: str, payload: dict | None = None, timeout: float = 10.0, session: Session | None = None) -> dict:
+    return _request_json("POST", url, payload or {}, timeout, session)
 
 
-def _request_json(method: str, url: str, payload: dict | None, timeout: float) -> dict:
+def _request_json(method: str, url: str, payload: dict | None, timeout: float, session: Session | None) -> dict:
     body = None
     headers = {"Accept": "application/json"}
     if payload is not None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
+    auth_header = _public_helper_auth_header(url, session)
+    if auth_header:
+        headers["Authorization"] = auth_header
     req = request.Request(url, data=body, headers=headers, method=method)
     try:
         with request.urlopen(req, timeout=timeout) as resp:
@@ -73,3 +78,44 @@ def _error_message_from_body(body: dict, default: str) -> str:
         if isinstance(value, str) and value:
             return value
     return default
+
+
+def _public_helper_auth_header(url: str, session: Session | None) -> str:
+    parsed = parse.urlparse(url)
+    if parsed.scheme != "https":
+        return ""
+    host = (parsed.hostname or "").strip().lower()
+    if not host.endswith(".dev.clock-p.com"):
+        return ""
+    token = _resolve_public_helper_bearer(session)
+    return f"Bearer {token}"
+
+
+def _resolve_public_helper_bearer(session: Session | None) -> str:
+    workspace = session.workspace if session is not None else None
+    candidates = _token_candidates(workspace)
+    for candidate in candidates:
+        try:
+            value = candidate.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if value:
+            return value
+    details = {"token_candidates": [str(path) for path in candidates]}
+    raise BridgeError("helper_bearer_missing", "feishu-token is required for public helper requests", details)
+
+
+def _token_candidates(workspace: Path | None) -> list[Path]:
+    candidates: list[Path] = []
+    if workspace is not None:
+        candidates.append(workspace / ".dev.clock-p.com" / "feishu-token")
+    for env_name, suffix in (
+        ("APPDATA", ("dev.clock-p.com", "feishu-token")),
+        ("USERPROFILE", (".dev.clock-p.com", "feishu-token")),
+        ("HOME", (".dev.clock-p.com", "feishu-token")),
+    ):
+        base_text = os.environ.get(env_name, "").strip()
+        if base_text:
+            base = Path(base_text)
+            candidates.append(base.joinpath(*suffix))
+    return candidates

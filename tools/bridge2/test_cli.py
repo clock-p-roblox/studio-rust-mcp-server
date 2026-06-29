@@ -9,9 +9,11 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import sys
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from clockp_bridge2 import commands
+from clockp_bridge2 import http as bridge_http
 from clockp_bridge2.commands import main
 from clockp_bridge2.errors import BridgeError
 from clockp_bridge2.session import load_session
@@ -78,6 +80,21 @@ class FakeHelper(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+
+class FakeURLResponse:
+    def __init__(self, body: dict, status: int = 200) -> None:
+        self.status = status
+        self._body = json.dumps(body).encode("utf-8")
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "FakeURLResponse":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
 
 
 class Bridge2CLITest(unittest.TestCase):
@@ -300,6 +317,36 @@ class Bridge2CLITest(unittest.TestCase):
         self.assertEqual(payload["ok"], False)
         self.assertEqual(payload["code"], "official_tool_error")
         self.assertEqual(payload["message"], "official failed")
+
+    def test_public_helper_request_injects_bearer_token(self) -> None:
+        token_dir = Path(self.workspace) / ".dev.clock-p.com"
+        token_dir.mkdir()
+        (token_dir / "feishu-token").write_text("secret-token\n", encoding="utf-8")
+        session_path = Path(self.workspace) / ".clock-p" / "session.json"
+        session_path.write_text(
+            json.dumps(
+                {
+                    "task_id": "task-a",
+                    "helper": {"base_url": "https://roblox-helper-sunjun2-sunjun-user.dev.clock-p.com"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        seen_headers: dict[str, str] = {}
+
+        def fake_urlopen(req, timeout=10.0):
+            nonlocal seen_headers
+            seen_headers = dict(req.header_items())
+            return FakeURLResponse({"ok": True, "state": "live", "task_id": "task-a"})
+
+        with mock.patch.object(bridge_http.request, "urlopen", side_effect=fake_urlopen):
+            code, payload, stderr = self.run_cli("status")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(payload["ok"], True)
+        self.assertEqual(seen_headers.get("Authorization"), "Bearer secret-token")
 
 
 if __name__ == "__main__":

@@ -113,7 +113,7 @@ K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe start `
   --project K:\roblox_space\test_game3\default.project.json
 ```
 
-`--user` 可省略，此时 task-agent 会读取本机 `feishu-user_name`。helper2 的 HTTP 请求不做 Bearer 鉴权；`feishu-token` 只用于 helper2 和 task-agent 注册 clockbridge 公网域名。`--register-domain` 默认开启，会注册 Rojo 诊断域名，并在 `.clock-p/session.json` 中写入 `rojo.public_url`。
+`--user` 可省略，此时 task-agent 会读取本机 `feishu-user_name`。helper2 自身的 HTTP handler 不做 Bearer 鉴权；但当 `bridge2` 通过公网 `helper.base_url` 访问时，外层 `dev.clock-p.com` 入口仍要求 `Authorization: Bearer <feishu-token>`。`bridge2` 会自动从 workspace 或身份目录读取 `feishu-token` 注入。`--register-domain` 默认开启，会注册 Rojo 诊断域名，并在 `.clock-p/session.json` 中写入 `rojo.public_url`。
 
 ## session.json
 

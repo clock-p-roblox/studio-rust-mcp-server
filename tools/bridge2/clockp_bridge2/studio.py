@@ -8,59 +8,59 @@ from .session import Session
 
 
 def status(session: Session) -> dict:
-    return get_json(task_url(session, "/status"))
+    return get_json(task_url(session, "/status"), session=session)
 
 
 def mode(session: Session) -> dict:
-    return get_json(task_url(session, "/studio/mode"))
+    return get_json(task_url(session, "/studio/mode"), session=session)
 
 
 def play(session: Session) -> dict:
-    return post_json(task_url(session, "/studio/play"))
+    return post_json(task_url(session, "/studio/play"), session=session)
 
 
 def stop(session: Session) -> dict:
-    return post_json(task_url(session, "/studio/stop"))
+    return post_json(task_url(session, "/studio/stop"), session=session)
 
 
 def screenshot(session: Session) -> dict:
-    return get_json(task_url(session, "/studio/screenshot"), timeout=30.0)
+    return get_json(task_url(session, "/studio/screenshot"), timeout=30.0, session=session)
 
 
 def play_mode_logs(session: Session, cursor: str | None = None, limit: int | None = None) -> dict:
-    return get_json(task_url(session, "/runtime-log", {"cursor": cursor, "limit": limit}))
+    return get_json(task_url(session, "/runtime-log", {"cursor": cursor, "limit": limit}), session=session)
 
 
 def run_code_direct(session: Session, code: str) -> dict:
-    return post_json(task_url(session, "/studio/run-code-direct"), {"code": code}, timeout=30.0)
+    return post_json(task_url(session, "/studio/run-code-direct"), {"code": code}, timeout=30.0, session=session)
 
 
 def official_ping(session: Session) -> dict:
-    return post_json(task_url(session, "/official/ping"), {}, timeout=30.0)
+    return post_json(task_url(session, "/official/ping"), {}, timeout=30.0, session=session)
 
 
 def official_store_image(session: Session, file_path: str) -> dict:
-    return post_json(task_url(session, "/official/store-image"), {"file_path": file_path}, timeout=120.0)
+    return post_json(task_url(session, "/official/store-image"), {"file_path": file_path}, timeout=120.0, session=session)
 
 
 def official_generate_mesh(session: Session, payload: dict) -> dict:
-    return post_json(task_url(session, "/official/generate-mesh"), payload, timeout=None)
+    return post_json(task_url(session, "/official/generate-mesh"), payload, timeout=None, session=session)
 
 
 def official_generate_procedural_model(session: Session, payload: dict) -> dict:
-    return post_json(task_url(session, "/official/generate-procedural-model"), payload, timeout=None)
+    return post_json(task_url(session, "/official/generate-procedural-model"), payload, timeout=None, session=session)
 
 
 def official_wait_job(session: Session, payload: dict) -> dict:
-    return post_json(task_url(session, "/official/wait-job"), payload, timeout=None)
+    return post_json(task_url(session, "/official/wait-job"), payload, timeout=None, session=session)
 
 
 def official_search_creator_store(session: Session, payload: dict) -> dict:
-    return post_json(task_url(session, "/official/search-creator-store"), payload, timeout=120.0)
+    return post_json(task_url(session, "/official/search-creator-store"), payload, timeout=120.0, session=session)
 
 
 def official_insert_from_creator_store(session: Session, payload: dict) -> dict:
-    return post_json(task_url(session, "/official/insert-from-creator-store"), payload, timeout=None)
+    return post_json(task_url(session, "/official/insert-from-creator-store"), payload, timeout=None, session=session)
 
 
 def ensure_edit_mode(session: Session, timeout_seconds: float = 20.0, poll_seconds: float = 0.5) -> dict:
