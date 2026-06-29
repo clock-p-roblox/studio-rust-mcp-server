@@ -134,7 +134,7 @@ K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe start `
   },
   "rojo": {
     "local_url": "http://127.0.0.1:34872",
-    "upstream_url": "http://127.0.0.1:34872",
+    "upstream_url": "https://113577273791190-t0123abcd45-rojo-user-user.dev.clock-p.com",
     "public_url": "https://113577273791190-t0123abcd45-rojo-user-user.dev.clock-p.com"
   }
 }
@@ -143,7 +143,8 @@ K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe start `
 约束：
 
 - `helper.base_url` 是 bridge2 控制面的目标地址；公网验收时必须是真实公网 helper URL。
-- `rojo.upstream_url` 是 helper2 转发给本机 Rojo 的权威上游，当前保持本地地址。
+- `rojo.local_url` 是 task-agent 本机 Rojo 监听地址，只给 task-agent 自己和内嵌 clockbridge 使用。
+- `rojo.upstream_url` 是 helper2 实际拨号的权威 Rojo 上游：本地模式下等于本地 `127.0.0.1`，公网模式下必须等于 helper2 可访问的公网 Rojo URL。
 - `rojo.public_url` 只用于诊断公网注册结果，不作为 Studio 初始同步的权威判据。
 - 后续命令不得重新拼 machine、user、token 或 task 身份。
 

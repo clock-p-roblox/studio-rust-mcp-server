@@ -133,6 +133,28 @@ func TestResolveHelperBaseURLPublicNeverReadsMachineNameFile(t *testing.T) {
 	}
 }
 
+func TestHelperFacingRojoUpstreamURLUsesLocalURLForLocalHelper(t *testing.T) {
+	got := helperFacingRojoUpstreamURL(
+		"http://127.0.0.1:44750",
+		"http://127.0.0.1:5000",
+		"https://123-tabc-rojo-sunjun-user.dev.clock-p.com",
+	)
+	if got != "http://127.0.0.1:5000" {
+		t.Fatalf("unexpected local helper upstream URL: %q", got)
+	}
+}
+
+func TestHelperFacingRojoUpstreamURLUsesPublicURLForPublicHelper(t *testing.T) {
+	got := helperFacingRojoUpstreamURL(
+		"https://roblox-helper-win-a-sunjun-user.dev.clock-p.com",
+		"http://127.0.0.1:5000",
+		"https://123-tabc-rojo-sunjun-user.dev.clock-p.com",
+	)
+	if got != "https://123-tabc-rojo-sunjun-user.dev.clock-p.com" {
+		t.Fatalf("unexpected public helper upstream URL: %q", got)
+	}
+}
+
 func TestRequestExistingShutdownUsesStatusURLAndTaskID(t *testing.T) {
 	shutdownCalled := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

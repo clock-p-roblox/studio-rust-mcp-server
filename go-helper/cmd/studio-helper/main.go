@@ -1168,7 +1168,7 @@ func main() {
 			return
 		}
 		logger.Info("proxying task-bound Rojo websocket", "task_id", binding.TaskID, "place_id", binding.PlaceID, "studio_pid", binding.StudioPID, "target", targetURL)
-		proxyRojoWebSocket(w, r, targetURL)
+		proxyRojoWebSocket(w, r, targetURL, publicExposure.config.TokenFile)
 	})
 	rojoForwardHTTP := func(w http.ResponseWriter, r *http.Request) {
 		placeID := r.PathValue("place_id")
@@ -1183,7 +1183,7 @@ func main() {
 			writeRojoAPIError(w, http.StatusBadGateway, "invalid_rojo_upstream", err.Error(), map[string]any{"task_id": binding.TaskID})
 			return
 		}
-		status, bytes, err := proxyRojoHTTPRequest(r.Context(), w, r, targetURL)
+		status, bytes, err := proxyRojoHTTPRequest(r.Context(), w, r, targetURL, publicExposure.config.TokenFile)
 		if err != nil {
 			logger.Warn("failed to proxy task-bound Rojo HTTP request", "task_id", binding.TaskID, "place_id", binding.PlaceID, "target", targetURL, "error", err)
 			writeRojoAPIError(w, http.StatusBadGateway, "rojo_proxy_failed", err.Error(), map[string]any{"task_id": binding.TaskID})
@@ -1820,7 +1820,7 @@ func rojoForwardJoinedPath(basePath string, path string) string {
 	return basePath + "/" + path
 }
 
-func proxyRojoHTTPRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, targetURL string) (int, int64, error) {
+func proxyRojoHTTPRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, targetURL string, tokenFile string) (int, int64, error) {
 	var body io.Reader
 	if r.Body != nil {
 		body = r.Body
@@ -1831,6 +1831,9 @@ func proxyRojoHTTPRequest(ctx context.Context, w http.ResponseWriter, r *http.Re
 	}
 	copyRojoForwardRequestHeaders(req.Header, r.Header)
 	req.Header.Set("Accept-Encoding", "identity")
+	if err := applyRojoUpstreamAuthorization(req, tokenFile); err != nil {
+		return 0, 0, err
+	}
 	response, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return 0, 0, err
@@ -1877,7 +1880,7 @@ func rojoHopByHopHeader(key string) bool {
 	}
 }
 
-func proxyRojoWebSocket(w http.ResponseWriter, r *http.Request, targetURL string) {
+func proxyRojoWebSocket(w http.ResponseWriter, r *http.Request, targetURL string, tokenFile string) {
 	if !headerContainsToken(r.Header, "Connection", "upgrade") || !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 		writeRojoAPIError(w, http.StatusBadRequest, "websocket_upgrade_required", "Rojo socket endpoint requires a WebSocket upgrade request", nil)
 		return
@@ -1905,7 +1908,7 @@ func proxyRojoWebSocket(w http.ResponseWriter, r *http.Request, targetURL string
 	}
 	defer remoteConn.Close()
 
-	if err := writeRojoWebSocketHandshake(remoteConn, r, target); err != nil {
+	if err := writeRojoWebSocketHandshake(remoteConn, r, target, tokenFile); err != nil {
 		writeRawHTTPError(clientRW.Writer, http.StatusBadGateway, "failed to write Rojo websocket handshake")
 		return
 	}
@@ -1958,7 +1961,7 @@ func dialRojoWebSocketTarget(ctx context.Context, target *url.URL) (net.Conn, er
 	return dialer.DialContext(ctx, "tcp", host)
 }
 
-func writeRojoWebSocketHandshake(conn net.Conn, original *http.Request, target *url.URL) error {
+func writeRojoWebSocketHandshake(conn net.Conn, original *http.Request, target *url.URL, tokenFile string) error {
 	path := target.EscapedPath()
 	if path == "" {
 		path = "/"
@@ -1972,9 +1975,63 @@ func writeRojoWebSocketHandshake(conn net.Conn, original *http.Request, target *
 			request += key + ": " + value + "\r\n"
 		}
 	}
+	authHeader, err := publicBearerHeaderForRojoUpstream(target, tokenFile)
+	if err != nil {
+		return err
+	}
+	if authHeader != "" {
+		request += "Authorization: " + authHeader + "\r\n"
+	}
 	request += "\r\n"
-	_, err := io.WriteString(conn, request)
+	_, err = io.WriteString(conn, request)
 	return err
+}
+
+func applyRojoUpstreamAuthorization(req *http.Request, tokenFile string) error {
+	authHeader, err := publicBearerHeaderForRojoUpstream(req.URL, tokenFile)
+	if err != nil {
+		return err
+	}
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
+	return nil
+}
+
+func publicBearerHeaderForRojoUpstream(target *url.URL, tokenFile string) (string, error) {
+	if !rojoUpstreamNeedsPublicBearer(target) {
+		return "", nil
+	}
+	token, err := readRojoUpstreamBearerToken(tokenFile)
+	if err != nil {
+		return "", err
+	}
+	return "Bearer " + token, nil
+}
+
+func rojoUpstreamNeedsPublicBearer(target *url.URL) bool {
+	if target == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(target.Scheme)) {
+	case "https", "wss":
+	default:
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(target.Hostname()))
+	return host != "" && strings.HasSuffix(host, ".dev.clock-p.com")
+}
+
+func readRojoUpstreamBearerToken(tokenFile string) (string, error) {
+	body, err := os.ReadFile(strings.TrimSpace(tokenFile))
+	if err != nil {
+		return "", err
+	}
+	token := strings.TrimSpace(string(body))
+	if token == "" {
+		return "", errors.New("rojo upstream bearer token file is empty")
+	}
+	return token, nil
 }
 
 func headerContainsToken(header http.Header, key string, token string) bool {

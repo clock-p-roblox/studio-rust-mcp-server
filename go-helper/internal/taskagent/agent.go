@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -205,6 +206,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		a.config.UserName = userName
 		a.descriptor.Rojo.PublicURL = publicURL
 	}
+	a.descriptor.Rojo.UpstreamURL = helperFacingRojoUpstreamURL(
+		a.descriptor.Helper.BaseURL,
+		a.descriptor.Rojo.LocalURL,
+		a.descriptor.Rojo.PublicURL,
+	)
 	a.rojoStatus = RojoStatus{
 		State:       "starting",
 		LocalURL:    a.descriptor.Rojo.LocalURL,
@@ -258,6 +264,25 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	a.shutdownBounded()
 	return nil
+}
+
+func helperFacingRojoUpstreamURL(helperBaseURL string, localURL string, publicURL string) string {
+	if helperBaseURLUsesPublicClockPHost(helperBaseURL) && strings.TrimSpace(publicURL) != "" {
+		// Public helper2 runs on another machine, so it must dial the helper-
+		// reachable public Rojo route rather than the task-agent's local
+		// 127.0.0.1 listener.
+		return publicURL
+	}
+	return localURL
+}
+
+func helperBaseURLUsesPublicClockPHost(baseURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || parsed.Scheme != "https" {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	return host != "" && strings.HasSuffix(host, ".dev.clock-p.com")
 }
 
 func (a *Agent) Shutdown() {

@@ -9,7 +9,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -81,7 +83,7 @@ func TestProxyRojoHTTPRequestForcesIdentityEncoding(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/rojo-forward/113/task/task-a/api/rojo", nil)
 	request.Header.Set("Accept-Encoding", "gzip")
 	recorder := httptest.NewRecorder()
-	status, written, err := proxyRojoHTTPRequest(context.Background(), recorder, request, upstream.URL+"/api/rojo")
+	status, written, err := proxyRojoHTTPRequest(context.Background(), recorder, request, upstream.URL+"/api/rojo", "")
 	if err != nil {
 		t.Fatalf("proxy request failed: %v", err)
 	}
@@ -93,6 +95,37 @@ func TestProxyRojoHTTPRequestForcesIdentityEncoding(t *testing.T) {
 	}
 	if !bytes.Equal(recorder.Body.Bytes(), msgpackBody) {
 		t.Fatalf("proxied body = % X, want % X", recorder.Body.Bytes(), msgpackBody)
+	}
+}
+
+func TestPublicBearerHeaderForRojoUpstream(t *testing.T) {
+	tokenFile := filepath.Join(t.TempDir(), "feishu-token")
+	if err := os.WriteFile(tokenFile, []byte("secret-token\n"), 0o600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+
+	localTarget, err := url.Parse("http://127.0.0.1:34872/api/rojo")
+	if err != nil {
+		t.Fatalf("parse local target: %v", err)
+	}
+	localHeader, err := publicBearerHeaderForRojoUpstream(localTarget, tokenFile)
+	if err != nil {
+		t.Fatalf("local target header failed: %v", err)
+	}
+	if localHeader != "" {
+		t.Fatalf("local target header = %q, want empty", localHeader)
+	}
+
+	publicTarget, err := url.Parse("https://demo.dev.clock-p.com/api/rojo")
+	if err != nil {
+		t.Fatalf("parse public target: %v", err)
+	}
+	publicHeader, err := publicBearerHeaderForRojoUpstream(publicTarget, tokenFile)
+	if err != nil {
+		t.Fatalf("public target header failed: %v", err)
+	}
+	if publicHeader != "Bearer secret-token" {
+		t.Fatalf("public target header = %q, want bearer token", publicHeader)
 	}
 }
 
