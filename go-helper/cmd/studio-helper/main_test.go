@@ -399,6 +399,100 @@ func TestModeSeqChangeCompletesPendingAndWaitingCommands(t *testing.T) {
 	}
 }
 
+func TestPlayServerRejectsStaleEditLifecycleUntilStopRequested(t *testing.T) {
+	broker := newMCP2CommandBroker()
+	initializeBroker(t, broker, "edit", 11, 101)
+
+	playCommand, err := broker.enqueueStudioPlay("111")
+	if err != nil {
+		t.Fatalf("enqueue play failed: %v", err)
+	}
+	pulledPlay, closePlayPull := broker.pull(context.Background(), "edit", 11, 101, time.Second)
+	if closePlayPull || pulledPlay.CommandID != playCommand.CommandID {
+		t.Fatalf("pulled play command = %+v close=%v, want %d", pulledPlay, closePlayPull, playCommand.CommandID)
+	}
+	recorded, reason := broker.record(mcp2ResponseResult{
+		CommandID: playCommand.CommandID,
+		ModeSeq:   11,
+		OK:        true,
+		Result: map[string]any{
+			"status": "play_requested",
+		},
+	}, 101)
+	if !recorded {
+		t.Fatalf("play result was not recorded, reason=%q", reason)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	response, closeConnection := broker.pull(ctx, "play_server", 22, 101, time.Second)
+	if closeConnection || response.Type != mcp2MessageTypeShouldRestartPull || response.Reason != "request_context_closed" {
+		t.Fatalf("play_server lifecycle response = %+v close=%v, want request_context_closed", response, closeConnection)
+	}
+	if summary := broker.summary(); summary.ActiveMode != "play_server" || summary.ActiveModeSeq == nil || *summary.ActiveModeSeq != 22 {
+		t.Fatalf("play_server lifecycle was not accepted: %+v", summary)
+	}
+
+	stopCommand, err := broker.enqueueStudioStop("111")
+	if err != nil {
+		t.Fatalf("enqueue stop failed: %v", err)
+	}
+	staleEditResponse, staleEditClosed := broker.pull(ctx, "edit", 11, 101, time.Second)
+	if staleEditClosed || staleEditResponse.Type != mcp2MessageTypeShouldRestartPull || staleEditResponse.Reason != "invalid_lifecycle_source" {
+		t.Fatalf("stale edit response = %+v close=%v, want invalid_lifecycle_source", staleEditResponse, staleEditClosed)
+	}
+	if summary := broker.summary(); summary.ActiveMode != "play_server" || summary.ActiveModeSeq == nil || *summary.ActiveModeSeq != 22 || summary.QueuedCommandCount != 1 {
+		t.Fatalf("stale edit changed play_server state: %+v", summary)
+	}
+	pulledStop, closeStopPull := broker.pull(context.Background(), "play_server", 22, 101, time.Second)
+	if closeStopPull || pulledStop.CommandID != stopCommand.CommandID {
+		t.Fatalf("play_server stop pull = %+v close=%v, want %d", pulledStop, closeStopPull, stopCommand.CommandID)
+	}
+}
+
+func TestStopRequestedAllowsEditLifecycleToBecomeActive(t *testing.T) {
+	broker := newMCP2CommandBroker()
+	initializeBroker(t, broker, "play_server", 22, 101)
+
+	stopCommand, err := broker.enqueueStudioStop("111")
+	if err != nil {
+		t.Fatalf("enqueue stop failed: %v", err)
+	}
+	pulledStop, closeStopPull := broker.pull(context.Background(), "play_server", 22, 101, time.Second)
+	if closeStopPull || pulledStop.CommandID != stopCommand.CommandID {
+		t.Fatalf("pulled stop command = %+v close=%v, want %d", pulledStop, closeStopPull, stopCommand.CommandID)
+	}
+	recorded, reason := broker.record(mcp2ResponseResult{
+		CommandID: stopCommand.CommandID,
+		ModeSeq:   22,
+		OK:        true,
+		Result: map[string]any{
+			"status": "stop_requested",
+		},
+	}, 101)
+	if !recorded {
+		t.Fatalf("stop result was not recorded, reason=%q", reason)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	response, closeConnection := broker.pull(ctx, "edit", 33, 101, time.Second)
+	if closeConnection || response.Type != mcp2MessageTypeShouldRestartPull || response.Reason != "request_context_closed" {
+		t.Fatalf("edit lifecycle response = %+v close=%v, want request_context_closed", response, closeConnection)
+	}
+	if summary := broker.summary(); summary.ActiveMode != "edit" || summary.ActiveModeSeq == nil || *summary.ActiveModeSeq != 33 || summary.ExpectedNextMode != "" {
+		t.Fatalf("edit lifecycle was not accepted cleanly: %+v", summary)
+	}
+
+	stalePlayResponse, stalePlayClosed := broker.pull(ctx, "play_server", 22, 101, time.Second)
+	if stalePlayClosed || stalePlayResponse.Type != mcp2MessageTypeShouldRestartPull || stalePlayResponse.Reason != "invalid_lifecycle_source" {
+		t.Fatalf("stale play_server response = %+v close=%v, want invalid_lifecycle_source", stalePlayResponse, stalePlayClosed)
+	}
+	if summary := broker.summary(); summary.ActiveMode != "edit" || summary.ActiveModeSeq == nil || *summary.ActiveModeSeq != 33 {
+		t.Fatalf("stale play_server changed edit state: %+v", summary)
+	}
+}
+
 func TestPingDoesNotSwitchLifecycleOrClearQueue(t *testing.T) {
 	broker := newMCP2CommandBroker()
 	initializeBroker(t, broker, "edit", 11, 101)

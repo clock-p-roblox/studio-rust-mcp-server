@@ -113,6 +113,7 @@ type mcp2ChannelSummary struct {
 	ActiveMode             string       `json:"active_mode"`
 	ActiveModeSeq          *int64       `json:"active_mode_seq"`
 	ActiveStudioPID        *int         `json:"active_studio_pid"`
+	ExpectedNextMode       string       `json:"expected_next_mode,omitempty"`
 	LastPullAt             *time.Time   `json:"last_pull_at"`
 	Stale                  bool         `json:"stale"`
 	QueuedCommandCount     int          `json:"queued_command_count"`
@@ -142,6 +143,7 @@ type mcp2CommandBroker struct {
 	activeMode             string
 	activeModeSeq          *int64
 	activeStudioPID        *int
+	expectedNextMode       string
 	lastPullAt             *time.Time
 	waitingPullCount       int
 	waitingResponseCommand *mcp2Command
@@ -467,6 +469,10 @@ func (b *mcp2CommandBroker) record(result mcp2ResponseResult, studioPID int) (bo
 		return false, "not_waiting_for_command"
 	}
 
+	waitingCommand := *b.waitingResponseCommand
+	if nextMode := expectedNextModeForCommandResult(waitingCommand, result); nextMode != "" {
+		b.expectedNextMode = nextMode
+	}
 	b.results = append(b.results, result)
 	if len(b.results) > 200 {
 		b.results = b.results[len(b.results)-200:]
@@ -615,6 +621,7 @@ func (b *mcp2CommandBroker) cleanup(reason string) {
 	b.activeMode = "wait_init_mode"
 	b.activeModeSeq = nil
 	b.activeStudioPID = nil
+	b.expectedNextMode = ""
 	b.lastPullAt = nil
 	b.signalLocked()
 }
@@ -634,6 +641,7 @@ func (b *mcp2CommandBroker) markStaleIfNeeded(staleAfter time.Duration) (int, bo
 	b.activeMode = "wait_init_mode"
 	b.activeModeSeq = nil
 	b.activeStudioPID = nil
+	b.expectedNextMode = ""
 	b.lastPullAt = nil
 	pending := append([]mcp2Command(nil), b.pending...)
 	for _, command := range pending {
@@ -685,6 +693,7 @@ func (b *mcp2CommandBroker) summary() mcp2ChannelSummary {
 		ActiveMode:             b.activeMode,
 		ActiveModeSeq:          activeModeSeq,
 		ActiveStudioPID:        activeStudioPID,
+		ExpectedNextMode:       b.expectedNextMode,
 		LastPullAt:             lastPullAt,
 		Stale:                  stale,
 		QueuedCommandCount:     len(b.pending),
@@ -706,11 +715,17 @@ func (b *mcp2CommandBroker) acceptLifecycleLocked(mode string, modeSeq int64, st
 		b.setActiveStudioPIDLocked(studioPID)
 		return true
 	}
+	if !b.canAcceptLifecycleChangeLocked(mode) {
+		return false
+	}
 
 	b.activeMode = mode
 	seq := modeSeq
 	b.activeModeSeq = &seq
 	b.activeStudioPID = nil
+	if b.expectedNextMode == mode {
+		b.expectedNextMode = ""
+	}
 	b.setActiveStudioPIDLocked(studioPID)
 	pending := append([]mcp2Command(nil), b.pending...)
 	for _, command := range pending {
@@ -722,6 +737,51 @@ func (b *mcp2CommandBroker) acceptLifecycleLocked(mode string, modeSeq int64, st
 	}
 	b.signalLocked()
 	return true
+}
+
+func (b *mcp2CommandBroker) canAcceptLifecycleChangeLocked(mode string) bool {
+	if b.activeMode == "wait_init_mode" || b.activeModeSeq == nil {
+		return true
+	}
+	if mode == b.activeMode {
+		return true
+	}
+	if b.expectedNextMode != "" {
+		return mode == b.expectedNextMode
+	}
+	if b.waitingResponseCommand == nil {
+		return false
+	}
+	return mode == expectedNextModeForCommandKind(b.waitingResponseCommand.Kind)
+}
+
+func expectedNextModeForCommandResult(command mcp2Command, result mcp2ResponseResult) string {
+	if !result.OK {
+		return ""
+	}
+	status, _ := result.Result["status"].(string)
+	switch command.Kind {
+	case mcp2CommandStudioPlay:
+		if status == "play_requested" {
+			return "play_server"
+		}
+	case mcp2CommandStudioStop:
+		if status == "stop_requested" {
+			return "edit"
+		}
+	}
+	return ""
+}
+
+func expectedNextModeForCommandKind(kind mcp2CommandKind) string {
+	switch kind {
+	case mcp2CommandStudioPlay:
+		return "play_server"
+	case mcp2CommandStudioStop:
+		return "edit"
+	default:
+		return ""
+	}
 }
 
 func (b *mcp2CommandBroker) setActiveStudioPIDLocked(studioPID int) {
