@@ -7,5 +7,5 @@ output/
 .tmp/
 __pycache__/
 *.pyc
-.clock-p/session.json
+.clock-p/
 go-helper/bin/

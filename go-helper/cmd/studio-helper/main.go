@@ -960,34 +960,6 @@ func main() {
 			"next_cursor": nextCursor,
 		})
 	})
-	mux.HandleFunc("POST /runtime-log/upload", func(w http.ResponseWriter, r *http.Request) {
-		startedAt := time.Now()
-		binding, ok := resolveRuntimeLogUploadBinding(w, r, effectiveListenAddr, studioManager, taskSessions, logger)
-		if !ok {
-			return
-		}
-		var upload runtimelog.Upload
-		if err := json.NewDecoder(r.Body).Decode(&upload); err != nil {
-			writeRuntimeLogAPIError(w, http.StatusBadRequest, "bad_request", err.Error(), map[string]any{"task_id": binding.TaskID})
-			return
-		}
-		entry, err := runtimeLogs.Append(binding.TaskID, upload)
-		if err != nil {
-			writeRuntimeLogAPIError(w, http.StatusBadRequest, "invalid_runtime_log", err.Error(), map[string]any{"task_id": binding.TaskID})
-			return
-		}
-		elapsed := time.Since(startedAt)
-		if elapsed > 500*time.Millisecond {
-			logger.Warn("runtime log upload was slow", "task_id", binding.TaskID, "runtime_id", entry.RuntimeID, "elapsed_ms", elapsed.Milliseconds())
-		}
-		logger.Info("runtime log uploaded", "task_id", binding.TaskID, "runtime_id", entry.RuntimeID, "seq", entry.Seq, "studio_pid", binding.StudioPID)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":         true,
-			"task_id":    binding.TaskID,
-			"runtime_id": entry.RuntimeID,
-			"seq":        entry.Seq,
-		})
-	})
 	mux.HandleFunc("POST /session/{task_id}/studio/play", func(w http.ResponseWriter, r *http.Request) {
 		taskID := r.PathValue("task_id")
 		status := taskSessions.Status(taskID)
@@ -1700,40 +1672,6 @@ func printPrettyJSON(label string, value any) {
 		return
 	}
 	fmt.Printf("%s:\n%s\n", label, body)
-}
-
-func resolveRuntimeLogUploadBinding(
-	w http.ResponseWriter,
-	r *http.Request,
-	listenAddr string,
-	studioManager *studio.Manager,
-	taskSessions *tasksession.Registry,
-	logger *slog.Logger,
-) (rojoPluginBinding, bool) {
-	managedStudio, ok := resolvePeerManagedStudioProcess(r, listenAddr, studioManager, logger)
-	if !ok {
-		writeRuntimeLogAPIError(w, http.StatusForbidden, "invalid_plugin_binding", "request is not from a helper-managed Roblox Studio process", nil)
-		return rojoPluginBinding{}, false
-	}
-	if managedStudio.OwnerKind != "task" || managedStudio.OwnerID == "" {
-		writeRuntimeLogAPIError(w, http.StatusForbidden, "task_binding_required", "managed Studio is not bound to a task session", map[string]any{"studio_pid": managedStudio.PID})
-		return rojoPluginBinding{}, false
-	}
-	status := taskSessions.Status(managedStudio.OwnerID)
-	if !status.OK || status.State != "live" || status.Contract == nil {
-		writeRuntimeLogAPIError(w, http.StatusForbidden, "task_not_live", "managed Studio is not bound to a live task session", map[string]any{
-			"task_id":    managedStudio.OwnerID,
-			"state":      status.State,
-			"studio_pid": managedStudio.PID,
-		})
-		return rojoPluginBinding{}, false
-	}
-	return rojoPluginBinding{
-		TaskID:      status.Contract.TaskID,
-		PlaceID:     status.Contract.PlaceID,
-		UpstreamURL: status.Contract.RojoUpstreamURL,
-		StudioPID:   managedStudio.PID,
-	}, true
 }
 
 func parseRuntimeLogLimit(value string) (int, error) {
