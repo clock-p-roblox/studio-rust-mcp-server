@@ -57,17 +57,25 @@ helper2 不再接受下面这些启动参数：
 
 ### 构建
 
+helper2 必须使用本仓当前源码 build 出来的本地二进制：
+
+```text
+K:\roblox_space\studio-rust-mcp-server\go-helper\bin\studio-helper.exe
+```
+
+不要使用公网矩阵测试临时目录里的 `studio-helper.exe`，也不要继续启动旧的 `go-helper\bin` 残留二进制。启动前先重新 build。当前 Windows 测试机的 Go 在 `K:\Program Files\Go\bin\go.exe`；如果 PATH 已配置好，也可以直接用 `go`。
+
 ```powershell
 cd K:\roblox_space\studio-rust-mcp-server\go-helper
 New-Item -ItemType Directory -Force bin | Out-Null
-go build -o bin\studio-helper.exe ./cmd/studio-helper
-go build -o bin\task-agent.exe ./cmd/task-agent
+& 'K:\Program Files\Go\bin\go.exe' build -o bin\studio-helper.exe ./cmd/studio-helper
+& 'K:\Program Files\Go\bin\go.exe' build -o bin\task-agent.exe ./cmd/task-agent
 ```
 
 ### 启动 helper2
 
 ```powershell
-K:\roblox_space\studio-rust-mcp-server\go-helper\bin\studio-helper.exe --addr 127.0.0.1:0
+K:\roblox_space\studio-rust-mcp-server\go-helper\bin\studio-helper.exe --addr 127.0.0.1:44750
 ```
 
 `--register-domain` 默认开启。开启后 helper2 会按本机身份文件注册公网 helper 域名，同时保留本地监听端口。
@@ -281,8 +289,8 @@ Go 侧：
 cd K:\roblox_space\studio-rust-mcp-server\go-helper
 go test -count=1 ./...
 New-Item -ItemType Directory -Force bin | Out-Null
-go build -o bin\studio-helper.exe ./cmd/studio-helper
-go build -o bin\task-agent.exe ./cmd/task-agent
+& 'K:\Program Files\Go\bin\go.exe' build -o bin\studio-helper.exe ./cmd/studio-helper
+& 'K:\Program Files\Go\bin\go.exe' build -o bin\task-agent.exe ./cmd/task-agent
 ```
 
 bridge2 Python：
