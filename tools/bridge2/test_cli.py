@@ -24,6 +24,7 @@ class FakeHelper(BaseHTTPRequestHandler):
     available = True
     stop_changes_mode = True
     run_code_ok = True
+    official_ok = True
     requests_seen: list[tuple[str, str, dict | None]] = []
 
     def log_message(self, format: str, *args: object) -> None:
@@ -59,6 +60,11 @@ class FakeHelper(BaseHTTPRequestHandler):
                 self._json({"ok": True, "result": {"prints": ["hello"], "code": payload.get("code")}})
             else:
                 self._json({"ok": False, "command_result": {"error": "blocked token"}})
+        elif "/official/" in self.path:
+            if type(self).official_ok:
+                self._json({"ok": True, "official": {"path": self.path, "payload": payload}})
+            else:
+                self._json({"ok": False, "code": "official_tool_error", "message": "official failed"})
         else:
             self._json({"code": "not_found", "message": self.path}, status=404)
 
@@ -81,6 +87,7 @@ class Bridge2CLITest(unittest.TestCase):
         FakeHelper.available = True
         FakeHelper.stop_changes_mode = True
         FakeHelper.run_code_ok = True
+        FakeHelper.official_ok = True
         FakeHelper.requests_seen = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), FakeHelper)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -220,7 +227,7 @@ class Bridge2CLITest(unittest.TestCase):
         self.assertEqual(payload["message"], "blocked token")
 
     def test_thin_commands_do_not_ensure_edit(self) -> None:
-        for command in ("status", "mode", "play", "stop", "screenshot", "play-mode-logs"):
+        for command in ("status", "mode", "play", "stop", "screenshot", "play-mode-logs", "official-ping"):
             with self.subTest(command=command):
                 FakeHelper.requests_seen = []
                 FakeHelper.mode = "edit"
@@ -231,6 +238,63 @@ class Bridge2CLITest(unittest.TestCase):
                 paths = [path for _method, path, _payload in FakeHelper.requests_seen]
                 if command != "mode":
                     self.assertNotIn("/session/task-a/studio/mode", paths)
+
+    def test_official_generate_mesh_ensures_edit_by_default(self) -> None:
+        FakeHelper.mode = "play_server"
+        code, payload, stderr = self.run_cli("official-generate-mesh", "--text-prompt", "small tree", "--size-x", "1", "--size-y", "2", "--size-z", "3", "--max-triangles", "120")
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(payload["details"]["ensure_edit"]["reason"], "stopped_play")
+        official = payload["details"]["official"]["official"]
+        self.assertEqual(official["path"], "/session/task-a/official/generate-mesh")
+        self.assertEqual(official["payload"]["text_prompt"], "small tree")
+        self.assertEqual(official["payload"]["size"], {"x": 1.0, "y": 2.0, "z": 3.0})
+        self.assertEqual(official["payload"]["max_triangles"], 120)
+
+    def test_official_direct_option_skips_ensure(self) -> None:
+        FakeHelper.mode = "play_server"
+        code, payload, stderr = self.run_cli("official-generate-procedural-model", "--prompt", "crate", "--no-ensure-edit")
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertNotIn("ensure_edit", payload["details"])
+        paths = [path for _method, path, _payload in FakeHelper.requests_seen]
+        self.assertNotIn("/session/task-a/studio/stop", paths)
+        self.assertIn("/session/task-a/official/generate-procedural-model", paths)
+
+    def test_official_search_and_insert_payloads(self) -> None:
+        code, search_payload, _stderr = self.run_cli("official-search-creator-store", "--query", "tree", "--asset-type", "Model", "--max-results", "3", "--price-filter", "free", "--verified-creators-only")
+        self.assertEqual(code, 0)
+        search = search_payload["details"]["official"]["payload"]
+        self.assertEqual(search["query"], "tree")
+        self.assertEqual(search["asset_type"], "Model")
+        self.assertEqual(search["max_results"], 3)
+        self.assertEqual(search["price_filter"], "free")
+        self.assertEqual(search["verified_creators_only"], True)
+
+        FakeHelper.requests_seen = []
+        code, insert_payload, _stderr = self.run_cli("official-insert-from-creator-store", "--asset-id", "123", "--asset-name", "Tree", "--asset-type", "Model", "--parent-path", "game.Workspace")
+        self.assertEqual(code, 0)
+        insert = insert_payload["details"]["official"]["official"]["payload"]
+        self.assertEqual(insert["asset_id"], "123")
+        self.assertEqual(insert["asset_name"], "Tree")
+        paths = [path for _method, path, _payload in FakeHelper.requests_seen]
+        self.assertIn("/session/task-a/studio/mode", paths)
+        self.assertIn("/session/task-a/official/insert-from-creator-store", paths)
+
+    def test_official_mesh_rejects_partial_size(self) -> None:
+        code, payload, stderr = self.run_cli("official-generate-mesh", "--text-prompt", "tree", "--size-x", "1")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(payload["code"], "argument_error")
+
+    def test_official_helper_failure_is_json_failure(self) -> None:
+        FakeHelper.official_ok = False
+        code, payload, stderr = self.run_cli("official-ping")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(payload["ok"], False)
+        self.assertEqual(payload["code"], "official_tool_error")
+        self.assertEqual(payload["message"], "official failed")
 
 
 if __name__ == "__main__":

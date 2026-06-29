@@ -761,6 +761,7 @@ func main() {
 	}
 	commandBrokers := newMCP2CommandBrokerRegistry()
 	taskSessions := tasksession.NewRegistry(31*time.Second, studioManager)
+	officialRunner := officialCLIProcessRunner{}
 	runtimeLogs, err := runtimelog.NewStore(runtimelog.DefaultMaxEntriesPerTask)
 	if err != nil {
 		logger.Error("failed to create runtime log store", "error", err)
@@ -789,9 +790,10 @@ func main() {
 			Service: "studio-helper",
 		})
 	})
-	registerMCPHandlers(mux, taskSessions, studioManager, commandBrokers, runtimeLogs, logger, func() publicExposureStatus {
+	registerMCPHandlers(mux, taskSessions, studioManager, commandBrokers, runtimeLogs, officialRunner, logger, func() publicExposureStatus {
 		return publicExposure.Status()
 	})
+	registerOfficialHTTPHandlers(mux, taskSessions, studioManager, officialRunner)
 	mux.HandleFunc("POST /session/{task_id}/heartbeat", func(w http.ResponseWriter, r *http.Request) {
 		pathTaskID := r.PathValue("task_id")
 		var request tasksession.HeartbeatRequest

@@ -277,9 +277,7 @@ GET /session/{task_id}/runtime-log
 
 ## Phase 19B：official CLI 包装
 
-Phase 19A 不实现 official 命令。
-
-Phase 19B 等 Phase 18 helper2 官方原语落地后，再提供 bridge2 薄包装。初始候选命令：
+Phase 19B 在本地 helper2 中提供官方 CLI 白名单原语，并由 bridge2 提供薄包装。命令：
 
 ```text
 official-ping
@@ -287,16 +285,31 @@ official-store-image
 official-generate-mesh
 official-generate-procedural-model
 official-wait-job
-```
-
-Creator Store search / insert 不属于 Phase 19A。它们需要先在 Phase 18B 或后续 official Creator Store phase 中定 helper2 原语，再接入 bridge2：
-
-```text
 official-search-creator-store
 official-insert-from-creator-store
 ```
 
 official 命令即使不调用 `ensure-edit`，也仍必须读取 `.clock-p/session.json`、要求 live task、走 task-scoped helper2 API。`不 ensure-edit` 只表示 bridge2 不负责停止 play 并等待 edit，不表示绕开 task / Studio 绑定。
+
+helper2 原语规则：
+
+- 每次请求启动一个新的官方 `StudioMCP.exe` 进程。
+- 先调用 `list_roblox_studios`，再调用 `set_active_studio`，最后调用一个白名单工具。
+- 当前官方 `list_roblox_studios` 只返回 `id/name/active`，不返回 PID。Phase 19B 因此只允许官方 CLI 看到 exactly one Studio；随后必须用官方 `execute_luau(Edit)` 读取 `game.PlaceId`，并与 task place_id 对账。看到 0 个或多个 Studio、或 place_id 不匹配时，都返回结构化失败。
+- helper2 不做 `ensure-edit`、不 stop、不重试、不做公网路由。
+- helper2 不暴露通用 official tool passthrough。
+
+bridge2 per-command `ensure-edit` 规则：
+
+- 不调用：`official-ping`、`official-store-image`、`official-wait-job`、`official-search-creator-store`。
+- 默认调用，可用 `--no-ensure-edit` 跳过：`official-generate-mesh`、`official-generate-procedural-model`、`official-insert-from-creator-store`。
+
+`official-wait-job` 使用短轮询语义：
+
+- bridge2 默认传 `timeout=1`。
+- 官方 `wait_job_finished` 返回 `status=Timeout` 且带 `lastKnownStatus` 时，不视为 helper2 / CLI 失败；helper2 与 bridge2 都返回 `ok:true`，并保留官方原始内容。
+- 上层 skill / 脚本负责循环调用，直到 `status` 进入 `Completed`、`Failed` 或 `Cancelled`。
+- 当前不要求 helper2 transport 支持单次长等待；长等待 transport 问题不阻塞 Phase 19B 本地收口。
 
 ## Phase 19C：read-studio-log
 

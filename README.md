@@ -130,6 +130,13 @@ POST /session/{task_id}/studio/stop
 GET  /session/{task_id}/studio/screenshot
 POST /session/{task_id}/studio/run-code-direct
 GET  /session/{task_id}/runtime-log
+POST /session/{task_id}/official/ping
+POST /session/{task_id}/official/store-image
+POST /session/{task_id}/official/generate-mesh
+POST /session/{task_id}/official/generate-procedural-model
+POST /session/{task_id}/official/wait-job
+POST /session/{task_id}/official/search-creator-store
+POST /session/{task_id}/official/insert-from-creator-store
 ```
 
 `/session/{task_id}/runtime-log` 是 helper2 内部 task-scoped 日志读取 API。bridge2 对外命令名是 `play-mode-logs`；不要把新 CLI 命令叫做 `runtime-log`，也不要恢复旧独立 runtime-log server。
@@ -144,6 +151,13 @@ helper2_studio_stop
 helper2_studio_screenshot
 helper2_studio_run_code
 helper2_runtime_log
+helper2_official_ping
+helper2_official_store_image
+helper2_official_generate_mesh
+helper2_official_generate_procedural_model
+helper2_official_wait_job
+helper2_official_search_creator_store
+helper2_official_insert_from_creator_store
 ```
 
 旧 `run_code`、`insert_model`、`launch_studio_session`、`start_stop_play`、`take_screenshot` 等旧 MCP 名称不再作为新版 MCP 工具暴露。
@@ -163,9 +177,9 @@ EndTest
 
 ## official CLI
 
-official generation bridge 属于 Phase 18 / Phase 19B，当前不属于 Phase 19A 本地 CLI 收口范围。
+official generation bridge 属于 Phase 19B 本地范围。helper2 每次请求启动一个新的官方 `StudioMCP.exe`，绑定当前 task-owned Studio，执行一个白名单工具，然后结束进程。
 
-Phase 19A 不实现：
+当前 bridge2 命令：
 
 ```text
 official-ping
@@ -177,7 +191,15 @@ official-search-creator-store
 official-insert-from-creator-store
 ```
 
-这些命令必须等 helper2 official 原语落地后再接 bridge2。Creator Store search / insert 需要单独定义 official Creator Store phase 或 Phase 18B。
+helper2 official 原语都是 direct：只要求 live task 和 task-owned Studio，不做 `ensure-edit`、不 stop、不重试、不做公网路由。
+
+bridge2 的 per-command 规则：
+
+- `official-ping`、`official-store-image`、`official-wait-job`、`official-search-creator-store` 不调用 `ensure-edit`。
+- `official-generate-mesh`、`official-generate-procedural-model`、`official-insert-from-creator-store` 默认先 `ensure-edit`，可用 `--no-ensure-edit` 跳过。
+- `official-wait-job` 默认按短轮询执行，`timeout` 默认为 1 秒。官方返回 `{"status":"Timeout","lastKnownStatus":"Polling"}` 时，bridge2 仍返回 `ok:true`，上层 skill / 脚本继续轮询；`Completed` / `Failed` / `Cancelled` 才是终态。
+
+当前官方 `list_roblox_studios` 只返回 `id/name/active`，不返回 PID。为避免猜测窗口，Phase 19B 本地 official 命令只在官方 CLI 看到一个 Studio、helper2 当前 task 也只有一个 task-owned Studio、且官方 `execute_luau(Edit)` 读到的 `game.PlaceId` 等于 task place_id 时执行；多 Studio 场景返回结构化失败，不作为本轮验收项。
 
 ## 当前验收
 
@@ -206,6 +228,8 @@ Phase 19A 已验证过的本地真实 Studio 路径包括：
 本轮不验收 Studio 多开场景；不要把多开行为作为 Phase 19A 完成条件。
 
 本轮也不验收公网路由；Phase 19A 只以本地 helper2 + task-agent + 真实 Studio 路径为完成条件。
+
+Phase 19B 同样只验收本地 helper2 + task-agent + 真实 Studio 路径；不做公网验收。
 
 ## 旧代码说明
 

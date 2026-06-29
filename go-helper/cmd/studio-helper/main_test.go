@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -521,6 +522,9 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 	if !mcpToolListContains(tools, "helper2_status") || !mcpToolListContains(tools, "helper2_studio_play") || !mcpToolListContains(tools, "helper2_studio_run_code") {
 		t.Fatalf("tools/list missing helper2 tools: %+v", tools)
 	}
+	if !mcpToolListContains(tools, "helper2_official_generate_mesh") || !mcpToolListContains(tools, "helper2_official_wait_job") || !mcpToolListContains(tools, "helper2_official_search_creator_store") {
+		t.Fatalf("tools/list missing helper2 official tools: %+v", tools)
+	}
 	if mcpToolListContains(tools, "launch_studio_session") || mcpToolListContains(tools, "start_stop_play") || mcpToolListContains(tools, "take_screenshot") {
 		t.Fatalf("tools/list should not expose legacy helper tool aliases: %+v", tools)
 	}
@@ -532,6 +536,15 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 	required, ok := inputSchema["required"].([]any)
 	if !ok || !stringListContainsAny(required, "task_id") || !stringListContainsAny(required, "code") {
 		t.Fatalf("run code required schema = %+v, want task_id and code", inputSchema["required"])
+	}
+	generateMeshTool := mcpToolByName(tools, "helper2_official_generate_mesh")
+	generateMeshSchema, ok := generateMeshTool["inputSchema"].(map[string]any)
+	if !ok {
+		t.Fatalf("generate mesh input schema missing: %+v", generateMeshTool)
+	}
+	generateMeshRequired, ok := generateMeshSchema["required"].([]any)
+	if !ok || !stringListContainsAny(generateMeshRequired, "task_id") || !stringListContainsAny(generateMeshRequired, "text_prompt") {
+		t.Fatalf("generate mesh required schema = %+v, want task_id and text_prompt", generateMeshSchema["required"])
 	}
 }
 
@@ -653,6 +666,136 @@ func TestMCPLegacyToolAliasesAreNotAccepted(t *testing.T) {
 	}
 }
 
+func TestOfficialArgumentMapping(t *testing.T) {
+	maxTriangles := 120
+	meshArgs, err := officialGenerateMeshArgs(officialGenerateMeshRequest{
+		TextPrompt:   "small tree",
+		Size:         &officialVector3Request{X: 1, Y: 2, Z: 3},
+		MaxTriangles: &maxTriangles,
+		PartNames:    "trunk, leaves",
+	})
+	if err != nil {
+		t.Fatalf("generate mesh args failed: %v", err)
+	}
+	if meshArgs["textPrompt"] != "small tree" || meshArgs["maxTriangles"] != 120 || meshArgs["partNames"] != "trunk, leaves" {
+		t.Fatalf("mesh args = %+v", meshArgs)
+	}
+	size, ok := meshArgs["size"].(map[string]any)
+	if !ok || size["x"] != float64(1) || size["y"] != float64(2) || size["z"] != float64(3) {
+		t.Fatalf("mesh size args = %+v", meshArgs["size"])
+	}
+
+	proceduralArgs, err := officialGenerateProceduralModelArgs(officialGenerateProceduralModelRequest{
+		Prompt:           "",
+		AttachedImageURI: "IMAGEID_123",
+	})
+	if err != nil {
+		t.Fatalf("procedural args failed: %v", err)
+	}
+	if proceduralArgs["prompt"] != "" || proceduralArgs["attachedImageUri"] != "IMAGEID_123" {
+		t.Fatalf("procedural args = %+v", proceduralArgs)
+	}
+
+	searchArgs := officialSearchCreatorStoreArgs(officialSearchCreatorStoreRequest{
+		Query:       "tree",
+		AssetType:   "Model",
+		PriceFilter: "free",
+	})
+	if searchArgs["scope"] != "creator_store" || searchArgs["assetType"] != "Model" || searchArgs["priceFilter"] != "free" {
+		t.Fatalf("search args = %+v", searchArgs)
+	}
+}
+
+func TestOfficialStudioBindingRequiresExactlyOneStudio(t *testing.T) {
+	_, err := chooseSingleOfficialStudio(officialToolMCPResult{
+		Content: []officialContent{{Type: "text", Text: `{"studios":[]}`}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "did not find any connected") {
+		t.Fatalf("empty studio list err = %v", err)
+	}
+
+	_, err = chooseSingleOfficialStudio(officialToolMCPResult{
+		Content: []officialContent{{Type: "text", Text: `{"studios":[{"id":"a","name":"A"},{"id":"b","name":"B"}]}`}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "multiple Roblox Studio") {
+		t.Fatalf("multi studio list err = %v", err)
+	}
+
+	studioRef, err := chooseSingleOfficialStudio(officialToolMCPResult{
+		Content: []officialContent{{Type: "text", Text: `{"studios":[{"id":"a","name":"A","active":false}]}`}},
+	})
+	if err != nil || studioRef.ID != "a" || studioRef.Name != "A" {
+		t.Fatalf("single studio = %+v err=%v", studioRef, err)
+	}
+}
+
+func TestOfficialWaitJobTimeoutIsNonTerminalResult(t *testing.T) {
+	response := officialToolResponse{
+		Tool:          officialToolWaitJobFinished,
+		IsError:       true,
+		ParsedContent: map[string]any{"status": "Timeout", "lastKnownStatus": "Polling"},
+	}
+	if !officialWaitJobTimedOut(response.ParsedContent) {
+		t.Fatalf("wait job timeout was not detected")
+	}
+	if officialWaitJobTimedOut(map[string]any{"status": "Failed"}) {
+		t.Fatalf("failed status must not be treated as timeout")
+	}
+	args, err := officialWaitJobArgs(officialWaitJobRequest{GenerationID: "job-a"})
+	if err != nil {
+		t.Fatalf("wait args failed: %v", err)
+	}
+	if args["timeout"] != float64(1) {
+		t.Fatalf("default wait timeout = %+v, want 1", args)
+	}
+}
+
+func TestOfficialVerifyActiveStudioPlaceRequiresMatchingPlace(t *testing.T) {
+	process := &officialProcess{
+		stdin:  &testWriteCloser{},
+		reader: bufio.NewReader(strings.NewReader(`{"jsonrpc":"2.0","id":9,"result":{"content":[{"type":"text","text":"222"}],"isError":false}}` + "\n")),
+		stderr: &bytes.Buffer{},
+	}
+	_, err := process.verifyActiveStudioPlace(9, "111")
+	if err == nil || !strings.Contains(err.Error(), "place_id mismatch") {
+		t.Fatalf("place mismatch err = %v", err)
+	}
+}
+
+func TestMCPOfficialGenerateMeshRejectsPartialSize(t *testing.T) {
+	runtime := newTestMCPRuntime(t)
+	registerTestTask(t, runtime, "task-a", "123")
+
+	result := callMCPTool(t, runtime, "helper2_official_generate_mesh", map[string]any{
+		"task_id":     "task-a",
+		"text_prompt": "tree",
+		"size_x":      1,
+	})
+	if result["isError"] != true {
+		t.Fatalf("partial size should be tool error: %+v", result)
+	}
+	if text := toolText(t, result); !strings.Contains(text, "size_x, size_y and size_z") {
+		t.Fatalf("tool error = %q, want partial size message", text)
+	}
+}
+
+func TestOfficialTaskToolFailurePaths(t *testing.T) {
+	runtime := newTestMCPRuntime(t)
+	payload, statusCode := runOfficialTaskTool(context.Background(), "missing", runtime.taskSessions, runtime.studioManager, runtime.officialRunner, "", map[string]any{})
+	if statusCode != http.StatusNotFound || payload["code"] != "task_not_registered" {
+		t.Fatalf("missing task payload=%+v status=%d", payload, statusCode)
+	}
+
+	registerTestTask(t, runtime, "task-a", "123")
+	payload, statusCode = runOfficialTaskTool(context.Background(), "task-a", runtime.taskSessions, runtime.studioManager, runtime.officialRunner, "", map[string]any{})
+	if statusCode != http.StatusConflict || payload["code"] != "studio_not_available" {
+		t.Fatalf("missing studio payload=%+v status=%d", payload, statusCode)
+	}
+	if code := officialErrorCode(officialToolBusinessError{response: officialToolResponse{IsError: true}}); code != "official_tool_error" {
+		t.Fatalf("official business error code = %s, want official_tool_error", code)
+	}
+}
+
 func newTestMCPRuntime(t *testing.T) *mcpRuntime {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -675,12 +818,43 @@ func newTestMCPRuntime(t *testing.T) *mcpRuntime {
 		}
 	})
 	return &mcpRuntime{
-		taskSessions:  tasksession.NewRegistry(31*time.Second, manager),
-		studioManager: manager,
-		commandBroker: newMCP2CommandBrokerRegistry(),
-		runtimeLogs:   logs,
-		logger:        logger,
+		taskSessions:   tasksession.NewRegistry(31*time.Second, manager),
+		studioManager:  manager,
+		commandBroker:  newMCP2CommandBrokerRegistry(),
+		runtimeLogs:    logs,
+		officialRunner: fakeOfficialRunner{},
+		logger:         logger,
 	}
+}
+
+type fakeOfficialRunner struct{}
+
+func (fakeOfficialRunner) Run(_ context.Context, managedStudio studio.ManagedProcess, toolName string, arguments map[string]any) (officialToolResponse, error) {
+	return officialToolResponse{
+		Tool:          toolName,
+		Studio:        officialStudioRef{ID: "studio-a", Name: "Studio A"},
+		IsError:       false,
+		ParsedContent: map[string]any{"place_id": managedStudio.PlaceID, "arguments": arguments},
+	}, nil
+}
+
+type failingOfficialRunner struct{}
+
+func (failingOfficialRunner) Run(_ context.Context, _ studio.ManagedProcess, _ string, _ map[string]any) (officialToolResponse, error) {
+	response := officialToolResponse{
+		Tool:    "generate_mesh",
+		IsError: true,
+		Content: []officialContent{{Type: "text", Text: "official failed"}},
+	}
+	return response, officialToolBusinessError{response: response}
+}
+
+type testWriteCloser struct {
+	bytes.Buffer
+}
+
+func (w *testWriteCloser) Close() error {
+	return nil
 }
 
 func registerTestTask(t *testing.T, runtime *mcpRuntime, taskID string, placeID string) {

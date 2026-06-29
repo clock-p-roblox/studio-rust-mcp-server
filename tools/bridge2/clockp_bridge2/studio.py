@@ -35,6 +35,34 @@ def run_code_direct(session: Session, code: str) -> dict:
     return post_json(task_url(session, "/studio/run-code-direct"), {"code": code}, timeout=30.0)
 
 
+def official_ping(session: Session) -> dict:
+    return post_json(task_url(session, "/official/ping"), {}, timeout=30.0)
+
+
+def official_store_image(session: Session, file_path: str) -> dict:
+    return post_json(task_url(session, "/official/store-image"), {"file_path": file_path}, timeout=120.0)
+
+
+def official_generate_mesh(session: Session, payload: dict) -> dict:
+    return post_json(task_url(session, "/official/generate-mesh"), payload, timeout=None)
+
+
+def official_generate_procedural_model(session: Session, payload: dict) -> dict:
+    return post_json(task_url(session, "/official/generate-procedural-model"), payload, timeout=None)
+
+
+def official_wait_job(session: Session, payload: dict) -> dict:
+    return post_json(task_url(session, "/official/wait-job"), payload, timeout=None)
+
+
+def official_search_creator_store(session: Session, payload: dict) -> dict:
+    return post_json(task_url(session, "/official/search-creator-store"), payload, timeout=120.0)
+
+
+def official_insert_from_creator_store(session: Session, payload: dict) -> dict:
+    return post_json(task_url(session, "/official/insert-from-creator-store"), payload, timeout=None)
+
+
 def ensure_edit_mode(session: Session, timeout_seconds: float = 20.0, poll_seconds: float = 0.5) -> dict:
     task_status = status(session)
     state = task_status.get("state")

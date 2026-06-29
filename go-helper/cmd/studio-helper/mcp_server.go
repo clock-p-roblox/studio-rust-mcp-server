@@ -45,6 +45,7 @@ type mcpRuntime struct {
 	studioManager        *studio.Manager
 	commandBroker        *mcp2CommandBrokerRegistry
 	runtimeLogs          *runtimelog.Store
+	officialRunner       officialToolRunner
 	logger               *slog.Logger
 	publicExposureStatus func() publicExposureStatus
 }
@@ -55,6 +56,7 @@ func registerMCPHandlers(
 	studioManager *studio.Manager,
 	commandBrokers *mcp2CommandBrokerRegistry,
 	runtimeLogs *runtimelog.Store,
+	officialRunner officialToolRunner,
 	logger *slog.Logger,
 	publicExposureStatus func() publicExposureStatus,
 ) {
@@ -63,6 +65,7 @@ func registerMCPHandlers(
 		studioManager:        studioManager,
 		commandBroker:        commandBrokers,
 		runtimeLogs:          runtimeLogs,
+		officialRunner:       officialRunner,
 		logger:               logger,
 		publicExposureStatus: publicExposureStatus,
 	}
@@ -199,6 +202,75 @@ func (m *mcpRuntime) runTool(ctx context.Context, name string, args map[string]a
 		cursor, _ := optionalStringArg(args, "cursor")
 		limit := optionalIntArg(args, "limit", runtimelog.DefaultReadLimit)
 		return m.readRuntimeLog(taskID, cursor, limit)
+	case "helper2_official_ping":
+		return m.runOfficial(ctx, taskID, "", map[string]any{})
+	case "helper2_official_store_image":
+		filePath, err := requiredStringArg(args, "file_path")
+		if err != nil {
+			return nil, err
+		}
+		return m.runOfficial(ctx, taskID, officialToolStoreImage, map[string]any{"filePath": filePath})
+	case "helper2_official_generate_mesh":
+		textPrompt, err := requiredStringArg(args, "text_prompt")
+		if err != nil {
+			return nil, err
+		}
+		toolArgs := map[string]any{"textPrompt": textPrompt}
+		copyOptionalOfficialArgs(args, toolArgs, map[string]string{
+			"max_triangles": "maxTriangles",
+			"part_names":    "partNames",
+		})
+		size, hasSize, err := optionalSizeArg(args)
+		if err != nil {
+			return nil, err
+		}
+		if hasSize {
+			toolArgs["size"] = size
+		}
+		return m.runOfficial(ctx, taskID, officialToolGenerateMesh, toolArgs)
+	case "helper2_official_generate_procedural_model":
+		prompt, err := requiredRawStringArg(args, "prompt")
+		if err != nil {
+			return nil, err
+		}
+		toolArgs := map[string]any{"prompt": prompt}
+		copyOptionalOfficialArgs(args, toolArgs, map[string]string{
+			"attached_image_uri": "attachedImageUri",
+			"part_names":         "partNames",
+		})
+		return m.runOfficial(ctx, taskID, officialToolGenerateProceduralModel, toolArgs)
+	case "helper2_official_wait_job":
+		generationID, err := requiredStringArg(args, "generation_id")
+		if err != nil {
+			return nil, err
+		}
+		toolArgs := map[string]any{"generationId": generationID}
+		copyOptionalOfficialArgs(args, toolArgs, map[string]string{"timeout": "timeout"})
+		return m.runOfficial(ctx, taskID, officialToolWaitJobFinished, toolArgs)
+	case "helper2_official_search_creator_store":
+		toolArgs := map[string]any{"scope": "creator_store"}
+		copyOptionalOfficialArgs(args, toolArgs, map[string]string{
+			"query":                  "query",
+			"asset_type":             "assetType",
+			"max_results":            "maxResults",
+			"price_filter":           "priceFilter",
+			"min_price_cents":        "minPriceCents",
+			"max_price_cents":        "maxPriceCents",
+			"verified_creators_only": "verifiedCreatorsOnly",
+		})
+		return m.runOfficial(ctx, taskID, officialToolSearchAsset, toolArgs)
+	case "helper2_official_insert_from_creator_store":
+		assetID, err := requiredStringArg(args, "asset_id")
+		if err != nil {
+			return nil, err
+		}
+		toolArgs := map[string]any{"assetId": assetID}
+		copyOptionalOfficialArgs(args, toolArgs, map[string]string{
+			"asset_name":  "assetName",
+			"asset_type":  "assetType",
+			"parent_path": "parentPath",
+		})
+		return m.runOfficial(ctx, taskID, officialToolInsertAsset, toolArgs)
 	default:
 		return nil, fmt.Errorf("unknown helper2 MCP tool: %s", name)
 	}
@@ -413,6 +485,17 @@ func (m *mcpRuntime) readRuntimeLog(taskID string, cursor string, limit int) (ma
 	}, nil
 }
 
+func (m *mcpRuntime) runOfficial(ctx context.Context, taskID string, toolName string, args map[string]any) (map[string]any, error) {
+	if m.officialRunner == nil {
+		return nil, fmt.Errorf("official runner is not configured")
+	}
+	payload, statusCode := runOfficialTaskTool(ctx, taskID, m.taskSessions, m.studioManager, m.officialRunner, toolName, args)
+	if statusCode >= 400 {
+		return nil, fmt.Errorf("%v", payload["message"])
+	}
+	return payload, nil
+}
+
 func taskStudioCommandTerminalPayload(taskID string, command mcp2Command, terminal mcp2CommandTerminal) (map[string]any, bool) {
 	if terminal.Result == nil {
 		return map[string]any{
@@ -572,6 +655,18 @@ func requiredCodeArg(args map[string]any, key string) (string, error) {
 	return text, nil
 }
 
+func requiredRawStringArg(args map[string]any, key string) (string, error) {
+	value, ok := args[key]
+	if !ok {
+		return "", fmt.Errorf("%s is required", key)
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("%s must be a string", key)
+	}
+	return text, nil
+}
+
 func optionalStringArg(args map[string]any, key string) (string, bool) {
 	value, ok := args[key]
 	if !ok {
@@ -603,6 +698,55 @@ func optionalIntArg(args map[string]any, key string, defaultValue int) int {
 	return defaultValue
 }
 
+func copyOptionalOfficialArgs(source map[string]any, target map[string]any, mapping map[string]string) {
+	for sourceKey, targetKey := range mapping {
+		value, ok := source[sourceKey]
+		if !ok || value == nil {
+			continue
+		}
+		if text, ok := value.(string); ok {
+			if strings.TrimSpace(text) == "" {
+				continue
+			}
+			target[targetKey] = text
+			continue
+		}
+		target[targetKey] = value
+	}
+}
+
+func optionalSizeArg(args map[string]any) (map[string]any, bool, error) {
+	x, okX := optionalNumberLikeArg(args, "size_x")
+	y, okY := optionalNumberLikeArg(args, "size_y")
+	z, okZ := optionalNumberLikeArg(args, "size_z")
+	if !okX && !okY && !okZ {
+		return nil, false, nil
+	}
+	if !okX || !okY || !okZ {
+		return nil, false, fmt.Errorf("size_x, size_y and size_z must be provided together")
+	}
+	return map[string]any{"x": x, "y": y, "z": z}, true, nil
+}
+
+func optionalNumberLikeArg(args map[string]any, key string) (float64, bool) {
+	value, ok := args[key]
+	if !ok {
+		return 0, false
+	}
+	switch typed := value.(type) {
+	case float64:
+		return typed, true
+	case int:
+		return float64(typed), true
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(typed), 64)
+		if err == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
 func mcpToolNames() []string {
 	names := make([]string, 0, len(mcpTools()))
 	for _, tool := range mcpTools() {
@@ -629,6 +773,48 @@ func mcpTools() []map[string]any {
 			"cursor":  stringSchema(),
 			"limit":   map[string]any{"type": "integer"},
 		}),
+		mcpTool("helper2_official_ping", "Bind the official Roblox Studio CLI to the task-owned Studio.", map[string]any{"task_id": stringSchema()}),
+		mcpTool("helper2_official_store_image", "Call official store_image for the task-owned Studio.", map[string]any{
+			"task_id":   stringSchema(),
+			"file_path": stringSchema(),
+		}),
+		mcpTool("helper2_official_generate_mesh", "Call official generate_mesh for the task-owned Studio without ensuring edit mode.", map[string]any{
+			"task_id":       stringSchema(),
+			"text_prompt":   stringSchema(),
+			"size_x":        numberSchema(),
+			"size_y":        numberSchema(),
+			"size_z":        numberSchema(),
+			"max_triangles": map[string]any{"type": "integer"},
+			"part_names":    stringSchema(),
+		}),
+		mcpTool("helper2_official_generate_procedural_model", "Call official generate_procedural_model for the task-owned Studio without ensuring edit mode.", map[string]any{
+			"task_id":            stringSchema(),
+			"prompt":             stringSchema(),
+			"attached_image_uri": stringSchema(),
+			"part_names":         stringSchema(),
+		}),
+		mcpTool("helper2_official_wait_job", "Call official wait_job_finished for the task-owned Studio.", map[string]any{
+			"task_id":       stringSchema(),
+			"generation_id": stringSchema(),
+			"timeout":       numberSchema(),
+		}),
+		mcpTool("helper2_official_search_creator_store", "Call official search_asset constrained to Creator Store.", map[string]any{
+			"task_id":                stringSchema(),
+			"query":                  stringSchema(),
+			"asset_type":             stringSchema(),
+			"max_results":            map[string]any{"type": "integer"},
+			"price_filter":           stringSchema(),
+			"min_price_cents":        numberSchema(),
+			"max_price_cents":        numberSchema(),
+			"verified_creators_only": map[string]any{"type": "boolean"},
+		}),
+		mcpTool("helper2_official_insert_from_creator_store", "Call official insert_asset for the task-owned Studio without ensuring edit mode.", map[string]any{
+			"task_id":     stringSchema(),
+			"asset_id":    stringSchema(),
+			"asset_name":  stringSchema(),
+			"asset_type":  stringSchema(),
+			"parent_path": stringSchema(),
+		}),
 	}
 }
 
@@ -636,6 +822,11 @@ func mcpTool(name string, description string, properties map[string]any) map[str
 	required := []string{"task_id"}
 	if _, ok := properties["code"]; ok {
 		required = append(required, "code")
+	}
+	for _, key := range []string{"file_path", "text_prompt", "prompt", "generation_id", "asset_id"} {
+		if _, ok := properties[key]; ok {
+			required = append(required, key)
+		}
 	}
 	return map[string]any{
 		"name":        name,
@@ -651,4 +842,8 @@ func mcpTool(name string, description string, properties map[string]any) map[str
 
 func stringSchema() map[string]any {
 	return map[string]any{"type": "string"}
+}
+
+func numberSchema() map[string]any {
+	return map[string]any{"type": "number"}
 }
