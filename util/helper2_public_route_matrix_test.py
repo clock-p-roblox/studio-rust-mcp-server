@@ -18,8 +18,9 @@ from typing import Any
 
 HELPER_LOCAL_URL = "http://127.0.0.1:44750"
 DEFAULT_PLACE_ID = "105986423068266"
-DEFAULT_ROJO = Path(r"D:\roblox_space\rojo\target\release\rojo.exe")
-ROJO_REPO = Path(r"D:\roblox_space\rojo")
+ROBLOX_SPACE = Path(__file__).resolve().parents[2]
+DEFAULT_ROJO = ROBLOX_SPACE / "rojo" / "target" / "release" / "rojo.exe"
+ROJO_REPO = ROBLOX_SPACE / "rojo"
 PLUGIN_PATH = Path(os.environ["LOCALAPPDATA"]) / "Roblox" / "Plugins" / "MCP2Plugin.rbxm"
 ROJO_PLUGIN_PATH = Path(os.environ["LOCALAPPDATA"]) / "Roblox" / "Plugins" / "Rojo.rbxm"
 PUBLIC_HOST_PATTERN = re.compile(r"^[a-z0-9.-]+\.dev\.clock-p\.com$")
@@ -48,6 +49,16 @@ def run_command(args: list[str], *, cwd: Path, timeout: float) -> subprocess.Com
     if result.stdout.strip():
         print(result.stdout.strip(), flush=True)
     return result
+
+
+def go_bin() -> str:
+    explicit = os.environ.get("GO_BIN", "").strip()
+    if explicit:
+        return explicit
+    common = Path(r"K:\Program Files\Go\bin\go.exe")
+    if common.exists():
+        return str(common)
+    return "go"
 
 
 def read_text_trim(path: Path) -> str:
@@ -334,8 +345,9 @@ def ensure_no_existing_test_processes(*, kill_existing: bool) -> None:
 def prepare_binaries(root: Path, bin_dir: Path, rojo: Path) -> None:
     bin_dir.mkdir(parents=True, exist_ok=True)
     go_helper = root / "go-helper"
-    run_command(["go", "build", "-o", str(bin_dir / "studio-helper.exe"), r".\cmd\studio-helper"], cwd=go_helper, timeout=120)
-    run_command(["go", "build", "-o", str(bin_dir / "task-agent.exe"), r".\cmd\task-agent"], cwd=go_helper, timeout=120)
+    go = go_bin()
+    run_command([go, "build", "-o", str(bin_dir / "studio-helper.exe"), r".\cmd\studio-helper"], cwd=go_helper, timeout=120)
+    run_command([go, "build", "-o", str(bin_dir / "task-agent.exe"), r".\cmd\task-agent"], cwd=go_helper, timeout=120)
     if not rojo.exists():
         raise PublicMatrixError(f"rojo executable does not exist: {rojo}")
     run_command([str(rojo), "build", r"plugin-mcp2\default.project.json", "--plugin", "MCP2Plugin.rbxm"], cwd=root, timeout=60)
