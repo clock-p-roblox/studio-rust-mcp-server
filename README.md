@@ -1,231 +1,212 @@
-# clock-p Studio MCP Server
+# clock-p Roblox agent / helper2
 
-## Current mainline status
-
-The active roblox-agent refactor mainline is the hubless Phase 9+ path:
+本仓当前主线是新版 Roblox agent 本地链路：
 
 ```text
 task-agent -> helper2 -> mcp2
 ```
 
-Current ownership:
+旧 `helper1`、旧 `task-server`、旧 `hub`、旧 Rust clockp MCP server / `mcp1` 代码暂时保留，但不再作为当前实现入口、兼容 fallback 或验收依据。除非任务明确要求追溯旧实现，否则不要按旧链路开发、测试或写文档。
 
-- `go-helper/cmd/task-agent`: workspace-local task session, Rojo supervision, helper2 heartbeat, and shutdown/release.
-- `go-helper/cmd/studio-helper`: helper2 local session authority, task lease tracking, task-owned Studio lifecycle, and mcp2-facing helper APIs.
-- `mcp2`: the Studio plugin side of the helper2 command channel.
+## 当前组件
 
-Deprecated legacy stack:
+- `go-helper/cmd/studio-helper`：helper2。负责本机 task session、task-owned Studio 生命周期、mcp2 command broker、截图、日志读取、helper2 MCP。
+- `go-helper/cmd/task-agent`：workspace 本地 agent。负责 `.clock-p/session.json`、Rojo server、helper2 heartbeat、shutdown/release。
+- `plugin-mcp2`：Studio 插件。只连接本机 helper2，执行 helper2 下发的 task-scoped Studio 命令。
+- `tools/bridge2`：LLM / 脚本调用的本地 CLI。只读 `.clock-p/session.json`，不猜 machine，不走旧 hub/helper1/mcp1。
 
-- old hub
-- old task-server
-- helper1
-- mcp1 / old Rust clockp MCP server path
-- old runtime-log server
+## 身份边界
 
-Do not use the deprecated stack as the implementation target, compatibility fallback, or validation gate for the Phase 9+ mainline. In particular, do not run `cargo` checks/tests as Phase 9+ verification unless the task is explicitly about the legacy Rust binaries.
-
-Phase 9+ verification should use the Go helper2/task-agent path:
-
-```sh
-cd go-helper
-go test ./...
-go build ./cmd/studio-helper ./cmd/task-agent
-```
-
-The sections below are retained as historical notes for the old stack and should not be read as the current architecture.
-
----
-
-This repository is used by clock-p as the internal `clockp MCP` server that runs inside each debug task.
-
-Do not configure this binary directly as a Claude / Cursor / Codex MCP server for clock-p Roblox workflows. Codex and other LLM operators must use the clock-p Roblox skills and high-level scripts in `../roblox-dev-infra`.
-
-The current clock-p shape is:
-
-- `rbx-studio-mcp --http --plugin-port ... --http-port ... --no-auth` runs inside a task tab.
-- Linux exposes task-scoped Rojo / clockp MCP / runtime-log routes through clockbridge.
-- Windows `studio_helper` registers with hub, claims one task, launches Studio, and bridges plugin/helper traffic.
-- `official MCP` is Roblox's Studio-internal MCP. clockp MCP may route selected internal capabilities to official MCP, but platform scripts and Codex do not call official MCP directly.
-
-### Included clockp MCP tools
-
-- **run_code** - Runs a command in Roblox Studio and returns printed output.
-- **insert_model** - Inserts a model from the Roblox marketplace.
-- **get_console_output** - Gets Studio console output.
-- **launch_studio_session** - The only tool that launches Studio into start_play or run_server through helper.
-- **start_stop_play** - Stops the current play/run session.
-- **get_studio_mode** - Gets the current Studio mode.
-- **take_screenshot** - Captures the active Studio window through helper.
-
-### Build from source
-
-```sh
-cargo build
-```
-
-### Backend mode (domain/proxy friendly)
-
-For clock-p task usage, run this process without installer behavior and expose two local endpoints:
-
-- Studio plugin bridge (long polling): `http://127.0.0.1:44755`
-- MCP Streamable HTTP: `http://127.0.0.1:44756/mcp`
-
-```sh
-cargo run -- --http --plugin-port 44755 --http-port 44756 --no-auth
-```
-
-By default `--http` requires a bearer token. It checks in this order:
-
-1. `--bearer-token`
-2. `--bearer-token-file`
-3. `~/.dev.clock-p.com/feishu-token`
-
-Use `--no-auth` only for local debugging.
-
-Useful flags:
-
-- `--plugin-port <port>`: plugin bridge port (default `44755`)
-- `--http-port <port>`: MCP HTTP port (default `44756`)
-- `--write-plugin <path>`: export bundled `MCPStudioPlugin.rbxm` and exit
-- `--workspace-path <path>`: explicit workspace identity
-
-### Clock-p task cluster mode
-
-`clock-p` 当前的联调链路已经升级为 task 化 debug cluster：
-
-- server cluster 先向 hub 创建 task，拿到 `task_id`
-- rojo / clockp MCP / runtime-log 都按同一个 `task_id` 暴露公网 host
-- helper 是机器级单例，通过 hub claim task，再连到对应 task 的远端 MCP WebSocket
-- restart / stop 后重新启动都会申请新的 `task_id`
-- 当前不再使用 recover 语义
-
-hub 本身只做 control plane：
-
-- helper register / heartbeat / claim
-- task create / heartbeat / release
-- helper block / drain
-
-为了覆盖极端故障场景，hub 现在会把 task 状态落盘；helper heartbeat 也会回填和校正 task claim。这样在 hub 重启、helper 重启、supervisor 过期等场景下，Linux 阶段就能先验证控制面的稳定性。
-
-本仓新增 `roblox_hub` 二进制作为 hub server：
-
-```sh
-cargo run --bin roblox_hub -- --port 44758 --no-auth
-```
-
-常见返回字段：
-
-- task：`task_id / task_token / routes`
-- helper：`helper_id / capacity / active_launches`
-
-### Clock-p helper mode
-
-`clock-p` 的 Studio helper 现在是机器级单例：
-
-- `Rojo plugin -> helper 本地 forward URL -> helper 使用当前 claimed task 的 Rojo route 转发`
-- `clockp MCP plugin -> helper -> helper 通过 task-scoped clockp MCP 通道收发工具调用`
-- `helper -> hub register / heartbeat / claim`
-- `take_screenshot -> helper 截图 -> helper 通过 MCP WebSocket 分片上传 -> MCP server 落盘到 workspace artifacts`
-- `official_mcp_store_image(image_base64, mime_type) -> helper 写入 Windows 本机 task-scoped 临时图片 -> helper 调用 hidden official MCP store_image(filePath)`
-- official MCP 长任务的同步等待上限是 30 分钟；LLM / Codex 操作时超过 3 分钟仍未返回，应先汇报并检查状态后再决定是否继续等。
-
-helper 二进制是本仓库里的 `studio_helper`：
-
-```sh
-cargo run --bin studio_helper -- --port 44750 --hub-base-url https://roblox-hub-<user>-public.dev.clock-p.com
-```
-
-默认行为：
-
-- helper 自己读取 `feishu-user_name` 和 `feishu-token`
-- 在 Windows 用户会话里直接运行 `studio_helper.exe` 时，会自动推导 `hub_base_url = https://roblox-hub-<user>-public.dev.clock-p.com`
-- 所以正常情况下不再需要额外传 `--user-name`、`--bearer-token-file` 或 `--hub-base-url`
-- helper 有稳定 `helper_id`；Windows helper 使用 `MachineGuid` 派生，其他平台使用持久化本地 id
-- helper 注册 hub 后，会 claim task 并拿到：
-  - `task_id`
-  - `mcp_base_url`
-  - `rojo_base_url`
-- hub 会拒绝活跃重复 `helper_id`；helper 应在启动早期先 register hub，并把 `helper_id_conflict` 视为 fatal startup error
-- hub 可以 block 某个 helper；block 后 helper 不能再 register / claim，新 claim 必须等 drain ack 或 timeout force release 后才交给其他 helper
-- plugin 侧只需要配置 helper 端口
-- helper 还额外提供：
-  - `GET /status`
-  - `GET /v1/rojo/config?placeId=...`
-  - `POST /v1/mcp/register`
-  - `GET /v1/mcp/plugin/request?instance_id=...`
-  - `POST /v1/mcp/plugin/response`
-  - `POST /v1/helper/screenshot`
-  - `POST /v1/helper/runtime-screenshot`
-  - `GET /v1/helper/studio-log`
-
-clockp MCP HTTP 服务额外开放：
-
-- `GET /ws/helper`
-
-这个 WebSocket 由 helper 主动连接。Linux helper 提供 register / heartbeat / claim / 远端 WS 代理能力，但不提供 Win32 专属的截图、窗口定位和 Studio 本地日志读取能力。
-
-### Helper block / drain
-
-`block-helper` 是 hub control plane 操作，不是 Windows 进程 kill。它的目标是阻止 helper 继续拿新 task，并请求它释放当前 task，避免旧 helper 和新 helper 同时持有同一个 task。
-
-目标状态机：
-
-- `blocked/draining`：helper 已被 block，不允许 register / claim；已 claim task 保持在该 helper 名下，等待释放。
-- `blocked/drained`：helper 后续 heartbeat 不再上报 pending task，hub 视为 ack 并清 claim。
-- `blocked/force_released`：超过 drain deadline 后，hub 强制清 pending claim；这不表示 Windows helper 或 Studio 已停止。
-
-协议约束：
-
-- blocked helper heartbeat 仍返回 200 JSON。
-- 旧 helper 的兼容释放依赖 `release_task_ids`；`ok:false` 只能作为新 helper 的拒绝/诊断信号。
-- hub 计算 `reported_active_task_ids = active_task_ids ∪ active_tasks[].task_id`。
-- `release_task_ids` 覆盖 helper 上报但 hub 不允许它继续持有的全部 task，包括 pending、claim 不匹配、不存在、expired 或 released 的 task。
-- pending task 不再出现在 `reported_active_task_ids` 时，hub 才清 `claimed_by_helper_id`。
-- drain timeout 使用独立 deadline，不使用 helper 最近 heartbeat；坏 helper 持续 heartbeat 也不能无限占住 task。
-- force release 后，如果 blocked helper 迟到 heartbeat 仍上报 task，hub 继续返回 release 指令。
-- 存在 pending drain 时，`unblock-helper` 不应静默丢弃 drain 状态。
-
-`/v1/helpers` 的 blocked helper 输出应能解释排障链路：hub 是否发过 release、helper 最后上报了哪些 task、还有哪些 pending task、drain deadline 是否已到、deadline 还剩多久、哪些 task 已 force release。Linux 侧只能验证 hub API / 协议 / 单测，不能声称 Windows helper 或 Studio 已被实机停止。
-
-当前收口方向：
-
-- helper 是本机唯一权威配置源
-- plugin 不应自行猜测或长期缓存 task 路由
-
-### Ubuntu 交叉编译 Windows helper
-
-如果你要在 Ubuntu 上产出 `studio_helper.exe`，先安装交叉编译依赖：
-
-```sh
-sudo ./util/install-ubuntu-windows-cross.sh
-```
-
-这个脚本会安装：
-
-- `binutils-mingw-w64-x86-64`
-- `gcc-mingw-w64-x86-64-posix`
-- `g++-mingw-w64-x86-64-posix`
-- Rust target `x86_64-pc-windows-gnu`
-
-然后执行：
-
-```sh
-cargo build --release --bin studio_helper --target x86_64-pc-windows-gnu
-```
-
-产物路径：
+Windows client 侧 helper2 的 public exposure 身份只允许来自同一个本机系统身份目录。正常位置是：
 
 ```text
-target/x86_64-pc-windows-gnu/release/studio_helper.exe
+%APPDATA%\dev.clock-p.com\
+  machine_name
+  feishu-user_name
+  feishu-token
 ```
 
-## Verify setup
+`machine_name` 必须和 `feishu-token`、`feishu-user_name` 放在同一个目录。helper2 启动时自己读取这些文件；禁止用 `--public-machine-name`、`--public-user` 或 `--clockbridge-token-file` 覆盖。
 
-For clock-p workflows, verify through the platform scripts:
+`task-agent start` 是另一条边界：`--machine_name` 必须显式传入。task-agent 不读取本机 `machine_name` 文件，也不从历史 workspace 状态推断。启动成功后，task-agent 把 `machine_name`、`task_id` 和 `helper.base_url` 写入 `.clock-p/session.json`。后续 bridge2、MCP、截图、日志、play/stop/mode 命令都只读 `.clock-p/session.json`。
 
-```sh
-python3 ../clock-p-platform/tools/bridge/debug-cluster-status.py --workspace <workspace>
-python3 ../clock-p-platform/tools/bridge/roblox-mcp-request.py --workspace <workspace> status
+## 本地启动
+
+构建 helper2 和 task-agent：
+
+```powershell
+cd go-helper
+go test ./...
+go build -o bin\studio-helper.exe .\cmd\studio-helper
+go build -o bin\task-agent.exe .\cmd\task-agent
 ```
 
-Codex and other LLM operators should not send requests directly to this server as their MCP client. Use `roblox-start-services` and `roblox-launch-game` skills.
+构建并安装 mcp2 插件：
+
+```powershell
+rojo build ..\plugin-mcp2\default.project.json -o $env:LOCALAPPDATA\Roblox\Plugins\MCP2Plugin.rbxm
+```
+
+启动 helper2：
+
+```powershell
+.\bin\studio-helper.exe
+```
+
+启动 task-agent：
+
+```powershell
+.\bin\task-agent.exe start `
+  --workspace K:\roblox_space\test_game3 `
+  --environment local `
+  --machine_name sunjun2 `
+  --place_id 113577273791190 `
+  --helper-base-url http://127.0.0.1:44750 `
+  --rojo-bin K:\roblox_space\rojo\target\release\rojo.exe `
+  --project K:\roblox_space\test_game3\default.project.json
+```
+
+停止 task-agent：
+
+```powershell
+.\bin\task-agent.exe stop --workspace K:\roblox_space\test_game3
+```
+
+## bridge2 CLI
+
+入口：
+
+```text
+tools/bridge2/clockp-roblox-cli.cmd
+tools/bridge2/clockp-roblox-cli.sh
+tools/bridge2/cli.py
+```
+
+所有 bridge2 命令只输出一个 JSON 对象。成功和失败都走 JSON；stderr 默认不输出。参数错误、help、异常也会转成 JSON。
+
+Phase 19A 命令：
+
+```text
+status
+mode
+ensure-edit
+play
+stop
+screenshot
+run-code-direct
+run-code
+play-mode-logs
+```
+
+`run-code-direct` 不做 `ensure-edit`，当前 Studio 不是 edit 时直接失败，也不会 stop。
+
+`run-code` 会先执行 `ensure-edit`：如果当前是 `play_server`，先 stop，再轮询到新的 `edit` mode，然后执行代码。
+
+`run-code-direct` 和 `run-code` 都支持：
+
+```text
+--code <luau>
+--file <path>
+```
+
+二者必须且只能提供一个。
+
+示例：
+
+```powershell
+py -3 tools\bridge2\cli.py --workspace K:\roblox_space\test_game3 mode
+py -3 tools\bridge2\cli.py --workspace K:\roblox_space\test_game3 run-code --code "print('hello'); return 'ok'"
+```
+
+## helper2 HTTP / MCP
+
+当前 task-scoped HTTP API：
+
+```text
+GET  /session/{task_id}/status
+GET  /session/{task_id}/studio/mode
+POST /session/{task_id}/studio/play
+POST /session/{task_id}/studio/stop
+GET  /session/{task_id}/studio/screenshot
+POST /session/{task_id}/studio/run-code-direct
+GET  /session/{task_id}/runtime-log
+```
+
+`/session/{task_id}/runtime-log` 是 helper2 内部 task-scoped 日志读取 API。bridge2 对外命令名是 `play-mode-logs`；不要把新 CLI 命令叫做 `runtime-log`，也不要恢复旧独立 runtime-log server。
+
+helper2 MCP 当前只暴露新版 task-scoped 工具，不保留旧工具别名：
+
+```text
+helper2_status
+helper2_studio_mode
+helper2_studio_play
+helper2_studio_stop
+helper2_studio_screenshot
+helper2_studio_run_code
+helper2_runtime_log
+```
+
+旧 `run_code`、`insert_model`、`launch_studio_session`、`start_stop_play`、`take_screenshot` 等旧 MCP 名称不再作为新版 MCP 工具暴露。
+
+## run-code 安全边界
+
+`studio_run_code` 是本地可信联调能力，不是强安全沙箱。它会拦截明显的 Studio 生命周期控制 API token：
+
+```text
+StudioTestService
+ExecutePlayModeAsync
+ExecuteRunModeAsync
+EndTest
+```
+
+这用于防止 LLM 通过任意 Luau 绕过 `play/stop/ensure-edit` 编排；不要把它理解成对恶意 Luau 的完整隔离。
+
+## official CLI
+
+official generation bridge 属于 Phase 18 / Phase 19B，当前不属于 Phase 19A 本地 CLI 收口范围。
+
+Phase 19A 不实现：
+
+```text
+official-ping
+official-store-image
+official-generate-mesh
+official-generate-procedural-model
+official-wait-job
+official-search-creator-store
+official-insert-from-creator-store
+```
+
+这些命令必须等 helper2 official 原语落地后再接 bridge2。Creator Store search / insert 需要单独定义 official Creator Store phase 或 Phase 18B。
+
+## 当前验收
+
+提交前至少跑：
+
+```powershell
+py -3 -m unittest .\tools\bridge2\test_cli.py
+cd go-helper
+go test ./cmd/studio-helper ./cmd/task-agent ./internal/taskagent ./internal/tasksession
+rojo build ..\plugin-mcp2\default.project.json -o $env:TEMP\MCP2Plugin-test.rbxm
+```
+
+涉及 Studio 行为时，必须用真实 Studio 本地跑通。只靠单测或 fake HTTP helper 不算完成。
+
+Phase 19A 已验证过的本地真实 Studio 路径包括：
+
+- bridge2 `status` / `mode` / `screenshot` / `play-mode-logs`
+- edit 模式 `run-code-direct`
+- play 模式 `run-code-direct` 失败且不 stop
+- play 模式 `run-code` 先 stop、等待 edit、再执行
+- forbidden token 返回 JSON 失败
+- helper2 MCP `tools/list` 只暴露新版 task-scoped 工具
+- helper2 MCP `helper2_studio_run_code` 在真实 Studio edit 模式成功返回 `print` / `warn` / `return`
+- helper2 MCP `helper2_studio_run_code` 的编译失败和 forbidden token 拦截都返回结构化 JSON，不转成旧工具或旧路由异常
+
+本轮不验收 Studio 多开场景；不要把多开行为作为 Phase 19A 完成条件。
+
+本轮也不验收公网路由；Phase 19A 只以本地 helper2 + task-agent + 真实 Studio 路径为完成条件。
+
+## 旧代码说明
+
+仓内旧 Rust MCP、旧 helper、旧 hub/task-server 相关代码目前只作为历史实现保留。不要删除它们，除非有单独清理任务；也不要在新文档里把它们写成当前操作入口。

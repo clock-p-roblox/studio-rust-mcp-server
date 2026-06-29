@@ -57,6 +57,7 @@ const (
 	mcp2CommandStudioPlay    mcp2CommandKind = "studio_play"
 	mcp2CommandStudioStop    mcp2CommandKind = "studio_stop"
 	mcp2CommandStudioMode    mcp2CommandKind = "studio_mode_query"
+	mcp2CommandStudioRunCode mcp2CommandKind = "studio_run_code"
 )
 
 type mcp2Command struct {
@@ -101,6 +102,11 @@ type studioStopCommandArgs struct {
 
 type studioModeCommandArgs struct {
 	PlaceID string `json:"place_id"`
+}
+
+type studioRunCodeCommandArgs struct {
+	PlaceID string `json:"place_id"`
+	Code    string `json:"code"`
 }
 
 type mcp2ChannelSummary struct {
@@ -391,10 +397,25 @@ func (b *mcp2CommandBroker) enqueueStudioModeQuery(placeID string) (mcp2Command,
 	})
 }
 
+func (b *mcp2CommandBroker) enqueueStudioRunCode(placeID string, code string) (mcp2Command, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.activeMode != "edit" {
+		return mcp2Command{}, fmt.Errorf("studio_run_code requires edit mode; current mode=%s", b.activeMode)
+	}
+	return b.enqueueLocked(mcp2MessageTypeCommand, mcp2CommandStudioRunCode, studioRunCodeCommandArgs{
+		PlaceID: placeID,
+		Code:    code,
+	})
+}
+
 func (b *mcp2CommandBroker) enqueue(commandType mcp2MessageType, commandKind mcp2CommandKind, args any) (mcp2Command, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return b.enqueueLocked(commandType, commandKind, args)
+}
 
+func (b *mcp2CommandBroker) enqueueLocked(commandType mcp2MessageType, commandKind mcp2CommandKind, args any) (mcp2Command, error) {
 	if b.activeMode == "wait_init_mode" {
 		return mcp2Command{}, errors.New("mcp2 channel is waiting for initial mode")
 	}
@@ -723,11 +744,8 @@ func main() {
 	mcp2StaleCheckInterval := flag.Duration("mcp2-stale-check-interval", 5*time.Second, "mcp2 channel stale watchdog interval")
 	publicExposureEnabled := flag.Bool("public-exposure", false, "enable helper2 public exposure through clockbridge/https-proxy")
 	publicExposureDryRun := flag.Bool("public-exposure-dry-run", false, "resolve helper2 public exposure without starting clockbridge")
-	publicMachineName := flag.String("public-machine-name", "", "explicit machine name for helper2 public exposure")
-	publicUserName := flag.String("public-user", "", "explicit user name for helper2 public exposure")
 	publicDomainSuffix := flag.String("public-domain-suffix", defaultPublicDomainSuffix, "domain suffix for helper2 public exposure")
 	clockbridgeBin := flag.String("clockbridge-bin", "clockbridge-cli", "clockbridge-cli executable for helper2 public exposure")
-	clockbridgeTokenFile := flag.String("clockbridge-token-file", "", "clockbridge bearer token file for helper2 public exposure")
 	clockbridgeXToken := flag.String("clockbridge-x-token", "", "optional clockbridge X-Token for helper2 public exposure")
 	clockbridgeRegisterHost := flag.String("clockbridge-register-host", "", "clockbridge register host; defaults to register-https-proxy.<public-domain-suffix>")
 	clockbridgeRegisterIP := flag.String("clockbridge-register-ip", "", "optional clockbridge register TCP override")
@@ -1013,6 +1031,48 @@ func main() {
 			return
 		}
 		writeTaskStudioModeTerminal(w, taskID, command, terminal)
+	})
+	mux.HandleFunc("POST /session/{task_id}/studio/run-code-direct", func(w http.ResponseWriter, r *http.Request) {
+		taskID := r.PathValue("task_id")
+		status := taskSessions.Status(taskID)
+		if !status.OK || status.Contract == nil {
+			writeJSON(w, http.StatusNotFound, status)
+			return
+		}
+		if status.State != "live" {
+			writeTaskAPIError(w, http.StatusConflict, taskID, "task_not_live", "task session is not live", "restart_task_agent", map[string]any{"state": status.State})
+			return
+		}
+		var request struct {
+			Code string `json:"code"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeTaskAPIError(w, http.StatusBadRequest, taskID, "bad_request", err.Error(), "fix_request", nil)
+			return
+		}
+		if strings.TrimSpace(request.Code) == "" {
+			writeTaskAPIError(w, http.StatusBadRequest, taskID, "missing_code", "code is required", "fix_request", nil)
+			return
+		}
+		if _, err := studioManager.ManagedProcessForTask(taskID); err != nil {
+			writeTaskAPIError(w, http.StatusConflict, taskID, "studio_not_available", err.Error(), "wait_for_studio", nil)
+			return
+		}
+		broker := commandBrokers.forTask(taskID)
+		command, err := broker.enqueueStudioRunCode(status.Contract.PlaceID, request.Code)
+		if err != nil {
+			writeTaskAPIError(w, http.StatusConflict, taskID, "studio_not_edit", err.Error(), "ensure_edit", nil)
+			return
+		}
+		waitCtx, cancel := context.WithTimeout(r.Context(), taskStudioCommandWaitTimeout)
+		defer cancel()
+		terminal, found := broker.waitForTerminal(waitCtx, command.CommandID)
+		if !found {
+			broker.cancelCommandWithReason(command.CommandID, "command_timeout")
+			writeTaskAPIError(w, http.StatusGatewayTimeout, taskID, "command_timeout", "mcp2 command did not complete before timeout", "retry", map[string]any{"command_id": command.CommandID})
+			return
+		}
+		writeTaskStudioRunCodeTerminal(w, taskID, command, terminal)
 	})
 	mux.HandleFunc("GET /session/{task_id}/studio/screenshot", func(w http.ResponseWriter, r *http.Request) {
 		taskID := r.PathValue("task_id")
@@ -1484,10 +1544,7 @@ func main() {
 		Enabled:        *publicExposureEnabled,
 		DryRun:         *publicExposureDryRun,
 		ClockbridgeBin: *clockbridgeBin,
-		MachineName:    *publicMachineName,
-		UserName:       *publicUserName,
 		DomainSuffix:   *publicDomainSuffix,
-		TokenFile:      *clockbridgeTokenFile,
 		XToken:         *clockbridgeXToken,
 		RegisterHost:   *clockbridgeRegisterHost,
 		RegisterIP:     *clockbridgeRegisterIP,
@@ -1991,6 +2048,25 @@ func writeTaskStudioCommandTerminal(w http.ResponseWriter, taskID string, comman
 		"command_result":      terminal.Result,
 		"terminal":            terminal,
 	})
+}
+
+func writeTaskStudioRunCodeTerminal(w http.ResponseWriter, taskID string, command mcp2Command, terminal mcp2CommandTerminal) {
+	payload, ok := taskStudioRunCodeTerminalPayload(taskID, command, terminal)
+	if !ok {
+		message := "mcp2 command ended before a successful response"
+		code := terminal.Reason
+		if terminal.Result != nil && terminal.Result.Error != "" {
+			message = terminal.Result.Error
+			code = "helper_command_failed"
+		}
+		writeTaskAPIError(w, http.StatusConflict, taskID, code, message, "retry", map[string]any{
+			"command_id":     command.CommandID,
+			"terminal":       terminal,
+			"command_result": payload["command_result"],
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func writeTaskStudioModeTerminal(w http.ResponseWriter, taskID string, command mcp2Command, terminal mcp2CommandTerminal) {

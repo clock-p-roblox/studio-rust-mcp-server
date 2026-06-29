@@ -1,5 +1,9 @@
 # helper 架构整理 draft
 
+> 历史文档：本文基于旧 hub / helper / clockp MCP 架构整理问题，不是当前 Roblox agent 主线。
+> 当前主线以仓库根 README 为准：`task-agent -> helper2 -> mcp2`，bridge2 只读 `.clock-p/session.json`。
+> 旧 hub、task-server、helper1、mcp1 只能作为历史背景，不作为当前实现入口、兼容 fallback 或验收依据。
+
 ## 目标
 
 把 Windows helper 从“所有事情都管的状态大脑”整理成“本机事实拥有者 + 单步动作执行器”。

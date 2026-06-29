@@ -189,6 +189,12 @@ func (m *mcpRuntime) runTool(ctx context.Context, name string, args map[string]a
 		return m.runStudioCommand(ctx, taskID, mcp2CommandStudioStop)
 	case "helper2_studio_screenshot":
 		return m.runScreenshot(ctx, taskID)
+	case "helper2_studio_run_code":
+		code, err := requiredCodeArg(args, "code")
+		if err != nil {
+			return nil, err
+		}
+		return m.runStudioRunCode(ctx, taskID, code)
 	case "helper2_runtime_log":
 		cursor, _ := optionalStringArg(args, "cursor")
 		limit := optionalIntArg(args, "limit", runtimelog.DefaultReadLimit)
@@ -332,6 +338,39 @@ func (m *mcpRuntime) runStudioCommand(ctx context.Context, taskID string, kind m
 	return payload, nil
 }
 
+func (m *mcpRuntime) runStudioRunCode(ctx context.Context, taskID string, code string) (map[string]any, error) {
+	status := m.taskSessions.Status(taskID)
+	if !status.OK || status.Contract == nil {
+		return nil, fmt.Errorf("helper2 has no registered session for task_id %s", taskID)
+	}
+	if status.State != "live" {
+		return nil, fmt.Errorf("task session is not live: %s", status.State)
+	}
+	if _, err := m.studioManager.ManagedProcessForTask(taskID); err != nil {
+		return nil, fmt.Errorf("studio_not_available: %w", err)
+	}
+	broker := m.commandBroker.forTask(taskID)
+	command, err := broker.enqueueStudioRunCode(status.Contract.PlaceID, code)
+	if err != nil {
+		return nil, err
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, taskStudioCommandWaitTimeout)
+	defer cancel()
+	terminal, found := broker.waitForTerminal(waitCtx, command.CommandID)
+	if !found {
+		broker.cancelCommandWithReason(command.CommandID, "command_timeout")
+		return nil, fmt.Errorf("mcp2 command did not complete before timeout")
+	}
+	payload, ok := taskStudioRunCodeTerminalPayload(taskID, command, terminal)
+	if !ok {
+		if terminal.Result != nil {
+			return payload, nil
+		}
+		return nil, fmt.Errorf("mcp2 command ended before a successful response: %s", terminal.Reason)
+	}
+	return payload, nil
+}
+
 func (m *mcpRuntime) runScreenshot(ctx context.Context, taskID string) (map[string]any, error) {
 	status := m.taskSessions.Status(taskID)
 	if !status.OK || status.Contract == nil {
@@ -397,6 +436,42 @@ func taskStudioCommandTerminalPayload(taskID string, command mcp2Command, termin
 		"command_result":      terminal.Result,
 		"terminal":            terminal,
 	}, terminal.Result.OK
+}
+
+func taskStudioRunCodeTerminalPayload(taskID string, command mcp2Command, terminal mcp2CommandTerminal) (map[string]any, bool) {
+	if terminal.Result == nil {
+		return map[string]any{
+			"ok":         false,
+			"task_id":    taskID,
+			"code":       terminal.Reason,
+			"message":    "mcp2 command ended before a response was received",
+			"action":     "retry",
+			"command_id": command.CommandID,
+			"terminal":   terminal,
+		}, false
+	}
+	payload := map[string]any{
+		"ok":             terminal.Result.OK,
+		"task_id":        taskID,
+		"command_id":     command.CommandID,
+		"command_result": terminal.Result,
+		"terminal":       terminal,
+		"result":         terminal.Result.Result,
+	}
+	ok := terminal.Result.OK
+	if !ok && terminal.Result.Error != "" {
+		payload["message"] = terminal.Result.Error
+	}
+	if ok && terminal.Result.Result != nil {
+		if success, found := terminal.Result.Result["success"].(bool); found && !success {
+			ok = false
+			payload["ok"] = false
+			if message, found := terminal.Result.Result["error"].(string); found && message != "" {
+				payload["message"] = message
+			}
+		}
+	}
+	return payload, ok
 }
 
 func taskStudioModeTerminalPayload(taskID string, command mcp2Command, terminal mcp2CommandTerminal) map[string]any {
@@ -485,6 +560,18 @@ func requiredStringArg(args map[string]any, key string) (string, error) {
 	return strings.TrimSpace(text), nil
 }
 
+func requiredCodeArg(args map[string]any, key string) (string, error) {
+	value, ok := args[key]
+	if !ok {
+		return "", fmt.Errorf("%s is required", key)
+	}
+	text, ok := value.(string)
+	if !ok || strings.TrimSpace(text) == "" {
+		return "", fmt.Errorf("%s must be a non-empty string", key)
+	}
+	return text, nil
+}
+
 func optionalStringArg(args map[string]any, key string) (string, bool) {
 	value, ok := args[key]
 	if !ok {
@@ -533,6 +620,10 @@ func mcpTools() []map[string]any {
 		mcpTool("helper2_studio_stop", "Request Studio stop through the task-bound mcp2 channel.", map[string]any{"task_id": stringSchema()}),
 		mcpTool("helper2_studio_mode", "Read Studio mode through the task-bound mcp2 channel.", map[string]any{"task_id": stringSchema()}),
 		mcpTool("helper2_studio_screenshot", "Capture a screenshot from the task-bound Studio process.", map[string]any{"task_id": stringSchema()}),
+		mcpTool("helper2_studio_run_code", "Run Luau code in edit mode through the task-bound mcp2 channel without ensuring edit mode.", map[string]any{
+			"task_id": stringSchema(),
+			"code":    stringSchema(),
+		}),
 		mcpTool("helper2_runtime_log", "Read helper2 runtime logs for a task.", map[string]any{
 			"task_id": stringSchema(),
 			"cursor":  stringSchema(),
@@ -543,6 +634,9 @@ func mcpTools() []map[string]any {
 
 func mcpTool(name string, description string, properties map[string]any) map[string]any {
 	required := []string{"task_id"}
+	if _, ok := properties["code"]; ok {
+		required = append(required, "code")
+	}
 	return map[string]any{
 		"name":        name,
 		"description": description,

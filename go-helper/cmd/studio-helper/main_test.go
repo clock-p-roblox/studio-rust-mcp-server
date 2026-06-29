@@ -419,6 +419,37 @@ func TestPingDoesNotSwitchLifecycleOrClearQueue(t *testing.T) {
 	}
 }
 
+func TestStudioRunCodeRequiresEditMode(t *testing.T) {
+	broker := newMCP2CommandBroker()
+	initializeBroker(t, broker, "play_server", 11, 101)
+	if _, err := broker.enqueueStudioRunCode("111", "print('no')"); err == nil {
+		t.Fatalf("enqueueStudioRunCode succeeded in play_server mode")
+	}
+}
+
+func TestStudioRunCodeRoutesTaskScopedCommand(t *testing.T) {
+	broker := newMCP2CommandBroker()
+	initializeBroker(t, broker, "edit", 11, 101)
+	command, err := broker.enqueueStudioRunCode("111", "print('hello')")
+	if err != nil {
+		t.Fatalf("enqueueStudioRunCode failed: %v", err)
+	}
+	pulled, closePull := broker.pull(context.Background(), "edit", 11, 101, time.Second)
+	if closePull {
+		t.Fatalf("pull unexpectedly closed")
+	}
+	if pulled.CommandID != command.CommandID || pulled.Kind != mcp2CommandStudioRunCode {
+		t.Fatalf("pulled command = %+v, want studio_run_code command_id %d", pulled, command.CommandID)
+	}
+	args, ok := pulled.Args.(studioRunCodeCommandArgs)
+	if !ok {
+		t.Fatalf("pulled args type = %T, want studioRunCodeCommandArgs", pulled.Args)
+	}
+	if args.PlaceID != "111" || args.Code != "print('hello')" {
+		t.Fatalf("run code args = %+v", args)
+	}
+}
+
 func TestCleanupPreventsLateResponseFromResurrectingCommand(t *testing.T) {
 	registry := newMCP2CommandBrokerRegistry()
 	broker := registry.forTask("task-a")
@@ -487,11 +518,20 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 	if !ok || len(tools) == 0 {
 		t.Fatalf("tools/list tools missing: %+v", result)
 	}
-	if !mcpToolListContains(tools, "helper2_status") || !mcpToolListContains(tools, "helper2_studio_play") {
+	if !mcpToolListContains(tools, "helper2_status") || !mcpToolListContains(tools, "helper2_studio_play") || !mcpToolListContains(tools, "helper2_studio_run_code") {
 		t.Fatalf("tools/list missing helper2 tools: %+v", tools)
 	}
 	if mcpToolListContains(tools, "launch_studio_session") || mcpToolListContains(tools, "start_stop_play") || mcpToolListContains(tools, "take_screenshot") {
 		t.Fatalf("tools/list should not expose legacy helper tool aliases: %+v", tools)
+	}
+	runCodeTool := mcpToolByName(tools, "helper2_studio_run_code")
+	inputSchema, ok := runCodeTool["inputSchema"].(map[string]any)
+	if !ok {
+		t.Fatalf("run code input schema missing: %+v", runCodeTool)
+	}
+	required, ok := inputSchema["required"].([]any)
+	if !ok || !stringListContainsAny(required, "task_id") || !stringListContainsAny(required, "code") {
+		t.Fatalf("run code required schema = %+v, want task_id and code", inputSchema["required"])
 	}
 }
 
@@ -542,6 +582,57 @@ func TestMCPStudioToolsRejectWithoutTaskBoundStudio(t *testing.T) {
 	text := toolText(t, result)
 	if !strings.Contains(text, "studio_not_available") {
 		t.Fatalf("tool error = %q, want studio_not_available", text)
+	}
+
+	runCodeResult := callMCPTool(t, runtime, "helper2_studio_run_code", map[string]any{
+		"task_id": "task-a",
+		"code":    "print('hello')",
+	})
+	if runCodeResult["isError"] != true {
+		t.Fatalf("run code without task-bound Studio should be tool error: %+v", runCodeResult)
+	}
+	runCodeText := toolText(t, runCodeResult)
+	if !strings.Contains(runCodeText, "studio_not_available") {
+		t.Fatalf("tool error = %q, want studio_not_available", runCodeText)
+	}
+
+	missingCodeResult := callMCPTool(t, runtime, "helper2_studio_run_code", map[string]any{
+		"task_id": "task-a",
+	})
+	if missingCodeResult["isError"] != true {
+		t.Fatalf("run code without code should be tool error: %+v", missingCodeResult)
+	}
+	missingCodeText := toolText(t, missingCodeResult)
+	if !strings.Contains(missingCodeText, "code is required") {
+		t.Fatalf("tool error = %q, want code is required", missingCodeText)
+	}
+}
+
+func TestRunCodeTerminalPayloadTreatsCodeFailureAsFailure(t *testing.T) {
+	command := mcp2Command{CommandID: 7, Type: mcp2MessageTypeCommand, Kind: mcp2CommandStudioRunCode}
+	terminal := mcp2CommandTerminal{
+		CommandID: 7,
+		Reason:    "response",
+		Result: &mcp2ResponseResult{
+			CommandID: 7,
+			Mode:      "edit",
+			ModeSeq:   11,
+			OK:        true,
+			Result: map[string]any{
+				"kind":    "studio_run_code",
+				"success": false,
+				"stage":   "runtime",
+				"error":   "boom",
+			},
+		},
+	}
+
+	payload, ok := taskStudioRunCodeTerminalPayload("task-a", command, terminal)
+	if ok {
+		t.Fatalf("run code payload ok=true, want false: %+v", payload)
+	}
+	if payload["ok"] != false || payload["message"] != "boom" {
+		t.Fatalf("run code failure payload = %+v", payload)
 	}
 }
 
@@ -676,6 +767,25 @@ func mcpToolListContains(tools []any, name string) bool {
 			continue
 		}
 		if tool["name"] == name {
+			return true
+		}
+	}
+	return false
+}
+
+func mcpToolByName(tools []any, name string) map[string]any {
+	for _, item := range tools {
+		tool, ok := item.(map[string]any)
+		if ok && tool["name"] == name {
+			return tool
+		}
+	}
+	return nil
+}
+
+func stringListContainsAny(values []any, expected string) bool {
+	for _, value := range values {
+		if value == expected {
 			return true
 		}
 	}

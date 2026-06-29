@@ -8,6 +8,8 @@ Status note: Phases 1-8 are obsolete historical planning context. The current ro
 
 The old hub, task-server, helper1, mcp1 / old Rust clockp MCP server path, and old runtime-log server are deprecated. They must not be used as the implementation target, compatibility fallback, or validation gate for Phase 9+ work.
 
+Phase 19 之后，面向 bridge2 / LLM 的日志入口统一按 helper2 日志读取理解：CLI 命令名使用 `play-mode-logs`，不再把新操作面称为 `runtime-log`。
+
 Development location note: do not create git worktrees for the Phase 9+ helper2/task-agent/mcp2 mainline. Implement and validate follow-up phases directly in the main repository directory.
 
 The channel is intentionally minimal:
@@ -21,7 +23,7 @@ The channel is intentionally minimal:
 
 The obsolete Phase 1-8 notes validate and support exactly one active helper-managed Studio lifecycle on the global mcp2 command channel. The temporary `placeid` debug endpoints select the desired target for local testing, but they do not make this channel safe for concurrent control of multiple Studio instances. Multi-Studio concurrency belongs to the current task-scoped command channel work in Phase 9 and later.
 
-hub and task-server are outside the current PR scope. This draft includes the first formal Studio control command kinds needed to test edit/play lifecycle switching. Later hubless task-agent, Rojo, runtime-log, and public-exposure work is captured separately under Roadmap.
+hub and task-server are outside the current PR scope. This draft includes the first formal Studio control command kinds needed to test edit/play lifecycle switching. Later hubless task-agent, Rojo, helper2 log reading, and public-exposure work is captured separately under Roadmap.
 
 ## Execution Model
 
@@ -610,6 +612,21 @@ machine_name = explicit Windows helper2 target
 helper2 = Studio/session authority
 task-agent = workspace/Rojo/session lease agent
 ```
+
+## Client 身份边界
+
+Windows client 侧 helper2 自己拥有 public exposure 身份。它必须从同一个本机系统身份目录读取所有 public 身份输入：
+
+```text
+%APPDATA%\dev.clock-p.com\
+  machine_name
+  feishu-user_name
+  feishu-token
+```
+
+`machine_name` 必须和 `feishu-user_name`、`feishu-token` 放在同一个目录。helper2 禁止通过 CLI flag 覆盖 public 身份；`--public-machine-name`、`--public-user` 和 `--clockbridge-token-file` 对 helper2 都是禁用入口。本机 helper launcher 可以为了诊断预检这些文件，但不能把它们作为 public 身份参数传给 helper2。
+
+这条 helper2 client 身份规则必须和 task-agent 启动规则分开。task-agent 属于 project / server 侧：启动时仍必须显式接收 `--machine_name`，然后把选定机器写入 `.clock-p/session.json`。后续 bridge 指令只使用 `.clock-p/session.json`，不得再次询问 machine，也不得读取 client 侧 `machine_name` 文件。
 
 Repository ownership is intentionally split:
 
@@ -1434,3 +1451,52 @@ Phase completion rule: a phase is not complete when code exists. A phase is comp
   - `list_roblox_studios` plus `set_active_studio` binds to the task's Studio when the task `place_id` appears exactly once
   - same-place multi-open returns `cli_studio_ambiguous`
   - at least one real allowed generation action returns through helper2 and closes the CLI process afterward
+
+### Phase 19: bridge2 本地 CLI 与编辑态原语
+
+- Phase 19 单独承载 bridge2、本地 CLI 编排、编辑态代码执行与日志读取；不塞回 Phase 14 / 15 / 18。
+- 独立设计稿见 `pr-list/bridge2-helper2-edit-official/design.md`。后续实现以该 design 为权威入口，本长路线图只保留摘要。
+- Phase 19 拆分为：
+  - Phase 19A：本地 bridge2 CLI、`ensure-edit`、现有 helper2 task API 薄封装、`run-code-direct`、`run-code`、`play-mode-logs`。
+  - Phase 19B：等 Phase 18 helper2 官方原语落地后，bridge2 再接 official 命令。
+  - Phase 19C：helper2 Windows 本机 `read-studio-log`。
+- Phase 19A 只做本地验证，不做公网路由验收。
+- Phase 19A 新增 `tools/bridge2`、`clockp-roblox-cli.cmd`、`clockp-roblox-cli.sh`。bridge2 只读 `.clock-p/session.json`，不读本机 `machine_name` 文件，不猜 helper。
+- bridge2 所有命令只输出 JSON：stdout 只输出一个 JSON 对象，stderr 默认空；argparse 参数错误、help 和异常都必须转成 JSON 失败结果。
+- helper2 只暴露稳定原语。`ensure-edit -> run-code-direct` 这种流程编排放在 bridge2 Python 侧，不放进 helper2 primitive handler。
+- Phase 19A 新增编辑态 helper2 / mcp2 原语：
+  - `POST /session/{task_id}/studio/run-code-direct`
+  - helper2 MCP tool `helper2_studio_run_code`
+  - mcp2 command kind `studio_run_code`
+- `*-direct` 命令绝不停止 Studio、等待 edit 或做流程编排。当前 task-bound mcp2 模式不是 `edit` 时直接失败。
+- Phase 19A bridge2 子命令行为：
+  - `status`、`mode`、`play`、`stop`、`screenshot`：不做 `ensure-edit`，只薄封装现有 helper2 task-scoped API。
+  - `run-code-direct`：不做 `ensure-edit`，只调用 helper2 direct 原语。
+  - `run-code`：先 `ensure-edit`，再调用 `run-code-direct`。
+  - `play-mode-logs`：不做 `ensure-edit`，可以调用 helper2 现有 task-scoped log API，但不得暴露旧 `runtime-log` CLI 名称。
+- `ensure-edit` 是 bridge2 子命令 / Python 工具函数，不是 CLI 全局选项。每个子命令必须显式决定是否调用它，CLI 层默认值不能隐式增加或移除编辑态编排。
+- `ensure-edit` 只使用当前 helper2 task-scoped 原语：
+  - 读取 `.clock-p/session.json`
+  - 要求 helper2 task status 为 live
+  - 查询 `/session/{task_id}/studio/mode`
+  - 如果 mode 是 `edit`，直接成功
+  - 如果 mode 是 `play_server`，调用 `/session/{task_id}/studio/stop`，然后轮询 mode 直到 `edit`
+  - 如果 mode 是 unavailable、unknown、play_client 或任何未支持状态，返回结构化错误，不猜测
+  - stop 返回成功不代表已进入 edit；stop 后必须重新查到新鲜的 `edit` mode 才算成功
+- `ensure-edit` 成功结果必须用 `details.reason` 表示 `already_edit` 或 `stopped_play`，并在 `details.last_mode` 带上最后一次 mode payload。
+- `run-code-direct` 与 `run-code` 都支持 `--code` 与 `--file`，必须且只能提供一个。
+- `run-code-direct` 及其 mcp2 命令应保留历史安全意图，但不能依赖旧代码：任意 Luau 中禁止 Studio 生命周期控制 API，例如 `StudioTestService`、`ExecutePlayModeAsync`、`ExecuteRunModeAsync`、`EndTest`。这是本地可信场景下的危险调用拦截，不是强安全沙箱。
+- 面向 CLI 的日志命令改名为 `play-mode-logs`。不要把 bridge2 命令叫做 `runtime-log`。当前语义是“LLM 从 helper2 读取 task / play 日志”；文档不得描述 bridge2 对接独立 runtime-log server。`play-mode-logs` 可以调用 helper2 内部现有 task-scoped log API。
+- Phase 19A 不实现旧 marketplace 关键词式 `insert_model`，也不实现 official 命令。official 命令等 Phase 19B，Creator Store search / insert 需要先在 Phase 18B 或后续 official Creator Store phase 中定 helper2 原语。
+- `read-studio-log` 是 Phase 19C 能力，不进入 Phase 19A。
+- Test Gate:
+  - Python 单测覆盖 bridge2 session 读取、JSON-only 成功 / 失败输出、stderr 默认为空、命令路由、`--code` / `--file` 互斥，以及不 fallback 到 helper1 / mcp1 / 旧 hub / 旧独立 runtime-log server。
+  - Python 单测覆盖 `ensure-edit`：already-edit、play-server-stop-then-edit、stop 超时、unknown / unavailable mode、stale task。
+  - Go 单测覆盖 helper2 direct 原语拒绝非 edit 模式，并要求显式 task-bound mcp2 路由。
+  - Go 单测覆盖 helper2 MCP `helper2_studio_run_code` 的 tools/list schema、必填 `task_id` / `code`、无旧 `run_code` 别名。
+  - 真实 Studio 本地测试：`status`、`mode`、`play`、`stop`、`screenshot` 通过 bridge2 调现有 helper2 task API。
+  - 真实 Studio 本地测试：`run-code-direct` 在 edit 模式成功，并返回 print / return 输出。
+  - 真实 Studio 本地测试：`run-code` 在 play 模式下先停止、通过新鲜 mode 查询等待 edit，再执行代码。
+  - 真实 Studio 本地测试：`run-code-direct` 在 play 模式失败，且不会停止 Studio。
+  - 真实 Studio 本地测试：helper2 MCP `helper2_studio_run_code` 在 edit 模式返回结构化结果。
+  - 真实 Studio 本地测试：`play-mode-logs` 从 helper2 读取 task/play 日志，不使用旧独立 runtime-log server。

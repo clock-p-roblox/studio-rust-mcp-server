@@ -1,5 +1,8 @@
 # helper2 Phase 9/10 design
 
+> 阶段文档：本文记录 helper2/task-agent 早期 Phase 9/10 设计。当前操作入口与验收标准以仓库根 README 和 Phase 19 文档为准。
+> 当前主线仍是 `task-agent -> helper2 -> mcp2`；旧 hub、task-server、helper1、mcp1 不作为 fallback 或验收依据。
+
 ## Scope
 
 Implement the first hubless task-agent/helper2 loop from the mcp2/helper2 draft:

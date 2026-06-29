@@ -7,11 +7,15 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 )
 
 const defaultPublicDomainSuffix = "dev.clock-p.com"
+
+var publicIdentityValuePattern = regexp.MustCompile(`^[a-z0-9-]+$`)
 
 type publicExposureConfig struct {
 	Enabled        bool
@@ -21,6 +25,7 @@ type publicExposureConfig struct {
 	UserName       string
 	DomainSuffix   string
 	TokenFile      string
+	IdentityDir    string
 	XToken         string
 	RegisterHost   string
 	RegisterIP     string
@@ -93,21 +98,17 @@ func resolvePublicExposureConfig(config publicExposureConfig) (publicExposureCon
 	if config.ClockbridgeBin == "" {
 		config.ClockbridgeBin = "clockbridge-cli"
 	}
-	config.MachineName = strings.TrimSpace(config.MachineName)
-	if config.MachineName == "" {
-		return config, errors.New("--public-machine-name is required when --public-exposure is enabled")
+	identity, err := resolveClientIdentity(config.IdentityDir)
+	if err != nil {
+		return config, err
 	}
-	config.UserName = strings.TrimSpace(config.UserName)
-	if config.UserName == "" {
-		return config, errors.New("--public-user is required when --public-exposure is enabled")
-	}
+	config.IdentityDir = identity.Dir
+	config.MachineName = identity.MachineName
+	config.UserName = identity.UserName
+	config.TokenFile = identity.TokenFile
 	config.DomainSuffix = strings.Trim(strings.TrimSpace(config.DomainSuffix), ".")
 	if config.DomainSuffix == "" {
 		config.DomainSuffix = defaultPublicDomainSuffix
-	}
-	config.TokenFile = strings.TrimSpace(config.TokenFile)
-	if config.TokenFile == "" {
-		return config, errors.New("--clockbridge-token-file is required when --public-exposure is enabled")
 	}
 	config.RegisterHost = strings.TrimSpace(config.RegisterHost)
 	if config.RegisterHost == "" {
@@ -123,6 +124,89 @@ func resolvePublicExposureConfig(config publicExposureConfig) (publicExposureCon
 		return config, fmt.Errorf("helper listen addr is invalid for public exposure: %w", err)
 	}
 	return config, nil
+}
+
+type clientIdentity struct {
+	Dir         string
+	MachineName string
+	UserName    string
+	TokenFile   string
+}
+
+func resolveClientIdentity(explicitDir string) (clientIdentity, error) {
+	candidates := clientIdentityDirs(explicitDir)
+	var checked []string
+	for _, dir := range candidates {
+		if dir == "" {
+			continue
+		}
+		checked = append(checked, dir)
+		identity, err := readClientIdentityDir(dir)
+		if err == nil {
+			return identity, nil
+		}
+		if explicitDir != "" {
+			return clientIdentity{}, err
+		}
+	}
+	return clientIdentity{}, fmt.Errorf("cannot resolve helper2 client identity files machine_name, feishu-user_name, feishu-token; checked %s", strings.Join(checked, ", "))
+}
+
+func clientIdentityDirs(explicitDir string) []string {
+	if strings.TrimSpace(explicitDir) != "" {
+		return []string{strings.TrimSpace(explicitDir)}
+	}
+	var candidates []string
+	if appData := os.Getenv("APPDATA"); appData != "" {
+		candidates = append(candidates, filepath.Join(appData, "dev.clock-p.com"))
+	}
+	if userProfile := os.Getenv("USERPROFILE"); userProfile != "" {
+		candidates = append(candidates, filepath.Join(userProfile, ".dev.clock-p.com"))
+	}
+	if home := os.Getenv("HOME"); home != "" {
+		candidates = append(candidates, filepath.Join(home, ".dev.clock-p.com"))
+	}
+	return candidates
+}
+
+func readClientIdentityDir(dir string) (clientIdentity, error) {
+	machineName, err := readIdentityValue(filepath.Join(dir, "machine_name"), "machine_name")
+	if err != nil {
+		return clientIdentity{}, err
+	}
+	userName, err := readIdentityValue(filepath.Join(dir, "feishu-user_name"), "feishu-user_name")
+	if err != nil {
+		return clientIdentity{}, err
+	}
+	tokenFile := filepath.Join(dir, "feishu-token")
+	token, err := os.ReadFile(tokenFile)
+	if err != nil {
+		return clientIdentity{}, fmt.Errorf("cannot read feishu-token from %s: %w", dir, err)
+	}
+	if strings.TrimSpace(string(token)) == "" {
+		return clientIdentity{}, fmt.Errorf("feishu-token is empty in %s", dir)
+	}
+	return clientIdentity{
+		Dir:         dir,
+		MachineName: machineName,
+		UserName:    userName,
+		TokenFile:   tokenFile,
+	}, nil
+}
+
+func readIdentityValue(path string, name string) (string, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("cannot read %s: %w", path, err)
+	}
+	value := strings.TrimSpace(string(body))
+	if value == "" {
+		return "", fmt.Errorf("%s is empty: %s", name, path)
+	}
+	if !publicIdentityValuePattern.MatchString(value) {
+		return "", fmt.Errorf("%s must match [a-z0-9-]+: %s", name, value)
+	}
+	return value, nil
 }
 
 func publicExposureHost(config publicExposureConfig) string {

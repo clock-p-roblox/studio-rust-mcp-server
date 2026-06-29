@@ -204,6 +204,115 @@ local function startCommandHeartbeat()
 	end
 end
 
+local FORBIDDEN_RUN_CODE_TOKENS = {
+	"StudioTestService",
+	"ExecutePlayModeAsync",
+	"ExecuteRunModeAsync",
+	"EndTest",
+}
+
+local function serializeRunCodeValue(value)
+	if typeof(value) == "table" then
+		local ok, encoded = pcall(function()
+			return HttpService:JSONEncode(value)
+		end)
+		if ok then
+			return encoded
+		end
+	end
+	return tostring(value)
+end
+
+local function serializeRunCodeValues(...)
+	local packed = table.pack(...)
+	local values = table.create(packed.n)
+	for index = 1, packed.n do
+		values[index] = serializeRunCodeValue(packed[index])
+	end
+	return values
+end
+
+local function rejectForbiddenRunCodeTokens(code)
+	for _, token in FORBIDDEN_RUN_CODE_TOKENS do
+		if string.find(code, token, 1, true) ~= nil then
+			return "run code cannot call Studio lifecycle control API token: " .. token
+		end
+	end
+	return nil
+end
+
+local function runStudioCode(code)
+	if mode ~= "edit" then
+		return false, nil, "studio_run_code requires edit mode; current mode=" .. mode
+	end
+	if typeof(code) ~= "string" or code == "" then
+		return false, nil, "studio_run_code requires non-empty code"
+	end
+	local forbiddenReason = rejectForbiddenRunCodeTokens(code)
+	if forbiddenReason ~= nil then
+		return false, nil, forbiddenReason
+	end
+
+	local chunk, compileError = loadstring(code)
+	if chunk == nil then
+		return true, {
+			kind = "studio_run_code",
+			success = false,
+			stage = "compile",
+			prints = {},
+			warnings = {},
+			returns = {},
+			error = tostring(compileError),
+		}, nil
+	end
+
+	local prints = {}
+	local warnings = {}
+	local chunkEnv = getfenv(chunk)
+	local oldPrint = chunkEnv.print or print
+	local oldWarn = chunkEnv.warn or warn
+	chunkEnv.print = function(...)
+		oldPrint(...)
+		table.insert(prints, serializeRunCodeValues(...))
+	end
+	chunkEnv.warn = function(...)
+		oldWarn(...)
+		table.insert(warnings, serializeRunCodeValues(...))
+	end
+
+	local packedResults
+	local ok, runtimeError = pcall(function()
+		packedResults = table.pack(chunk())
+	end)
+	chunkEnv.print = oldPrint
+	chunkEnv.warn = oldWarn
+
+	if not ok then
+		return true, {
+			kind = "studio_run_code",
+			success = false,
+			stage = "runtime",
+			prints = prints,
+			warnings = warnings,
+			returns = {},
+			error = tostring(runtimeError),
+		}, nil
+	end
+
+	local returns = {}
+	for index = 1, packedResults.n do
+		returns[index] = serializeRunCodeValue(packedResults[index])
+	end
+	return true, {
+		kind = "studio_run_code",
+		success = true,
+		stage = "complete",
+		prints = prints,
+		warnings = warnings,
+		returns = returns,
+	}, nil
+end
+
 local function processCommand(command)
 	local kind = tostring(command.kind or "")
 	if kind == "noop" then
@@ -241,6 +350,11 @@ local function processCommand(command)
 				IsStudio = isStudio,
 			},
 		}, nil
+	end
+	if kind == "studio_run_code" then
+		local args = command.args
+		local code = if typeof(args) == "table" then args.code else nil
+		return runStudioCode(code)
 	end
 	if kind == "studio_play" then
 		if mode == "play_server" then

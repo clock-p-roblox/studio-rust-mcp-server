@@ -12,15 +12,13 @@ import (
 )
 
 func TestPublicExposureCommandUsesHelper2MachineDomain(t *testing.T) {
-	manager, err := newPublicExposureManager(publicExposureConfig{
+	config := publicExposureTestConfig(t, publicExposureConfig{
 		Enabled:        true,
 		DryRun:         true,
 		ClockbridgeBin: "clockbridge-cli",
-		MachineName:    "win-a",
-		UserName:       "sunjun",
-		TokenFile:      "token.txt",
 		ListenAddr:     "127.0.0.1:44750",
-	}, slog.Default())
+	})
+	manager, err := newPublicExposureManager(config, slog.Default())
 	if err != nil {
 		t.Fatalf("public exposure manager failed: %v", err)
 	}
@@ -37,7 +35,7 @@ func TestPublicExposureCommandUsesHelper2MachineDomain(t *testing.T) {
 	joined := strings.Join(status.Command, " ")
 	for _, want := range []string{
 		"clockbridge-cli",
-		"-i token.txt",
+		"-i " + filepath.Join(statusIdentityDir(t, manager), "feishu-token"),
 		"--proxy-mode legacy_framed",
 		"-R http://127.0.0.1:44750/",
 		"roblox-helper-win-a-sunjun-user@register-https-proxy.dev.clock-p.com",
@@ -48,17 +46,22 @@ func TestPublicExposureCommandUsesHelper2MachineDomain(t *testing.T) {
 	}
 }
 
+func statusIdentityDir(t *testing.T, manager *publicExposureManager) string {
+	t.Helper()
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	return manager.config.IdentityDir
+}
+
 func TestPublicExposureStatusRedactsXToken(t *testing.T) {
-	manager, err := newPublicExposureManager(publicExposureConfig{
+	config := publicExposureTestConfig(t, publicExposureConfig{
 		Enabled:        true,
 		DryRun:         true,
 		ClockbridgeBin: "clockbridge-cli",
-		MachineName:    "win-a",
-		UserName:       "sunjun",
-		TokenFile:      "token.txt",
 		XToken:         "secret-x-token",
 		ListenAddr:     "127.0.0.1:44750",
-	}, slog.Default())
+	})
+	manager, err := newPublicExposureManager(config, slog.Default())
 	if err != nil {
 		t.Fatalf("public exposure manager failed: %v", err)
 	}
@@ -72,15 +75,13 @@ func TestPublicExposureStatusRedactsXToken(t *testing.T) {
 }
 
 func TestPublicExposureDryRunDoesNotStartProcess(t *testing.T) {
-	manager, err := newPublicExposureManager(publicExposureConfig{
+	config := publicExposureTestConfig(t, publicExposureConfig{
 		Enabled:        true,
 		DryRun:         true,
 		ClockbridgeBin: "definitely-not-a-real-clockbridge-binary",
-		MachineName:    "win-a",
-		UserName:       "sunjun",
-		TokenFile:      "token.txt",
 		ListenAddr:     "127.0.0.1:44750",
-	}, slog.Default())
+	})
+	manager, err := newPublicExposureManager(config, slog.Default())
 	if err != nil {
 		t.Fatalf("public exposure manager failed: %v", err)
 	}
@@ -95,14 +96,12 @@ func TestPublicExposureDryRunDoesNotStartProcess(t *testing.T) {
 
 func TestPublicExposureStartStopCanRepeat(t *testing.T) {
 	script := writeSleepScript(t)
-	manager, err := newPublicExposureManager(publicExposureConfig{
+	config := publicExposureTestConfig(t, publicExposureConfig{
 		Enabled:        true,
 		ClockbridgeBin: script,
-		MachineName:    "win-a",
-		UserName:       "sunjun",
-		TokenFile:      "token.txt",
 		ListenAddr:     "127.0.0.1:44750",
-	}, slog.Default())
+	})
+	manager, err := newPublicExposureManager(config, slog.Default())
 	if err != nil {
 		t.Fatalf("public exposure manager failed: %v", err)
 	}
@@ -121,14 +120,12 @@ func TestPublicExposureStartStopCanRepeat(t *testing.T) {
 }
 
 func TestPublicExposureStopPreservesExitedError(t *testing.T) {
-	manager, err := newPublicExposureManager(publicExposureConfig{
+	config := publicExposureTestConfig(t, publicExposureConfig{
 		Enabled:        true,
 		ClockbridgeBin: "clockbridge-cli",
-		MachineName:    "win-a",
-		UserName:       "sunjun",
-		TokenFile:      "token.txt",
 		ListenAddr:     "127.0.0.1:44750",
-	}, slog.Default())
+	})
+	manager, err := newPublicExposureManager(config, slog.Default())
 	if err != nil {
 		t.Fatalf("public exposure manager failed: %v", err)
 	}
@@ -144,51 +141,72 @@ func TestPublicExposureStopPreservesExitedError(t *testing.T) {
 	}
 }
 
-func TestPublicExposureRequiresExplicitInputs(t *testing.T) {
+func TestPublicExposureRequiresSystemIdentityFiles(t *testing.T) {
 	cases := []struct {
 		name    string
-		config  publicExposureConfig
+		files   map[string]string
 		wantErr string
 	}{
 		{
 			name: "missing machine",
-			config: publicExposureConfig{
-				Enabled:    true,
-				UserName:   "sunjun",
-				TokenFile:  "token.txt",
-				ListenAddr: "127.0.0.1:44750",
+			files: map[string]string{
+				"feishu-user_name": "sunjun\n",
+				"feishu-token":     "token\n",
 			},
-			wantErr: "--public-machine-name is required",
+			wantErr: "machine_name",
 		},
 		{
 			name: "missing user",
-			config: publicExposureConfig{
-				Enabled:     true,
-				MachineName: "win-a",
-				TokenFile:   "token.txt",
-				ListenAddr:  "127.0.0.1:44750",
+			files: map[string]string{
+				"machine_name": "win-a\n",
+				"feishu-token": "token\n",
 			},
-			wantErr: "--public-user is required",
+			wantErr: "feishu-user_name",
 		},
 		{
 			name: "missing token",
-			config: publicExposureConfig{
-				Enabled:     true,
-				MachineName: "win-a",
-				UserName:    "sunjun",
-				ListenAddr:  "127.0.0.1:44750",
+			files: map[string]string{
+				"machine_name":     "win-a\n",
+				"feishu-user_name": "sunjun\n",
 			},
-			wantErr: "--clockbridge-token-file is required",
+			wantErr: "feishu-token",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := newPublicExposureManager(tc.config, slog.Default())
+			dir := t.TempDir()
+			for name, content := range tc.files {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
+					t.Fatalf("write identity file: %v", err)
+				}
+			}
+			_, err := newPublicExposureManager(publicExposureConfig{
+				Enabled:     true,
+				IdentityDir: dir,
+				ListenAddr:  "127.0.0.1:44750",
+			}, slog.Default())
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
 			}
 		})
 	}
+}
+
+func publicExposureTestConfig(t *testing.T, config publicExposureConfig) publicExposureConfig {
+	t.Helper()
+	dir := t.TempDir()
+	files := map[string]string{
+		"machine_name":     "win-a\n",
+		"feishu-user_name": "sunjun\n",
+		"feishu-token":     "token\n",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
+			t.Fatalf("write identity file: %v", err)
+		}
+	}
+	config.IdentityDir = dir
+	return config
 }
 
 func waitForPublicExposureState(t *testing.T, manager *publicExposureManager, want string) {

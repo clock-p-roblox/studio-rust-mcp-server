@@ -8,3 +8,4 @@ output/
 __pycache__/
 *.pyc
 .clock-p/session.json
+go-helper/bin/
