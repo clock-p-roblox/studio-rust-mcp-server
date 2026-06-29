@@ -203,7 +203,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 		publicURL := RojoPublicURL(a.config.PlaceID, taskID, userName, a.config.DomainSuffix)
 		a.config.UserName = userName
-		a.descriptor.Rojo.UpstreamURL = publicURL
+		a.descriptor.Rojo.PublicURL = publicURL
 	}
 	a.rojoStatus = RojoStatus{
 		State:       "starting",
@@ -211,7 +211,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		UpstreamURL: a.descriptor.Rojo.UpstreamURL,
 	}
 	if a.config.RegisterDomain {
-		a.rojoStatus.PublicURL = a.descriptor.Rojo.UpstreamURL
+		a.rojoStatus.PublicURL = a.descriptor.Rojo.PublicURL
 		a.rojoStatus.PublicState = "configured"
 	}
 	if err := SaveDescriptor(a.config.Workspace, a.descriptor); err != nil {

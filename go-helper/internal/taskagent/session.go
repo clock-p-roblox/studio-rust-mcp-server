@@ -35,6 +35,7 @@ type HelperRoute struct {
 type RojoRoute struct {
 	LocalURL    string `json:"local_url"`
 	UpstreamURL string `json:"upstream_url"`
+	PublicURL   string `json:"public_url,omitempty"`
 }
 
 func SessionPath(workspace string) string {

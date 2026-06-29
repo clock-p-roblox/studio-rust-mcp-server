@@ -67,6 +67,35 @@ func TestLocalRojoForwardBaseURLUsesHelperPortAndTaskPath(t *testing.T) {
 	}
 }
 
+func TestProxyRojoHTTPRequestForcesIdentityEncoding(t *testing.T) {
+	msgpackBody := []byte{0x81, 0xaf, 'p', 'r', 'o', 't', 'o', 'c', 'o', 'l', 'V', 'e', 'r', 's', 'i', 'o', 'n', 0x05}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Accept-Encoding"); got != "identity" {
+			t.Fatalf("upstream Accept-Encoding = %q, want identity", got)
+		}
+		w.Header().Set("Content-Type", "application/msgpack")
+		_, _ = w.Write(msgpackBody)
+	}))
+	defer upstream.Close()
+
+	request := httptest.NewRequest(http.MethodGet, "/rojo-forward/113/task/task-a/api/rojo", nil)
+	request.Header.Set("Accept-Encoding", "gzip")
+	recorder := httptest.NewRecorder()
+	status, written, err := proxyRojoHTTPRequest(context.Background(), recorder, request, upstream.URL+"/api/rojo")
+	if err != nil {
+		t.Fatalf("proxy request failed: %v", err)
+	}
+	if status != http.StatusOK || recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d recorder=%d, want 200", status, recorder.Code)
+	}
+	if written != int64(len(msgpackBody)) {
+		t.Fatalf("written = %d, want %d", written, len(msgpackBody))
+	}
+	if !bytes.Equal(recorder.Body.Bytes(), msgpackBody) {
+		t.Fatalf("proxied body = % X, want % X", recorder.Body.Bytes(), msgpackBody)
+	}
+}
+
 func TestRojoBindingRejectsCrossTaskOrPlaceRequests(t *testing.T) {
 	runtime := newTestMCPRuntime(t)
 	registerTestTask(t, runtime, "task-a", "111")

@@ -1896,6 +1896,7 @@ func proxyRojoHTTPRequest(ctx context.Context, w http.ResponseWriter, r *http.Re
 		return 0, 0, err
 	}
 	copyRojoForwardRequestHeaders(req.Header, r.Header)
+	req.Header.Set("Accept-Encoding", "identity")
 	response, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return 0, 0, err
@@ -1913,7 +1914,7 @@ func proxyRojoHTTPRequest(ctx context.Context, w http.ResponseWriter, r *http.Re
 
 func copyRojoForwardRequestHeaders(dst http.Header, src http.Header) {
 	for key, values := range src {
-		if rojoHopByHopHeader(key) || strings.EqualFold(key, "Host") {
+		if rojoHopByHopHeader(key) || strings.EqualFold(key, "Host") || strings.EqualFold(key, "Accept-Encoding") {
 			continue
 		}
 		for _, value := range values {

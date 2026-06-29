@@ -23,6 +23,7 @@ DEFAULT_ROJO = ROBLOX_SPACE / "rojo" / "target" / "release" / "rojo.exe"
 ROJO_REPO = ROBLOX_SPACE / "rojo"
 PLUGIN_PATH = Path(os.environ["LOCALAPPDATA"]) / "Roblox" / "Plugins" / "MCP2Plugin.rbxm"
 ROJO_PLUGIN_PATH = Path(os.environ["LOCALAPPDATA"]) / "Roblox" / "Plugins" / "Rojo.rbxm"
+ROBLOX_LOG_DIR = Path(os.environ["LOCALAPPDATA"]) / "Roblox" / "logs"
 PUBLIC_HOST_PATTERN = re.compile(r"^[a-z0-9.-]+\.dev\.clock-p\.com$")
 
 
@@ -260,6 +261,36 @@ def wait_mode(base_url: str, token: str, task_id: str, expected: str, *, timeout
         raise PublicMatrixError(f"{exc}; last mode payload={last_payload}") from exc
 
 
+def latest_studio_log_after(started_at: float) -> Path | None:
+    candidates = []
+    for path in ROBLOX_LOG_DIR.glob("*Studio*.log"):
+        try:
+            if path.stat().st_mtime >= started_at - 5:
+                candidates.append(path)
+        except OSError:
+            continue
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def wait_rojo_initial_sync(task_id: str, *, started_at: float, timeout: float = 90) -> Path:
+    def read_log() -> Path | None:
+        path = latest_studio_log_after(started_at)
+        if path is None:
+            return None
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if task_id not in text:
+            return None
+        if "attempt to index number with 'protocolVersion'" in text or "Rojo serve session start failed" in text:
+            raise PublicMatrixError(f"Rojo plugin failed during public matrix; inspect Studio log {path}")
+        if "Rojo serve session initial sync completed" in text:
+            return path
+        return None
+
+    return wait_until(f"Rojo initial sync for task {task_id}", timeout, read_log)
+
+
 def require_screenshot_file(payload: dict[str, Any]) -> None:
     screenshot = payload.get("screenshot")
     if not isinstance(screenshot, dict):
@@ -329,6 +360,13 @@ def assert_no_matching_processes() -> None:
     if processes:
         formatted = json.dumps(processes, ensure_ascii=False, indent=2)
         raise PublicMatrixError("public matrix left helper2/Studio/Rojo/clockbridge processes running:\n" + formatted)
+
+
+def wait_no_matching_processes(timeout: float) -> None:
+    def no_processes() -> bool:
+        return not matching_test_processes()
+
+    wait_until("helper2/Studio/Rojo/clockbridge process cleanup", timeout, no_processes)
 
 
 def ensure_no_existing_test_processes(*, kill_existing: bool) -> None:
@@ -409,13 +447,17 @@ def validate_descriptor(descriptor: dict[str, Any], public_url: str) -> str:
     if not isinstance(rojo, dict):
         raise PublicMatrixError(f"descriptor missing rojo route: {descriptor}")
     upstream = rojo.get("upstream_url")
-    if not isinstance(upstream, str) or not upstream.startswith("https://") or "-rojo-" not in upstream:
-        raise PublicMatrixError(f"descriptor rojo.upstream_url is not public URL: {rojo}")
+    if not isinstance(upstream, str) or not upstream.startswith("http://127.0.0.1:"):
+        raise PublicMatrixError(f"descriptor rojo.upstream_url is not helper-local URL: {rojo}")
+    public_url = rojo.get("public_url")
+    if not isinstance(public_url, str) or not public_url.startswith("https://") or "-rojo-" not in public_url:
+        raise PublicMatrixError(f"descriptor rojo.public_url is not diagnostic public URL: {rojo}")
     return task_id
 
 
 def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
     root = repo_root()
+    started_at = time.time()
     run_dir = Path(tempfile.mkdtemp(prefix="helper2-public-matrix-"))
     bin_dir = run_dir / "bin"
     logs_dir = run_dir / "logs"
@@ -484,6 +526,8 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
         wait_session_live(public_url, bearer_token, task_id)
         initial_mode = wait_mode(public_url, bearer_token, task_id, "edit", timeout=args.initial_mode_timeout)
         print(f"initial public mode={initial_mode.get('mode')}", flush=True)
+        studio_log = wait_rojo_initial_sync(task_id, started_at=started_at)
+        print(f"public Rojo initial sync ok log={studio_log}", flush=True)
 
         status_from_mcp_status = http_json("GET", f"{public_url}/status?task_id={task_id}", token=bearer_token, timeout=20)
         if status_from_mcp_status.get("task_id") != task_id:
@@ -542,6 +586,7 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
             "run_dir": str(run_dir),
             "public_url": public_url,
             "task_id": task_id,
+            "studio_log": str(studio_log),
             "direct_play_mode": direct_play.get("mode"),
             "direct_stop_mode": direct_stop.get("mode"),
             "direct_screenshot": direct_screenshot.get("screenshot"),
@@ -569,6 +614,7 @@ def main() -> int:
     args = parse_args()
     try:
         result = run_matrix(args)
+        wait_no_matching_processes(30)
         assert_no_matching_processes()
     except Exception as exc:  # noqa: BLE001 - CLI should report concise failure.
         print(f"PUBLIC_MATRIX_FAILED: {exc}", file=sys.stderr, flush=True)

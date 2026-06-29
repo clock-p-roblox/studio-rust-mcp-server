@@ -77,7 +77,7 @@ rojo build ..\plugin-mcp2\default.project.json -o $env:LOCALAPPDATA\Roblox\Plugi
 
 ```text
 task-agent -> public helper2 URL -> helper2 -> mcp2 -> Studio
-helper2 Rojo proxy -> public Rojo URL -> task-agent Rojo server
+helper2 Rojo proxy -> local task-agent Rojo server
 ```
 
 helper2 公网域名由本机身份文件推导：
@@ -92,7 +92,16 @@ task-agent 公网 Rojo 域名由显式 machine 对应的 task 和本机 user 推
 https://{place_id}-{task_id}-rojo-{feishu-user_name}-user.dev.clock-p.com
 ```
 
-公网测试时，即使 server/client 在同一台机器上模拟，也必须让 `.clock-p/session.json` 中的 `helper.base_url` 和 `rojo.upstream_url` 都是公网 URL，不允许用 `127.0.0.1` 绕过公网路由。
+当前线上只保证 `roblox-helper-*` helper2 公网域名可作为外部入口。Rojo 插件连接时仍先访问本机 helper2，再由 helper2 转发到 task-agent 启动的本机 Rojo server。
+
+`.clock-p/session.json` 中：
+
+- `helper.base_url`：公网 helper2 URL，public 模式下外部脚本和 LLM 只走这个入口。
+- `rojo.upstream_url`：helper2 实际使用的 Rojo upstream，当前必须是本机 `http://127.0.0.1:<port>`。
+- `rojo.public_url`：task-agent 诊断字段，表示尝试注册的独立 Rojo 公网 URL；当前线上 Nginx/gateway 未保证该子域可作为 client 路由，不能交给 helper2 或 Rojo 插件作为权威 upstream。
+
+公网测试时，即使 server/client 在同一台机器上模拟，也必须让外部控制面走 `helper.base_url` 的公网 URL；Rojo 同步是否成功要看 Studio 日志中 Rojo 插件是否真正连上并完成初始同步，不能只看 HTTP 200。
+
 
 停止 task-agent：
 

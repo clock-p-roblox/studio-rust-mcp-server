@@ -92,8 +92,11 @@ func TestAgentRegistersRojoPublicDomain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load descriptor: %v", err)
 	}
-	if !strings.HasPrefix(descriptor.Rojo.UpstreamURL, "https://113577273791190-") || !strings.Contains(descriptor.Rojo.UpstreamURL, "-rojo-sunjun-user.dev.clock-p.com") {
+	if !strings.HasPrefix(descriptor.Rojo.UpstreamURL, "http://127.0.0.1:") {
 		t.Fatalf("descriptor Rojo upstream URL = %q", descriptor.Rojo.UpstreamURL)
+	}
+	if !strings.HasPrefix(descriptor.Rojo.PublicURL, "https://113577273791190-") || !strings.Contains(descriptor.Rojo.PublicURL, "-rojo-sunjun-user.dev.clock-p.com") {
+		t.Fatalf("descriptor Rojo public URL = %q", descriptor.Rojo.PublicURL)
 	}
 
 	select {
