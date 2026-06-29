@@ -19,7 +19,6 @@ from typing import Any
 HELPER_LOCAL_URL = "http://127.0.0.1:44750"
 DEFAULT_PLACE_ID = "105986423068266"
 DEFAULT_ROJO = Path(r"D:\roblox_space\rojo\target\release\rojo.exe")
-DEFAULT_HTTPS_PROXY_REPO = Path(r"D:\roblox_space\https-proxy")
 ROJO_REPO = Path(r"D:\roblox_space\rojo")
 PLUGIN_PATH = Path(os.environ["LOCALAPPDATA"]) / "Roblox" / "Plugins" / "MCP2Plugin.rbxm"
 ROJO_PLUGIN_PATH = Path(os.environ["LOCALAPPDATA"]) / "Roblox" / "Plugins" / "Rojo.rbxm"
@@ -75,6 +74,15 @@ def user_name_candidates(workspace: Path) -> list[Path]:
     return paths
 
 
+def machine_name_candidates() -> list[Path]:
+    paths: list[Path] = []
+    if appdata := os.environ.get("APPDATA"):
+        paths.append(Path(appdata) / "dev.clock-p.com" / "machine_name")
+    if home := os.environ.get("HOME"):
+        paths.append(Path(home) / ".dev.clock-p.com" / "machine_name")
+    return paths
+
+
 def resolve_token_file(workspace: Path) -> Path:
     for path in token_file_candidates(workspace):
         if path.is_file():
@@ -99,9 +107,13 @@ def resolve_user_name(workspace: Path, explicit: str) -> str:
 
 
 def default_machine_name() -> str:
+    for path in machine_name_candidates():
+        value = read_text_trim(path).lower()
+        if value:
+            return value
     value = socket.gethostname().lower()
     value = re.sub(r"[^a-z0-9-]+", "-", value).strip("-")
-    return value or "windows-client"
+    raise PublicMatrixError(f"cannot resolve machine_name from system identity files; hostname fallback would be {value!r}")
 
 
 def helper_public_url(machine_name: str, user_name: str) -> str:
@@ -319,13 +331,11 @@ def ensure_no_existing_test_processes(*, kill_existing: bool) -> None:
     raise PublicMatrixError("existing helper2/Studio/Rojo/clockbridge processes are running; pass --kill-existing on a dedicated test machine:\n" + formatted)
 
 
-def prepare_binaries(root: Path, bin_dir: Path, rojo: Path, https_proxy_repo: Path) -> Path:
+def prepare_binaries(root: Path, bin_dir: Path, rojo: Path) -> None:
     bin_dir.mkdir(parents=True, exist_ok=True)
     go_helper = root / "go-helper"
     run_command(["go", "build", "-o", str(bin_dir / "studio-helper.exe"), r".\cmd\studio-helper"], cwd=go_helper, timeout=120)
     run_command(["go", "build", "-o", str(bin_dir / "task-agent.exe"), r".\cmd\task-agent"], cwd=go_helper, timeout=120)
-    clockbridge = bin_dir / "clockbridge-cli.exe"
-    run_command(["go", "build", "-o", str(clockbridge), r".\cmd\clockbridge-cli"], cwd=https_proxy_repo, timeout=120)
     if not rojo.exists():
         raise PublicMatrixError(f"rojo executable does not exist: {rojo}")
     run_command([str(rojo), "build", r"plugin-mcp2\default.project.json", "--plugin", "MCP2Plugin.rbxm"], cwd=root, timeout=60)
@@ -334,7 +344,6 @@ def prepare_binaries(root: Path, bin_dir: Path, rojo: Path, https_proxy_repo: Pa
     run_command([str(rojo), "build", "plugin.project.json", "--plugin", "Rojo.rbxm"], cwd=ROJO_REPO, timeout=60)
     if not ROJO_PLUGIN_PATH.exists():
         raise PublicMatrixError(f"Rojo plugin was not installed at {ROJO_PLUGIN_PATH}")
-    return clockbridge
 
 
 def create_project(parent: Path) -> Path:
@@ -384,6 +393,12 @@ def validate_descriptor(descriptor: dict[str, Any], public_url: str) -> str:
     task_id = descriptor.get("task_id")
     if not isinstance(task_id, str) or not task_id:
         raise PublicMatrixError(f"descriptor missing task_id: {descriptor}")
+    rojo = descriptor.get("rojo")
+    if not isinstance(rojo, dict):
+        raise PublicMatrixError(f"descriptor missing rojo route: {descriptor}")
+    upstream = rojo.get("upstream_url")
+    if not isinstance(upstream, str) or not upstream.startswith("https://") or "-rojo-" not in upstream:
+        raise PublicMatrixError(f"descriptor rojo.upstream_url is not public URL: {rojo}")
     return task_id
 
 
@@ -397,7 +412,6 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
     machine_name = args.machine_name or default_machine_name()
     user_name = resolve_user_name(workspace, args.user)
     public_url = helper_public_url(machine_name, user_name)
-    token_file = resolve_token_file(workspace)
     bearer_token = resolve_bearer_token(workspace)
     project = create_project(run_dir)
     helper: subprocess.Popen[str] | None = None
@@ -405,7 +419,7 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
 
     print(f"run_dir={run_dir}", flush=True)
     print(f"public_url={public_url}", flush=True)
-    clockbridge = prepare_binaries(root, bin_dir, args.rojo, args.https_proxy_repo)
+    prepare_binaries(root, bin_dir, args.rojo)
     ensure_no_existing_test_processes(kill_existing=args.kill_existing)
 
     try:
@@ -417,18 +431,8 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
                 "20s",
                 "--mcp2-stale-check-interval",
                 "2s",
-                "--public-exposure",
-                "--public-machine-name",
-                machine_name,
-                "--public-user",
-                user_name,
-                "--clockbridge-bin",
-                str(clockbridge),
-                "--clockbridge-token-file",
-                str(token_file),
+                "--register-domain=true",
         ]
-        if args.register_ip:
-            helper_args.extend(["--clockbridge-register-ip", args.register_ip])
         helper = start_process(
             helper_args,
             logs_dir / "helper.log",
@@ -541,10 +545,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run real helper2 public exposure route matrix through dev.clock-p.com.")
     parser.add_argument("--place-id", default=DEFAULT_PLACE_ID)
     parser.add_argument("--rojo", type=Path, default=DEFAULT_ROJO)
-    parser.add_argument("--https-proxy-repo", type=Path, default=DEFAULT_HTTPS_PROXY_REPO)
-    parser.add_argument("--machine-name", default="", help="public helper machine name; defaults to sanitized local hostname")
+    parser.add_argument("--machine-name", default="", help="public helper machine name; defaults to system machine_name file")
     parser.add_argument("--user", default="", help="clock-p user name; defaults to feishu-user_name")
-    parser.add_argument("--register-ip", default="", help="optional clockbridge register TCP override")
     parser.add_argument("--public-ready-timeout", type=float, default=60)
     parser.add_argument("--initial-mode-timeout", type=float, default=180)
     parser.add_argument("--kill-existing", action="store_true", help="Kill existing helper2/Studio/Rojo/clockbridge processes before the test.")

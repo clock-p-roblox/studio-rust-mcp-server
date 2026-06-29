@@ -72,6 +72,22 @@ func TestResolveHelperBaseURLPublicDerivesFromMachineAndUser(t *testing.T) {
 	}
 }
 
+func TestResolveHelperBaseURLPublicHonorsDomainSuffix(t *testing.T) {
+	baseURL, publicURL, err := ResolveHelperBaseURL(RouteConfig{
+		Environment:  "public",
+		MachineName:  "win-a",
+		UserName:     "sunjun",
+		DomainSuffix: "example.test",
+	})
+	if err != nil {
+		t.Fatalf("public helper URL failed: %v", err)
+	}
+	want := "https://roblox-helper-win-a-sunjun-user.example.test"
+	if baseURL != want || publicURL != want {
+		t.Fatalf("unexpected public URLs: base=%q public=%q", baseURL, publicURL)
+	}
+}
+
 func TestResolveHelperBaseURLPublicRequiresExplicitIdentity(t *testing.T) {
 	emptyHome := t.TempDir()
 	t.Setenv("APPDATA", emptyHome)
@@ -92,6 +108,28 @@ func TestResolveHelperBaseURLPublicRequiresExplicitIdentity(t *testing.T) {
 	})
 	if missingMachineErr == nil || !strings.Contains(missingMachineErr.Error(), "machine_name is required") {
 		t.Fatalf("expected public machine error, got %v", missingMachineErr)
+	}
+}
+
+func TestResolveHelperBaseURLPublicNeverReadsMachineNameFile(t *testing.T) {
+	dir := t.TempDir()
+	identityDir := filepath.Join(dir, "dev.clock-p.com")
+	if err := os.MkdirAll(identityDir, 0o755); err != nil {
+		t.Fatalf("mkdir identity dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(identityDir, "machine_name"), []byte("file-machine\n"), 0o600); err != nil {
+		t.Fatalf("write machine_name: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(identityDir, "feishu-user_name"), []byte("sunjun\n"), 0o600); err != nil {
+		t.Fatalf("write user: %v", err)
+	}
+	t.Setenv("APPDATA", dir)
+	t.Setenv("USERPROFILE", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+
+	_, _, err := ResolveHelperBaseURL(RouteConfig{Environment: "public"})
+	if err == nil || !strings.Contains(err.Error(), "machine_name is required") {
+		t.Fatalf("expected explicit machine_name error, got %v", err)
 	}
 }
 

@@ -47,6 +47,8 @@ func runStart(args []string) error {
 	userName := fs.String("user", "", "clock-p user name for public helper URL derivation")
 	placeID := fs.String("place_id", "", "Roblox place id")
 	helperBaseURL := fs.String("helper-base-url", "", "local helper2 base URL")
+	registerDomain := fs.Bool("register-domain", true, "register task-agent Rojo public domain through embedded clockbridge")
+	publicDomainSuffix := fs.String("public-domain-suffix", "dev.clock-p.com", "domain suffix for public helper and Rojo exposure")
 	rojoBin := fs.String("rojo-bin", "rojo", "Rojo executable")
 	projectPath := fs.String("project", "", "Rojo project path")
 	statusAddr := fs.String("status-addr", "127.0.0.1:0", "task-agent status listen address")
@@ -63,6 +65,7 @@ func runStart(args []string) error {
 		Environment:   *environment,
 		MachineName:   *machineName,
 		UserName:      *userName,
+		DomainSuffix:  *publicDomainSuffix,
 		HelperBaseURL: *helperBaseURL,
 	})
 	if err != nil {
@@ -90,9 +93,12 @@ func runStart(args []string) error {
 		Workspace:       *workspace,
 		Environment:     *environment,
 		MachineName:     *machineName,
+		UserName:        *userName,
 		PlaceID:         *placeID,
 		HelperBaseURL:   resolvedHelperBaseURL,
 		HelperPublicURL: resolvedHelperPublicURL,
+		RegisterDomain:  *registerDomain,
+		DomainSuffix:    *publicDomainSuffix,
 		RojoBin:         *rojoBin,
 		ProjectPath:     *projectPath,
 		StatusAddr:      *statusAddr,

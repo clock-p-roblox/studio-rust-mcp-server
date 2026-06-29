@@ -11,7 +11,7 @@ task-agent -> helper2 -> mcp2
 ## 当前组件
 
 - `go-helper/cmd/studio-helper`：helper2。负责本机 task session、task-owned Studio 生命周期、mcp2 command broker、截图、日志读取、helper2 MCP。
-- `go-helper/cmd/task-agent`：workspace 本地 agent。负责 `.clock-p/session.json`、Rojo server、helper2 heartbeat、shutdown/release。
+- `go-helper/cmd/task-agent`：workspace agent。负责 `.clock-p/session.json`、Rojo server、Rojo 公网域名注册、helper2 heartbeat、shutdown/release。
 - `plugin-mcp2`：Studio 插件。只连接本机 helper2，执行 helper2 下发的 task-scoped Studio 命令。
 - `tools/bridge2`：LLM / 脚本调用的本地 CLI。只读 `.clock-p/session.json`，不猜 machine，不走旧 hub/helper1/mcp1。
 
@@ -26,9 +26,9 @@ Windows client 侧 helper2 的 public exposure 身份只允许来自同一个本
   feishu-token
 ```
 
-`machine_name` 必须和 `feishu-token`、`feishu-user_name` 放在同一个目录。helper2 启动时自己读取这些文件；禁止用 `--public-machine-name`、`--public-user` 或 `--clockbridge-token-file` 覆盖。
+`machine_name` 必须和 `feishu-token`、`feishu-user_name` 放在同一个目录。helper2 启动时自己读取这些文件；禁止用 `--public-machine-name`、`--public-user`、`--clockbridge-token-file`、`--clockbridge-bin`、`--clockbridge-x-token`、`--clockbridge-register-host` 或 `--clockbridge-register-ip` 覆盖或透传 clockbridge 细节。
 
-`task-agent start` 是另一条边界：`--machine_name` 必须显式传入。task-agent 不读取本机 `machine_name` 文件，也不从历史 workspace 状态推断。启动成功后，task-agent 把 `machine_name`、`task_id` 和 `helper.base_url` 写入 `.clock-p/session.json`。后续 bridge2、MCP、截图、日志、play/stop/mode 命令都只读 `.clock-p/session.json`。
+`task-agent start` 是另一条边界：`--machine_name` 必须显式传入。task-agent 不读取本机 `machine_name` 文件，也不从历史 workspace 状态推断。task-agent 可以读取本机 `feishu-user_name` 和 `feishu-token` 来注册 Rojo 公网域名、访问 public helper2，但 machine 选择只能来自 `--machine_name`。启动成功后，task-agent 把 `machine_name`、`task_id`、`helper.base_url` 和 Rojo 路由写入 `.clock-p/session.json`。后续 bridge2、MCP、截图、日志、play/stop/mode 命令都只读 `.clock-p/session.json`。
 
 ## 本地启动
 
@@ -50,8 +50,10 @@ rojo build ..\plugin-mcp2\default.project.json -o $env:LOCALAPPDATA\Roblox\Plugi
 启动 helper2：
 
 ```powershell
-.\bin\studio-helper.exe
+.\bin\studio-helper.exe --register-domain=false
 ```
+
+`--register-domain` 默认是 `true`。纯本地开发、不需要把 helper2 域名打到公网时，显式传 `--register-domain=false`。启用时 helper2 内嵌 clockbridge remote forward，不再启动外部 `clockbridge-cli`。
 
 启动 task-agent：
 
@@ -62,9 +64,35 @@ rojo build ..\plugin-mcp2\default.project.json -o $env:LOCALAPPDATA\Roblox\Plugi
   --machine_name sunjun2 `
   --place_id 113577273791190 `
   --helper-base-url http://127.0.0.1:44750 `
+  --register-domain=false `
   --rojo-bin K:\roblox_space\rojo\target\release\rojo.exe `
   --project K:\roblox_space\test_game3\default.project.json
 ```
+
+`task-agent` 的 Rojo server 总是在本地启动。`--register-domain` 默认是 `true`；启用时 task-agent 会内嵌 clockbridge，把本地 Rojo 注册成公网域名，并把 `.clock-p/session.json` 与 heartbeat 里的 `rojo.upstream_url` 写成公网 URL。纯本地开发时显式传 `--register-domain=false`。
+
+## 公网路由
+
+公网链路仍然是同一套 helper2 / task-agent / mcp2，不恢复旧 hub、helper1 或 mcp1：
+
+```text
+task-agent -> public helper2 URL -> helper2 -> mcp2 -> Studio
+helper2 Rojo proxy -> public Rojo URL -> task-agent Rojo server
+```
+
+helper2 公网域名由本机身份文件推导：
+
+```text
+https://roblox-helper-{machine_name}-{feishu-user_name}-user.dev.clock-p.com
+```
+
+task-agent 公网 Rojo 域名由显式 machine 对应的 task 和本机 user 推导：
+
+```text
+https://{place_id}-{task_id}-rojo-{feishu-user_name}-user.dev.clock-p.com
+```
+
+公网测试时，即使 server/client 在同一台机器上模拟，也必须让 `.clock-p/session.json` 中的 `helper.base_url` 和 `rojo.upstream_url` 都是公网 URL，不允许用 `127.0.0.1` 绕过公网路由。
 
 停止 task-agent：
 
@@ -191,7 +219,7 @@ official-search-creator-store
 official-insert-from-creator-store
 ```
 
-helper2 official 原语都是 direct：只要求 live task 和 task-owned Studio，不做 `ensure-edit`、不 stop、不重试、不做公网路由。
+helper2 official 原语都是 direct：只要求 live task 和 task-owned Studio，不做 `ensure-edit`、不 stop、不重试。是否走公网取决于调用方读取 `.clock-p/session.json` 后使用的 `helper.base_url`。
 
 bridge2 的 per-command 规则：
 
@@ -227,9 +255,7 @@ Phase 19A 已验证过的本地真实 Studio 路径包括：
 
 本轮不验收 Studio 多开场景；不要把多开行为作为 Phase 19A 完成条件。
 
-本轮也不验收公网路由；Phase 19A 只以本地 helper2 + task-agent + 真实 Studio 路径为完成条件。
-
-Phase 19B 同样只验收本地 helper2 + task-agent + 真实 Studio 路径；不做公网验收。
+Phase 19A / 19B 的本地验收已经完成；后续公网验收必须确认 helper2 和 Rojo 都通过内嵌 clockbridge 注册域名，且 bridge2 全程只按 `.clock-p/session.json` 里的公网 URL 路由。
 
 ## 旧代码说明
 

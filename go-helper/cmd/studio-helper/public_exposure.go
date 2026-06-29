@@ -6,11 +6,12 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+
+	"github.com/clock-p/clockbridge/pkg/clockbridge"
 )
 
 const defaultPublicDomainSuffix = "dev.clock-p.com"
@@ -18,47 +19,41 @@ const defaultPublicDomainSuffix = "dev.clock-p.com"
 var publicIdentityValuePattern = regexp.MustCompile(`^[a-z0-9-]+$`)
 
 type publicExposureConfig struct {
-	Enabled        bool
-	DryRun         bool
-	ClockbridgeBin string
-	MachineName    string
-	UserName       string
-	DomainSuffix   string
-	TokenFile      string
-	IdentityDir    string
-	XToken         string
-	RegisterHost   string
-	RegisterIP     string
-	ListenAddr     string
+	Enabled       bool
+	DryRun        bool
+	MachineName   string
+	UserName      string
+	DomainSuffix  string
+	TokenFile     string
+	IdentityDir   string
+	ListenAddr    string
+	ForwardRunner func(context.Context, clockbridge.RemoteForwardConfig) error
 }
 
 type publicExposureStatus struct {
-	Enabled        bool     `json:"enabled"`
-	DryRun         bool     `json:"dry_run"`
-	State          string   `json:"state"`
-	PublicURL      string   `json:"public_url,omitempty"`
-	PublicHost     string   `json:"public_host,omitempty"`
-	BridgeIdentity string   `json:"bridge_identity,omitempty"`
-	LocalTargetURL string   `json:"local_target_url,omitempty"`
-	RegisterHost   string   `json:"register_host,omitempty"`
-	Command        []string `json:"command,omitempty"`
-	PID            int      `json:"pid,omitempty"`
-	LastError      string   `json:"last_error,omitempty"`
+	Enabled        bool   `json:"enabled"`
+	DryRun         bool   `json:"dry_run"`
+	State          string `json:"state"`
+	PublicURL      string `json:"public_url,omitempty"`
+	PublicHost     string `json:"public_host,omitempty"`
+	BridgeIdentity string `json:"bridge_identity,omitempty"`
+	LocalTargetURL string `json:"local_target_url,omitempty"`
+	RegisterHost   string `json:"register_host,omitempty"`
+	LastError      string `json:"last_error,omitempty"`
 }
 
 type publicExposureManager struct {
 	config         publicExposureConfig
 	logger         *slog.Logger
 	mu             sync.Mutex
-	cmd            *exec.Cmd
-	job            *publicProcessJob
+	cancel         context.CancelFunc
+	generation     int64
 	state          string
 	lastError      string
 	publicHost     string
 	publicURL      string
 	bridgeIdentity string
 	localTargetURL string
-	command        []string
 }
 
 func newPublicExposureManager(config publicExposureConfig, logger *slog.Logger) (*publicExposureManager, error) {
@@ -72,32 +67,18 @@ func newPublicExposureManager(config publicExposureConfig, logger *slog.Logger) 
 	if err != nil {
 		return nil, err
 	}
-	command := publicExposureCommand(resolved)
-	var job *publicProcessJob
-	if !resolved.DryRun {
-		job, err = newPublicProcessJob()
-		if err != nil {
-			return nil, err
-		}
-	}
 	return &publicExposureManager{
 		config:         resolved,
 		logger:         logger,
-		job:            job,
 		state:          "configured",
 		publicHost:     publicExposureHost(resolved),
 		publicURL:      publicExposureURL(resolved),
 		bridgeIdentity: publicExposureBridgeIdentity(resolved),
 		localTargetURL: publicExposureLocalTargetURL(resolved.ListenAddr),
-		command:        command,
 	}, nil
 }
 
 func resolvePublicExposureConfig(config publicExposureConfig) (publicExposureConfig, error) {
-	config.ClockbridgeBin = strings.TrimSpace(config.ClockbridgeBin)
-	if config.ClockbridgeBin == "" {
-		config.ClockbridgeBin = "clockbridge-cli"
-	}
 	identity, err := resolveClientIdentity(config.IdentityDir)
 	if err != nil {
 		return config, err
@@ -110,12 +91,6 @@ func resolvePublicExposureConfig(config publicExposureConfig) (publicExposureCon
 	if config.DomainSuffix == "" {
 		config.DomainSuffix = defaultPublicDomainSuffix
 	}
-	config.RegisterHost = strings.TrimSpace(config.RegisterHost)
-	if config.RegisterHost == "" {
-		config.RegisterHost = "register-https-proxy." + config.DomainSuffix
-	}
-	config.RegisterIP = strings.TrimSpace(config.RegisterIP)
-	config.XToken = strings.TrimSpace(config.XToken)
 	config.ListenAddr = strings.TrimSpace(config.ListenAddr)
 	if config.ListenAddr == "" {
 		return config, errors.New("helper listen addr is required for public exposure")
@@ -218,7 +193,7 @@ func publicExposureURL(config publicExposureConfig) string {
 }
 
 func publicExposureBridgeIdentity(config publicExposureConfig) string {
-	return fmt.Sprintf("roblox-helper-%s-%s-user@%s", config.MachineName, config.UserName, config.RegisterHost)
+	return fmt.Sprintf("roblox-helper-%s-%s-user@%s", config.MachineName, config.UserName, publicExposureRegisterHost(config))
 }
 
 func publicExposureLocalTargetURL(listenAddr string) string {
@@ -229,37 +204,12 @@ func publicExposureLocalTargetURL(listenAddr string) string {
 	return fmt.Sprintf("http://127.0.0.1:%d/", port)
 }
 
-func publicExposureCommand(config publicExposureConfig) []string {
-	command := []string{
-		config.ClockbridgeBin,
-		"-i", config.TokenFile,
-		"--proxy-mode", "legacy_framed",
+func publicExposureRegisterHost(config publicExposureConfig) string {
+	domainSuffix := strings.Trim(strings.TrimSpace(config.DomainSuffix), ".")
+	if domainSuffix == "" {
+		domainSuffix = defaultPublicDomainSuffix
 	}
-	if config.XToken != "" {
-		command = append(command, "-x-token", config.XToken)
-	}
-	if config.RegisterIP != "" {
-		command = append(command, "--register-ip", config.RegisterIP)
-	}
-	command = append(command,
-		"-R", publicExposureLocalTargetURL(config.ListenAddr),
-		publicExposureBridgeIdentity(config),
-	)
-	return command
-}
-
-func redactedPublicExposureCommand(command []string) []string {
-	redacted := append([]string(nil), command...)
-	for index, arg := range redacted {
-		if arg == "-x-token" && index+1 < len(redacted) {
-			redacted[index+1] = "<redacted>"
-			continue
-		}
-		if strings.HasPrefix(arg, "-x-token=") {
-			redacted[index] = "-x-token=<redacted>"
-		}
-	}
-	return redacted
+	return "register-https-proxy." + domainSuffix
 }
 
 func (m *publicExposureManager) Start(ctx context.Context) error {
@@ -275,52 +225,50 @@ func (m *publicExposureManager) Start(ctx context.Context) error {
 		m.logger.Info("helper2 public exposure dry-run configured", "public_url", m.publicURL, "target", m.localTargetURL, "identity", m.bridgeIdentity)
 		return nil
 	}
-	if m.cmd != nil {
+	if m.cancel != nil {
 		m.mu.Unlock()
 		return nil
 	}
-	if m.job == nil {
-		job, err := newPublicProcessJob()
-		if err != nil {
-			m.state = "error"
-			m.lastError = err.Error()
-			m.mu.Unlock()
-			return err
-		}
-		m.job = job
-	}
-	command := append([]string(nil), m.command...)
-	cmd := exec.CommandContext(ctx, command[0], command[1:]...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	m.state = "starting"
-
-	if err := startPublicManagedCommand(cmd, m.job); err != nil {
-		m.cmd = nil
+	token, err := readPublicBearerToken(m.config.TokenFile)
+	if err != nil {
 		m.state = "error"
 		m.lastError = err.Error()
 		m.mu.Unlock()
 		return err
 	}
-
-	m.cmd = cmd
-	m.state = "running"
-	pid := cmd.Process.Pid
+	forwardConfig := clockbridge.RemoteForwardConfig{
+		TargetURL:           m.localTargetURL,
+		UUID:                publicExposureHostPrefix(m.config),
+		RegisterHost:        publicExposureRegisterHost(m.config),
+		ProxyMode:           clockbridge.ProxyModeLegacyFramed,
+		RegisterBearerToken: token,
+	}
+	runner := m.config.ForwardRunner
+	if runner == nil {
+		runner = runEmbeddedPublicForward
+	}
+	forwardCtx, cancel := context.WithCancel(ctx)
+	m.cancel = cancel
+	m.generation++
+	generation := m.generation
+	m.state = "starting"
+	m.lastError = ""
 	m.mu.Unlock()
-	m.logger.Info("helper2 public exposure started", "pid", pid, "public_url", m.publicURL, "target", m.localTargetURL, "identity", m.bridgeIdentity)
+
+	m.mu.Lock()
+	m.state = "running"
+	m.mu.Unlock()
+	m.logger.Info("helper2 public exposure started", "public_url", m.publicURL, "target", m.localTargetURL, "identity", m.bridgeIdentity)
 
 	go func() {
-		err := cmd.Wait()
+		err := runner(forwardCtx, forwardConfig)
 		m.mu.Lock()
 		defer m.mu.Unlock()
-		if m.cmd != cmd {
-			if m.state == "stopping" {
-				m.state = "stopped"
-			}
+		if m.generation != generation {
 			return
 		}
-		m.cmd = nil
-		if err != nil && ctx.Err() == nil {
+		m.cancel = nil
+		if err != nil && forwardCtx.Err() == nil {
 			m.state = "exited"
 			m.lastError = err.Error()
 			m.logger.Warn("helper2 public exposure exited", "error", err)
@@ -333,26 +281,19 @@ func (m *publicExposureManager) Start(ctx context.Context) error {
 
 func (m *publicExposureManager) Stop() {
 	m.mu.Lock()
-	cmd := m.cmd
-	job := m.job
-	m.cmd = nil
-	m.job = nil
-	if m.config.Enabled && !m.config.DryRun && cmd != nil {
+	cancel := m.cancel
+	m.cancel = nil
+	if m.config.Enabled && !m.config.DryRun && cancel != nil {
 		m.state = "stopping"
-	} else if m.config.Enabled && !m.config.DryRun && cmd == nil {
+	} else if m.config.Enabled && !m.config.DryRun && cancel == nil {
 		switch m.state {
 		case "starting", "running", "stopping", "configured":
 			m.state = "stopped"
 		}
 	}
 	m.mu.Unlock()
-	if cmd != nil && cmd.Process != nil {
-		stopPublicManagedCommand(cmd)
-	}
-	if job != nil {
-		if err := job.close(); err != nil {
-			m.logger.Warn("failed to close public exposure job", "error", err)
-		}
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -367,12 +308,20 @@ func (m *publicExposureManager) Status() publicExposureStatus {
 		PublicHost:     m.publicHost,
 		BridgeIdentity: m.bridgeIdentity,
 		LocalTargetURL: m.localTargetURL,
-		RegisterHost:   m.config.RegisterHost,
-		Command:        redactedPublicExposureCommand(m.command),
+		RegisterHost:   publicExposureRegisterHost(m.config),
 		LastError:      m.lastError,
 	}
-	if m.cmd != nil && m.cmd.Process != nil {
-		status.PID = m.cmd.Process.Pid
-	}
 	return status
+}
+
+func publicExposureHostPrefix(config publicExposureConfig) string {
+	return fmt.Sprintf("roblox-helper-%s-%s-user", config.MachineName, config.UserName)
+}
+
+func runEmbeddedPublicForward(ctx context.Context, config clockbridge.RemoteForwardConfig) error {
+	forward, err := clockbridge.NewRemoteForward(config)
+	if err != nil {
+		return err
+	}
+	return forward.Run(ctx)
 }

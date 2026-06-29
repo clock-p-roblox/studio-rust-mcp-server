@@ -802,13 +802,9 @@ func main() {
 	autoStartPlaceID := flag.String("auto-start-place-id", defaultAutoStartPlaceID, "Roblox place id to launch when helper starts; empty disables auto launch")
 	mcp2StaleAfter := flag.Duration("mcp2-stale-after", 60*time.Second, "mcp2 channel stale timeout")
 	mcp2StaleCheckInterval := flag.Duration("mcp2-stale-check-interval", 5*time.Second, "mcp2 channel stale watchdog interval")
-	publicExposureEnabled := flag.Bool("public-exposure", false, "enable helper2 public exposure through clockbridge/https-proxy")
-	publicExposureDryRun := flag.Bool("public-exposure-dry-run", false, "resolve helper2 public exposure without starting clockbridge")
+	registerDomain := flag.Bool("register-domain", true, "register helper2 public domain through embedded clockbridge")
+	registerDomainDryRun := flag.Bool("register-domain-dry-run", false, "resolve helper2 public domain without starting embedded clockbridge")
 	publicDomainSuffix := flag.String("public-domain-suffix", defaultPublicDomainSuffix, "domain suffix for helper2 public exposure")
-	clockbridgeBin := flag.String("clockbridge-bin", "clockbridge-cli", "clockbridge-cli executable for helper2 public exposure")
-	clockbridgeXToken := flag.String("clockbridge-x-token", "", "optional clockbridge X-Token for helper2 public exposure")
-	clockbridgeRegisterHost := flag.String("clockbridge-register-host", "", "clockbridge register host; defaults to register-https-proxy.<public-domain-suffix>")
-	clockbridgeRegisterIP := flag.String("clockbridge-register-ip", "", "optional clockbridge register TCP override")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
@@ -1603,14 +1599,10 @@ func main() {
 	}
 	effectiveListenAddr = listener.Addr().String()
 	publicExposure, err = newPublicExposureManager(publicExposureConfig{
-		Enabled:        *publicExposureEnabled,
-		DryRun:         *publicExposureDryRun,
-		ClockbridgeBin: *clockbridgeBin,
-		DomainSuffix:   *publicDomainSuffix,
-		XToken:         *clockbridgeXToken,
-		RegisterHost:   *clockbridgeRegisterHost,
-		RegisterIP:     *clockbridgeRegisterIP,
-		ListenAddr:     effectiveListenAddr,
+		Enabled:      *registerDomain,
+		DryRun:       *registerDomainDryRun,
+		DomainSuffix: *publicDomainSuffix,
+		ListenAddr:   effectiveListenAddr,
 	}, logger)
 	if err != nil {
 		logger.Error("failed to configure helper2 public exposure", "error", err)

@@ -15,8 +15,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/clock-p/clockbridge/pkg/clockbridge"
 )
 
 const heartbeatInterval = 5 * time.Second
@@ -25,15 +28,19 @@ const heartbeatHTTPTimeout = 5 * time.Second
 var placeIDPattern = regexp.MustCompile(`^[0-9]+$`)
 
 type Config struct {
-	Workspace       string
-	Environment     string
-	MachineName     string
-	PlaceID         string
-	HelperBaseURL   string
-	HelperPublicURL string
-	RojoBin         string
-	ProjectPath     string
-	StatusAddr      string
+	Workspace         string
+	Environment       string
+	MachineName       string
+	UserName          string
+	PlaceID           string
+	HelperBaseURL     string
+	HelperPublicURL   string
+	RegisterDomain    bool
+	DomainSuffix      string
+	RojoBin           string
+	ProjectPath       string
+	StatusAddr        string
+	RojoForwardRunner func(context.Context, clockbridge.RemoteForwardConfig) error
 }
 
 type StatusResponse struct {
@@ -57,9 +64,12 @@ type RojoStatus struct {
 	PID         int        `json:"pid,omitempty"`
 	LocalURL    string     `json:"local_url"`
 	UpstreamURL string     `json:"upstream_url"`
+	PublicURL   string     `json:"public_url,omitempty"`
+	PublicState string     `json:"public_state,omitempty"`
 	Restarts    int        `json:"restarts"`
 	LastExitAt  *time.Time `json:"last_exit_at,omitempty"`
 	LastError   string     `json:"last_error,omitempty"`
+	PublicError string     `json:"public_error,omitempty"`
 }
 
 type Agent struct {
@@ -77,6 +87,8 @@ type Agent struct {
 	mu                    sync.Mutex
 	rojoCmd               *exec.Cmd
 	rojoJob               *processJob
+	rojoForwardCancel     context.CancelFunc
+	rojoForwardGeneration int64
 	rojoStatus            RojoStatus
 	helperState           string
 	helperLastHeartbeatAt *time.Time
@@ -114,6 +126,7 @@ func New(config Config, logger *slog.Logger) (*Agent, error) {
 	if config.Environment == "" {
 		config.Environment = "local"
 	}
+	config.DomainSuffix = ResolveDomainSuffix(config.DomainSuffix)
 	if config.RojoBin == "" {
 		config.RojoBin = "rojo"
 	}
@@ -182,10 +195,24 @@ func (a *Agent) Run(ctx context.Context) error {
 			UpstreamURL: "http://" + rojoAddr,
 		},
 	}
+	if a.config.RegisterDomain {
+		userName, err := ResolveUserName(a.config.UserName)
+		if err != nil {
+			_ = listener.Close()
+			return err
+		}
+		publicURL := RojoPublicURL(a.config.PlaceID, taskID, userName, a.config.DomainSuffix)
+		a.config.UserName = userName
+		a.descriptor.Rojo.UpstreamURL = publicURL
+	}
 	a.rojoStatus = RojoStatus{
 		State:       "starting",
 		LocalURL:    a.descriptor.Rojo.LocalURL,
 		UpstreamURL: a.descriptor.Rojo.UpstreamURL,
+	}
+	if a.config.RegisterDomain {
+		a.rojoStatus.PublicURL = a.descriptor.Rojo.UpstreamURL
+		a.rojoStatus.PublicState = "configured"
 	}
 	if err := SaveDescriptor(a.config.Workspace, a.descriptor); err != nil {
 		_ = listener.Close()
@@ -214,6 +241,14 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 	}()
 	go a.runRojoSupervisor()
+	if a.config.RegisterDomain {
+		if err := a.startRojoPublicForward(ctx); err != nil {
+			_ = listener.Close()
+			a.Shutdown()
+			a.shutdownBounded()
+			return err
+		}
+	}
 	go a.runHeartbeatLoop()
 
 	select {
@@ -272,8 +307,9 @@ func (a *Agent) runHeartbeatLoop() {
 func (a *Agent) sendHeartbeat() {
 	a.mu.Lock()
 	rojoRunning := a.rojoStatus.State == "running"
+	rojoPublicReady := !a.config.RegisterDomain || a.rojoStatus.PublicState == "running"
 	a.mu.Unlock()
-	if !rojoRunning {
+	if !rojoRunning || !rojoPublicReady {
 		a.mu.Lock()
 		a.helperState = "waiting_for_rojo"
 		a.mu.Unlock()
@@ -400,6 +436,7 @@ func (a *Agent) shutdownBounded() {
 	go func() {
 		a.releaseHelper()
 		time.Sleep(time.Second)
+		a.stopRojoPublicForward()
 		a.stopRojo()
 		if a.server != nil {
 			_ = a.server.Shutdown(context.Background())
@@ -412,6 +449,76 @@ func (a *Agent) shutdownBounded() {
 	case <-ctx.Done():
 		a.stopRojo()
 	}
+}
+
+func (a *Agent) startRojoPublicForward(ctx context.Context) error {
+	token, err := ResolveBearerToken(a.config.Workspace)
+	if err != nil {
+		a.mu.Lock()
+		a.rojoStatus.PublicState = "error"
+		a.rojoStatus.PublicError = err.Error()
+		a.mu.Unlock()
+		return err
+	}
+	runner := a.config.RojoForwardRunner
+	if runner == nil {
+		runner = runEmbeddedRojoForward
+	}
+	config := clockbridge.RemoteForwardConfig{
+		TargetURL:           a.descriptor.Rojo.LocalURL,
+		UUID:                strings.TrimSuffix(RojoPublicHost(a.config.PlaceID, a.descriptor.TaskID, a.config.UserName, a.config.DomainSuffix), "."+ResolveDomainSuffix(a.config.DomainSuffix)),
+		RegisterHost:        ClockbridgeRegisterHost(a.config.DomainSuffix),
+		ProxyMode:           clockbridge.ProxyModeLegacyFramed,
+		RegisterBearerToken: token,
+	}
+	forwardCtx, cancel := context.WithCancel(ctx)
+	a.mu.Lock()
+	a.rojoForwardCancel = cancel
+	a.rojoForwardGeneration++
+	generation := a.rojoForwardGeneration
+	a.rojoStatus.PublicState = "running"
+	a.rojoStatus.PublicError = ""
+	a.mu.Unlock()
+
+	go func() {
+		err := runner(forwardCtx, config)
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if a.rojoForwardGeneration != generation {
+			return
+		}
+		a.rojoForwardCancel = nil
+		if err != nil && forwardCtx.Err() == nil {
+			a.rojoStatus.PublicState = "exited"
+			a.rojoStatus.PublicError = err.Error()
+			a.logger.Warn("task-agent Rojo public exposure exited", "error", err)
+			return
+		}
+		a.rojoStatus.PublicState = "stopped"
+	}()
+	return nil
+}
+
+func (a *Agent) stopRojoPublicForward() {
+	a.mu.Lock()
+	cancel := a.rojoForwardCancel
+	a.rojoForwardCancel = nil
+	if cancel != nil {
+		a.rojoForwardGeneration++
+		a.rojoStatus.PublicState = "stopping"
+	}
+	a.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func runEmbeddedRojoForward(ctx context.Context, config clockbridge.RemoteForwardConfig) error {
+	forward, err := clockbridge.NewRemoteForward(config)
+	if err != nil {
+		return err
+	}
+	return forward.Run(ctx)
 }
 
 func (a *Agent) releaseHelper() {

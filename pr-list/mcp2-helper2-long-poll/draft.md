@@ -624,9 +624,9 @@ Windows client 侧 helper2 自己拥有 public exposure 身份。它必须从同
   feishu-token
 ```
 
-`machine_name` 必须和 `feishu-user_name`、`feishu-token` 放在同一个目录。helper2 禁止通过 CLI flag 覆盖 public 身份；`--public-machine-name`、`--public-user` 和 `--clockbridge-token-file` 对 helper2 都是禁用入口。本机 helper launcher 可以为了诊断预检这些文件，但不能把它们作为 public 身份参数传给 helper2。
+`machine_name` 必须和 `feishu-user_name`、`feishu-token` 放在同一个目录。helper2 禁止通过 CLI flag 覆盖 public 身份，也禁止透传底层 clockbridge CLI 细节；`--public-machine-name`、`--public-user`、`--clockbridge-token-file`、`--clockbridge-bin`、`--clockbridge-x-token`、`--clockbridge-register-host` 和 `--clockbridge-register-ip` 对 helper2 都是禁用入口。本机 helper launcher 可以为了诊断预检这些文件，但不能把它们作为 public 身份参数传给 helper2。
 
-这条 helper2 client 身份规则必须和 task-agent 启动规则分开。task-agent 属于 project / server 侧：启动时仍必须显式接收 `--machine_name`，然后把选定机器写入 `.clock-p/session.json`。后续 bridge 指令只使用 `.clock-p/session.json`，不得再次询问 machine，也不得读取 client 侧 `machine_name` 文件。
+这条 helper2 client 身份规则必须和 task-agent 启动规则分开。task-agent 属于 project / server 侧：启动时仍必须显式接收 `--machine_name`，然后把选定机器写入 `.clock-p/session.json`。后续 bridge 指令只使用 `.clock-p/session.json`，不得再次询问 machine，也不得读取 client 侧 `machine_name` 文件。task-agent 可以读取 `feishu-user_name` 和 `feishu-token` 来注册 Rojo 公网域名、访问 public helper2，但 machine 选择只能来自 `--machine_name`。
 
 Repository ownership is intentionally split:
 
@@ -683,13 +683,15 @@ Other project commands, such as launch, stop, screenshot, log read, and MCP call
 
 `helper.base_url` is the routing authority for bridge scripts in both local and public modes. `helper.public_url`, if present, is diagnostic or informational unless a later public-exposure phase explicitly makes it the same value as `helper.base_url`.
 
+Current public mode makes `helper.base_url` and `helper.public_url` the same public helper2 URL. `--register-domain` controls whether helper2 / task-agent register domains through embedded clockbridge; local HTTP and local Rojo processes still start normally. The default is `--register-domain=true`; pure local development should pass `--register-domain=false`.
+
 In public mode, task-agent derives the helper base URL from the explicit machine name and current user identity:
 
 ```text
 https://roblox-helper-{machine_name}-{user}-user.dev.clock-p.com
 ```
 
-In local development mode, task-agent must be given an explicit helper base URL. It must not guess or reuse a historical helper endpoint.
+In local development mode, task-agent must be given an explicit helper base URL. It must not guess or reuse a historical helper endpoint. If `--register-domain=true`, task-agent still registers Rojo and reports a public `rojo.upstream_url`; if `--register-domain=false`, `rojo.upstream_url` remains the local Rojo URL.
 
 Before starting a new task-agent, the launcher must inspect `.clock-p/session.json`:
 
@@ -750,12 +752,12 @@ There must be no fallback from `place_id` to `task_id`. If a plugin connection c
 
 Runtime logs do not require a separate server in this direction. Runtime code should write to local helper2, and project-side commands or task-agent can pull logs from helper2 by `task_id`. helper2 should store runtime logs on local disk rather than keeping an unbounded in-memory buffer. On helper2 shutdown it should best-effort clean its own temporary log files.
 
-### Local-first Hubless Plan
+### Hubless Public Route Plan
 
-The first hubless implementation should be local-first. Public clockbridge exposure is a later phase, not a dependency for the first task-agent/helper2 loop.
+The first hubless implementation was local-first. Current mainline includes embedded clockbridge public registration for helper2 and Rojo; external `clockbridge-cli` remains a standalone tool, not a helper2/task-agent runtime dependency.
 
-- helper2 endpoints must support local IP/port use. Public helper URLs are optional session fields until the public phase.
-- Rojo server also needs local port support. task-agent reports a concrete `rojo.upstream_url` to helper2 through every heartbeat. In local mode this can be a local IP/port. In public mode, Rojo should expose itself with a `task_id`-based domain or path and report that URL to helper2.
+- helper2 endpoints must support local IP/port use and public domain use. In public mode, helper2 registers `roblox-helper-{machine_name}-{user}-user.{domain}` through embedded clockbridge.
+- Rojo server always starts locally. task-agent reports a concrete `rojo.upstream_url` to helper2 through every heartbeat. With `--register-domain=true`, Rojo is exposed as `{place_id}-{task_id}-rojo-{user}-user.{domain}` through embedded clockbridge and this public URL is reported to helper2. With `--register-domain=false`, the local Rojo URL is reported.
 - Rojo remains a server in the first hubless phase. The Studio Rojo plugin still connects only to local helper2; helper2 proxies to the task-agent-reported Rojo upstream.
 - helper2's Rojo proxy should follow helper1's shape: a local config endpoint returns a helper-local Rojo forward base URL, normal HTTP requests preserve path and query, and `/api/socket/{cursor}` is proxied as a WebSocket session to the configured Rojo upstream.
 - task-agent owns Rojo supervision. If Rojo exits, task-agent restarts it at the same helper-visible Rojo upstream. `rojo.upstream_url` is a task-agent lifetime invariant. The URL is repeated in heartbeat to confirm the session contract, not to update it. There is no task-agent proxy indirection in this design.
@@ -782,7 +784,7 @@ The first hubless implementation should be local-first. Public clockbridge expos
 - helper2 should not adopt a manually opened Studio or an old Studio process. First implementation only binds Studio processes launched or reconciled by helper2 from a live task-agent heartbeat.
 - local development mode is intentionally unauthenticated. Public deployment security is a later review gate rather than a local-mode requirement.
 - concurrent `task-agent start` for the same workspace is not handled by the first design. Human operators should not start two deployment commands for the same workspace at the same time.
-- Public exposure should be a later phase. At that point helper2 can embed clockbridge/https-proxy as a library, and Rojo can expose a `task_id`-based public endpoint for helper2 to use.
+- Public exposure is no longer a later phase. helper2 and task-agent embed clockbridge/https-proxy as a library; they do not shell out to `clockbridge-cli`.
 - bridge default routing remains read-only with respect to session selection. Launch, stop, screenshot, log, and MCP scripts may read `.clock-p/session.json`, but they must not create sessions, pick machines, or fallback to historical helpers.
 - migration boundary: old hub, old MCP server, and runtime-log server removal should be phased. The first hubless phase should keep Rojo server semantics intact and route Rojo through helper2 before attempting any Rojo client rewrite.
 

@@ -160,6 +160,7 @@ type RouteConfig struct {
 	Environment   string
 	MachineName   string
 	UserName      string
+	DomainSuffix  string
 	HelperBaseURL string
 }
 
@@ -183,11 +184,31 @@ func ResolveHelperBaseURL(config RouteConfig) (string, string, error) {
 		if machineName == "" {
 			return "", "", errors.New("machine_name is required for public helper URL")
 		}
-		baseURL := fmt.Sprintf("https://roblox-helper-%s-%s-user.dev.clock-p.com", machineName, userName)
+		baseURL := fmt.Sprintf("https://roblox-helper-%s-%s-user.%s", machineName, userName, ResolveDomainSuffix(config.DomainSuffix))
 		return baseURL, baseURL, nil
 	default:
 		return "", "", fmt.Errorf("--environment must be local or public, got %q", environment)
 	}
+}
+
+func ResolveDomainSuffix(explicit string) string {
+	value := strings.Trim(strings.TrimSpace(explicit), ".")
+	if value == "" {
+		return "dev.clock-p.com"
+	}
+	return value
+}
+
+func RojoPublicHost(placeID string, taskID string, userName string, domainSuffix string) string {
+	return fmt.Sprintf("%s-%s-rojo-%s-user.%s", placeID, taskID, userName, ResolveDomainSuffix(domainSuffix))
+}
+
+func RojoPublicURL(placeID string, taskID string, userName string, domainSuffix string) string {
+	return "https://" + RojoPublicHost(placeID, taskID, userName, domainSuffix)
+}
+
+func ClockbridgeRegisterHost(domainSuffix string) string {
+	return "register-https-proxy." + ResolveDomainSuffix(domainSuffix)
 }
 
 func ResolveUserName(explicit string) (string, error) {
