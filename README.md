@@ -1,165 +1,212 @@
-# clock-p Roblox agent / helper2
+# clock-p Roblox agent
 
-本仓当前主线是新版 Roblox agent 本地链路：
+本文档只描述当前 Roblox agent 主线。新的联调入口由 `task-agent`、`helper2`、`plugin-mcp2`、`bridge2` 和内嵌 clockbridge 组成。
+
+## 主线结构
 
 ```text
-task-agent -> helper2 -> mcp2
+LLM / 脚本
+  -> tools/bridge2/clockp-roblox-cli
+  -> 工作区 .clock-p/session.json
+  -> helper2
+  -> plugin-mcp2
+  -> Roblox Studio
+
+task-agent
+  -> 维护 .clock-p/session.json
+  -> 启动 Rojo
+  -> 向 helper2 心跳
+  -> 在需要公网访问时注册 Rojo 诊断域名
 ```
 
-旧 `helper1`、旧 `task-server`、旧 `hub`、旧 Rust clockp MCP server / `mcp1` 代码暂时保留，但不再作为当前实现入口、兼容 fallback 或验收依据。除非任务明确要求追溯旧实现，否则不要按旧链路开发、测试或写文档。
+职责边界：
 
-## 当前组件
+- `task-agent`：工作区侧会话 owner。启动后写入 `.clock-p/session.json`，后续命令只读该文件，不再手动传会话身份。
+- `helper2`：Windows 客户端侧稳定原语。负责 Studio 插件长轮询、task 会话、play/stop、截图、Studio 日志、Rojo 转发和官方 Studio MCP adapter。
+- `plugin-mcp2`：Studio 内插件。只和 helper2 通信，负责执行 helper2 下发的 Studio 命令。
+- `bridge2`：LLM / 脚本使用的 CLI 层。只做会话读取、JSON 输出和命令编排。
+- `clockbridge`：公网转发能力。helper2 内嵌调用库，不依赖外部 `clockbridge-cli` 二进制。
 
-- `go-helper/cmd/studio-helper`：helper2。负责本机 task session、task-owned Studio 生命周期、mcp2 command broker、截图、日志读取、helper2 MCP。
-- `go-helper/cmd/task-agent`：workspace agent。负责 `.clock-p/session.json`、Rojo server、Rojo 公网域名注册、helper2 heartbeat、shutdown/release。
-- `plugin-mcp2`：Studio 插件。只连接本机 helper2，执行 helper2 下发的 task-scoped Studio 命令。
-- `tools/bridge2`：LLM / 脚本调用的本地 CLI。只读 `.clock-p/session.json`，不猜 machine，不走旧 hub/helper1/mcp1。
+## 本机身份文件
 
-## 身份边界
-
-Windows client 侧 helper2 的 public exposure 身份只允许来自同一个本机系统身份目录。正常位置是：
+Windows 客户端身份文件统一放在：
 
 ```text
 %APPDATA%\dev.clock-p.com\
-  machine_name
-  feishu-user_name
-  feishu-token
 ```
 
-`machine_name` 必须和 `feishu-token`、`feishu-user_name` 放在同一个目录。helper2 启动时自己读取这些文件；禁止用 `--public-machine-name`、`--public-user`、`--clockbridge-token-file`、`--clockbridge-bin`、`--clockbridge-x-token`、`--clockbridge-register-host` 或 `--clockbridge-register-ip` 覆盖或透传 clockbridge 细节。
+当前使用：
 
-`task-agent start` 是另一条边界：`--machine_name` 必须显式传入。task-agent 不读取本机 `machine_name` 文件，也不从历史 workspace 状态推断。task-agent 可以读取本机 `feishu-user_name` 和 `feishu-token` 来注册 Rojo 公网域名、访问 public helper2，但 machine 选择只能来自 `--machine_name`。启动成功后，task-agent 把 `machine_name`、`task_id`、`helper.base_url` 和 Rojo 路由写入 `.clock-p/session.json`。后续 bridge2、MCP、截图、日志、play/stop/mode 命令都只读 `.clock-p/session.json`。
+- `machine_name`：helper2 读取，用于注册公网 helper 域名。
+- `feishu-user_name`：helper2 读取，用于拼接公网用户名段。
+- `feishu-token`：helper2 读取，用于 clockbridge 注册认证。
 
-## 本地启动
+helper2 不再接受下面这些启动参数：
 
-构建 helper2 和 task-agent：
+- `--public-machine-name`
+- `--public-user`
+- `--clockbridge-token-file`
+- `--clockbridge-bin`
+- `--clockbridge-x-token`
+- `--clockbridge-register-host`
+- `--clockbridge-register-ip`
+
+`task-agent` 部署在服务端或工作区侧时，`machine_name` 必须由启动参数显式传入。`task-agent` 不读取本机 `machine_name` 文件；启动完成后写入 `.clock-p/session.json`，之后的 `bridge2` 命令从 session 文件取值。
+
+## 启动流程
+
+### 构建
 
 ```powershell
-cd go-helper
-go test ./...
-go build -o bin\studio-helper.exe .\cmd\studio-helper
-go build -o bin\task-agent.exe .\cmd\task-agent
+cd K:\roblox_space\studio-rust-mcp-server\go-helper
+New-Item -ItemType Directory -Force bin | Out-Null
+go build -o bin\studio-helper.exe ./cmd/studio-helper
+go build -o bin\task-agent.exe ./cmd/task-agent
 ```
 
-构建并安装 mcp2 插件：
+### 启动 helper2
 
 ```powershell
-rojo build ..\plugin-mcp2\default.project.json -o $env:LOCALAPPDATA\Roblox\Plugins\MCP2Plugin.rbxm
+K:\roblox_space\studio-rust-mcp-server\go-helper\bin\studio-helper.exe --addr 127.0.0.1:0
 ```
 
-启动 helper2：
+`--register-domain` 默认开启。开启后 helper2 会按本机身份文件注册公网 helper 域名，同时保留本地监听端口。
+
+### 启动 task-agent
 
 ```powershell
-.\bin\studio-helper.exe --register-domain=false
-```
-
-`--register-domain` 默认是 `true`。纯本地开发、不需要把 helper2 域名打到公网时，显式传 `--register-domain=false`。启用时 helper2 内嵌 clockbridge remote forward，不再启动外部 `clockbridge-cli`。
-
-启动 task-agent：
-
-```powershell
-.\bin\task-agent.exe start `
+K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe start `
   --workspace K:\roblox_space\test_game3 `
-  --environment local `
-  --machine_name sunjun2 `
   --place_id 113577273791190 `
-  --helper-base-url http://127.0.0.1:44750 `
-  --register-domain=false `
+  --machine_name sunjun2 `
+  --helper-base-url http://127.0.0.1:<helper2_port> `
+  --register-domain=false
+```
+
+`task-agent` 的 `--register-domain` 默认也是开启的。纯本地测试建议显式传 `--register-domain=false`，避免因为没有 `feishu-user_name` 或 `feishu-token` 身份文件而影响启动。
+
+查看和停止当前 workspace 的 task-agent：
+
+```powershell
+K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe status --workspace K:\roblox_space\test_game3
+K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe stop --workspace K:\roblox_space\test_game3
+```
+
+公网场景下，`task-agent` 必须显式传 `--machine_name`，并显式选择 `--environment public`：
+
+```powershell
+$env:ROBLOX_HELPER2_BEARER_TOKEN = (Get-Content $env:APPDATA\dev.clock-p.com\feishu-token -Raw).Trim()
+K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe start `
+  --workspace K:\roblox_space\test_game3 `
+  --environment public `
+  --place_id 113577273791190 `
+  --machine_name sunjun2 `
+  --user <feishu-user_name> `
   --rojo-bin K:\roblox_space\rojo\target\release\rojo.exe `
   --project K:\roblox_space\test_game3\default.project.json
 ```
 
-`task-agent` 的 Rojo server 总是在本地启动。`--register-domain` 默认是 `true`；启用时 task-agent 会内嵌 clockbridge，把本地 Rojo 注册成公网域名，并把 `.clock-p/session.json` 与 heartbeat 里的 `rojo.upstream_url` 写成公网 URL。纯本地开发时显式传 `--register-domain=false`。
+`--user` 可省略，此时 task-agent 会读取本机 `feishu-user_name`。公网 helper 请求需要 bearer token，优先读取 `ROBLOX_HELPER2_BEARER_TOKEN`，其次读取 workspace 或系统身份目录中的 `feishu-token`。`--register-domain` 默认开启，会注册 Rojo 诊断域名，并在 `.clock-p/session.json` 中写入 `rojo.public_url`。
 
-## 公网路由
+## session.json
 
-公网链路仍然是同一套 helper2 / task-agent / mcp2，不恢复旧 hub、helper1 或 mcp1：
+`.clock-p/session.json` 是 bridge2 的唯一会话入口。典型字段：
 
-```text
-task-agent -> public helper2 URL -> helper2 -> mcp2 -> Studio
-helper2 Rojo proxy -> local task-agent Rojo server
+```json
+{
+  "task_id": "t0123abcd45",
+  "environment": "public",
+  "machine_name": "sunjun2",
+  "place_id": "113577273791190",
+  "task_agent_pid": 12345,
+  "task_agent_started_at_ms": 1780000000000,
+  "task_agent_status_url": "http://127.0.0.1:32123/status",
+  "helper": {
+    "base_url": "https://roblox-helper-sunjun2-user-user.dev.clock-p.com",
+    "public_url": "https://roblox-helper-sunjun2-user-user.dev.clock-p.com"
+  },
+  "rojo": {
+    "local_url": "http://127.0.0.1:34872",
+    "upstream_url": "http://127.0.0.1:34872",
+    "public_url": "https://113577273791190-t0123abcd45-rojo-user-user.dev.clock-p.com"
+  }
+}
 ```
 
-helper2 公网域名由本机身份文件推导：
+约束：
 
-```text
-https://roblox-helper-{machine_name}-{feishu-user_name}-user.dev.clock-p.com
-```
-
-task-agent 公网 Rojo 域名由显式 machine 对应的 task 和本机 user 推导：
-
-```text
-https://{place_id}-{task_id}-rojo-{feishu-user_name}-user.dev.clock-p.com
-```
-
-当前线上只保证 `roblox-helper-*` helper2 公网域名可作为外部入口。Rojo 插件连接时仍先访问本机 helper2，再由 helper2 转发到 task-agent 启动的本机 Rojo server。
-
-`.clock-p/session.json` 中：
-
-- `helper.base_url`：公网 helper2 URL，public 模式下外部脚本和 LLM 只走这个入口。
-- `rojo.upstream_url`：helper2 实际使用的 Rojo upstream，当前必须是本机 `http://127.0.0.1:<port>`。
-- `rojo.public_url`：task-agent 诊断字段，表示尝试注册的独立 Rojo 公网 URL；当前线上 Nginx/gateway 未保证该子域可作为 client 路由，不能交给 helper2 或 Rojo 插件作为权威 upstream。
-
-公网测试时，即使 server/client 在同一台机器上模拟，也必须让外部控制面走 `helper.base_url` 的公网 URL；Rojo 同步是否成功要看 Studio 日志中 Rojo 插件是否真正连上并完成初始同步，不能只看 HTTP 200。
-
-
-停止 task-agent：
-
-```powershell
-.\bin\task-agent.exe stop --workspace K:\roblox_space\test_game3
-```
+- `helper.base_url` 是 bridge2 控制面的目标地址；公网验收时必须是真实公网 helper URL。
+- `rojo.upstream_url` 是 helper2 转发给本机 Rojo 的权威上游，当前保持本地地址。
+- `rojo.public_url` 只用于诊断公网注册结果，不作为 Studio 初始同步的权威判据。
+- 后续命令不得重新拼 machine、user、token 或 task 身份。
 
 ## bridge2 CLI
 
-入口：
+入口脚本：
 
-```text
-tools/bridge2/clockp-roblox-cli.cmd
-tools/bridge2/clockp-roblox-cli.sh
-tools/bridge2/cli.py
-```
+- `tools/bridge2/clockp-roblox-cli.cmd`
+- `tools/bridge2/clockp-roblox-cli.sh`
+- `tools/bridge2/cli.py`
 
-所有 bridge2 命令只输出一个 JSON 对象。成功和失败都走 JSON；stderr 默认不输出。参数错误、help、异常也会转成 JSON。
+所有命令只输出 JSON。成功和失败都必须是 JSON，便于 LLM 和脚本读取。
 
-Phase 19A 命令：
-
-```text
-status
-mode
-ensure-edit
-play
-stop
-screenshot
-run-code-direct
-run-code
-play-mode-logs
-```
-
-`run-code-direct` 不做 `ensure-edit`，当前 Studio 不是 edit 时直接失败，也不会 stop。
-
-`run-code` 会先执行 `ensure-edit`：如果当前是 `play_server`，先 stop，再轮询到新的 `edit` mode，然后执行代码。
-
-`run-code-direct` 和 `run-code` 都支持：
-
-```text
---code <luau>
---file <path>
-```
-
-二者必须且只能提供一个。
-
-示例：
+常用命令：
 
 ```powershell
-py -3 tools\bridge2\cli.py --workspace K:\roblox_space\test_game3 mode
-py -3 tools\bridge2\cli.py --workspace K:\roblox_space\test_game3 run-code --code "print('hello'); return 'ok'"
+tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 status
+tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 mode
+tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 ensure-edit
+tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 play
+tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 stop
+tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 screenshot
+tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 play-mode-logs
 ```
 
-## helper2 HTTP / MCP
+Lua 执行：
 
-当前 task-scoped HTTP API：
+```powershell
+tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 run-code-direct --file code.lua
+tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 run-code --file code.lua
+```
+
+语义：
+
+- `run-code-direct` 只转发执行，不做模式切换。
+- `run-code` 先确认 Studio 处于 edit 模式，再调用 `run-code-direct`。
+- 每个子命令自己决定是否需要 ensure-edit；CLI 顶层不做默认 ensure。
+
+官方 Studio MCP adapter 命令：
 
 ```text
+official-ping
+official-store-image
+official-generate-mesh
+official-generate-procedural-model
+official-wait-job
+official-search-creator-store
+official-insert-from-creator-store
+```
+
+常见参数：
+
+```powershell
+tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 official-store-image --file image.png
+tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 official-generate-mesh --text-prompt "small tree" --size-x 1 --size-y 2 --size-z 3
+tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 official-generate-procedural-model --prompt "wooden crate"
+tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 official-wait-job --generation-id <generation_id>
+tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 official-search-creator-store --query tree --asset-type Model --max-results 3
+tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 official-insert-from-creator-store --asset-id 123456789
+```
+
+需要 edit 模式的官方命令由对应子命令自己执行 ensure-edit。`official-generate-mesh`、`official-generate-procedural-model` 和 `official-insert-from-creator-store` 可用 `--no-ensure-edit` 跳过。
+
+## helper2 HTTP 原语
+
+当前 task-scoped 原语：
+
+```text
+POST /session/{task_id}/heartbeat
+POST /session/{task_id}/release
 GET  /session/{task_id}/status
 GET  /session/{task_id}/studio/mode
 POST /session/{task_id}/studio/play
@@ -176,9 +223,11 @@ POST /session/{task_id}/official/search-creator-store
 POST /session/{task_id}/official/insert-from-creator-store
 ```
 
-`/session/{task_id}/runtime-log` 是 helper2 内部 task-scoped 日志读取 API。bridge2 对外命令名是 `play-mode-logs`；不要把新 CLI 命令叫做 `runtime-log`，也不要恢复旧独立 runtime-log server。
+Studio 日志读取是 helper2 能力。bridge2 对外命令名是 `play-mode-logs`，语义是从 helper2 读取当前 task/play 日志。
 
-helper2 MCP 当前只暴露新版 task-scoped 工具，不保留旧工具别名：
+## helper2 MCP 工具
+
+helper2 当前 MCP 工具面：
 
 ```text
 helper2_status
@@ -197,75 +246,70 @@ helper2_official_search_creator_store
 helper2_official_insert_from_creator_store
 ```
 
-旧 `run_code`、`insert_model`、`launch_studio_session`、`start_stop_play`、`take_screenshot` 等旧 MCP 名称不再作为新版 MCP 工具暴露。
+MCP 工具与 bridge2 都使用相同的 task-scoped helper2 语义。
 
-## run-code 安全边界
+## Rojo 与公网
 
-`studio_run_code` 是本地可信联调能力，不是强安全沙箱。它会拦截明显的 Studio 生命周期控制 API token：
+Rojo 由 `task-agent` 启动和看护。helper2 通过 `rojo.upstream_url` 连接 Rojo，并向 Studio 插件提供本机转发入口。
 
-```text
-StudioTestService
-ExecutePlayModeAsync
-ExecuteRunModeAsync
-EndTest
-```
+公网验收时需要确认两件事：
 
-这用于防止 LLM 通过任意 Luau 绕过 `play/stop/ensure-edit` 编排；不要把它理解成对恶意 Luau 的完整隔离。
+- bridge2 控制面确实走 `helper.base_url` 的公网地址。
+- Studio 日志里出现 Rojo initial sync 成功记录，证明游戏内容已实际同步进 Studio。
 
-## official CLI
+不能只用 HTTP 状态码判断 Rojo 是否可用；需要结合 Studio 日志确认初始同步完成。
 
-official generation bridge 属于 Phase 19B 本地范围。helper2 每次请求启动一个新的官方 `StudioMCP.exe`，绑定当前 task-owned Studio，执行一个白名单工具，然后结束进程。
+## 测试工作区
 
-当前 bridge2 命令：
+当前测试工作区：
 
 ```text
-official-ping
-official-store-image
-official-generate-mesh
-official-generate-procedural-model
-official-wait-job
-official-search-creator-store
-official-insert-from-creator-store
+K:\roblox_space\test_game3
 ```
 
-helper2 official 原语都是 direct：只要求 live task 和 task-owned Studio，不做 `ensure-edit`、不 stop、不重试。是否走公网取决于调用方读取 `.clock-p/session.json` 后使用的 `helper.base_url`。
+当前测试 place：
 
-bridge2 的 per-command 规则：
+```text
+113577273791190
+```
 
-- `official-ping`、`official-store-image`、`official-wait-job`、`official-search-creator-store` 不调用 `ensure-edit`。
-- `official-generate-mesh`、`official-generate-procedural-model`、`official-insert-from-creator-store` 默认先 `ensure-edit`，可用 `--no-ensure-edit` 跳过。
-- `official-wait-job` 默认按短轮询执行，`timeout` 默认为 1 秒。官方返回 `{"status":"Timeout","lastKnownStatus":"Polling"}` 时，bridge2 仍返回 `ok:true`，上层 skill / 脚本继续轮询；`Completed` / `Failed` / `Cancelled` 才是终态。
+## 验证命令
 
-当前官方 `list_roblox_studios` 只返回 `id/name/active`，不返回 PID。为避免猜测窗口，Phase 19B 本地 official 命令只在官方 CLI 看到一个 Studio、helper2 当前 task 也只有一个 task-owned Studio、且官方 `execute_luau(Edit)` 读到的 `game.PlaceId` 等于 task place_id 时执行；多 Studio 场景返回结构化失败，不作为本轮验收项。
-
-## 当前验收
-
-提交前至少跑：
+Go 侧：
 
 ```powershell
-py -3 -m unittest .\tools\bridge2\test_cli.py
-cd go-helper
-go test ./cmd/studio-helper ./cmd/task-agent ./internal/taskagent ./internal/tasksession
-rojo build ..\plugin-mcp2\default.project.json -o $env:TEMP\MCP2Plugin-test.rbxm
+cd K:\roblox_space\studio-rust-mcp-server\go-helper
+go test -count=1 ./...
+New-Item -ItemType Directory -Force bin | Out-Null
+go build -o bin\studio-helper.exe ./cmd/studio-helper
+go build -o bin\task-agent.exe ./cmd/task-agent
 ```
 
-涉及 Studio 行为时，必须用真实 Studio 本地跑通。只靠单测或 fake HTTP helper 不算完成。
+bridge2 Python：
 
-Phase 19A 已验证过的本地真实 Studio 路径包括：
+```powershell
+cd K:\roblox_space\studio-rust-mcp-server
+py -3 -m py_compile tools\bridge2\cli.py
+```
 
-- bridge2 `status` / `mode` / `screenshot` / `play-mode-logs`
-- edit 模式 `run-code-direct`
-- play 模式 `run-code-direct` 失败且不 stop
-- play 模式 `run-code` 先 stop、等待 edit、再执行
-- forbidden token 返回 JSON 失败
-- helper2 MCP `tools/list` 只暴露新版 task-scoped 工具
-- helper2 MCP `helper2_studio_run_code` 在真实 Studio edit 模式成功返回 `print` / `warn` / `return`
-- helper2 MCP `helper2_studio_run_code` 的编译失败和 forbidden token 拦截都返回结构化 JSON，不转成旧工具或旧路由异常
+公网矩阵：
 
-本轮不验收 Studio 多开场景；不要把多开行为作为 Phase 19A 完成条件。
+```powershell
+cd K:\roblox_space\studio-rust-mcp-server
+py -3 util\helper2_public_route_matrix_test.py `
+  --place-id 113577273791190 `
+  --kill-existing `
+  --public-ready-timeout 120 `
+  --initial-mode-timeout 240
+```
 
-Phase 19A / 19B 的本地验收已经完成；后续公网验收必须确认 helper2 和 Rojo 都通过内嵌 clockbridge 注册域名，且 bridge2 全程只按 `.clock-p/session.json` 里的公网 URL 路由。
+公网矩阵必须覆盖：
 
-## 旧代码说明
+- helper2 公网 URL 鉴权和 task 可见性。
+- play / stop / screenshot 的 bridge2 直连路径。
+- MCP play / stop / screenshot / log。
+- Studio 日志里的 Rojo initial sync。
 
-仓内旧 Rust MCP、旧 helper、旧 hub/task-server 相关代码目前只作为历史实现保留。不要删除它们，除非有单独清理任务；也不要在新文档里把它们写成当前操作入口。
+## 文档原则
+
+以后新增文档只写当前主线。历史实现不作为入口、fallback 或验收依据。
