@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/studio"
 )
@@ -79,52 +80,23 @@ func (r officialCLIProcessRunner) Run(ctx context.Context, managedStudio studio.
 	if err != nil {
 		return officialToolResponse{}, err
 	}
-	listResponses, listStderr, err := runOfficialBatch(ctx, studioMCPPath, []map[string]any{
-		officialInitializeRequest(1),
-		officialInitializedNotification(),
-		officialToolCallRequest(2, "list_roblox_studios", map[string]any{}),
-	})
+	process, err := startOfficialProcess(ctx, studioMCPPath)
 	if err != nil {
 		return officialToolResponse{}, err
 	}
-	listResult, err := officialToolResultByID(listResponses, 2)
+	defer process.closeAndWait()
+
+	if err := process.call(1, "initialize", officialInitializeParams(), nil); err != nil {
+		return officialToolResponse{}, err
+	}
+	if err := process.notify("notifications/initialized", nil); err != nil {
+		return officialToolResponse{}, err
+	}
+	studioRef, verifiedPlaceID, nextID, err := process.waitForVerifiedStudioPlace(ctx, 2, managedStudio.PlaceID, 20*time.Second)
 	if err != nil {
 		return officialToolResponse{}, err
 	}
-	studioRef, err := chooseSingleOfficialStudio(listResult)
-	if err != nil {
-		return officialToolResponse{}, err
-	}
-	requests := []map[string]any{
-		officialInitializeRequest(1),
-		officialInitializedNotification(),
-		officialToolCallRequest(2, "set_active_studio", map[string]any{"studio_id": studioRef.ID}),
-		officialToolCallRequest(3, "execute_luau", map[string]any{
-			"datamodel_type": "Edit",
-			"code":           "return tostring(game.PlaceId)",
-		}),
-	}
-	toolResultID := 0
-	if toolName != "" {
-		toolResultID = 4
-		requests = append(requests, officialToolCallRequest(toolResultID, toolName, arguments))
-	}
-	responses, runStderr, err := runOfficialBatch(ctx, studioMCPPath, requests)
-	if err != nil {
-		return officialToolResponse{}, err
-	}
-	if _, err := officialToolResultByID(responses, 2); err != nil {
-		return officialToolResponse{}, err
-	}
-	placeResult, err := officialToolResultByID(responses, 3)
-	if err != nil {
-		return officialToolResponse{}, err
-	}
-	verifiedPlaceID, err := verifyOfficialPlaceResult(placeResult, managedStudio.PlaceID)
-	if err != nil {
-		return officialToolResponse{}, err
-	}
-	stderr := strings.TrimSpace(strings.TrimSpace(listStderr) + "\n" + strings.TrimSpace(runStderr))
+	stderr := strings.TrimSpace(process.stderr.String())
 	if toolName == "" {
 		return officialToolResponse{
 			Tool:          "official_ping",
@@ -136,7 +108,7 @@ func (r officialCLIProcessRunner) Run(ctx context.Context, managedStudio studio.
 		}, nil
 	}
 
-	result, err := officialToolResultByID(responses, toolResultID)
+	result, err := process.callTool(nextID, toolName, arguments)
 	if err != nil {
 		return officialToolResponse{}, err
 	}
@@ -162,16 +134,20 @@ func (r officialCLIProcessRunner) Run(ctx context.Context, managedStudio studio.
 	return response, nil
 }
 
+func officialInitializeParams() map[string]any {
+	return map[string]any{
+		"protocolVersion": "2025-11-25",
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]any{"name": "studio-helper2", "version": "official-local"},
+	}
+}
+
 func officialInitializeRequest(id int) map[string]any {
 	return map[string]any{
 		"jsonrpc": "2.0",
 		"id":      id,
 		"method":  "initialize",
-		"params": map[string]any{
-			"protocolVersion": "2025-11-25",
-			"capabilities":    map[string]any{},
-			"clientInfo":      map[string]any{"name": "studio-helper2", "version": "official-local"},
-		},
+		"params":  officialInitializeParams(),
 	}
 }
 
@@ -293,8 +269,8 @@ func officialStudioMCPPath(studioPath string) (string, error) {
 
 func startOfficialProcess(ctx context.Context, studioMCPPath string) (*officialProcess, error) {
 	cmd := exec.CommandContext(ctx, studioMCPPath, "--stdio")
-	if parent := filepath.Dir(studioMCPPath); parent != "" {
-		cmd.Dir = parent
+	if cwd, err := os.Getwd(); err == nil && filepath.Base(cwd) == "go-helper" {
+		cmd.Dir = filepath.Dir(cwd)
 	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -364,6 +340,68 @@ func (p *officialProcess) callTool(id int, name string, arguments map[string]any
 		"arguments": arguments,
 	}, &result)
 	return result, err
+}
+
+func (p *officialProcess) waitForStudioList(ctx context.Context, firstID int, timeout time.Duration) (officialToolMCPResult, int, error) {
+	deadline := time.Now().Add(timeout)
+	id := firstID
+	var lastResult officialToolMCPResult
+	for {
+		result, err := p.callTool(id, "list_roblox_studios", map[string]any{})
+		id++
+		if err != nil {
+			return officialToolMCPResult{}, id, err
+		}
+		if !officialStudioListPending(result) {
+			return result, id, nil
+		}
+		lastResult = result
+		if !time.Now().Before(deadline) {
+			return officialToolMCPResult{}, id, fmt.Errorf("official CLI list_roblox_studios returned an error: %s", firstOfficialContentText(lastResult.Content))
+		}
+		select {
+		case <-ctx.Done():
+			return officialToolMCPResult{}, id, ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+func (p *officialProcess) waitForVerifiedStudioPlace(ctx context.Context, firstID int, expectedPlaceID string, timeout time.Duration) (officialStudioRef, string, int, error) {
+	deadline := time.Now().Add(timeout)
+	id := firstID
+	var lastErr error
+	for {
+		listResult, nextID, err := p.waitForStudioList(ctx, id, 5*time.Second)
+		id = nextID
+		if err != nil {
+			lastErr = err
+		} else {
+			studioRef, err := chooseSingleOfficialStudio(listResult)
+			if err != nil {
+				lastErr = err
+			} else if _, err := p.callTool(id, "set_active_studio", map[string]any{"studio_id": studioRef.ID}); err != nil {
+				id++
+				lastErr = err
+			} else {
+				id++
+				verifiedPlaceID, err := p.verifyActiveStudioPlace(id, expectedPlaceID)
+				id++
+				if err == nil {
+					return studioRef, verifiedPlaceID, id, nil
+				}
+				lastErr = err
+			}
+		}
+		if !officialVerifyPlacePending(lastErr) || !time.Now().Before(deadline) {
+			return officialStudioRef{}, "", id, lastErr
+		}
+		select {
+		case <-ctx.Done():
+			return officialStudioRef{}, "", id, ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
 }
 
 func (p *officialProcess) verifyActiveStudioPlace(id int, expectedPlaceID string) (string, error) {
@@ -438,6 +476,39 @@ func chooseSingleOfficialStudio(result officialToolMCPResult) (officialStudioRef
 	default:
 		return officialStudioRef{}, fmt.Errorf("official CLI saw multiple Roblox Studio instances; local official commands require exactly one before public/multi-open support: %d", len(payload.Studios))
 	}
+}
+
+func officialStudioListNotConnected(result officialToolMCPResult) bool {
+	if !result.IsError {
+		return false
+	}
+	return strings.Contains(firstOfficialContentText(result.Content), "Not connected to the WS host")
+}
+
+func officialStudioListPending(result officialToolMCPResult) bool {
+	if officialStudioListNotConnected(result) {
+		return true
+	}
+	if result.IsError {
+		return false
+	}
+	var payload officialStudioListPayload
+	if err := decodeFirstOfficialJSONContent(result.Content, &payload); err != nil {
+		return false
+	}
+	return len(payload.Studios) == 0
+}
+
+func officialVerifyPlacePending(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "previously active Studio has disconnected") ||
+		strings.Contains(message, "doesn't have a place opened") ||
+		strings.Contains(message, "did not find any connected Roblox Studio") ||
+		strings.Contains(message, "Not connected to the WS host") ||
+		strings.Contains(message, `"studios":[]`)
 }
 
 func decodeFirstOfficialJSONContent(content []officialContent, out any) error {

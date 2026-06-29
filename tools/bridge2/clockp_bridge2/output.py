@@ -23,6 +23,10 @@ def failure(command: str, code: str, message: str, details: dict | None = None, 
 
 
 def _write_json(payload: dict) -> None:
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
-    sys.stdout.write("\n")
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is not None:
+        buffer.write(text.encode("utf-8"))
+    else:
+        sys.stdout.write(text)
     sys.stdout.flush()

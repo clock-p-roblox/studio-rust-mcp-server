@@ -162,6 +162,11 @@ class Bridge2CLITest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(payload["details"]["result"]["code"], "print('from file')")
 
+        code_path.write_text("\ufeffprint('from bom file')", encoding="utf-8")
+        code, payload, _stderr = self.run_cli("run-code-direct", "--file", str(code_path))
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["details"]["result"]["code"], "print('from bom file')")
+
         code, payload, stderr = self.run_cli("run-code-direct", "--code", "print(1)", "--file", str(code_path))
         self.assertNotEqual(code, 0)
         self.assertEqual(stderr, "")

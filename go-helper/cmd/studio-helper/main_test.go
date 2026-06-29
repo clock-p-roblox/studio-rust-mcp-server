@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -841,6 +842,37 @@ func TestOfficialWaitJobTimeoutIsNonTerminalResult(t *testing.T) {
 	}
 	if args["timeout"] != float64(1) {
 		t.Fatalf("default wait timeout = %+v, want 1", args)
+	}
+}
+
+func TestOfficialStudioListNotConnectedDetection(t *testing.T) {
+	if !officialStudioListNotConnected(officialToolMCPResult{
+		IsError: true,
+		Content: []officialContent{{Type: "text", Text: "Not connected to the WS host"}},
+	}) {
+		t.Fatalf("not connected list result was not detected")
+	}
+	if officialStudioListNotConnected(officialToolMCPResult{
+		IsError: true,
+		Content: []officialContent{{Type: "text", Text: "different official error"}},
+	}) {
+		t.Fatalf("unrelated official error was treated as not connected")
+	}
+	if !officialStudioListPending(officialToolMCPResult{
+		Content: []officialContent{{Type: "text", Text: `{"studios":[]}`}},
+	}) {
+		t.Fatalf("empty studio list was not treated as pending")
+	}
+	if officialStudioListPending(officialToolMCPResult{
+		Content: []officialContent{{Type: "text", Text: `{"studios":[{"id":"a","name":"A"}]}`}},
+	}) {
+		t.Fatalf("non-empty studio list was treated as pending")
+	}
+	if !officialVerifyPlacePending(errors.New("previously active Studio has disconnected")) {
+		t.Fatalf("stale active Studio verify error was not treated as pending")
+	}
+	if officialVerifyPlacePending(errors.New("place_id mismatch")) {
+		t.Fatalf("place mismatch must not be treated as pending")
 	}
 }
 

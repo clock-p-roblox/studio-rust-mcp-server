@@ -203,7 +203,7 @@ def _read_code(args: argparse.Namespace) -> str:
         return args.code
     path = Path(args.file)
     try:
-        return path.read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         raise BridgeError("code_file_read_failed", str(exc), {"path": str(path)}) from exc
 
