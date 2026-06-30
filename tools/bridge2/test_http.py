@@ -30,8 +30,7 @@ class HTTPTests(unittest.TestCase):
         server = ThreadingHTTPServer(("127.0.0.1", 0), JSONHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        self.addCleanup(server.shutdown)
-        self.addCleanup(server.server_close)
+        self.addCleanup(self._stop_server, server, thread)
         url = f"http://127.0.0.1:{server.server_port}/healthz"
         env = {
             "HTTP_PROXY": "http://127.0.0.1:1",
@@ -41,6 +40,11 @@ class HTTPTests(unittest.TestCase):
         }
         with mock.patch.dict(os.environ, env, clear=False):
             self.assertEqual(get_json(url, timeout=2.0), {"ok": True})
+
+    def _stop_server(self, server: ThreadingHTTPServer, thread: threading.Thread) -> None:
+        server.shutdown()
+        thread.join(timeout=2.0)
+        server.server_close()
 
 
 if __name__ == "__main__":

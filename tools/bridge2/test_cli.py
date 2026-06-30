@@ -138,21 +138,6 @@ class FakeHelper(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-class FakeURLResponse:
-    def __init__(self, body: dict, status: int = 200) -> None:
-        self.status = status
-        self._body = json.dumps(body).encode("utf-8")
-
-    def read(self) -> bytes:
-        return self._body
-
-    def __enter__(self) -> "FakeURLResponse":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        return None
-
-
 def test_session_payload(helper_base_url: str) -> dict:
     return {
         "task_id": "task-a",
@@ -557,12 +542,12 @@ class Bridge2CLITest(unittest.TestCase):
 
         seen_headers: dict[str, str] = {}
 
-        def fake_urlopen(req, timeout=10.0):
+        def fake_send_request(method, url, body, headers, timeout):
             nonlocal seen_headers
-            seen_headers = dict(req.header_items())
-            return FakeURLResponse({"ok": True, "state": "live", "task_id": "task-a"})
+            seen_headers = dict(headers)
+            return 200, json.dumps({"ok": True, "state": "live", "task_id": "task-a"}).encode("utf-8")
 
-        with mock.patch.object(bridge_http._NO_PROXY_OPENER, "open", side_effect=fake_urlopen):
+        with mock.patch.object(bridge_http, "_send_request", side_effect=fake_send_request):
             code, payload, stderr = self.run_cli("status")
 
         self.assertEqual(code, 0)

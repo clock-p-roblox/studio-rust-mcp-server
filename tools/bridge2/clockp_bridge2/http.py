@@ -3,12 +3,12 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from urllib import error, parse, request
+import http.client
+import ssl
+from urllib import parse
 
 from .errors import BridgeError
 from .session import Session
-
-_NO_PROXY_OPENER = request.build_opener(request.ProxyHandler({}))
 
 
 def task_url(session: Session, path: str, query: dict[str, str | int | None] | None = None) -> str:
@@ -40,24 +40,23 @@ def _request_json(method: str, url: str, payload: dict | None, timeout: float, s
         headers["Authorization"] = auth_header
     if session is not None and session.task_session_token:
         headers["X-ClockP-Task-Token"] = session.task_session_token
-    req = request.Request(url, data=body, headers=headers, method=method)
+
     try:
-        with _NO_PROXY_OPENER.open(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
-            status = resp.status
-    except error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
+        status, raw_body = _send_request(method, url, body, headers, timeout)
+    except (OSError, TimeoutError, http.client.HTTPException, ssl.SSLError) as exc:
+        raise BridgeError("helper_unreachable", str(exc), {"url": url}) from exc
+
+    raw = raw_body.decode("utf-8", errors="replace")
+    if status >= 400:
         try:
             parsed = json.loads(raw) if raw else {}
         except json.JSONDecodeError:
             parsed = {"raw": raw}
         raise BridgeError(
             _error_code_from_body(parsed, "helper_http_error"),
-            _error_message_from_body(parsed, f"helper returned HTTP {exc.code}"),
-            {"url": url, "status": exc.code, "body": parsed},
-        ) from exc
-    except error.URLError as exc:
-        raise BridgeError("helper_unreachable", str(exc.reason), {"url": url}) from exc
+            _error_message_from_body(parsed, f"helper returned HTTP {status}"),
+            {"url": url, "status": status, "body": parsed},
+        )
 
     try:
         parsed = json.loads(raw) if raw else {}
@@ -66,6 +65,31 @@ def _request_json(method: str, url: str, payload: dict | None, timeout: float, s
     if not isinstance(parsed, dict):
         raise BridgeError("helper_invalid_json", "helper response is not a JSON object", {"url": url, "status": status})
     return parsed
+
+
+def _send_request(method: str, url: str, body: bytes | None, headers: dict[str, str], timeout: float) -> tuple[int, bytes]:
+    parsed = parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise BridgeError("helper_invalid_url", f"unsupported helper URL scheme: {parsed.scheme or '<empty>'}", {"url": url})
+    if not parsed.hostname:
+        raise BridgeError("helper_invalid_url", "helper URL is missing a host", {"url": url})
+
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    if parsed.scheme == "https":
+        conn: http.client.HTTPConnection = http.client.HTTPSConnection(parsed.hostname, parsed.port, timeout=timeout)
+    else:
+        conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
+
+    try:
+        conn.request(method, path, body=body, headers=headers)
+        resp = conn.getresponse()
+        raw = resp.read()
+        return resp.status, raw
+    finally:
+        conn.close()
 
 
 def _error_code_from_body(body: dict, default: str) -> str:
