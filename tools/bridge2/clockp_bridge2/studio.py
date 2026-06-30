@@ -31,6 +31,7 @@ def play(
     request_payload = {"play_args": {"launch_id": requested_launch_id, "data": data or {}}}
     play_response = post_json(task_url(session, "/studio/play"), request_payload, timeout=12.0, session=session)
     _ensure_helper_ok("play", play_response)
+    _require_accepted_response("play", play_response)
     accepted_status = _command_status(play_response)
     if accepted_status != "play_requested":
         raise BridgeError(
@@ -39,6 +40,7 @@ def play(
             {"play_response": play_response},
         )
     _require_requested_launch_id_echo(play_response, requested_launch_id)
+    _require_command_launch_id_echo(play_response, requested_launch_id)
     started_at = time.monotonic()
     last_mode = before_mode
     deadline = started_at + transition_timeout_seconds
@@ -120,8 +122,15 @@ def stop(session: Session, transition_timeout_seconds: float = 20.0, poll_second
     before_mode_seq = _require_mode_seq(before_mode, "stop")
     stop_response = post_json(task_url(session, "/studio/stop"), timeout=12.0, session=session)
     _ensure_helper_ok("stop", stop_response)
+    _require_accepted_response("stop", stop_response)
     accepted_status = _command_status(stop_response)
     if accepted_status == "already_stopped":
+        if _mode_value(before_mode) != "edit":
+            raise BridgeError(
+                "unexpected_stop_response",
+                "helper2 reported already_stopped while Studio was not in edit mode",
+                {"before_mode": before_mode, "stop_response": stop_response},
+            )
         return {
             "accepted": True,
             "stop_request": stop_response,
@@ -263,10 +272,8 @@ def _is_transient_mode_unavailable(payload: dict) -> bool:
 
 def _require_mode_seq(payload: dict, command: str) -> int:
     value = payload.get("mode_seq")
-    if isinstance(value, int) and value > 0:
+    if type(value) is int and value > 0:
         return value
-    if isinstance(value, float) and value > 0 and value.is_integer():
-        return int(value)
     raise BridgeError(f"{command}_mode_seq_missing", f"{command} requires mode_seq in Studio mode payload", {"mode": payload})
 
 
@@ -307,11 +314,18 @@ def _mode_value(payload: dict) -> str:
 
 def _launch_id_value(payload: dict) -> int | None:
     value = payload.get("launch_id")
-    if isinstance(value, int) and value > 0:
+    if type(value) is int and 0 < value <= _SAFE_INT_MAX:
         return value
-    if isinstance(value, float) and value > 0 and value.is_integer():
-        return int(value)
     return None
+
+
+def _require_accepted_response(command: str, payload: dict) -> None:
+    if payload.get("ok") is not True or payload.get("accepted") is not True:
+        raise BridgeError(
+            f"invalid_{command}_response",
+            f"{command} response must include ok=true and accepted=true",
+            {f"{command}_response": payload},
+        )
 
 
 def _require_requested_launch_id_echo(payload: dict, expected_launch_id: int) -> None:
@@ -320,6 +334,22 @@ def _require_requested_launch_id_echo(payload: dict, expected_launch_id: int) ->
         raise BridgeError(
             "requested_launch_id_mismatch",
             "helper2 play response did not echo the requested launch_id",
+            {
+                "expected_launch_id": expected_launch_id,
+                "observed_launch_id": value,
+                "play_response": payload,
+            },
+        )
+
+
+def _require_command_launch_id_echo(payload: dict, expected_launch_id: int) -> None:
+    command_result = payload.get("command_result")
+    result = command_result.get("result") if isinstance(command_result, dict) else None
+    value = result.get("launch_id") if isinstance(result, dict) else None
+    if value != expected_launch_id:
+        raise BridgeError(
+            "command_launch_id_mismatch",
+            "mcp2 play response did not echo the requested launch_id",
             {
                 "expected_launch_id": expected_launch_id,
                 "observed_launch_id": value,

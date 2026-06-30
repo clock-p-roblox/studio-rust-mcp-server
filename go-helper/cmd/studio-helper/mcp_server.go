@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -167,6 +168,9 @@ func (m *mcpRuntime) handleToolCall(ctx context.Context, raw json.RawMessage) (m
 func (m *mcpRuntime) runTool(ctx context.Context, name string, args map[string]any) (map[string]any, error) {
 	taskID, err := requiredStringArg(args, "task_id")
 	if err != nil {
+		return nil, err
+	}
+	if err := m.requireTaskSessionTokenArg(taskID, args); err != nil {
 		return nil, err
 	}
 	switch name {
@@ -625,7 +629,7 @@ func requiredPlayArgsArg(args map[string]any, key string) (*studioPlayArgs, erro
 	}
 	launchID, ok := launchIDFromAny(raw["launch_id"])
 	if !ok {
-		return nil, fmt.Errorf("%s.launch_id must be a positive integer", key)
+		return nil, fmt.Errorf("%s.launch_id must be a positive safe integer", key)
 	}
 	dataValue, ok := raw["data"]
 	if !ok || dataValue == nil {
@@ -636,6 +640,21 @@ func requiredPlayArgsArg(args map[string]any, key string) (*studioPlayArgs, erro
 		return nil, fmt.Errorf("%s.data must be an object", key)
 	}
 	return &studioPlayArgs{LaunchID: launchID, Data: data}, nil
+}
+
+func (m *mcpRuntime) requireTaskSessionTokenArg(taskID string, args map[string]any) error {
+	status := m.taskSessions.Status(taskID)
+	if !status.OK || status.Contract == nil {
+		return fmt.Errorf("helper2 has no registered session for task_id %s", taskID)
+	}
+	token, err := requiredStringArg(args, "task_session_token")
+	if err != nil {
+		return err
+	}
+	if subtle.ConstantTimeCompare([]byte(token), []byte(status.Contract.TaskSessionToken)) != 1 {
+		return fmt.Errorf("task session token does not match")
+	}
+	return nil
 }
 
 func writeMCPResponse(w http.ResponseWriter, response mcpJSONRPCResponse) {
@@ -869,7 +888,8 @@ func mcpTools() []map[string]any {
 }
 
 func mcpTool(name string, description string, properties map[string]any) map[string]any {
-	required := []string{"task_id"}
+	properties["task_session_token"] = stringSchema()
+	required := []string{"task_id", "task_session_token"}
 	if _, ok := properties["code"]; ok {
 		required = append(required, "code")
 	}

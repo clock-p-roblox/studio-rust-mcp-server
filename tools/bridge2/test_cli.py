@@ -94,7 +94,7 @@ class FakeHelper(BaseHTTPRequestHandler):
                     "ok": True,
                     "accepted": True,
                     "requested_launch_id": requested_launch_id,
-                    "command_result": {"result": {"status": "play_requested"}},
+                    "command_result": {"result": {"status": "play_requested", "launch_id": requested_launch_id}},
                 }
             )
         elif self.path.endswith("/studio/stop"):

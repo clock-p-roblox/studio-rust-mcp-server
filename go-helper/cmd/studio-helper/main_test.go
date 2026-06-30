@@ -752,8 +752,8 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 		t.Fatalf("run code input schema missing: %+v", runCodeTool)
 	}
 	required, ok := inputSchema["required"].([]any)
-	if !ok || !stringListContainsAny(required, "task_id") || !stringListContainsAny(required, "code") {
-		t.Fatalf("run code required schema = %+v, want task_id and code", inputSchema["required"])
+	if !ok || !stringListContainsAny(required, "task_id") || !stringListContainsAny(required, "task_session_token") || !stringListContainsAny(required, "code") {
+		t.Fatalf("run code required schema = %+v, want task_id, task_session_token and code", inputSchema["required"])
 	}
 	generateMeshTool := mcpToolByName(tools, "helper2_official_generate_mesh")
 	generateMeshSchema, ok := generateMeshTool["inputSchema"].(map[string]any)
@@ -761,8 +761,8 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 		t.Fatalf("generate mesh input schema missing: %+v", generateMeshTool)
 	}
 	generateMeshRequired, ok := generateMeshSchema["required"].([]any)
-	if !ok || !stringListContainsAny(generateMeshRequired, "task_id") || !stringListContainsAny(generateMeshRequired, "text_prompt") {
-		t.Fatalf("generate mesh required schema = %+v, want task_id and text_prompt", generateMeshSchema["required"])
+	if !ok || !stringListContainsAny(generateMeshRequired, "task_id") || !stringListContainsAny(generateMeshRequired, "task_session_token") || !stringListContainsAny(generateMeshRequired, "text_prompt") {
+		t.Fatalf("generate mesh required schema = %+v, want task_id, task_session_token and text_prompt", generateMeshSchema["required"])
 	}
 }
 
@@ -780,13 +780,19 @@ func TestMCPStatusAndRuntimeLogToolsRequireExplicitTaskID(t *testing.T) {
 		t.Fatalf("append runtime log failed: %v", err)
 	}
 
-	statusResult := callMCPTool(t, runtime, "helper2_status", map[string]any{"task_id": "task-a"})
+	statusResult := callMCPTool(t, runtime, "helper2_status", map[string]any{
+		"task_id":            "task-a",
+		"task_session_token": "token-task-a",
+	})
 	statusPayload := decodeToolText(t, statusResult)
 	if statusPayload["task_id"] != "task-a" || statusPayload["state"] != "live" {
 		t.Fatalf("unexpected status payload: %+v", statusPayload)
 	}
 
-	logResult := callMCPTool(t, runtime, "helper2_runtime_log", map[string]any{"task_id": "task-a"})
+	logResult := callMCPTool(t, runtime, "helper2_runtime_log", map[string]any{
+		"task_id":            "task-a",
+		"task_session_token": "token-task-a",
+	})
 	logPayload := decodeToolText(t, logResult)
 	entries, ok := logPayload["entries"].([]any)
 	if !ok || len(entries) != 1 {
@@ -804,8 +810,9 @@ func TestMCPStudioToolsRejectWithoutTaskBoundStudio(t *testing.T) {
 	registerTestTask(t, runtime, "task-a", "123")
 
 	result := callMCPTool(t, runtime, "helper2_studio_play", map[string]any{
-		"task_id": "task-a",
-		"mode":    "start_play",
+		"task_id":            "task-a",
+		"task_session_token": "token-task-a",
+		"mode":               "start_play",
 		"play_args": map[string]any{
 			"launch_id": 101,
 			"data":      map[string]any{"kind": "test"},
@@ -820,8 +827,9 @@ func TestMCPStudioToolsRejectWithoutTaskBoundStudio(t *testing.T) {
 	}
 
 	runCodeResult := callMCPTool(t, runtime, "helper2_studio_run_code", map[string]any{
-		"task_id": "task-a",
-		"code":    "print('hello')",
+		"task_id":            "task-a",
+		"task_session_token": "token-task-a",
+		"code":               "print('hello')",
 	})
 	if runCodeResult["isError"] != true {
 		t.Fatalf("run code without task-bound Studio should be tool error: %+v", runCodeResult)
@@ -832,7 +840,8 @@ func TestMCPStudioToolsRejectWithoutTaskBoundStudio(t *testing.T) {
 	}
 
 	missingCodeResult := callMCPTool(t, runtime, "helper2_studio_run_code", map[string]any{
-		"task_id": "task-a",
+		"task_id":            "task-a",
+		"task_session_token": "token-task-a",
 	})
 	if missingCodeResult["isError"] != true {
 		t.Fatalf("run code without code should be tool error: %+v", missingCodeResult)
@@ -876,8 +885,9 @@ func TestMCPLegacyToolAliasesAreNotAccepted(t *testing.T) {
 	registerTestTask(t, runtime, "task-a", "123")
 
 	result := callMCPTool(t, runtime, "launch_studio_session", map[string]any{
-		"task_id": "task-a",
-		"mode":    "start_play",
+		"task_id":            "task-a",
+		"task_session_token": "token-task-a",
+		"mode":               "start_play",
 	})
 	if result["isError"] != true {
 		t.Fatalf("legacy alias should be rejected: %+v", result)
@@ -1020,9 +1030,10 @@ func TestMCPOfficialGenerateMeshRejectsPartialSize(t *testing.T) {
 	registerTestTask(t, runtime, "task-a", "123")
 
 	result := callMCPTool(t, runtime, "helper2_official_generate_mesh", map[string]any{
-		"task_id":     "task-a",
-		"text_prompt": "tree",
-		"size_x":      1,
+		"task_id":            "task-a",
+		"task_session_token": "token-task-a",
+		"text_prompt":        "tree",
+		"size_x":             1,
 	})
 	if result["isError"] != true {
 		t.Fatalf("partial size should be tool error: %+v", result)

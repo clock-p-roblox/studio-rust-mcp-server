@@ -34,6 +34,7 @@ const (
 	taskStudioCommandResponseTimeout = 60 * time.Second
 	taskStudioCommandWaitTimeout     = taskStudioCommandQueuedTimeout + taskStudioCommandResponseTimeout + 5*time.Second
 	taskSessionTokenHeader           = "X-ClockP-Task-Token"
+	maxJSONSafeInteger               = int64(1<<53 - 1)
 )
 
 type healthResponse struct {
@@ -746,6 +747,7 @@ func (b *mcp2CommandBroker) acceptLifecycleLocked(mode string, modeSeq int64, st
 	if studioPID <= 0 {
 		return false
 	}
+	previousExpectedNextMode := b.expectedNextMode
 	if b.activeModeSeq != nil && *b.activeModeSeq == modeSeq {
 		if b.activeStudioPID != nil && *b.activeStudioPID != studioPID {
 			return false
@@ -762,6 +764,8 @@ func (b *mcp2CommandBroker) acceptLifecycleLocked(mode string, modeSeq int64, st
 	b.activeModeSeq = &seq
 	b.activeStudioPID = nil
 	if b.expectedNextMode == mode {
+		b.expectedNextMode = ""
+	} else if previousExpectedNextMode != "" {
 		b.expectedNextMode = ""
 	}
 	b.setActiveStudioPIDLocked(studioPID)
@@ -1026,6 +1030,10 @@ func main() {
 		}
 		if request.PlayArgs == nil {
 			writeTaskAPIError(w, http.StatusBadRequest, taskID, "missing_play_args", "play_args is required", "fix_request", nil)
+			return
+		}
+		if err := validateStudioPlayArgs(request.PlayArgs); err != nil {
+			writeTaskAPIError(w, http.StatusBadRequest, taskID, "invalid_play_data", err.Error(), "fix_request", nil)
 			return
 		}
 		command, err := broker.enqueueStudioPlay(status.Contract.PlaceID, request.PlayArgs)
@@ -1445,218 +1453,6 @@ func main() {
 			"reason":     ignoredReason,
 		})
 	})
-	mux.HandleFunc("POST /debug/command/{placeid}", func(w http.ResponseWriter, r *http.Request) {
-		placeID := r.PathValue("placeid")
-		if !studio.PlaceIDIsValid(placeID) {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"ok":    false,
-				"error": "placeid must contain digits only",
-			})
-			return
-		}
-		var request struct {
-			Kind    string `json:"kind"`
-			SleepMS int64  `json:"sleep_ms"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil && !errors.Is(err, io.EOF) {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"ok":    false,
-				"error": err.Error(),
-			})
-			return
-		}
-		command, err := commandBrokers.forDebug().enqueueDebug(placeID, request.Kind, request.SleepMS)
-		if err != nil {
-			writeJSON(w, http.StatusConflict, map[string]any{
-				"ok":    false,
-				"error": err.Error(),
-			})
-			return
-		}
-		logger.Info("debug mcp2 command enqueued", "place_id", placeID, "command_id", command.CommandID, "kind", command.Kind)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":      true,
-			"command": command,
-		})
-	})
-	mux.HandleFunc("POST /debug/studio/play/{placeid}", func(w http.ResponseWriter, r *http.Request) {
-		placeID := r.PathValue("placeid")
-		if !studio.PlaceIDIsValid(placeID) {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"ok":    false,
-				"error": "placeid must contain digits only",
-			})
-			return
-		}
-		command, err := commandBrokers.forDebug().enqueueStudioPlay(placeID, &studioPlayArgs{
-			LaunchID: time.Now().UnixMilli(),
-			Data:     map[string]any{},
-		})
-		if err != nil {
-			writeJSON(w, http.StatusConflict, map[string]any{
-				"ok":    false,
-				"error": err.Error(),
-			})
-			return
-		}
-		logger.Info("studio play command enqueued", "place_id", placeID, "command_id", command.CommandID, "kind", command.Kind)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":         true,
-			"queued":     true,
-			"command_id": command.CommandID,
-			"command":    command,
-		})
-	})
-	mux.HandleFunc("POST /debug/studio/stop/{placeid}", func(w http.ResponseWriter, r *http.Request) {
-		placeID := r.PathValue("placeid")
-		if !studio.PlaceIDIsValid(placeID) {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"ok":    false,
-				"error": "placeid must contain digits only",
-			})
-			return
-		}
-		command, err := commandBrokers.forDebug().enqueueStudioStop(placeID)
-		if err != nil {
-			writeJSON(w, http.StatusConflict, map[string]any{
-				"ok":    false,
-				"error": err.Error(),
-			})
-			return
-		}
-		logger.Info("studio stop command enqueued", "place_id", placeID, "command_id", command.CommandID, "kind", command.Kind)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":         true,
-			"queued":     true,
-			"command_id": command.CommandID,
-			"command":    command,
-		})
-	})
-	mux.HandleFunc("GET /debug/studio/mode/{placeid}", func(w http.ResponseWriter, r *http.Request) {
-		placeID := r.PathValue("placeid")
-		if !studio.PlaceIDIsValid(placeID) {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"ok":    false,
-				"error": "placeid must contain digits only",
-			})
-			return
-		}
-		debugBroker := commandBrokers.forDebug()
-		command, err := debugBroker.enqueueStudioModeQuery(placeID)
-		if err != nil {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"ok":        true,
-				"available": false,
-				"place_id":  placeID,
-				"error":     err.Error(),
-			})
-			return
-		}
-
-		waitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		defer cancel()
-		result, found := debugBroker.waitForResult(waitCtx, command.CommandID)
-		if !found {
-			debugBroker.cancelCommand(command.CommandID)
-			writeJSON(w, http.StatusOK, map[string]any{
-				"ok":         true,
-				"available":  false,
-				"place_id":   placeID,
-				"command_id": command.CommandID,
-				"reason":     "mode_query_timeout",
-			})
-			return
-		}
-
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":             true,
-			"available":      result.OK,
-			"place_id":       placeID,
-			"command_id":     command.CommandID,
-			"command_result": result,
-		})
-	})
-	mux.HandleFunc("GET /studio/summary", func(w http.ResponseWriter, r *http.Request) {
-		summary := struct {
-			studio.Summary
-			MCP2Channels map[string]mcp2ChannelSummary `json:"mcp2_channels"`
-			TaskSessions tasksession.Summary           `json:"task_sessions"`
-		}{
-			Summary:      studioManager.Summary(),
-			MCP2Channels: commandBrokers.summaries(),
-			TaskSessions: taskSessions.Summary(),
-		}
-		printPrettyJSON("studio summary", summary)
-		writeJSON(w, http.StatusOK, summary)
-	})
-	mux.HandleFunc("POST /debug/start-roblox-studio/{placeid}", func(w http.ResponseWriter, r *http.Request) {
-		placeID := r.PathValue("placeid")
-		result, err := studioManager.StartDebug(r.Context(), placeID)
-		if err != nil {
-			logger.Error("failed to start Roblox Studio", "place_id", placeID, "error", err)
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"ok":       false,
-				"place_id": placeID,
-				"error":    err.Error(),
-			})
-			return
-		}
-		logger.Info(
-			"started Roblox Studio",
-			"place_id", result.PlaceID,
-			"universe_id", result.UniverseID,
-			"pid", result.PID,
-			"studio_path", result.StudioPath,
-		)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":     true,
-			"launch": result,
-		})
-	})
-	mux.HandleFunc("GET /debug/studio/screenshot/{placeid}", func(w http.ResponseWriter, r *http.Request) {
-		placeID := r.PathValue("placeid")
-		if !studio.PlaceIDIsValid(placeID) {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"ok":    false,
-				"error": "placeid must contain digits only",
-			})
-			return
-		}
-		studioPID, err := studioManager.ManagedPIDForPlace(placeID)
-		if err != nil {
-			writeJSON(w, http.StatusConflict, map[string]any{
-				"ok":       false,
-				"place_id": placeID,
-				"error":    err.Error(),
-			})
-			return
-		}
-		result, err := screenshot.CaptureStudioScreenshot(r.Context(), studioPID, "", "studio-"+placeID)
-		if err != nil {
-			logger.Warn("failed to capture Roblox Studio screenshot", "place_id", placeID, "studio_pid", studioPID, "error", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"ok":         false,
-				"place_id":   placeID,
-				"studio_pid": studioPID,
-				"error":      err.Error(),
-			})
-			return
-		}
-		logger.Info(
-			"captured Roblox Studio screenshot",
-			"place_id", placeID,
-			"studio_pid", result.StudioPID,
-			"path", result.Path,
-			"bytes", result.Bytes,
-			"fallback", result.Fallback,
-		)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":         true,
-			"place_id":   placeID,
-			"screenshot": result,
-		})
-	})
-
 	server := &http.Server{
 		Addr:              *addr,
 		Handler:           mux,
@@ -2111,24 +1907,37 @@ func launchIDFromResultMap(result map[string]any) (int64, bool) {
 func launchIDFromAny(value any) (int64, bool) {
 	switch typed := value.(type) {
 	case int64:
-		if typed > 0 {
+		if typed > 0 && typed <= maxJSONSafeInteger {
 			return typed, true
 		}
 	case int:
-		if typed > 0 {
+		if typed > 0 && int64(typed) <= maxJSONSafeInteger {
 			return int64(typed), true
 		}
 	case float64:
-		if typed > 0 && typed == float64(int64(typed)) {
+		if typed > 0 && typed <= float64(maxJSONSafeInteger) && typed == float64(int64(typed)) {
 			return int64(typed), true
 		}
 	case json.Number:
 		parsed, err := typed.Int64()
-		if err == nil && parsed > 0 {
+		if err == nil && parsed > 0 && parsed <= maxJSONSafeInteger {
 			return parsed, true
 		}
 	}
 	return 0, false
+}
+
+func validateStudioPlayArgs(playArgs *studioPlayArgs) error {
+	if playArgs == nil {
+		return errors.New("play_args is required")
+	}
+	if playArgs.LaunchID <= 0 || playArgs.LaunchID > maxJSONSafeInteger {
+		return errors.New("play_args.launch_id must be a positive safe integer")
+	}
+	if playArgs.Data == nil {
+		return errors.New("play_args.data is required")
+	}
+	return nil
 }
 
 func commandFailureDetails(result *mcp2ResponseResult) (string, string) {

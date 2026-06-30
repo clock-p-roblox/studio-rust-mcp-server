@@ -98,6 +98,21 @@ local function validatePlayArgs(value)
 	}, nil
 end
 
+local function validateCommandPlace(command)
+	local args = command.args
+	if typeof(args) ~= "table" then
+		return false, "place_id_required: command args must be a table"
+	end
+	local placeId = args.place_id
+	if typeof(placeId) ~= "string" and typeof(placeId) ~= "number" then
+		return false, "place_id_required: command args.place_id is required"
+	end
+	if tostring(placeId) ~= tostring(game.PlaceId) then
+		return false, "place_id_mismatch: command place_id=" .. tostring(placeId) .. " current_place_id=" .. tostring(game.PlaceId)
+	end
+	return true, nil
+end
+
 local function getCurrentPlayLaunchId()
 	if mode ~= "play_server" then
 		return nil
@@ -516,6 +531,9 @@ local function codeSyncGetManifest(args)
 	if args.mapping_profile ~= "sync_lua_v1" then
 		return false, nil, "code_sync_unsupported_mapping"
 	end
+	if typeof(args.roots) ~= "table" then
+		return false, nil, "code_sync_invalid_config: roots must be a table"
+	end
 	local result = {
 		kind = "code_sync_get_manifest",
 		protocol_version = 1,
@@ -527,6 +545,9 @@ local function codeSyncGetManifest(args)
 	}
 	local combinedRoots = {}
 	for _, root in args.roots do
+		if typeof(root) ~= "table" or typeof(root.root_id) ~= "string" or typeof(root.studio_path) ~= "table" then
+			return false, nil, "code_sync_invalid_config: root must include root_id and studio_path"
+		end
 		local summary = codeSyncSummarize(codeSyncFindPath(root.studio_path))
 		local currentRootHash = nil
 		if summary ~= nil then
@@ -558,40 +579,72 @@ local function codeSyncClassForKind(kind)
 	error("code_sync_unsupported_mapping: unsupported kind " .. tostring(kind))
 end
 
+local function codeSyncManagedClass(className)
+	return className == "Folder" or className == "ModuleScript" or className == "Script" or className == "LocalScript"
+end
+
+local function codeSyncFindUniqueChild(parent, name)
+	local found = nil
+	for _, child in parent:GetChildren() do
+		if child.Name == name then
+			if found ~= nil then
+				return nil, "code_sync_ambiguous_path: duplicate child name " .. name
+			end
+			found = child
+		end
+	end
+	return found, nil
+end
+
 local function codeSyncEnsureChild(parent, name, className)
-	local existing = parent:FindFirstChild(name)
+	local existing, findError = codeSyncFindUniqueChild(parent, name)
+	if findError ~= nil then
+		return nil, findError
+	end
 	if existing ~= nil and existing.ClassName ~= className then
-		existing:Destroy()
-		existing = nil
+		return nil, "code_sync_class_mismatch: " .. name .. " is " .. existing.ClassName .. ", want " .. className
 	end
 	if existing == nil then
 		existing = Instance.new(className)
 		existing.Name = name
 		existing.Parent = parent
 	end
-	return existing
+	return existing, nil
 end
 
 local function codeSyncEnsureRoot(path, tree)
 	local current = game:GetService(path[1])
 	for index = 2, #path do
 		local className = if index == #path then codeSyncClassForKind(tree.kind) else "Folder"
-		current = codeSyncEnsureChild(current, path[index], className)
+		local nextChild, childError = codeSyncEnsureChild(current, path[index], className)
+		if nextChild == nil then
+			return nil, childError
+		end
+		current = nextChild
 	end
-	return current
+	return current, nil
 end
 
 local function codeSyncWriteNode(instance, node)
 	if node.kind == "ModuleScript" or node.kind == "Script" or node.kind == "LocalScript" then
 		instance.Source = node.source or ""
 	end
+	for _, child in instance:GetChildren() do
+		if not codeSyncManagedClass(child.ClassName) then
+			return false, "code_sync_unmanaged_child: " .. child:GetFullName() .. " is " .. child.ClassName
+		end
+	end
 	instance:ClearAllChildren()
 	for _, child in node.children do
 		local childInstance = Instance.new(codeSyncClassForKind(child.kind))
 		childInstance.Name = child.name
 		childInstance.Parent = instance
-		codeSyncWriteNode(childInstance, child)
+		local ok, err = codeSyncWriteNode(childInstance, child)
+		if not ok then
+			return false, err
+		end
 	end
+	return true, nil
 end
 
 local function codeSyncApply(args)
@@ -607,10 +660,22 @@ local function codeSyncApply(args)
 	if args.mapping_profile ~= "sync_lua_v1" then
 		return false, nil, "code_sync_unsupported_mapping"
 	end
+	if typeof(args.roots) ~= "table" then
+		return false, nil, "code_sync_invalid_config: roots must be a table"
+	end
 	local applied = {}
 	for _, root in args.roots do
-		local rootInstance = codeSyncEnsureRoot(root.studio_path, root.tree)
-		codeSyncWriteNode(rootInstance, root.tree)
+		if typeof(root) ~= "table" or typeof(root.root_id) ~= "string" or typeof(root.studio_path) ~= "table" or typeof(root.tree) ~= "table" then
+			return false, nil, "code_sync_invalid_config: root must include root_id, studio_path and tree"
+		end
+		local rootInstance, rootError = codeSyncEnsureRoot(root.studio_path, root.tree)
+		if rootInstance == nil then
+			return false, nil, rootError
+		end
+		local writeOk, writeError = codeSyncWriteNode(rootInstance, root.tree)
+		if not writeOk then
+			return false, nil, writeError
+		end
 		table.insert(applied, root.root_id)
 	end
 	return true, {
@@ -630,6 +695,10 @@ local function processCommand(command)
 		return true, {
 			kind = kind,
 		}, nil
+	end
+	local placeOk, placeError = validateCommandPlace(command)
+	if not placeOk then
+		return false, nil, placeError
 	end
 	if kind == "debug_echo" then
 		local args = command.args
@@ -774,6 +843,9 @@ local function postResponseResultUntilRecorded(commandId, ok, result, errorMessa
 				or reason == "studio_pid_mismatch"
 				or reason == "mode_seq_mismatch"
 				or reason == "not_waiting_for_command"
+				or reason == "task_not_live"
+				or reason == "task_channel_not_found"
+				or reason == "task_binding_required"
 			then
 				bumpModeSeq("command result ignored by helper: " .. reason)
 				return false
@@ -781,59 +853,6 @@ local function postResponseResultUntilRecorded(commandId, ok, result, errorMessa
 			task.wait(5)
 		end
 	end
-end
-
-local function parsePostResponse(response)
-	if not response.Success then
-		return false, false, tostring(response.StatusCode) .. " " .. tostring(response.Body)
-	end
-
-	local decodedOk, decoded = pcall(function()
-		return HttpService:JSONDecode(response.Body)
-	end)
-	if not decodedOk or typeof(decoded) ~= "table" then
-		return true, false, "invalid_response_body"
-	end
-
-	return true, decoded.recorded == true, tostring(decoded.reason or "")
-end
-
-local function postResponseResultBounded(commandId, ok, result, errorMessage, timeoutSeconds)
-	local finished = false
-	local delivered = false
-	local recorded = false
-	local detail = "timeout"
-
-	task.spawn(function()
-		local responseOk, response = pcall(function()
-			return postResponseResult(commandId, ok, result, errorMessage)
-		end)
-		if not responseOk then
-			detail = tostring(response)
-		else
-			delivered, recorded, detail = parsePostResponse(response)
-		end
-		finished = true
-	end)
-
-	local deadline = os.clock() + timeoutSeconds
-	while not finished and os.clock() < deadline do
-		task.wait(0.05)
-	end
-
-	if not finished then
-		warn(LOG_PREFIX, "command result delivery timed out", "command_id=" .. tostring(commandId))
-		return false, false, "timeout"
-	end
-	if delivered and recorded then
-		print(LOG_PREFIX, "command result recorded", "command_id=" .. tostring(commandId))
-	elseif delivered then
-		warn(LOG_PREFIX, "command result delivery was accepted but not recorded", "command_id=" .. tostring(commandId), "reason=" .. detail)
-	else
-		warn(LOG_PREFIX, "command result delivery failed", "command_id=" .. tostring(commandId), "reason=" .. detail)
-	end
-
-	return delivered, recorded, detail
 end
 
 local function executeStudioTransitionAfterAck(command, result)
@@ -914,12 +933,7 @@ task.spawn(function()
 			and typeof(result) == "table"
 			and (result.status == "play_requested" or result.status == "stop_requested")
 		local resultRecorded = false
-		if shouldRequestStudioTransition then
-			local _delivered, recorded, _detail = postResponseResultBounded(commandId, ok, result, errorMessage, 3)
-			resultRecorded = recorded
-		else
-			resultRecorded = postResponseResultUntilRecorded(commandId, ok, result, errorMessage)
-		end
+		resultRecorded = postResponseResultUntilRecorded(commandId, ok, result, errorMessage)
 		stopHeartbeat()
 		if shouldRequestStudioTransition and resultRecorded then
 			executeStudioTransitionAfterAck(command, result)
