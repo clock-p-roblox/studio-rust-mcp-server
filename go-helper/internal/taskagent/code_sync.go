@@ -1,8 +1,7 @@
-﻿package taskagent
+package taskagent
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -11,6 +10,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/zeebo/blake3"
 )
 
 const codeSyncProtocolVersion = 1
@@ -124,7 +125,7 @@ func normalizeWorkspacePath(workspace string, value string, fallback string) (st
 
 func workspaceID(workspace string) string {
 	normalized := strings.ToLower(filepath.ToSlash(workspace))
-	sum := sha256.Sum256([]byte(normalized))
+	sum := blake3.Sum256([]byte(normalized))
 	return hex.EncodeToString(sum[:])[:24]
 }
 
@@ -421,7 +422,7 @@ func joinBytes(parts ...[]byte) []byte {
 }
 
 func blake3Hex(data []byte) string {
-	sum := sha256.Sum256(data)
+	sum := blake3.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
 

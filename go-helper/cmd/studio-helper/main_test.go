@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"bufio"
@@ -171,6 +171,88 @@ func TestRequireTaskSessionToken(t *testing.T) {
 			}
 			response := httptest.NewRecorder()
 			ok := requireTaskSessionToken(response, request, "task-a", status)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if tc.wantOK {
+				return
+			}
+			if response.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", response.Code, tc.wantStatus)
+			}
+			payload := decodeJSONMap(t, response.Body.Bytes())
+			if payload["code"] != tc.wantCode {
+				t.Fatalf("payload = %+v, want code %s", payload, tc.wantCode)
+			}
+		})
+	}
+}
+
+func TestRequireCodeSyncRequestBinding(t *testing.T) {
+	status := tasksession.StatusResponse{
+		OK:     true,
+		TaskID: "task-a",
+		State:  "live",
+		Contract: &tasksession.Contract{
+			TaskID: "task-a",
+			CodeSync: tasksession.CodeSyncBinding{
+				ProjectID:      "game",
+				MappingProfile: "code_sync_lua_v1",
+				Roots: []tasksession.CodeSyncRootRoute{
+					{RootID: "app", StudioPath: []string{"ReplicatedStorage", "ClockPTest"}},
+				},
+			},
+		},
+	}
+	cases := []struct {
+		name       string
+		projectID  string
+		mapping    string
+		roots      []map[string]any
+		wantOK     bool
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name:      "match",
+			projectID: "game",
+			mapping:   "code_sync_lua_v1",
+			roots: []map[string]any{{
+				"root_id":     "app",
+				"studio_path": []any{"ReplicatedStorage", "ClockPTest"},
+				"tree":        map[string]any{"kind": "Folder"},
+			}},
+			wantOK: true,
+		},
+		{
+			name:       "project mismatch",
+			projectID:  "other",
+			mapping:    "code_sync_lua_v1",
+			roots:      []map[string]any{{"root_id": "app", "studio_path": []any{"ReplicatedStorage", "ClockPTest"}}},
+			wantStatus: http.StatusConflict,
+			wantCode:   "code_sync_binding_mismatch",
+		},
+		{
+			name:       "root path mismatch",
+			projectID:  "game",
+			mapping:    "code_sync_lua_v1",
+			roots:      []map[string]any{{"root_id": "app", "studio_path": []any{"Workspace", "ClockPTest"}}},
+			wantStatus: http.StatusConflict,
+			wantCode:   "code_sync_binding_mismatch",
+		},
+		{
+			name:       "duplicate root",
+			projectID:  "game",
+			mapping:    "code_sync_lua_v1",
+			roots:      []map[string]any{{"root_id": "app", "studio_path": []any{"ReplicatedStorage", "ClockPTest"}}, {"root_id": "app", "studio_path": []any{"ReplicatedStorage", "ClockPTest"}}},
+			wantStatus: http.StatusConflict,
+			wantCode:   "code_sync_binding_mismatch",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			ok := requireCodeSyncRequestBinding(response, "task-a", status, tc.projectID, tc.mapping, tc.roots)
 			if ok != tc.wantOK {
 				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
 			}

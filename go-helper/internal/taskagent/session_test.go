@@ -1,4 +1,4 @@
-﻿package taskagent
+package taskagent
 
 import (
 	"encoding/json"
@@ -55,6 +55,32 @@ func TestResolveHelperBaseURLLocalRequiresExplicitURL(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "--helper-base-url is required") {
 		t.Fatalf("expected local helper URL error, got %v", err)
+	}
+}
+
+func TestCodeSyncHashesUseBlake3Fixtures(t *testing.T) {
+	scriptHash := blake3Hex(joinBytes(
+		canonicalString("clockp.code_sync.v1.script"),
+		canonicalString("ModuleScript"),
+		canonicalString("Main"),
+		canonicalString("return 1\n"),
+		canonicalString(0),
+	))
+	if scriptHash != "6520c8981971c534640f33cd4664b94b77ae9d2b9e6c3d3e7da744f13639a209" {
+		t.Fatalf("script hash = %s", scriptHash)
+	}
+	folderHash := blake3Hex(joinBytes(
+		canonicalString("clockp.code_sync.v1.folder"),
+		canonicalString("Root"),
+		canonicalString(1),
+		joinBytes(
+			canonicalString("Main"),
+			canonicalString("ModuleScript"),
+			canonicalString(scriptHash),
+		),
+	))
+	if folderHash != "0fa8f8896db5050d170a1682aff52745b71d44c1dd0b2779e7842e3062873ad4" {
+		t.Fatalf("folder hash = %s", folderHash)
 	}
 }
 

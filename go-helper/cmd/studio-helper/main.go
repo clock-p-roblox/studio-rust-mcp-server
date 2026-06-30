@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"context"
@@ -1192,12 +1192,7 @@ func main() {
 			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_protocol_version_unsupported", "code-sync protocol_version must be 1", "fix_request", map[string]any{"protocol_version": request.ProtocolVersion})
 			return
 		}
-		if request.MappingProfile != "code_sync_lua_v1" {
-			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_unsupported_mapping", "only mapping_profile=code_sync_lua_v1 is supported", "fix_request", map[string]any{"mapping_profile": request.MappingProfile})
-			return
-		}
-		if len(request.Roots) == 0 {
-			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_invalid_config", "roots must be non-empty", "fix_request", nil)
+		if !requireCodeSyncRequestBinding(w, taskID, status, request.ProjectID, request.MappingProfile, request.Roots) {
 			return
 		}
 		if _, err := studioManager.ManagedProcessForTask(taskID); err != nil {
@@ -1243,12 +1238,7 @@ func main() {
 			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_protocol_version_unsupported", "code-sync protocol_version must be 1", "fix_request", map[string]any{"protocol_version": request.ProtocolVersion})
 			return
 		}
-		if request.MappingProfile != "code_sync_lua_v1" {
-			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_unsupported_mapping", "only mapping_profile=code_sync_lua_v1 is supported", "fix_request", map[string]any{"mapping_profile": request.MappingProfile})
-			return
-		}
-		if len(request.Roots) == 0 {
-			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_invalid_config", "roots must be non-empty", "fix_request", nil)
+		if !requireCodeSyncRequestBinding(w, taskID, status, request.ProjectID, request.MappingProfile, request.Roots) {
 			return
 		}
 		if _, err := studioManager.ManagedProcessForTask(taskID); err != nil {
@@ -1968,6 +1958,95 @@ func requireTaskSessionToken(w http.ResponseWriter, r *http.Request, taskID stri
 	if subtle.ConstantTimeCompare([]byte(actual), []byte(expected)) != 1 {
 		writeTaskAPIError(w, http.StatusForbidden, taskID, "task_token_mismatch", "task session token does not match", "restart_task_agent", nil)
 		return false
+	}
+	return true
+}
+
+func requireCodeSyncRequestBinding(w http.ResponseWriter, taskID string, status tasksession.StatusResponse, projectID string, mappingProfile string, roots []map[string]any) bool {
+	if status.Contract == nil {
+		writeJSON(w, http.StatusNotFound, status)
+		return false
+	}
+	binding := status.Contract.CodeSync
+	if projectID != binding.ProjectID {
+		writeTaskAPIError(w, http.StatusConflict, taskID, "code_sync_binding_mismatch", "code-sync project_id does not match task session", "reload_session", map[string]any{"project_id": projectID, "expected_project_id": binding.ProjectID})
+		return false
+	}
+	if mappingProfile != binding.MappingProfile {
+		writeTaskAPIError(w, http.StatusConflict, taskID, "code_sync_binding_mismatch", "code-sync mapping_profile does not match task session", "reload_session", map[string]any{"mapping_profile": mappingProfile, "expected_mapping_profile": binding.MappingProfile})
+		return false
+	}
+	expected := make(map[string][]string, len(binding.Roots))
+	for _, root := range binding.Roots {
+		expected[root.RootID] = append([]string(nil), root.StudioPath...)
+	}
+	if len(roots) != len(expected) {
+		writeTaskAPIError(w, http.StatusConflict, taskID, "code_sync_binding_mismatch", "code-sync roots do not match task session", "reload_session", map[string]any{"root_count": len(roots), "expected_root_count": len(expected)})
+		return false
+	}
+	seen := make(map[string]struct{}, len(roots))
+	for _, root := range roots {
+		rootID := strings.TrimSpace(fmt.Sprint(root["root_id"]))
+		if rootID == "" {
+			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_invalid_config", "root_id is required", "fix_request", nil)
+			return false
+		}
+		expectedPath, ok := expected[rootID]
+		if !ok {
+			writeTaskAPIError(w, http.StatusConflict, taskID, "code_sync_binding_mismatch", "code-sync root_id does not belong to task session", "reload_session", map[string]any{"root_id": rootID})
+			return false
+		}
+		if _, exists := seen[rootID]; exists {
+			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_invalid_config", "duplicate root_id", "fix_request", map[string]any{"root_id": rootID})
+			return false
+		}
+		seen[rootID] = struct{}{}
+		studioPath, ok := codeSyncRequestStudioPath(root["studio_path"])
+		if !ok {
+			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_invalid_config", "studio_path must be a non-empty string array", "fix_request", map[string]any{"root_id": rootID})
+			return false
+		}
+		if !stringSlicesEqual(studioPath, expectedPath) {
+			writeTaskAPIError(w, http.StatusConflict, taskID, "code_sync_binding_mismatch", "code-sync studio_path does not match task session", "reload_session", map[string]any{"root_id": rootID, "studio_path": studioPath, "expected_studio_path": expectedPath})
+			return false
+		}
+	}
+	return true
+}
+
+func codeSyncRequestStudioPath(value any) ([]string, bool) {
+	switch typed := value.(type) {
+	case []string:
+		if len(typed) == 0 {
+			return nil, false
+		}
+		return append([]string(nil), typed...), true
+	case []any:
+		if len(typed) == 0 {
+			return nil, false
+		}
+		result := make([]string, 0, len(typed))
+		for _, item := range typed {
+			segment, ok := item.(string)
+			if !ok || strings.TrimSpace(segment) == "" {
+				return nil, false
+			}
+			result = append(result, segment)
+		}
+		return result, true
+	default:
+		return nil, false
+	}
+}
+
+func stringSlicesEqual(left []string, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
 	}
 	return true
 }
