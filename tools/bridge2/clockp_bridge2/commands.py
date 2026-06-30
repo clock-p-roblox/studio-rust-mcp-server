@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import json
 import traceback
 from pathlib import Path
 
@@ -84,8 +85,13 @@ def _build_parser() -> JSONArgumentParser:
     parser.add_argument("--workspace", default=".", help="workspace directory containing .clock-p/session.json")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    for name in ("status", "mode", "ensure-edit", "play", "stop", "screenshot"):
+    for name in ("status", "mode", "ensure-edit", "stop", "screenshot"):
         subparsers.add_parser(name, add_help=False)
+
+    play_parser = subparsers.add_parser("play", add_help=False)
+    play_source = play_parser.add_mutually_exclusive_group(required=False)
+    play_source.add_argument("--data-json")
+    play_source.add_argument("--data-file")
 
     logs_parser = subparsers.add_parser("play-mode-logs", add_help=False)
     logs_parser.add_argument("--cursor", default=None)
@@ -150,9 +156,9 @@ def _run_command(args: argparse.Namespace) -> dict:
     if command == "ensure-edit":
         return ensure_edit_mode(session)
     if command == "play":
-        return _checked_helper_result(command, play(session))
+        return play(session, _read_play_data(args))
     if command == "stop":
-        return _checked_helper_result(command, stop(session))
+        return stop(session)
     if command == "screenshot":
         return _checked_helper_result(command, screenshot(session))
     if command == "play-mode-logs":
@@ -206,6 +212,31 @@ def _read_code(args: argparse.Namespace) -> str:
         return path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         raise BridgeError("code_file_read_failed", str(exc), {"path": str(path)}) from exc
+
+
+def _read_play_data(args: argparse.Namespace) -> dict:
+    if getattr(args, "data_json", None) is not None:
+        return _parse_play_data(args.data_json, "data_json")
+    if getattr(args, "data_file", None) is not None:
+        path = Path(args.data_file)
+        try:
+            raw = path.read_text(encoding="utf-8-sig")
+        except OSError as exc:
+            raise BridgeError("play_data_file_read_failed", str(exc), {"path": str(path)}) from exc
+        details = {"path": str(path)}
+        return _parse_play_data(raw, "data_file", details)
+    return {}
+
+
+def _parse_play_data(raw: str, source: str, extra: dict | None = None) -> dict:
+    details = dict(extra or {})
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise BridgeError("invalid_play_data", str(exc), {"source": source, **details}) from exc
+    if not isinstance(value, dict):
+        raise BridgeError("invalid_play_data", "play data must be a JSON object", {"source": source, **details})
+    return value
 
 
 def _with_optional_ensure(ensure_result: dict | None, official_result: dict) -> dict:

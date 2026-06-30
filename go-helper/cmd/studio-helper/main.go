@@ -31,6 +31,7 @@ import (
 const defaultAutoStartPlaceID = ""
 
 const (
+	taskStudioRequestTimeout         = 10 * time.Second
 	taskStudioCommandQueuedTimeout   = 30 * time.Second
 	taskStudioCommandResponseTimeout = 60 * time.Second
 	taskStudioCommandWaitTimeout     = taskStudioCommandQueuedTimeout + taskStudioCommandResponseTimeout + 5*time.Second
@@ -91,9 +92,15 @@ type debugCommandArgs struct {
 	SleepMS    int64  `json:"sleep_ms,omitempty"`
 }
 
+type studioPlayArgs struct {
+	LaunchID int64          `json:"launch_id"`
+	Data     map[string]any `json:"data"`
+}
+
 type studioPlayCommandArgs struct {
-	PlaceID string `json:"place_id"`
-	Mode    string `json:"mode"`
+	PlaceID  string          `json:"place_id"`
+	Mode     string          `json:"mode"`
+	PlayArgs *studioPlayArgs `json:"play_args,omitempty"`
 }
 
 type studioStopCommandArgs struct {
@@ -380,10 +387,11 @@ func (b *mcp2CommandBroker) enqueueDebug(placeID string, kind string, sleepMS in
 	return b.enqueue(mcp2MessageTypeCommand, commandKind, args)
 }
 
-func (b *mcp2CommandBroker) enqueueStudioPlay(placeID string) (mcp2Command, error) {
+func (b *mcp2CommandBroker) enqueueStudioPlay(placeID string, playArgs *studioPlayArgs) (mcp2Command, error) {
 	return b.enqueue(mcp2MessageTypeCommand, mcp2CommandStudioPlay, studioPlayCommandArgs{
-		PlaceID: placeID,
-		Mode:    "start_play",
+		PlaceID:  placeID,
+		Mode:     "start_play",
+		PlayArgs: playArgs,
 	})
 }
 
@@ -972,17 +980,28 @@ func main() {
 			return
 		}
 		broker := commandBrokers.forTask(taskID)
-		command, err := broker.enqueueStudioPlay(status.Contract.PlaceID)
+		var request struct {
+			PlayArgs *studioPlayArgs `json:"play_args"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil && !errors.Is(err, io.EOF) {
+			writeTaskAPIError(w, http.StatusBadRequest, taskID, "bad_request", err.Error(), "fix_request", nil)
+			return
+		}
+		if request.PlayArgs == nil {
+			writeTaskAPIError(w, http.StatusBadRequest, taskID, "missing_play_args", "play_args is required", "fix_request", nil)
+			return
+		}
+		command, err := broker.enqueueStudioPlay(status.Contract.PlaceID, request.PlayArgs)
 		if err != nil {
 			writeTaskAPIError(w, http.StatusConflict, taskID, "mcp2_unavailable", err.Error(), "wait_for_studio_mcp2", nil)
 			return
 		}
-		waitCtx, cancel := context.WithTimeout(r.Context(), taskStudioCommandWaitTimeout)
+		waitCtx, cancel := context.WithTimeout(r.Context(), taskStudioRequestTimeout)
 		defer cancel()
 		terminal, found := broker.waitForTerminal(waitCtx, command.CommandID)
 		if !found {
 			broker.cancelCommandWithReason(command.CommandID, "command_timeout")
-			writeTaskAPIError(w, http.StatusGatewayTimeout, taskID, "command_timeout", "mcp2 command did not complete before timeout", "poll_studio_mode", map[string]any{"command_id": command.CommandID})
+			writeTaskAPIError(w, http.StatusGatewayTimeout, taskID, "play_request_timeout", "mcp2 play request did not complete before timeout", "retry", map[string]any{"command_id": command.CommandID})
 			return
 		}
 		writeTaskStudioCommandTerminal(w, taskID, command, terminal)
@@ -1004,12 +1023,12 @@ func main() {
 			writeTaskAPIError(w, http.StatusConflict, taskID, "mcp2_unavailable", err.Error(), "wait_for_studio_mcp2", nil)
 			return
 		}
-		waitCtx, cancel := context.WithTimeout(r.Context(), taskStudioCommandWaitTimeout)
+		waitCtx, cancel := context.WithTimeout(r.Context(), taskStudioRequestTimeout)
 		defer cancel()
 		terminal, found := broker.waitForTerminal(waitCtx, command.CommandID)
 		if !found {
 			broker.cancelCommandWithReason(command.CommandID, "command_timeout")
-			writeTaskAPIError(w, http.StatusGatewayTimeout, taskID, "command_timeout", "mcp2 command did not complete before timeout", "poll_studio_mode", map[string]any{"command_id": command.CommandID})
+			writeTaskAPIError(w, http.StatusGatewayTimeout, taskID, "stop_request_timeout", "mcp2 stop request did not complete before timeout", "retry", map[string]any{"command_id": command.CommandID})
 			return
 		}
 		writeTaskStudioCommandTerminal(w, taskID, command, terminal)
@@ -1388,7 +1407,10 @@ func main() {
 			})
 			return
 		}
-		command, err := commandBrokers.forDebug().enqueueStudioPlay(placeID)
+		command, err := commandBrokers.forDebug().enqueueStudioPlay(placeID, &studioPlayArgs{
+			LaunchID: time.Now().UnixMilli(),
+			Data:     map[string]any{},
+		})
 		if err != nil {
 			writeJSON(w, http.StatusConflict, map[string]any{
 				"ok":    false,
@@ -2084,7 +2106,21 @@ func writeTaskStudioCommandTerminal(w http.ResponseWriter, taskID string, comman
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	if !terminal.Result.OK {
+		code, message := commandFailureDetails(terminal.Result)
+		extra := map[string]any{
+			"command_id":     command.CommandID,
+			"accepted":       false,
+			"command_result": terminal.Result,
+			"terminal":       terminal,
+		}
+		if requestedLaunchID, ok := requestedLaunchIDFromCommand(command); ok {
+			extra["requested_launch_id"] = requestedLaunchID
+		}
+		writeTaskAPIError(w, http.StatusConflict, taskID, code, message, "retry", extra)
+		return
+	}
+	response := map[string]any{
 		"ok":                  terminal.Result.OK,
 		"task_id":             taskID,
 		"command_id":          command.CommandID,
@@ -2093,7 +2129,11 @@ func writeTaskStudioCommandTerminal(w http.ResponseWriter, taskID string, comman
 		"next_action":         "poll_studio_mode",
 		"command_result":      terminal.Result,
 		"terminal":            terminal,
-	})
+	}
+	if requestedLaunchID, ok := requestedLaunchIDFromCommand(command); ok {
+		response["requested_launch_id"] = requestedLaunchID
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func writeTaskStudioRunCodeTerminal(w http.ResponseWriter, taskID string, command mcp2Command, terminal mcp2CommandTerminal) {
@@ -2148,6 +2188,9 @@ func writeTaskStudioModeTerminal(w http.ResponseWriter, taskID string, command m
 		"terminal":       terminal,
 	}
 	if terminal.Result.Result != nil {
+		if launchID, ok := launchIDFromResultMap(terminal.Result.Result); ok {
+			response["launch_id"] = launchID
+		}
 		if runService, ok := terminal.Result.Result["run_service"]; ok {
 			response["run_service"] = runService
 		} else if runService, ok := terminal.Result.Result["run_service_flags"]; ok {
@@ -2189,6 +2232,78 @@ func parseModeSeq(value string) (int64, error) {
 		return 0, fmt.Errorf("mode_seq must be a positive integer: %s", value)
 	}
 	return parsed, nil
+}
+
+func requestedLaunchIDFromCommand(command mcp2Command) (int64, bool) {
+	switch args := command.Args.(type) {
+	case studioPlayCommandArgs:
+		if args.PlayArgs != nil && args.PlayArgs.LaunchID > 0 {
+			return args.PlayArgs.LaunchID, true
+		}
+	case *studioPlayCommandArgs:
+		if args != nil && args.PlayArgs != nil && args.PlayArgs.LaunchID > 0 {
+			return args.PlayArgs.LaunchID, true
+		}
+	case map[string]any:
+		playArgs, ok := args["play_args"].(map[string]any)
+		if !ok {
+			return 0, false
+		}
+		return launchIDFromAny(playArgs["launch_id"])
+	}
+	return 0, false
+}
+
+func launchIDFromResultMap(result map[string]any) (int64, bool) {
+	if result == nil {
+		return 0, false
+	}
+	return launchIDFromAny(result["launch_id"])
+}
+
+func launchIDFromAny(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case int64:
+		if typed > 0 {
+			return typed, true
+		}
+	case int:
+		if typed > 0 {
+			return int64(typed), true
+		}
+	case float64:
+		if typed > 0 && typed == float64(int64(typed)) {
+			return int64(typed), true
+		}
+	case json.Number:
+		parsed, err := typed.Int64()
+		if err == nil && parsed > 0 {
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
+func commandFailureDetails(result *mcp2ResponseResult) (string, string) {
+	if result == nil {
+		return "helper_command_failed", "mcp2 command failed"
+	}
+	message := strings.TrimSpace(result.Error)
+	if message == "" {
+		message = "mcp2 command failed"
+	}
+	code := "helper_command_failed"
+	if prefix, suffix, ok := strings.Cut(message, ":"); ok {
+		candidate := strings.TrimSpace(prefix)
+		if candidate != "" && !strings.Contains(candidate, " ") {
+			code = candidate
+			message = strings.TrimSpace(suffix)
+			if message == "" {
+				message = strings.TrimSpace(result.Error)
+			}
+		}
+	}
+	return code, message
 }
 
 func resolvePeerManagedStudioProcess(r *http.Request, listenAddr string, studioManager *studio.Manager, logger *slog.Logger) (studio.ManagedProcess, bool) {

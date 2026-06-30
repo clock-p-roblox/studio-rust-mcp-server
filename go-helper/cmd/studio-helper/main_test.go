@@ -31,6 +31,13 @@ func initializeBroker(t *testing.T, broker *mcp2CommandBroker, mode string, mode
 	}
 }
 
+func testPlayArgs() *studioPlayArgs {
+	return &studioPlayArgs{
+		LaunchID: 101,
+		Data:     map[string]any{"kind": "test"},
+	}
+}
+
 func TestRojoForwardTargetHTTPURLPreservesPathAndQuery(t *testing.T) {
 	target, err := rojoForwardTargetHTTPURL("http://127.0.0.1:5000/base", "api/rojo", "cursor=next&limit=1")
 	if err != nil {
@@ -282,7 +289,7 @@ func TestModePayloadAcceptsRunServiceFlagsAlias(t *testing.T) {
 func TestQueuedTimeoutDoesNotCancelDeliveredCommand(t *testing.T) {
 	broker := newMCP2CommandBroker()
 	initializeBroker(t, broker, "edit", 11, 101)
-	command, err := broker.enqueueStudioPlay("111")
+	command, err := broker.enqueueStudioPlay("111", testPlayArgs())
 	if err != nil {
 		t.Fatalf("enqueue command failed: %v", err)
 	}
@@ -307,7 +314,7 @@ func TestQueuedTimeoutDoesNotCancelDeliveredCommand(t *testing.T) {
 func TestResponseTimeoutOnlyCancelsWaitingResponseCommand(t *testing.T) {
 	broker := newMCP2CommandBroker()
 	initializeBroker(t, broker, "edit", 11, 101)
-	command, err := broker.enqueueStudioPlay("111")
+	command, err := broker.enqueueStudioPlay("111", testPlayArgs())
 	if err != nil {
 		t.Fatalf("enqueue command failed: %v", err)
 	}
@@ -339,7 +346,7 @@ func TestTaskBrokerRegistryIsolatesTaskQueues(t *testing.T) {
 
 	initializeBroker(t, taskA, "edit", 11, 101)
 	initializeBroker(t, taskB, "edit", 22, 202)
-	commandA, err := taskA.enqueueStudioPlay("111")
+	commandA, err := taskA.enqueueStudioPlay("111", testPlayArgs())
 	if err != nil {
 		t.Fatalf("enqueue task A failed: %v", err)
 	}
@@ -365,7 +372,7 @@ func TestTaskBrokerCleanupCompletesOnlyThatTask(t *testing.T) {
 
 	initializeBroker(t, taskA, "edit", 11, 101)
 	initializeBroker(t, taskB, "edit", 22, 202)
-	commandA, err := taskA.enqueueStudioPlay("111")
+	commandA, err := taskA.enqueueStudioPlay("111", testPlayArgs())
 	if err != nil {
 		t.Fatalf("enqueue task A failed: %v", err)
 	}
@@ -400,7 +407,7 @@ func TestTaskBrokerStaleCompletesOnlyStaleTask(t *testing.T) {
 	taskA.lastPullAt = &staleAt
 	taskA.mu.Unlock()
 
-	commandA, err := taskA.enqueueStudioPlay("111")
+	commandA, err := taskA.enqueueStudioPlay("111", testPlayArgs())
 	if err != nil {
 		t.Fatalf("enqueue task A failed: %v", err)
 	}
@@ -429,7 +436,7 @@ func TestTaskBrokerStaleCompletesOnlyStaleTask(t *testing.T) {
 func TestModeSeqChangeCompletesPendingAndWaitingCommands(t *testing.T) {
 	broker := newMCP2CommandBroker()
 	initializeBroker(t, broker, "edit", 11, 101)
-	waitingCommand, err := broker.enqueueStudioPlay("111")
+	waitingCommand, err := broker.enqueueStudioPlay("111", testPlayArgs())
 	if err != nil {
 		t.Fatalf("enqueue waiting command failed: %v", err)
 	}
@@ -466,7 +473,7 @@ func TestPlayServerRejectsStaleEditLifecycleUntilStopRequested(t *testing.T) {
 	broker := newMCP2CommandBroker()
 	initializeBroker(t, broker, "edit", 11, 101)
 
-	playCommand, err := broker.enqueueStudioPlay("111")
+	playCommand, err := broker.enqueueStudioPlay("111", testPlayArgs())
 	if err != nil {
 		t.Fatalf("enqueue play failed: %v", err)
 	}
@@ -559,7 +566,7 @@ func TestStopRequestedAllowsEditLifecycleToBecomeActive(t *testing.T) {
 func TestPingDoesNotSwitchLifecycleOrClearQueue(t *testing.T) {
 	broker := newMCP2CommandBroker()
 	initializeBroker(t, broker, "edit", 11, 101)
-	command, err := broker.enqueueStudioPlay("111")
+	command, err := broker.enqueueStudioPlay("111", testPlayArgs())
 	if err != nil {
 		t.Fatalf("enqueue command failed: %v", err)
 	}
@@ -612,7 +619,7 @@ func TestCleanupPreventsLateResponseFromResurrectingCommand(t *testing.T) {
 	registry := newMCP2CommandBrokerRegistry()
 	broker := registry.forTask("task-a")
 	initializeBroker(t, broker, "edit", 11, 101)
-	command, err := broker.enqueueStudioPlay("111")
+	command, err := broker.enqueueStudioPlay("111", testPlayArgs())
 	if err != nil {
 		t.Fatalf("enqueue command failed: %v", err)
 	}
@@ -745,6 +752,10 @@ func TestMCPStudioToolsRejectWithoutTaskBoundStudio(t *testing.T) {
 	result := callMCPTool(t, runtime, "helper2_studio_play", map[string]any{
 		"task_id": "task-a",
 		"mode":    "start_play",
+		"play_args": map[string]any{
+			"launch_id": 101,
+			"data":      map[string]any{"kind": "test"},
+		},
 	})
 	if result["isError"] != true {
 		t.Fatalf("launch without task-bound Studio should be tool error: %+v", result)

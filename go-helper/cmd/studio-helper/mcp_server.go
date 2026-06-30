@@ -183,13 +183,17 @@ func (m *mcpRuntime) runTool(ctx context.Context, name string, args map[string]a
 		if mode != "" && mode != "start_play" {
 			return nil, fmt.Errorf("helper2 MCP play supports start_play only in this phase, got %s", mode)
 		}
-		return m.runStudioCommand(ctx, taskID, mcp2CommandStudioPlay)
+		playArgs, err := requiredPlayArgsArg(args, "play_args")
+		if err != nil {
+			return nil, err
+		}
+		return m.runStudioCommand(ctx, taskID, mcp2CommandStudioPlay, playArgs)
 	case "helper2_studio_stop":
 		mode, _ := optionalStringArg(args, "mode")
 		if mode != "" && mode != "stop" {
 			return nil, fmt.Errorf("helper2 MCP stop supports stop only in this phase, got %s", mode)
 		}
-		return m.runStudioCommand(ctx, taskID, mcp2CommandStudioStop)
+		return m.runStudioCommand(ctx, taskID, mcp2CommandStudioStop, nil)
 	case "helper2_studio_screenshot":
 		return m.runScreenshot(ctx, taskID)
 	case "helper2_studio_run_code":
@@ -371,7 +375,7 @@ func (m *mcpRuntime) runStudioMode(ctx context.Context, taskID string) map[strin
 	return taskStudioModeTerminalPayload(taskID, command, terminal)
 }
 
-func (m *mcpRuntime) runStudioCommand(ctx context.Context, taskID string, kind mcp2CommandKind) (map[string]any, error) {
+func (m *mcpRuntime) runStudioCommand(ctx context.Context, taskID string, kind mcp2CommandKind, playArgs *studioPlayArgs) (map[string]any, error) {
 	status := m.taskSessions.Status(taskID)
 	if !status.OK || status.Contract == nil {
 		return nil, fmt.Errorf("helper2 has no registered session for task_id %s", taskID)
@@ -387,7 +391,7 @@ func (m *mcpRuntime) runStudioCommand(ctx context.Context, taskID string, kind m
 	var err error
 	switch kind {
 	case mcp2CommandStudioPlay:
-		command, err = broker.enqueueStudioPlay(status.Contract.PlaceID)
+		command, err = broker.enqueueStudioPlay(status.Contract.PlaceID, playArgs)
 	case mcp2CommandStudioStop:
 		command, err = broker.enqueueStudioStop(status.Contract.PlaceID)
 	default:
@@ -396,7 +400,11 @@ func (m *mcpRuntime) runStudioCommand(ctx context.Context, taskID string, kind m
 	if err != nil {
 		return nil, err
 	}
-	waitCtx, cancel := context.WithTimeout(ctx, taskStudioCommandWaitTimeout)
+	waitTimeout := taskStudioCommandWaitTimeout
+	if kind == mcp2CommandStudioPlay || kind == mcp2CommandStudioStop {
+		waitTimeout = taskStudioRequestTimeout
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, waitTimeout)
 	defer cancel()
 	terminal, found := broker.waitForTerminal(waitCtx, command.CommandID)
 	if !found {
@@ -509,7 +517,7 @@ func taskStudioCommandTerminalPayload(taskID string, command mcp2Command, termin
 			"terminal":   terminal,
 		}, false
 	}
-	return map[string]any{
+	payload := map[string]any{
 		"ok":                  terminal.Result.OK,
 		"task_id":             taskID,
 		"command_id":          command.CommandID,
@@ -518,7 +526,16 @@ func taskStudioCommandTerminalPayload(taskID string, command mcp2Command, termin
 		"next_action":         "poll_studio_mode",
 		"command_result":      terminal.Result,
 		"terminal":            terminal,
-	}, terminal.Result.OK
+	}
+	if requestedLaunchID, ok := requestedLaunchIDFromCommand(command); ok {
+		payload["requested_launch_id"] = requestedLaunchID
+	}
+	if !terminal.Result.OK {
+		code, message := commandFailureDetails(terminal.Result)
+		payload["code"] = code
+		payload["message"] = message
+	}
+	return payload, terminal.Result.OK
 }
 
 func taskStudioRunCodeTerminalPayload(taskID string, command mcp2Command, terminal mcp2CommandTerminal) (map[string]any, bool) {
@@ -589,6 +606,9 @@ func taskStudioModeTerminalPayload(taskID string, command mcp2Command, terminal 
 		"terminal":       terminal,
 	}
 	if terminal.Result.Result != nil {
+		if launchID, ok := launchIDFromResultMap(terminal.Result.Result); ok {
+			response["launch_id"] = launchID
+		}
 		if runService, ok := terminal.Result.Result["run_service"]; ok {
 			response["run_service"] = runService
 		} else if runService, ok := terminal.Result.Result["run_service_flags"]; ok {
@@ -596,6 +616,30 @@ func taskStudioModeTerminalPayload(taskID string, command mcp2Command, terminal 
 		}
 	}
 	return response
+}
+
+func requiredPlayArgsArg(args map[string]any, key string) (*studioPlayArgs, error) {
+	value, ok := args[key]
+	if !ok || value == nil {
+		return nil, fmt.Errorf("%s is required", key)
+	}
+	raw, ok := value.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("%s must be an object", key)
+	}
+	launchID, ok := launchIDFromAny(raw["launch_id"])
+	if !ok {
+		return nil, fmt.Errorf("%s.launch_id must be a positive integer", key)
+	}
+	dataValue, ok := raw["data"]
+	if !ok || dataValue == nil {
+		return nil, fmt.Errorf("%s.data is required", key)
+	}
+	data, ok := dataValue.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("%s.data must be an object", key)
+	}
+	return &studioPlayArgs{LaunchID: launchID, Data: data}, nil
 }
 
 func writeMCPResponse(w http.ResponseWriter, response mcpJSONRPCResponse) {
@@ -760,7 +804,17 @@ func mcpToolNames() []string {
 func mcpTools() []map[string]any {
 	return []map[string]any{
 		mcpTool("helper2_status", "Read helper2 task status.", map[string]any{"task_id": stringSchema()}),
-		mcpTool("helper2_studio_play", "Request Studio play through the task-bound mcp2 channel.", map[string]any{"task_id": stringSchema()}),
+		mcpTool("helper2_studio_play", "Request Studio play through the task-bound mcp2 channel.", map[string]any{
+			"task_id": stringSchema(),
+			"play_args": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"launch_id": map[string]any{"type": "integer"},
+					"data":      map[string]any{"type": "object"},
+				},
+				"required": []string{"launch_id", "data"},
+			},
+		}),
 		mcpTool("helper2_studio_stop", "Request Studio stop through the task-bound mcp2 channel.", map[string]any{"task_id": stringSchema()}),
 		mcpTool("helper2_studio_mode", "Read Studio mode through the task-bound mcp2 channel.", map[string]any{"task_id": stringSchema()}),
 		mcpTool("helper2_studio_screenshot", "Capture a screenshot from the task-bound Studio process.", map[string]any{"task_id": stringSchema()}),

@@ -22,8 +22,12 @@ from clockp_bridge2.studio import ensure_edit_mode
 
 class FakeHelper(BaseHTTPRequestHandler):
     mode = "edit"
+    mode_seq = 101
+    launch_id: int | None = None
     state = "live"
     available = True
+    play_changes_mode = True
+    play_launch_behavior = "match"
     stop_changes_mode = True
     run_code_ok = True
     official_ok = True
@@ -37,7 +41,16 @@ class FakeHelper(BaseHTTPRequestHandler):
         if self.path.endswith("/status"):
             self._json({"ok": True, "state": type(self).state, "task_id": "task-a"})
         elif self.path.endswith("/studio/mode"):
-            self._json({"ok": True, "available": type(self).available, "mode": type(self).mode, "task_id": "task-a"})
+            payload = {
+                "ok": True,
+                "available": type(self).available,
+                "mode": type(self).mode,
+                "mode_seq": type(self).mode_seq,
+                "task_id": "task-a",
+            }
+            if type(self).launch_id is not None:
+                payload["launch_id"] = type(self).launch_id
+            self._json(payload)
         elif self.path.endswith("/studio/screenshot"):
             self._json({"ok": True, "screenshot": {"path": "shot.png"}})
         elif self.path.startswith("/session/task-a/runtime-log"):
@@ -51,12 +64,33 @@ class FakeHelper(BaseHTTPRequestHandler):
         payload = json.loads(body) if body else {}
         self._record(payload)
         if self.path.endswith("/studio/play"):
-            type(self).mode = "play_server"
-            self._json({"ok": True, "result": {"status": "play_requested"}})
+            requested_launch_id = int(payload["play_args"]["launch_id"])
+            if type(self).play_changes_mode:
+                type(self).mode = "play_server"
+                type(self).mode_seq += 1
+                if type(self).play_launch_behavior == "match":
+                    type(self).launch_id = requested_launch_id
+                elif type(self).play_launch_behavior == "mismatch":
+                    type(self).launch_id = requested_launch_id + 1
+                elif type(self).play_launch_behavior == "missing":
+                    type(self).launch_id = None
+            self._json(
+                {
+                    "ok": True,
+                    "accepted": True,
+                    "requested_launch_id": requested_launch_id,
+                    "command_result": {"result": {"status": "play_requested"}},
+                }
+            )
         elif self.path.endswith("/studio/stop"):
+            if type(self).mode == "edit":
+                self._json({"ok": True, "accepted": True, "command_result": {"result": {"status": "already_stopped"}}})
+                return
             if type(self).stop_changes_mode:
                 type(self).mode = "edit"
-            self._json({"ok": True, "result": {"status": "stop_requested"}})
+                type(self).mode_seq += 1
+                type(self).launch_id = None
+            self._json({"ok": True, "accepted": True, "command_result": {"result": {"status": "stop_requested"}}})
         elif self.path.endswith("/studio/run-code-direct"):
             if type(self).run_code_ok:
                 self._json({"ok": True, "result": {"prints": ["hello"], "code": payload.get("code")}})
@@ -100,8 +134,12 @@ class FakeURLResponse:
 class Bridge2CLITest(unittest.TestCase):
     def setUp(self) -> None:
         FakeHelper.mode = "edit"
+        FakeHelper.mode_seq = 101
+        FakeHelper.launch_id = None
         FakeHelper.state = "live"
         FakeHelper.available = True
+        FakeHelper.play_changes_mode = True
+        FakeHelper.play_launch_behavior = "match"
         FakeHelper.stop_changes_mode = True
         FakeHelper.run_code_ok = True
         FakeHelper.official_ok = True
@@ -218,8 +256,48 @@ class Bridge2CLITest(unittest.TestCase):
         FakeHelper.mode = "play_server"
         FakeHelper.stop_changes_mode = False
         with self.assertRaises(BridgeError) as raised:
-            ensure_edit_mode(load_session(self.workspace), timeout_seconds=0.05, poll_seconds=0.01)
-        self.assertEqual(raised.exception.code, "ensure_edit_timeout")
+            ensure_edit_mode(load_session(self.workspace), stop_timeout_seconds=0.05, poll_seconds=0.01)
+        self.assertEqual(raised.exception.code, "stop_transition_timeout")
+
+    def test_play_with_data_json_verifies_launch_id(self) -> None:
+        code, payload, _stderr = self.run_cli("play", "--data-json", '{"kind":"smoke"}')
+        self.assertEqual(code, 0)
+        details = payload["details"]
+        self.assertEqual(details["accepted"], True)
+        self.assertEqual(details["final_mode"]["mode"], "play_server")
+        self.assertEqual(details["final_mode"]["launch_id"], details["requested_launch_id"])
+        play_requests = [request for request in FakeHelper.requests_seen if request[1].endswith("/studio/play")]
+        self.assertEqual(len(play_requests), 1)
+        sent_payload = play_requests[0][2]
+        self.assertEqual(sent_payload["play_args"]["data"], {"kind": "smoke"})
+
+    def test_play_with_data_file_verifies_launch_id(self) -> None:
+        data_path = Path(self.workspace) / "play-data.json"
+        data_path.write_text('{"map":"arena"}', encoding="utf-8")
+        code, payload, _stderr = self.run_cli("play", "--data-file", str(data_path))
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["details"]["final_mode"]["launch_id"], payload["details"]["requested_launch_id"])
+
+    def test_play_missing_launch_id_fails(self) -> None:
+        FakeHelper.play_launch_behavior = "missing"
+        code, payload, _stderr = self.run_cli("play")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(payload["code"], "launch_id_missing")
+
+    def test_stop_verifies_mode_seq_change(self) -> None:
+        FakeHelper.mode = "play_server"
+        FakeHelper.mode_seq = 120
+        FakeHelper.launch_id = 77
+        code, payload, _stderr = self.run_cli("stop")
+        self.assertEqual(code, 0)
+        details = payload["details"]
+        self.assertEqual(details["final_mode"]["mode"], "edit")
+        self.assertGreater(details["final_mode"]["mode_seq"], details["before_mode"]["mode_seq"])
+
+    def test_stop_already_stopped_is_success(self) -> None:
+        code, payload, _stderr = self.run_cli("stop")
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["details"]["reason"], "already_stopped")
 
     def test_run_code_stops_play_before_direct_call(self) -> None:
         FakeHelper.mode = "play_server"
@@ -258,7 +336,7 @@ class Bridge2CLITest(unittest.TestCase):
                 self.assertEqual(stderr, "")
                 self.assertEqual(payload["ok"], True)
                 paths = [path for _method, path, _payload in FakeHelper.requests_seen]
-                if command != "mode":
+                if command not in ("mode", "play", "stop"):
                     self.assertNotIn("/session/task-a/studio/mode", paths)
 
     def test_official_generate_mesh_ensures_edit_by_default(self) -> None:

@@ -6,6 +6,7 @@ local StudioTestService = game:GetService("StudioTestService")
 local LOG_PREFIX = "[MCP2 Plugin]"
 local RUNTIME_SCRIPT_NAME = "MCP2Runtime"
 local RUNTIME_SCRIPT_MARKER = "clockp_mcp2_runtime_v1"
+local MAX_SAFE_INTEGER = 9007199254740991
 
 local function readRunServiceFlag(reader)
 	local ok, value = pcall(reader)
@@ -60,6 +61,57 @@ end
 local function bumpModeSeq(reason)
 	modeSeq = nextModeSeq()
 	warn(LOG_PREFIX, "mode_seq bumped", "mode=" .. mode, "mode_seq=" .. tostring(modeSeq), "reason=" .. tostring(reason))
+end
+
+local function isPositiveSafeInteger(value)
+	return typeof(value) == "number" and value > 0 and value <= MAX_SAFE_INTEGER and value % 1 == 0
+end
+
+local function isJSONObjectTable(value)
+	if typeof(value) ~= "table" then
+		return false
+	end
+	for key, _ in pairs(value) do
+		if typeof(key) ~= "string" then
+			return false
+		end
+	end
+	return true
+end
+
+local function validatePlayArgs(value)
+	if typeof(value) ~= "table" then
+		return nil, "invalid_play_data: play_args must be a table"
+	end
+	local launchId = value.launch_id
+	if not isPositiveSafeInteger(launchId) then
+		return nil, "invalid_play_data: play_args.launch_id must be a positive safe integer"
+	end
+	local data = value.data
+	if not isJSONObjectTable(data) then
+		return nil, "invalid_play_data: play_args.data must be an object table"
+	end
+	return {
+		launch_id = launchId,
+		data = data,
+	}, nil
+end
+
+local function getCurrentPlayLaunchId()
+	if mode ~= "play_server" then
+		return nil
+	end
+	local ok, testArgs = pcall(function()
+		return StudioTestService:GetTestArgs()
+	end)
+	if not ok or typeof(testArgs) ~= "table" then
+		return nil
+	end
+	local launchId = testArgs.launch_id
+	if isPositiveSafeInteger(launchId) then
+		return launchId
+	end
+	return nil
 end
 
 print(LOG_PREFIX, "mode=" .. mode)
@@ -336,7 +388,7 @@ local function processCommand(command)
 		}, nil
 	end
 	if kind == "studio_mode_query" then
-		return true, {
+		local result = {
 			kind = kind,
 			available = true,
 			mode = mode,
@@ -349,7 +401,12 @@ local function processCommand(command)
 				IsRunMode = isRunMode,
 				IsStudio = isStudio,
 			},
-		}, nil
+		}
+		local launchId = getCurrentPlayLaunchId()
+		if launchId ~= nil then
+			result.launch_id = launchId
+		end
+		return true, result, nil
 	end
 	if kind == "studio_run_code" then
 		local args = command.args
@@ -369,6 +426,10 @@ local function processCommand(command)
 		if requestedMode ~= "start_play" then
 			return false, nil, "studio_play only supports start_play; requested mode=" .. tostring(requestedMode)
 		end
+		local playArgs, playArgsError = validatePlayArgs(if typeof(args) == "table" then args.play_args else nil)
+		if playArgs == nil then
+			return false, nil, playArgsError
+		end
 
 		local runtimeOk, runtimeErr = pcall(installPlayServerRuntimeScript)
 		if not runtimeOk then
@@ -379,6 +440,7 @@ local function processCommand(command)
 			kind = kind,
 			mode = requestedMode,
 			status = "play_requested",
+			launch_id = playArgs.launch_id,
 		}, nil
 	end
 	if kind == "studio_stop" then
@@ -495,15 +557,15 @@ local function postResponseResultBounded(commandId, ok, result, errorMessage, ti
 	end
 
 	if not finished then
-		warn(LOG_PREFIX, "command result delivery timed out; Studio transition will still be requested", "command_id=" .. tostring(commandId))
+		warn(LOG_PREFIX, "command result delivery timed out", "command_id=" .. tostring(commandId))
 		return false, false, "timeout"
 	end
 	if delivered and recorded then
 		print(LOG_PREFIX, "command result recorded", "command_id=" .. tostring(commandId))
 	elseif delivered then
-		warn(LOG_PREFIX, "command result delivery was accepted but not recorded; Studio transition will still be requested", "command_id=" .. tostring(commandId), "reason=" .. detail)
+		warn(LOG_PREFIX, "command result delivery was accepted but not recorded", "command_id=" .. tostring(commandId), "reason=" .. detail)
 	else
-		warn(LOG_PREFIX, "command result delivery failed; Studio transition will still be requested", "command_id=" .. tostring(commandId), "reason=" .. detail)
+		warn(LOG_PREFIX, "command result delivery failed", "command_id=" .. tostring(commandId), "reason=" .. detail)
 	end
 
 	return delivered, recorded, detail
@@ -514,8 +576,10 @@ local function executeStudioTransitionAfterAck(command, result)
 	local status = if typeof(result) == "table" then tostring(result.status or "") else ""
 	if kind == "studio_play" and status == "play_requested" then
 		print(LOG_PREFIX, "executing studio_play", "command_id=" .. tostring(command.command_id))
+		local args = command.args
+		local playArgs = if typeof(args) == "table" then args.play_args else nil
 		local ok, err = pcall(function()
-			StudioTestService:ExecutePlayModeAsync({})
+			StudioTestService:ExecutePlayModeAsync(playArgs)
 		end)
 		if not ok then
 			bumpModeSeq("studio_play failed after pre-action ack: " .. tostring(err))
@@ -592,8 +656,15 @@ task.spawn(function()
 			resultRecorded = postResponseResultUntilRecorded(commandId, ok, result, errorMessage)
 		end
 		stopHeartbeat()
-		if shouldRequestStudioTransition then
+		if shouldRequestStudioTransition and resultRecorded then
 			executeStudioTransitionAfterAck(command, result)
+		elseif shouldRequestStudioTransition then
+			warn(
+				LOG_PREFIX,
+				"studio transition skipped because response_result was not recorded",
+				"command_id=" .. tostring(commandId),
+				"kind=" .. tostring(command.kind)
+			)
 		end
 		if command.kind == "debug_stop_loop" then
 			print(LOG_PREFIX, "debug_stop_loop acknowledged; stopping command loop")
