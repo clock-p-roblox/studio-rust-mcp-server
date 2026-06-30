@@ -38,7 +38,7 @@ def play(
             f"unexpected play response status: {accepted_status or 'unknown'}",
             {"play_response": play_response},
         )
-    requested_launch_id = int(play_response.get("requested_launch_id") or requested_launch_id)
+    _require_requested_launch_id_echo(play_response, requested_launch_id)
     started_at = time.monotonic()
     last_mode = before_mode
     deadline = started_at + transition_timeout_seconds
@@ -312,6 +312,20 @@ def _launch_id_value(payload: dict) -> int | None:
     if isinstance(value, float) and value > 0 and value.is_integer():
         return int(value)
     return None
+
+
+def _require_requested_launch_id_echo(payload: dict, expected_launch_id: int) -> None:
+    value = payload.get("requested_launch_id")
+    if value != expected_launch_id:
+        raise BridgeError(
+            "requested_launch_id_mismatch",
+            "helper2 play response did not echo the requested launch_id",
+            {
+                "expected_launch_id": expected_launch_id,
+                "observed_launch_id": value,
+                "play_response": payload,
+            },
+        )
 
 
 def _generate_launch_id() -> int:
