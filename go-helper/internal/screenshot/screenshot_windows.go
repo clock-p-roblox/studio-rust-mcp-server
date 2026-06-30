@@ -209,14 +209,14 @@ func selectViewportWindow(studioWindow windowCandidate, candidates []childWindow
 	fullWidthThreshold := maxInt(studioWindow.width-200, 1)
 	fullHeightThreshold := maxInt(studioWindow.height-200, 1)
 	centeredCandidates := make([]childWindowCandidate, 0)
-	legacyCandidates := make([]childWindowCandidate, 0)
+	compactCandidates := make([]childWindowCandidate, 0)
 	generalCandidates := make([]childWindowCandidate, 0)
 	for _, candidate := range candidates {
 		if candidate.width <= 1000 || candidate.height <= 500 {
 			continue
 		}
 		if candidate.width < 1660 && candidate.height < 680 {
-			legacyCandidates = append(legacyCandidates, candidate)
+			compactCandidates = append(compactCandidates, candidate)
 		}
 		if candidate.width < fullWidthThreshold && candidate.height < fullHeightThreshold {
 			generalCandidates = append(generalCandidates, candidate)
@@ -228,8 +228,8 @@ func selectViewportWindow(studioWindow windowCandidate, candidates []childWindow
 	if len(centeredCandidates) > 0 {
 		return largestChildWindow(centeredCandidates)
 	}
-	if len(legacyCandidates) > 0 {
-		return largestChildWindow(legacyCandidates)
+	if len(compactCandidates) > 0 {
+		return largestChildWindow(compactCandidates)
 	}
 	if len(generalCandidates) > 0 {
 		return largestChildWindow(generalCandidates)

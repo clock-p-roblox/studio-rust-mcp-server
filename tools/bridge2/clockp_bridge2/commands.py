@@ -158,17 +158,14 @@ def _build_parser() -> JSONArgumentParser:
     code_sync_live_parser = subparsers.add_parser("code-sync-live-manifest", add_help=False)
     code_sync_live_parser.add_argument("--config", default="code-sync.roots.json")
     code_sync_live_parser.add_argument("--code-sync-project", default="default.project.json")
-    code_sync_live_parser.add_argument("--legacy-run-code", action="store_true")
 
     code_sync_dry_run_parser = subparsers.add_parser("code-sync-dry-run", add_help=False)
     code_sync_dry_run_parser.add_argument("--config", default="code-sync.roots.json")
     code_sync_dry_run_parser.add_argument("--code-sync-project", default="default.project.json")
-    code_sync_dry_run_parser.add_argument("--legacy-run-code", action="store_true")
 
     code_sync_apply_parser = subparsers.add_parser("code-sync-apply", add_help=False)
     code_sync_apply_parser.add_argument("--config", default="code-sync.roots.json")
     code_sync_apply_parser.add_argument("--code-sync-project", default="default.project.json")
-    code_sync_apply_parser.add_argument("--legacy-run-code", action="store_true")
 
     return parser
 
@@ -181,15 +178,15 @@ def _run_command(args: argparse.Namespace) -> dict:
     session = load_session(args.workspace)
     if command == "code-sync-live-manifest":
         workspace = Path(args.workspace)
-        return query_live_manifest(session, workspace, workspace / args.config, workspace / args.code_sync_project, legacy_run_code=args.legacy_run_code)
+        return query_live_manifest(session, workspace, workspace / args.config, workspace / args.code_sync_project)
     if command == "code-sync-dry-run":
         workspace = Path(args.workspace)
         local_manifest = build_local_manifest(workspace, workspace / args.config, workspace / args.code_sync_project)
-        live_manifest = query_live_manifest(session, workspace, workspace / args.config, workspace / args.code_sync_project, legacy_run_code=args.legacy_run_code)
+        live_manifest = query_live_manifest(session, workspace, workspace / args.config, workspace / args.code_sync_project)
         return {"local": local_manifest, "live": live_manifest, "diff": diff_manifests(local_manifest, live_manifest)}
     if command == "code-sync-apply":
         workspace = Path(args.workspace)
-        return apply_code_sync(session, workspace, workspace / args.config, workspace / args.code_sync_project, legacy_run_code=args.legacy_run_code)
+        return apply_code_sync(session, workspace, workspace / args.config, workspace / args.code_sync_project)
     if command == "status":
         return _checked_helper_result(command, status(session))
     if command == "mode":

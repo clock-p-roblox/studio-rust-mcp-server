@@ -470,12 +470,12 @@ func TestStudioCommandTerminalReasonForSupersededPlayAndStop(t *testing.T) {
 		t.Fatalf("stop terminal message = %q", stopMessage)
 	}
 
-	fallbackCode, fallbackMessage, fallbackAction := studioCommandTerminalReason(mcp2Command{Kind: mcp2CommandStudioPlay}, "command_timeout")
-	if fallbackCode != "command_timeout" || fallbackAction != "retry" {
-		t.Fatalf("fallback terminal reason = (%q, %q, %q)", fallbackCode, fallbackMessage, fallbackAction)
+	defaultCode, defaultMessage, defaultAction := studioCommandTerminalReason(mcp2Command{Kind: mcp2CommandStudioPlay}, "command_timeout")
+	if defaultCode != "command_timeout" || defaultAction != "retry" {
+		t.Fatalf("default terminal reason = (%q, %q, %q)", defaultCode, defaultMessage, defaultAction)
 	}
-	if fallbackMessage != "mcp2 command ended before a response was received" {
-		t.Fatalf("fallback terminal message = %q", fallbackMessage)
+	if defaultMessage != "mcp2 command ended before a response was received" {
+		t.Fatalf("default terminal message = %q", defaultMessage)
 	}
 }
 
@@ -744,7 +744,7 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 		t.Fatalf("tools/list missing helper2 official tools: %+v", tools)
 	}
 	if mcpToolListContains(tools, "launch_studio_session") || mcpToolListContains(tools, "start_stop_play") || mcpToolListContains(tools, "take_screenshot") {
-		t.Fatalf("tools/list should not expose legacy helper tool aliases: %+v", tools)
+		t.Fatalf("tools/list should expose only helper2 tool names: %+v", tools)
 	}
 	runCodeTool := mcpToolByName(tools, "helper2_studio_run_code")
 	inputSchema, ok := runCodeTool["inputSchema"].(map[string]any)
@@ -880,7 +880,7 @@ func TestRunCodeTerminalPayloadTreatsCodeFailureAsFailure(t *testing.T) {
 	}
 }
 
-func TestMCPLegacyToolAliasesAreNotAccepted(t *testing.T) {
+func TestMCPUnsupportedToolAliasesAreNotAccepted(t *testing.T) {
 	runtime := newTestMCPRuntime(t)
 	registerTestTask(t, runtime, "task-a", "123")
 
@@ -890,7 +890,7 @@ func TestMCPLegacyToolAliasesAreNotAccepted(t *testing.T) {
 		"mode":               "start_play",
 	})
 	if result["isError"] != true {
-		t.Fatalf("legacy alias should be rejected: %+v", result)
+		t.Fatalf("unsupported alias should be rejected: %+v", result)
 	}
 	text := toolText(t, result)
 	if !strings.Contains(text, "unknown helper2 MCP tool") {

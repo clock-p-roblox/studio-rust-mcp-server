@@ -134,7 +134,7 @@ func TestPublicExposureStartsEmbeddedForwardWithSystemToken(t *testing.T) {
 		t.Fatalf("bearer token = %q", got.RegisterBearerToken)
 	}
 	if got.RegisterIP != "" || got.RegisterXToken != "" {
-		t.Fatalf("unexpected legacy passthrough fields: %+v", got)
+		t.Fatalf("unexpected removed passthrough fields: %+v", got)
 	}
 }
 

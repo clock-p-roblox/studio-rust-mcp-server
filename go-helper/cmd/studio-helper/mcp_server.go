@@ -114,7 +114,7 @@ func (m *mcpRuntime) handleMCP(w http.ResponseWriter, r *http.Request) {
 				},
 				"serverInfo": map[string]any{
 					"name":    "studio-helper2",
-					"version": "helper2-hubless",
+					"version": "helper2-agent",
 				},
 			},
 		})

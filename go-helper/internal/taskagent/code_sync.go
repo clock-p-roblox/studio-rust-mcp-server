@@ -111,10 +111,10 @@ func NewTaskSessionToken() (string, error) {
 	return hex.EncodeToString(raw[:]), nil
 }
 
-func normalizeWorkspacePath(workspace string, value string, fallback string) (string, string) {
+func normalizeWorkspacePath(workspace string, value string, defaultValue string) (string, string) {
 	trimmed := strings.TrimSpace(value)
 	if trimmed == "" {
-		trimmed = fallback
+		trimmed = defaultValue
 	}
 	cleaned := filepath.Clean(trimmed)
 	if filepath.IsAbs(cleaned) {
@@ -202,9 +202,9 @@ func escapesWorkspace(path string) bool {
 	return regexp.MustCompile(`^[A-Za-z]:(/|$)`).MatchString(path)
 }
 
-func normalizePatterns(values []string, fallback []string) []string {
+func normalizePatterns(values []string, defaultValues []string) []string {
 	if values == nil {
-		values = fallback
+		values = defaultValues
 	}
 	result := make([]string, 0, len(values))
 	for _, value := range values {
