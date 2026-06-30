@@ -29,6 +29,9 @@ class FakeHelper(BaseHTTPRequestHandler):
     play_changes_mode = True
     play_launch_behavior = "match"
     stop_changes_mode = True
+    mode_query_count = 0
+    mode_unavailable_on_query_number: int | None = None
+    mode_unavailable_reason: str | None = None
     run_code_ok = True
     official_ok = True
     requests_seen: list[tuple[str, str, dict | None]] = []
@@ -41,6 +44,14 @@ class FakeHelper(BaseHTTPRequestHandler):
         if self.path.endswith("/status"):
             self._json({"ok": True, "state": type(self).state, "task_id": "task-a"})
         elif self.path.endswith("/studio/mode"):
+            type(self).mode_query_count += 1
+            if (
+                type(self).mode_unavailable_on_query_number is not None
+                and type(self).mode_query_count == type(self).mode_unavailable_on_query_number
+            ):
+                reason = type(self).mode_unavailable_reason or "mode_seq_changed"
+                self._json({"ok": True, "available": False, "mode": "unknown", "reason": reason, "task_id": "task-a"})
+                return
             payload = {
                 "ok": True,
                 "available": type(self).available,
@@ -141,6 +152,9 @@ class Bridge2CLITest(unittest.TestCase):
         FakeHelper.play_changes_mode = True
         FakeHelper.play_launch_behavior = "match"
         FakeHelper.stop_changes_mode = True
+        FakeHelper.mode_query_count = 0
+        FakeHelper.mode_unavailable_on_query_number = None
+        FakeHelper.mode_unavailable_reason = None
         FakeHelper.run_code_ok = True
         FakeHelper.official_ok = True
         FakeHelper.requests_seen = []
@@ -283,6 +297,13 @@ class Bridge2CLITest(unittest.TestCase):
         code, payload, _stderr = self.run_cli("play")
         self.assertNotEqual(code, 0)
         self.assertEqual(payload["code"], "launch_id_missing")
+
+    def test_play_tolerates_transient_mode_seq_changed_unavailable(self) -> None:
+        FakeHelper.mode_unavailable_on_query_number = 2
+        FakeHelper.mode_unavailable_reason = "mode_seq_changed"
+        code, payload, _stderr = self.run_cli("play")
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["details"]["final_mode"]["launch_id"], payload["details"]["requested_launch_id"])
 
     def test_stop_verifies_mode_seq_change(self) -> None:
         FakeHelper.mode = "play_server"

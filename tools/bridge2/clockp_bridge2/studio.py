@@ -43,7 +43,22 @@ def play(
     last_mode = before_mode
     deadline = started_at + transition_timeout_seconds
     while True:
-        last_mode = _require_live_mode(mode(session), "play")
+        polled_mode = mode(session)
+        if _is_transient_mode_unavailable(polled_mode):
+            if time.monotonic() >= deadline:
+                raise BridgeError(
+                    "play_transition_timeout",
+                    "timed out waiting for Studio play mode with matching launch_id",
+                    {
+                        "before_mode": before_mode,
+                        "last_mode": polled_mode,
+                        "play_response": play_response,
+                        "requested_launch_id": requested_launch_id,
+                    },
+                )
+            time.sleep(poll_seconds)
+            continue
+        last_mode = _require_live_mode(polled_mode, "play")
         current_mode_seq = _require_mode_seq(last_mode, "play")
         current_mode = _mode_value(last_mode)
         if current_mode == "play_server" and current_mode_seq != before_mode_seq:
@@ -125,7 +140,17 @@ def stop(session: Session, transition_timeout_seconds: float = 20.0, poll_second
     last_mode = before_mode
     deadline = started_at + transition_timeout_seconds
     while True:
-        last_mode = _require_live_mode(mode(session), "stop")
+        polled_mode = mode(session)
+        if _is_transient_mode_unavailable(polled_mode):
+            if time.monotonic() >= deadline:
+                raise BridgeError(
+                    "stop_transition_timeout",
+                    "timed out waiting for Studio edit mode after stop request",
+                    {"before_mode": before_mode, "last_mode": polled_mode, "stop_response": stop_response},
+                )
+            time.sleep(poll_seconds)
+            continue
+        last_mode = _require_live_mode(polled_mode, "stop")
         current_mode_seq = _require_mode_seq(last_mode, "stop")
         current_mode = _mode_value(last_mode)
         if current_mode == "edit" and current_mode_seq != before_mode_seq:
@@ -219,6 +244,13 @@ def _require_live_mode(payload: dict, command: str) -> dict:
     if payload.get("available") is False:
         raise BridgeError(f"{command}_mode_unavailable", f"{command} requires a live Studio mode query", {"mode": payload})
     return payload
+
+
+def _is_transient_mode_unavailable(payload: dict) -> bool:
+    if payload.get("ok") is not True or payload.get("available") is not False:
+        return False
+    reason = str(payload.get("reason") or "")
+    return reason in {"mode_seq_changed", "mode_query_timeout"}
 
 
 def _require_mode_seq(payload: dict, command: str) -> int:
