@@ -118,6 +118,8 @@ rojo build default.project.json --plugin MCP2Plugin.rbxm
   --code-sync-project default.project.json
 ```
 
+public `task-agent` 访问公网 helper 时会读取 workspace 或本机身份目录里的 `feishu-token`，并注入 Bearer 鉴权。
+
 helper2 自身的 HTTP handler 不做 Bearer 鉴权；但当 `bridge2` 通过公网 `helper.base_url` 访问时，外层 `dev.clock-p.com` 入口仍要求 `Authorization: Bearer <feishu-token>`。`bridge2` 会自动从 workspace 或身份目录读取 `feishu-token` 注入。
 
 

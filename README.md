@@ -123,6 +123,7 @@ rojo build default.project.json --plugin MCP2Plugin.rbxm
   --code-sync-project default.project.json
 ```
 
+public `task-agent` 访问公网 helper 时会读取 workspace 或本机身份目录里的 `feishu-token`，并注入 Bearer 鉴权。
 
 ## session.json
 

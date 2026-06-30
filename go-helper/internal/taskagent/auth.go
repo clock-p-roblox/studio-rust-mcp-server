@@ -3,13 +3,46 @@ package taskagent
 import (
 	"errors"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 )
 
-func newHelperHTTPClient(_ string, _ string) (*http.Client, error) {
-	return &http.Client{Timeout: heartbeatHTTPTimeout}, nil
+type bearerTransport struct {
+	token string
+	base  http.RoundTripper
+}
+
+func (transport bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	base := transport.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	next := req.Clone(req.Context())
+	next.Header.Set("Authorization", "Bearer "+transport.token)
+	return base.RoundTrip(next)
+}
+
+func newHelperHTTPClient(helperBaseURL string, workspace string) (*http.Client, error) {
+	client := &http.Client{Timeout: heartbeatHTTPTimeout}
+	if helperBaseURLRequiresBearer(helperBaseURL) {
+		token, err := ResolveClockbridgeRegisterToken(workspace)
+		if err != nil {
+			return nil, err
+		}
+		client.Transport = bearerTransport{token: token}
+	}
+	return client, nil
+}
+
+func helperBaseURLRequiresBearer(helperBaseURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(helperBaseURL))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	return parsed.Scheme == "https" && strings.HasPrefix(host, "roblox-helper-") && strings.HasSuffix(host, ".dev.clock-p.com")
 }
 
 func ResolveClockbridgeRegisterToken(workspace string) (string, error) {
