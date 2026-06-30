@@ -335,7 +335,7 @@ py -3 -m unittest discover tools\bridge2 -p "test*.py"
 
 ```powershell
 cd <mcp_repo>
-py -3 util\helper2_task_session_gate_test.py
+py -3 util\helper2_task_session_gate_test.py --place-id <place_id>
 ```
 
 公网矩阵必须覆盖：

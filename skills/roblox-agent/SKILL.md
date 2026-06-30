@@ -193,5 +193,5 @@ go test -count=1 ./...
 
 ```powershell
 cd <mcp_repo>
-py -3 util\helper2_task_session_gate_test.py
+py -3 util\helper2_task_session_gate_test.py --place-id <place_id>
 ```

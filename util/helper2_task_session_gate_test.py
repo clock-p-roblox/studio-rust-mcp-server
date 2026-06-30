@@ -18,7 +18,6 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 GO_HELPER = ROOT / "go-helper"
 MACHINE_NAME = "task-session-win"
-PLACE_ID = "134795435066737"
 
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 PROCESS_TERMINATE = 0x0001
@@ -170,7 +169,7 @@ def task_token(task_id: str) -> str:
     return f"token-{task_id}"
 
 
-def code_sync_binding(task_id: str, *, place_id: str = PLACE_ID, config_hash: str | None = None) -> dict[str, Any]:
+def code_sync_binding(task_id: str, *, place_id: str, config_hash: str | None = None) -> dict[str, Any]:
     return {
         "protocol_version": 1,
         "workspace_id": f"workspace-{task_id}",
@@ -195,7 +194,7 @@ def heartbeat(
     *,
     pid: int,
     started_at: int,
-    place_id: str = PLACE_ID,
+    place_id: str,
     config_hash: str | None = None,
     expected: int = 200,
 ) -> dict[str, Any]:
@@ -252,17 +251,21 @@ def run_task_session_gate(args: argparse.Namespace) -> dict[str, Any]:
     bin_dir.mkdir(parents=True)
     helper_bin = bin_dir / "studio-helper.exe"
     helpers: list[subprocess.Popen[str]] = []
+
+    def beat(base_url: str, task_id: str, *, pid: int, started_at: int, config_hash: str | None = None, expected: int = 200) -> dict[str, Any]:
+        return heartbeat(base_url, task_id, pid=pid, started_at=started_at, place_id=args.place_id, config_hash=config_hash, expected=expected)
+
     try:
         run_command(["go", "build", "-o", str(helper_bin), r".\cmd\studio-helper"], cwd=GO_HELPER, timeout=120)
 
         helper1, base1, log1 = start_helper(helper_bin, run_root, "helper1", check_interval=args.check_interval)
         helpers.append(helper1)
 
-        hb_a = heartbeat(base1, "task-a", pid=40101, started_at=1700000001001)
+        hb_a = beat(base1, "task-a", pid=40101, started_at=1700000001001)
         require(hb_a.get("state") == "live", f"task A heartbeat failed: {hb_a}")
-        hb_b = heartbeat(base1, "task-b", pid=40102, started_at=1700000001002)
+        hb_b = beat(base1, "task-b", pid=40102, started_at=1700000001002)
         require(hb_b.get("state") == "live", f"task B heartbeat failed: {hb_b}")
-        hb_a_again = heartbeat(base1, "task-a", pid=40101, started_at=1700000001001)
+        hb_a_again = beat(base1, "task-a", pid=40101, started_at=1700000001001)
         require(hb_a_again.get("state") == "live", f"task A idempotent heartbeat failed: {hb_a_again}")
 
         status_missing_token = http_json("GET", f"{base1}/session/task-a/status", expected=401)
@@ -280,7 +283,7 @@ def run_task_session_gate(args: argparse.Namespace) -> dict[str, Any]:
         require("task_session_token" not in contract_a, f"status leaked task token: {status_a}")
         require((contract_a.get("code_sync") or {}).get("roots_authority_hash") == "roots-task-a", f"task A code_sync missing: {status_a}")
 
-        mismatch = heartbeat(base1, "task-a", pid=40101, started_at=1700000001001, config_hash="changed-config", expected=409)
+        mismatch = beat(base1, "task-a", pid=40101, started_at=1700000001001, config_hash="changed-config", expected=409)
         require(mismatch.get("code") == "immutable_mismatch", f"code_sync mutation was not rejected: {mismatch}")
 
         released_b = release(base1, "task-b", pid=40102, started_at=1700000001002)
@@ -288,17 +291,17 @@ def run_task_session_gate(args: argparse.Namespace) -> dict[str, Any]:
         ended_b = status(base1, "task-b")
         require(ended_b.get("state") == "ended", f"task B status is not ended: {ended_b}")
         require(desired_owner_ids(ended_b) == [], f"task B desired survived release: {ended_b}")
-        post_release_hb = heartbeat(base1, "task-b", pid=40102, started_at=1700000001002, expected=409)
+        post_release_hb = beat(base1, "task-b", pid=40102, started_at=1700000001002, expected=409)
         require(post_release_hb.get("code") == "task_ended", f"task B heartbeat after release was not rejected: {post_release_hb}")
         status_a_after_b = status(base1, "task-a")
         require(status_a_after_b.get("state") == "live", f"task A changed after task B release: {status_a_after_b}")
         require(desired_owner_ids(status_a_after_b) == ["task-a"], f"task A desired mutated by task B release: {status_a_after_b}")
 
-        heartbeat(base1, "task-c", pid=40103, started_at=1700000001003)
-        wait_for_task_c_expiry_while_refreshing_a(base1, args.expiry_timeout)
+        beat(base1, "task-c", pid=40103, started_at=1700000001003)
+        wait_for_task_c_expiry_while_refreshing_a(base1, args.expiry_timeout, args.place_id)
         expired_c = status(base1, "task-c")
         require(desired_owner_ids(expired_c) == [], f"task C desired survived expiry: {expired_c}")
-        recovered_c = heartbeat(base1, "task-c", pid=40103, started_at=1700000001003)
+        recovered_c = beat(base1, "task-c", pid=40103, started_at=1700000001003)
         require(recovered_c.get("state") == "live", f"task C did not recover after expiry: {recovered_c}")
         status_c = status(base1, "task-c")
         require(desired_owner_ids(status_c) == ["task-c"], f"task C desired was not restored: {status_c}")
@@ -311,7 +314,7 @@ def run_task_session_gate(args: argparse.Namespace) -> dict[str, Any]:
         helper2, base2, log2 = start_helper(helper_bin, run_root, "helper2", check_interval=args.check_interval)
         helpers.append(helper2)
         status(base2, "task-a", expected=404)
-        heartbeat(base2, "task-a", pid=40101, started_at=1700000001001)
+        beat(base2, "task-a", pid=40101, started_at=1700000001001)
         restored_a = status(base2, "task-a")
         require(restored_a.get("state") == "live", f"task A did not restore after helper restart: {restored_a}")
         require(desired_owner_ids(restored_a) == ["task-a"], f"helper restart restored unexpected desired state: {restored_a}")
@@ -332,13 +335,13 @@ def run_task_session_gate(args: argparse.Namespace) -> dict[str, Any]:
             stop_helper(helper)
 
 
-def wait_for_task_c_expiry_while_refreshing_a(base_url: str, timeout: float) -> None:
+def wait_for_task_c_expiry_while_refreshing_a(base_url: str, timeout: float, place_id: str) -> None:
     deadline = time.monotonic() + timeout
     next_a_heartbeat = 0.0
     while time.monotonic() < deadline:
         now = time.monotonic()
         if now >= next_a_heartbeat:
-            heartbeat(base_url, "task-a", pid=40101, started_at=1700000001001)
+            heartbeat(base_url, "task-a", pid=40101, started_at=1700000001001, place_id=place_id)
             next_a_heartbeat = now + 5.0
         payload = status(base_url, "task-c")
         if payload.get("state") == "expired":
@@ -349,6 +352,7 @@ def wait_for_task_c_expiry_while_refreshing_a(base_url: str, timeout: float) -> 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run helper2 code-sync task-session gate.")
+    parser.add_argument("--place-id", required=True, help="Roblox place id supplied by the tester")
     parser.add_argument("--check-interval", default="250ms")
     parser.add_argument("--expiry-timeout", type=float, default=40.0)
     args = parser.parse_args()
