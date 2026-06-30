@@ -53,12 +53,14 @@ const (
 type mcp2CommandKind string
 
 const (
-	mcp2CommandDebugEcho     mcp2CommandKind = "debug_echo"
-	mcp2CommandDebugStopLoop mcp2CommandKind = "debug_stop_loop"
-	mcp2CommandStudioPlay    mcp2CommandKind = "studio_play"
-	mcp2CommandStudioStop    mcp2CommandKind = "studio_stop"
-	mcp2CommandStudioMode    mcp2CommandKind = "studio_mode_query"
-	mcp2CommandStudioRunCode mcp2CommandKind = "studio_run_code"
+	mcp2CommandDebugEcho           mcp2CommandKind = "debug_echo"
+	mcp2CommandDebugStopLoop       mcp2CommandKind = "debug_stop_loop"
+	mcp2CommandStudioPlay          mcp2CommandKind = "studio_play"
+	mcp2CommandStudioStop          mcp2CommandKind = "studio_stop"
+	mcp2CommandStudioMode          mcp2CommandKind = "studio_mode_query"
+	mcp2CommandStudioRunCode       mcp2CommandKind = "studio_run_code"
+	mcp2CommandCodeSyncGetManifest mcp2CommandKind = "code_sync_get_manifest"
+	mcp2CommandCodeSyncApply       mcp2CommandKind = "code_sync_apply"
 )
 
 type mcp2Command struct {
@@ -114,6 +116,22 @@ type studioModeCommandArgs struct {
 type studioRunCodeCommandArgs struct {
 	PlaceID string `json:"place_id"`
 	Code    string `json:"code"`
+}
+
+type codeSyncGetManifestCommandArgs struct {
+	PlaceID         string           `json:"place_id"`
+	ProtocolVersion int              `json:"protocol_version"`
+	ProjectID       string           `json:"project_id"`
+	MappingProfile  string           `json:"mapping_profile"`
+	Roots           []map[string]any `json:"roots"`
+}
+
+type codeSyncApplyCommandArgs struct {
+	PlaceID         string           `json:"place_id"`
+	ProtocolVersion int              `json:"protocol_version"`
+	ProjectID       string           `json:"project_id"`
+	MappingProfile  string           `json:"mapping_profile"`
+	Roots           []map[string]any `json:"roots"`
 }
 
 type mcp2ChannelSummary struct {
@@ -417,6 +435,26 @@ func (b *mcp2CommandBroker) enqueueStudioRunCode(placeID string, code string) (m
 		PlaceID: placeID,
 		Code:    code,
 	})
+}
+
+func (b *mcp2CommandBroker) enqueueCodeSyncGetManifest(placeID string, request codeSyncGetManifestCommandArgs) (mcp2Command, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.activeMode != "edit" {
+		return mcp2Command{}, fmt.Errorf("code_sync_get_manifest requires edit mode; current mode=%s", b.activeMode)
+	}
+	request.PlaceID = placeID
+	return b.enqueueLocked(mcp2MessageTypeCommand, mcp2CommandCodeSyncGetManifest, request)
+}
+
+func (b *mcp2CommandBroker) enqueueCodeSyncApply(placeID string, request codeSyncApplyCommandArgs) (mcp2Command, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.activeMode != "edit" {
+		return mcp2Command{}, fmt.Errorf("code_sync_apply requires edit mode; current mode=%s", b.activeMode)
+	}
+	request.PlaceID = placeID
+	return b.enqueueLocked(mcp2MessageTypeCommand, mcp2CommandCodeSyncApply, request)
 }
 
 func (b *mcp2CommandBroker) enqueue(commandType mcp2MessageType, commandKind mcp2CommandKind, args any) (mcp2Command, error) {
@@ -1122,6 +1160,102 @@ func main() {
 			return
 		}
 		writeTaskStudioRunCodeTerminal(w, taskID, command, terminal)
+	})
+	mux.HandleFunc("POST /session/{task_id}/code-sync/get-manifest", func(w http.ResponseWriter, r *http.Request) {
+		taskID := r.PathValue("task_id")
+		status := taskSessions.Status(taskID)
+		if !status.OK || status.Contract == nil {
+			writeJSON(w, http.StatusNotFound, status)
+			return
+		}
+		if status.State != "live" {
+			writeTaskAPIError(w, http.StatusConflict, taskID, "task_not_live", "task session is not live", "restart_task_agent", map[string]any{"state": status.State})
+			return
+		}
+		var request codeSyncGetManifestCommandArgs
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeTaskAPIError(w, http.StatusBadRequest, taskID, "bad_request", err.Error(), "fix_request", nil)
+			return
+		}
+		if request.ProtocolVersion != 1 {
+			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_protocol_version_unsupported", "code-sync protocol_version must be 1", "fix_request", map[string]any{"protocol_version": request.ProtocolVersion})
+			return
+		}
+		if request.MappingProfile != "rojo_lua_v1" {
+			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_unsupported_mapping", "only mapping_profile=rojo_lua_v1 is supported", "fix_request", map[string]any{"mapping_profile": request.MappingProfile})
+			return
+		}
+		if len(request.Roots) == 0 {
+			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_invalid_config", "roots must be non-empty", "fix_request", nil)
+			return
+		}
+		if _, err := studioManager.ManagedProcessForTask(taskID); err != nil {
+			writeTaskAPIError(w, http.StatusConflict, taskID, "studio_not_available", err.Error(), "wait_for_studio", nil)
+			return
+		}
+		broker := commandBrokers.forTask(taskID)
+		command, err := broker.enqueueCodeSyncGetManifest(status.Contract.PlaceID, request)
+		if err != nil {
+			writeTaskAPIError(w, http.StatusConflict, taskID, "code_sync_not_in_edit", err.Error(), "ensure_edit", nil)
+			return
+		}
+		waitCtx, cancel := context.WithTimeout(r.Context(), taskStudioCommandWaitTimeout)
+		defer cancel()
+		terminal, found := broker.waitForTerminal(waitCtx, command.CommandID)
+		if !found {
+			broker.cancelCommandWithReason(command.CommandID, "command_timeout")
+			writeTaskAPIError(w, http.StatusGatewayTimeout, taskID, "command_timeout", "mcp2 command did not complete before timeout", "retry", map[string]any{"command_id": command.CommandID})
+			return
+		}
+		writeTaskCodeSyncTerminal(w, taskID, command, terminal)
+	})
+	mux.HandleFunc("POST /session/{task_id}/code-sync/apply", func(w http.ResponseWriter, r *http.Request) {
+		taskID := r.PathValue("task_id")
+		status := taskSessions.Status(taskID)
+		if !status.OK || status.Contract == nil {
+			writeJSON(w, http.StatusNotFound, status)
+			return
+		}
+		if status.State != "live" {
+			writeTaskAPIError(w, http.StatusConflict, taskID, "task_not_live", "task session is not live", "restart_task_agent", map[string]any{"state": status.State})
+			return
+		}
+		var request codeSyncApplyCommandArgs
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeTaskAPIError(w, http.StatusBadRequest, taskID, "bad_request", err.Error(), "fix_request", nil)
+			return
+		}
+		if request.ProtocolVersion != 1 {
+			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_protocol_version_unsupported", "code-sync protocol_version must be 1", "fix_request", map[string]any{"protocol_version": request.ProtocolVersion})
+			return
+		}
+		if request.MappingProfile != "rojo_lua_v1" {
+			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_unsupported_mapping", "only mapping_profile=rojo_lua_v1 is supported", "fix_request", map[string]any{"mapping_profile": request.MappingProfile})
+			return
+		}
+		if len(request.Roots) == 0 {
+			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_invalid_config", "roots must be non-empty", "fix_request", nil)
+			return
+		}
+		if _, err := studioManager.ManagedProcessForTask(taskID); err != nil {
+			writeTaskAPIError(w, http.StatusConflict, taskID, "studio_not_available", err.Error(), "wait_for_studio", nil)
+			return
+		}
+		broker := commandBrokers.forTask(taskID)
+		command, err := broker.enqueueCodeSyncApply(status.Contract.PlaceID, request)
+		if err != nil {
+			writeTaskAPIError(w, http.StatusConflict, taskID, "code_sync_not_in_edit", err.Error(), "ensure_edit", nil)
+			return
+		}
+		waitCtx, cancel := context.WithTimeout(r.Context(), taskStudioCommandWaitTimeout)
+		defer cancel()
+		terminal, found := broker.waitForTerminal(waitCtx, command.CommandID)
+		if !found {
+			broker.cancelCommandWithReason(command.CommandID, "command_timeout")
+			writeTaskAPIError(w, http.StatusGatewayTimeout, taskID, "command_timeout", "mcp2 command did not complete before timeout", "retry", map[string]any{"command_id": command.CommandID})
+			return
+		}
+		writeTaskCodeSyncTerminal(w, taskID, command, terminal)
 	})
 	mux.HandleFunc("GET /session/{task_id}/studio/screenshot", func(w http.ResponseWriter, r *http.Request) {
 		taskID := r.PathValue("task_id")
@@ -2152,6 +2286,30 @@ func writeTaskStudioRunCodeTerminal(w http.ResponseWriter, taskID string, comman
 			"command_result": payload["command_result"],
 		})
 		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func writeTaskCodeSyncTerminal(w http.ResponseWriter, taskID string, command mcp2Command, terminal mcp2CommandTerminal) {
+	if terminal.Result == nil || !terminal.Result.OK {
+		message := "mcp2 code-sync command ended before a successful response"
+		code := terminal.Reason
+		if terminal.Result != nil && terminal.Result.Error != "" {
+			message = terminal.Result.Error
+			code = "code_sync_remote_query_failed"
+		}
+		writeTaskAPIError(w, http.StatusConflict, taskID, code, message, "retry", map[string]any{"command_id": command.CommandID, "terminal": terminal})
+		return
+	}
+	payload := map[string]any{
+		"ok":             true,
+		"task_id":        taskID,
+		"command_id":     command.CommandID,
+		"command_result": terminal.Result,
+		"terminal":       terminal,
+	}
+	for key, value := range terminal.Result.Result {
+		payload[key] = value
 	}
 	writeJSON(w, http.StatusOK, payload)
 }

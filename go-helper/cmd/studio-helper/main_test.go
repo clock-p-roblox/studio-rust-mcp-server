@@ -641,6 +641,50 @@ func TestStudioRunCodeRoutesTaskScopedCommand(t *testing.T) {
 	}
 }
 
+func TestCodeSyncCommandsRequireEditMode(t *testing.T) {
+	broker := newMCP2CommandBroker()
+	initializeBroker(t, broker, "play_server", 11, 101)
+	manifestRequest := codeSyncGetManifestCommandArgs{ProtocolVersion: 1, MappingProfile: "rojo_lua_v1", Roots: []map[string]any{{"root_id": "r"}}}
+	if _, err := broker.enqueueCodeSyncGetManifest("111", manifestRequest); err == nil {
+		t.Fatalf("enqueueCodeSyncGetManifest succeeded in play_server mode")
+	}
+	applyRequest := codeSyncApplyCommandArgs{ProtocolVersion: 1, MappingProfile: "rojo_lua_v1", Roots: []map[string]any{{"root_id": "r"}}}
+	if _, err := broker.enqueueCodeSyncApply("111", applyRequest); err == nil {
+		t.Fatalf("enqueueCodeSyncApply succeeded in play_server mode")
+	}
+}
+
+func TestCodeSyncCommandsRouteTaskScopedCommand(t *testing.T) {
+	broker := newMCP2CommandBroker()
+	initializeBroker(t, broker, "edit", 11, 101)
+	manifestRequest := codeSyncGetManifestCommandArgs{ProtocolVersion: 1, ProjectID: "game", MappingProfile: "rojo_lua_v1", Roots: []map[string]any{{"root_id": "r"}}}
+	manifestCommand, err := broker.enqueueCodeSyncGetManifest("111", manifestRequest)
+	if err != nil {
+		t.Fatalf("enqueueCodeSyncGetManifest failed: %v", err)
+	}
+	pulled, closePull := broker.pull(context.Background(), "edit", 11, 101, time.Second)
+	if closePull || pulled.CommandID != manifestCommand.CommandID || pulled.Kind != mcp2CommandCodeSyncGetManifest {
+		t.Fatalf("pulled manifest command = %+v close=%v, want %d", pulled, closePull, manifestCommand.CommandID)
+	}
+	args, ok := pulled.Args.(codeSyncGetManifestCommandArgs)
+	if !ok || args.PlaceID != "111" || args.ProjectID != "game" {
+		t.Fatalf("manifest args = %+v type_ok=%v", pulled.Args, ok)
+	}
+	applyRequest := codeSyncApplyCommandArgs{ProtocolVersion: 1, ProjectID: "game", MappingProfile: "rojo_lua_v1", Roots: []map[string]any{{"root_id": "r"}}}
+	applyCommand, err := broker.enqueueCodeSyncApply("222", applyRequest)
+	if err != nil {
+		t.Fatalf("enqueueCodeSyncApply failed: %v", err)
+	}
+	pulled, closePull = broker.pull(context.Background(), "edit", 11, 101, time.Second)
+	if closePull || pulled.CommandID != applyCommand.CommandID || pulled.Kind != mcp2CommandCodeSyncApply {
+		t.Fatalf("pulled apply command = %+v close=%v, want %d", pulled, closePull, applyCommand.CommandID)
+	}
+	applyArgs, ok := pulled.Args.(codeSyncApplyCommandArgs)
+	if !ok || applyArgs.PlaceID != "222" || applyArgs.ProjectID != "game" {
+		t.Fatalf("apply args = %+v type_ok=%v", pulled.Args, ok)
+	}
+}
+
 func TestCleanupPreventsLateResponseFromResurrectingCommand(t *testing.T) {
 	registry := newMCP2CommandBrokerRegistry()
 	broker := registry.forTask("task-a")

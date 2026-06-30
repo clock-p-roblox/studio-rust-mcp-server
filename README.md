@@ -170,6 +170,17 @@ tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 scree
 tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 play-mode-logs
 ```
 
+代码 flush：
+
+```powershell
+tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 code-sync-manifest
+tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 code-sync-live-manifest
+tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 code-sync-dry-run
+tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 code-sync-apply
+```
+
+`code-sync-manifest` 只扫描本地 `code-sync.roots.json` 和 Rojo project，不需要 session。其他 code-sync 命令走当前 `.clock-p/session.json` 绑定的 helper2 / mcp2 / Studio 链路，只允许稳定 edit 态执行。Studio 侧使用 `EncodingService:ComputeStringHash(..., Enum.HashAlgorithm.Blake3)` 与本地 manifest 做 hash 对账。
+
 Lua 执行：
 
 ```powershell
@@ -222,6 +233,8 @@ POST /session/{task_id}/studio/stop
 GET  /session/{task_id}/studio/screenshot
 POST /session/{task_id}/studio/run-code-direct
 GET  /session/{task_id}/runtime-log
+POST /session/{task_id}/code-sync/get-manifest
+POST /session/{task_id}/code-sync/apply
 POST /session/{task_id}/official/ping
 POST /session/{task_id}/official/store-image
 POST /session/{task_id}/official/generate-mesh

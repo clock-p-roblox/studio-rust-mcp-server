@@ -125,9 +125,15 @@ tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 scree
 tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 play-mode-logs
 tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 run-code-direct --file code.lua
 tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 run-code --file code.lua
+tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 code-sync-manifest
+tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 code-sync-live-manifest
+tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 code-sync-dry-run
+tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 code-sync-apply
 ```
 
 `run-code-direct` 不做模式切换。`run-code` 会先 ensure edit。需要 edit 的子命令自己决定是否 ensure；CLI 顶层不做全局 ensure。
+
+`code-sync-manifest` 是本地扫描，不需要 `.clock-p/session.json`。`code-sync-live-manifest`、`code-sync-dry-run`、`code-sync-apply` 走 task-scoped helper2 / mcp2 链路，只允许稳定 edit 态，并用 BLAKE3 hash 验证 Studio live tree。
 
 官方 adapter 命令：
 

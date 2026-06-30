@@ -1,4 +1,5 @@
 local HttpService = game:GetService("HttpService")
+local EncodingService = game:GetService("EncodingService")
 local RunService = game:GetService("RunService")
 local ServerScriptService = game:GetService("ServerScriptService")
 local StudioTestService = game:GetService("StudioTestService")
@@ -365,6 +366,264 @@ local function runStudioCode(code)
 	}, nil
 end
 
+local function codeSyncS(value)
+	local text = tostring(value)
+	return tostring(#text) .. ":" .. text
+end
+
+local function codeSyncBytesToHex(value)
+	local parts = table.create(#value)
+	for index = 1, #value do
+		parts[index] = string.format("%02x", string.byte(value, index))
+	end
+	return table.concat(parts)
+end
+
+local function codeSyncBlake3Hex(value)
+	return codeSyncBytesToHex(EncodingService:ComputeStringHash(value, Enum.HashAlgorithm.Blake3))
+end
+
+local function codeSyncKind(instance)
+	if instance:IsA("Folder") then
+		return "Folder"
+	elseif instance:IsA("ModuleScript") then
+		return "ModuleScript"
+	elseif instance:IsA("Script") then
+		return "Script"
+	elseif instance:IsA("LocalScript") then
+		return "LocalScript"
+	end
+	return nil
+end
+
+local function codeSyncSortChildren(left, right)
+	if left.name == right.name then
+		return left.entry_kind < right.entry_kind
+	end
+	return left.name < right.name
+end
+
+local function codeSyncSourceOf(instance)
+	if not (instance:IsA("ModuleScript") or instance:IsA("Script") or instance:IsA("LocalScript")) then
+		return nil
+	end
+	local ok, value = pcall(function()
+		return instance.Source
+	end)
+	if ok then
+		local cr = string.char(13)
+		local lf = string.char(10)
+		return string.gsub(string.gsub(value, cr .. lf, lf), cr, lf)
+	end
+	return nil
+end
+
+local function codeSyncChildSummaryBytes(child)
+	return codeSyncS(child.name) .. codeSyncS(child.entry_kind) .. codeSyncS(child.entry_hash)
+end
+
+local function codeSyncNodeHash(kind, name, source, children)
+	table.sort(children, codeSyncSortChildren)
+	local encodedChildren = table.create(#children)
+	for index, child in children do
+		encodedChildren[index] = codeSyncChildSummaryBytes(child)
+	end
+	if kind == "Folder" then
+		return codeSyncBlake3Hex(codeSyncS("clockp.code_sync.v1.folder") .. codeSyncS(name) .. codeSyncS(#children) .. table.concat(encodedChildren))
+	end
+	if kind == "ModuleScript" or kind == "Script" or kind == "LocalScript" then
+		return codeSyncBlake3Hex(codeSyncS("clockp.code_sync.v1.script") .. codeSyncS(kind) .. codeSyncS(name) .. codeSyncS(source or "") .. codeSyncS(#children) .. table.concat(encodedChildren))
+	end
+	error("code_sync_unsupported_mapping: unsupported kind " .. tostring(kind))
+end
+
+local function codeSyncFindPath(path)
+	local current = game:GetService(path[1])
+	for index = 2, #path do
+		current = current:FindFirstChild(path[index])
+		if current == nil then
+			return nil
+		end
+	end
+	return current
+end
+
+local function codeSyncSummarize(instance)
+	if instance == nil then
+		return nil
+	end
+	local kind = codeSyncKind(instance)
+	if kind == nil then
+		return nil
+	end
+	local seen = {}
+	local children = {}
+	for _, child in instance:GetChildren() do
+		local childEntryKind = codeSyncKind(child)
+		if childEntryKind ~= nil then
+			if seen[child.Name] then
+				error("code_sync_ambiguous_remote_tree: duplicate child name " .. child.Name)
+			end
+			seen[child.Name] = true
+			local childSummary = codeSyncSummarize(child)
+			table.insert(children, {
+				name = child.Name,
+				entry_kind = childEntryKind,
+				entry_hash = childSummary.entry_hash,
+				children_count = childSummary.children_count,
+			})
+		end
+	end
+	table.sort(children, codeSyncSortChildren)
+	local entryHash = codeSyncNodeHash(kind, instance.Name, codeSyncSourceOf(instance), children)
+	return {
+		name = instance.Name,
+		root_kind = kind,
+		entry_kind = kind,
+		entry_hash = entryHash,
+		children_count = #children,
+		children_complete = true,
+		children = children,
+		source = codeSyncSourceOf(instance),
+	}
+end
+
+local function codeSyncRootHash(rootId, mappingProfile, summary)
+	return codeSyncBlake3Hex(codeSyncS("clockp.code_sync.v1.root") .. codeSyncS(rootId) .. codeSyncS(mappingProfile) .. codeSyncS(summary.root_kind) .. codeSyncS(summary.entry_hash))
+end
+
+local function codeSyncCombinedHash(mappingProfile, roots)
+	table.sort(roots, function(left, right)
+		return left.root_id < right.root_id
+	end)
+	local encoded = table.create(#roots)
+	for index, root in roots do
+		encoded[index] = codeSyncS(root.root_id) .. codeSyncS(root.root_hash)
+	end
+	return codeSyncBlake3Hex(codeSyncS("clockp.code_sync.v1.combined") .. codeSyncS(mappingProfile) .. codeSyncS(#roots) .. table.concat(encoded))
+end
+
+local function codeSyncGetManifest(args)
+	if mode ~= "edit" then
+		return false, nil, "code_sync_not_in_edit: current mode=" .. mode
+	end
+	if typeof(args) ~= "table" then
+		return false, nil, "code_sync_invalid_config: args must be a table"
+	end
+	if args.protocol_version ~= 1 then
+		return false, nil, "code_sync_protocol_version_unsupported"
+	end
+	if args.mapping_profile ~= "rojo_lua_v1" then
+		return false, nil, "code_sync_unsupported_mapping"
+	end
+	local result = {
+		kind = "code_sync_get_manifest",
+		protocol_version = 1,
+		project_id = args.project_id,
+		mapping_profile = args.mapping_profile,
+		mode = mode,
+		mode_seq = modeSeq,
+		roots = {},
+	}
+	local combinedRoots = {}
+	for _, root in args.roots do
+		local summary = codeSyncSummarize(codeSyncFindPath(root.studio_path))
+		local currentRootHash = nil
+		if summary ~= nil then
+			currentRootHash = codeSyncRootHash(root.root_id, args.mapping_profile, summary)
+			table.insert(combinedRoots, { root_id = root.root_id, root_hash = currentRootHash })
+		end
+		table.insert(result.roots, {
+			root_id = root.root_id,
+			studio_path = root.studio_path,
+			exists = summary ~= nil,
+			root_hash = currentRootHash,
+			summary = summary,
+		})
+	end
+	result.combined_hash = codeSyncCombinedHash(args.mapping_profile, combinedRoots)
+	return true, result, nil
+end
+
+local function codeSyncClassForKind(kind)
+	if kind == "Folder" then
+		return "Folder"
+	elseif kind == "ModuleScript" then
+		return "ModuleScript"
+	elseif kind == "Script" then
+		return "Script"
+	elseif kind == "LocalScript" then
+		return "LocalScript"
+	end
+	error("code_sync_unsupported_mapping: unsupported kind " .. tostring(kind))
+end
+
+local function codeSyncEnsureChild(parent, name, className)
+	local existing = parent:FindFirstChild(name)
+	if existing ~= nil and existing.ClassName ~= className then
+		existing:Destroy()
+		existing = nil
+	end
+	if existing == nil then
+		existing = Instance.new(className)
+		existing.Name = name
+		existing.Parent = parent
+	end
+	return existing
+end
+
+local function codeSyncEnsureRoot(path, tree)
+	local current = game:GetService(path[1])
+	for index = 2, #path do
+		local className = if index == #path then codeSyncClassForKind(tree.kind) else "Folder"
+		current = codeSyncEnsureChild(current, path[index], className)
+	end
+	return current
+end
+
+local function codeSyncWriteNode(instance, node)
+	if node.kind == "ModuleScript" or node.kind == "Script" or node.kind == "LocalScript" then
+		instance.Source = node.source or ""
+	end
+	instance:ClearAllChildren()
+	for _, child in node.children do
+		local childInstance = Instance.new(codeSyncClassForKind(child.kind))
+		childInstance.Name = child.name
+		childInstance.Parent = instance
+		codeSyncWriteNode(childInstance, child)
+	end
+end
+
+local function codeSyncApply(args)
+	if mode ~= "edit" then
+		return false, nil, "code_sync_not_in_edit: current mode=" .. mode
+	end
+	if typeof(args) ~= "table" then
+		return false, nil, "code_sync_invalid_config: args must be a table"
+	end
+	if args.protocol_version ~= 1 then
+		return false, nil, "code_sync_protocol_version_unsupported"
+	end
+	if args.mapping_profile ~= "rojo_lua_v1" then
+		return false, nil, "code_sync_unsupported_mapping"
+	end
+	local applied = {}
+	for _, root in args.roots do
+		local rootInstance = codeSyncEnsureRoot(root.studio_path, root.tree)
+		codeSyncWriteNode(rootInstance, root.tree)
+		table.insert(applied, root.root_id)
+	end
+	return true, {
+		kind = "code_sync_apply",
+		protocol_version = 1,
+		project_id = args.project_id,
+		mapping_profile = args.mapping_profile,
+		mode = mode,
+		mode_seq = modeSeq,
+		applied_roots = applied,
+	}, nil
+end
+
 local function processCommand(command)
 	local kind = tostring(command.kind or "")
 	if kind == "noop" then
@@ -412,6 +671,12 @@ local function processCommand(command)
 		local args = command.args
 		local code = if typeof(args) == "table" then args.code else nil
 		return runStudioCode(code)
+	end
+	if kind == "code_sync_get_manifest" then
+		return codeSyncGetManifest(command.args)
+	end
+	if kind == "code_sync_apply" then
+		return codeSyncApply(command.args)
 	end
 	if kind == "studio_play" then
 		if mode == "play_server" then

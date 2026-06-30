@@ -188,6 +188,14 @@ def run_code_direct(session: Session, code: str) -> dict:
     return post_json(task_url(session, "/studio/run-code-direct"), {"code": code}, timeout=30.0, session=session)
 
 
+def code_sync_get_manifest(session: Session, payload: dict) -> dict:
+    return post_json(task_url(session, "/code-sync/get-manifest"), payload, timeout=30.0, session=session)
+
+
+def code_sync_apply(session: Session, payload: dict) -> dict:
+    return post_json(task_url(session, "/code-sync/apply"), payload, timeout=30.0, session=session)
+
+
 def official_ping(session: Session) -> dict:
     return post_json(task_url(session, "/official/ping"), {}, timeout=30.0, session=session)
 

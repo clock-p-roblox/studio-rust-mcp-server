@@ -20,9 +20,7 @@ HELPER_BASE_URL = "http://127.0.0.1:44750"
 DEFAULT_PLACE_ID = "105986423068266"
 DEFAULT_PROJECT = Path(r"D:\roblox_space\.codex-runtime-stop-local\workspace\default.project.json")
 DEFAULT_ROJO = Path(r"D:\roblox_space\rojo\target\release\rojo.exe")
-ROJO_REPO = Path(r"D:\roblox_space\rojo")
 PLUGIN_PATH = Path(os.environ["LOCALAPPDATA"]) / "Roblox" / "Plugins" / "MCP2Plugin.rbxm"
-ROJO_PLUGIN_PATH = Path(os.environ["LOCALAPPDATA"]) / "Roblox" / "Plugins" / "Rojo.rbxm"
 ROBLOX_LOG_DIR = Path(os.environ["LOCALAPPDATA"]) / "Roblox" / "logs"
 ROJO_STUDIO_FAILURE_MARKERS = (
     "Unknown HTTP error: 502",
@@ -367,14 +365,12 @@ def latest_studio_diagnostics() -> str:
     text = latest.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
     user_plugin_loaded = "user_MCP2Plugin.rbxm" in text
-    rojo_plugin_loaded = "user_Rojo.rbxm" in text
     login_seen = "www.roblox.com/login" in text or "LoginDialog" in text or "show login dialog" in text
     requested_lines = [
         line
         for line in lines
         if "plugins requested to load" in line
         or "user_MCP2Plugin.rbxm" in line
-        or "user_Rojo.rbxm" in line
         or "[Rojo-" in line
         or "www.roblox.com/login" in line
         or "LoginDialog" in line
@@ -384,7 +380,6 @@ def latest_studio_diagnostics() -> str:
     return (
         f"latest_studio_log={latest}; "
         f"user_MCP2Plugin_loaded={user_plugin_loaded}; "
-        f"user_RojoPlugin_loaded={rojo_plugin_loaded}; "
         f"login_seen={login_seen}\n{tail}"
     )
 
@@ -606,9 +601,6 @@ def prepare_binaries(root: Path, bin_dir: Path, rojo: Path) -> None:
     run_command([str(rojo), "build", r"plugin-mcp2\default.project.json", "--plugin", "MCP2Plugin.rbxm"], cwd=root, timeout=60)
     if not PLUGIN_PATH.exists():
         raise StressError(f"MCP2 plugin was not installed at {PLUGIN_PATH}")
-    run_command([str(rojo), "build", "plugin.project.json", "--plugin", "Rojo.rbxm"], cwd=ROJO_REPO, timeout=60)
-    if not ROJO_PLUGIN_PATH.exists():
-        raise StressError(f"Rojo plugin was not installed at {ROJO_PLUGIN_PATH}")
 
 
 def stop_agent(bin_dir: Path, workspace: Path) -> None:

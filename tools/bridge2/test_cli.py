@@ -108,7 +108,10 @@ class FakeHelper(BaseHTTPRequestHandler):
             self._json({"ok": True, "accepted": True, "command_result": {"result": {"status": "stop_requested"}}})
         elif self.path.endswith("/studio/run-code-direct"):
             if type(self).run_code_ok:
-                self._json({"ok": True, "result": {"prints": ["hello"], "code": payload.get("code")}})
+                if "code_sync" in str(payload.get("code")):
+                    self._json({"ok": True, "result": {"returns": [json.dumps({"combined_hash": "remote-hash", "roots": []})]}})
+                else:
+                    self._json({"ok": True, "result": {"prints": ["hello"], "code": payload.get("code")}})
             else:
                 self._json({"ok": False, "command_result": {"error": "blocked token"}})
         elif "/official/" in self.path:
@@ -116,6 +119,10 @@ class FakeHelper(BaseHTTPRequestHandler):
                 self._json({"ok": True, "official": {"path": self.path, "payload": payload}})
             else:
                 self._json({"ok": False, "code": "official_tool_error", "message": "official failed"})
+        elif self.path.endswith("/code-sync/get-manifest"):
+            self._json({"ok": True, "combined_hash": "remote-hash", "roots": [], "mode": "edit", "mode_seq": type(self).mode_seq})
+        elif self.path.endswith("/code-sync/apply"):
+            self._json({"ok": True, "applied_roots": [root.get("root_id") for root in payload.get("roots", [])], "mode": "edit", "mode_seq": type(self).mode_seq})
         else:
             self._json({"code": "not_found", "message": self.path}, status=404)
 
@@ -216,6 +223,92 @@ class Bridge2CLITest(unittest.TestCase):
         self.assertEqual(stderr, "")
         self.assertEqual(payload["ok"], False)
         self.assertEqual(payload["code"], "help_requested")
+
+    def test_code_sync_manifest_does_not_require_session(self) -> None:
+        workspace = Path(self.workspace)
+        (workspace / ".clock-p" / "session.json").unlink()
+        (workspace / "default.project.json").write_text(
+            json.dumps(
+                {
+                    "tree": {
+                        "$className": "DataModel",
+                        "ReplicatedStorage": {
+                            "$className": "ReplicatedStorage",
+                            "ClockPRealTest": {"$className": "Folder"},
+                        },
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        (workspace / "code-sync.roots.json").write_text(
+            json.dumps(
+                {
+                    "project_id": "cli-test",
+                    "mapping_profile": "rojo_lua_v1",
+                    "roots": [
+                        {
+                            "root_id": "app",
+                            "local_path": "src",
+                            "studio_path": ["ReplicatedStorage", "ClockPRealTest"],
+                            "include": ["**/*.lua"],
+                            "exclude": [],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        src = workspace / "src"
+        src.mkdir()
+        (src / "Main.lua").write_text("return 1\n", encoding="utf-8")
+        code, payload, stderr = self.run_cli("code-sync-manifest")
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(payload["ok"], True)
+        self.assertEqual(payload["details"]["file_count"], 1)
+        self.assertEqual(FakeHelper.requests_seen, [])
+
+    def test_code_sync_live_manifest_uses_session(self) -> None:
+        workspace = Path(self.workspace)
+        (workspace / "default.project.json").write_text(
+            json.dumps(
+                {
+                    "tree": {
+                        "$className": "DataModel",
+                        "ReplicatedStorage": {
+                            "$className": "ReplicatedStorage",
+                            "ClockPRealTest": {"$className": "Folder"},
+                        },
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        (workspace / "code-sync.roots.json").write_text(
+            json.dumps(
+                {
+                    "project_id": "cli-test",
+                    "mapping_profile": "rojo_lua_v1",
+                    "roots": [
+                        {
+                            "root_id": "app",
+                            "local_path": "src",
+                            "studio_path": ["ReplicatedStorage", "ClockPRealTest"],
+                            "include": ["**/*.lua"],
+                            "exclude": [],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (workspace / "src").mkdir()
+        code, payload, stderr = self.run_cli("code-sync-live-manifest")
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(payload["details"]["combined_hash"], "remote-hash")
+        self.assertTrue(any(path.endswith("/code-sync/get-manifest") for _method, path, _payload in FakeHelper.requests_seen))
 
     def test_unhandled_exception_is_json(self) -> None:
         original = commands.load_session

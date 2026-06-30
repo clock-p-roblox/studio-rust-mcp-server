@@ -22,7 +22,6 @@ ROBLOX_SPACE = Path(__file__).resolve().parents[2]
 DEFAULT_ROJO = ROBLOX_SPACE / "rojo" / "target" / "release" / "rojo.exe"
 ROJO_REPO = ROBLOX_SPACE / "rojo"
 PLUGIN_PATH = Path(os.environ["LOCALAPPDATA"]) / "Roblox" / "Plugins" / "MCP2Plugin.rbxm"
-ROJO_PLUGIN_PATH = Path(os.environ["LOCALAPPDATA"]) / "Roblox" / "Plugins" / "Rojo.rbxm"
 ROBLOX_LOG_DIR = Path(os.environ["LOCALAPPDATA"]) / "Roblox" / "logs"
 PUBLIC_HOST_PATTERN = re.compile(r"^[a-z0-9.-]+\.dev\.clock-p\.com$")
 
@@ -391,9 +390,6 @@ def prepare_binaries(root: Path, bin_dir: Path, rojo: Path) -> None:
     run_command([str(rojo), "build", r"plugin-mcp2\default.project.json", "--plugin", "MCP2Plugin.rbxm"], cwd=root, timeout=60)
     if not PLUGIN_PATH.exists():
         raise PublicMatrixError(f"MCP2 plugin was not installed at {PLUGIN_PATH}")
-    run_command([str(rojo), "build", "plugin.project.json", "--plugin", "Rojo.rbxm"], cwd=ROJO_REPO, timeout=60)
-    if not ROJO_PLUGIN_PATH.exists():
-        raise PublicMatrixError(f"Rojo plugin was not installed at {ROJO_PLUGIN_PATH}")
 
 
 def create_project(parent: Path) -> Path:
@@ -526,8 +522,10 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
         wait_session_live(public_url, bearer_token, task_id)
         initial_mode = wait_mode(public_url, bearer_token, task_id, "edit", timeout=args.initial_mode_timeout)
         print(f"initial public mode={initial_mode.get('mode')}", flush=True)
-        studio_log = wait_rojo_initial_sync(task_id, started_at=started_at)
-        print(f"public Rojo initial sync ok log={studio_log}", flush=True)
+        studio_log: Path | None = None
+        if args.require_rojo_plugin_sync:
+            studio_log = wait_rojo_initial_sync(task_id, started_at=started_at)
+            print(f"public Rojo initial sync ok log={studio_log}", flush=True)
 
         status_from_mcp_status = http_json("GET", f"{public_url}/status?task_id={task_id}", token=bearer_token, timeout=20)
         if status_from_mcp_status.get("task_id") != task_id:
@@ -586,7 +584,7 @@ def run_matrix(args: argparse.Namespace) -> dict[str, Any]:
             "run_dir": str(run_dir),
             "public_url": public_url,
             "task_id": task_id,
-            "studio_log": str(studio_log),
+            "studio_log": str(studio_log) if studio_log is not None else "",
             "direct_play_mode": direct_play.get("mode"),
             "direct_stop_mode": direct_stop.get("mode"),
             "direct_screenshot": direct_screenshot.get("screenshot"),
@@ -607,6 +605,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--public-ready-timeout", type=float, default=60)
     parser.add_argument("--initial-mode-timeout", type=float, default=180)
     parser.add_argument("--kill-existing", action="store_true", help="Kill existing helper2/Studio/Rojo/clockbridge processes before the test.")
+    parser.add_argument("--require-rojo-plugin-sync", action="store_true", help="Legacy check: require Studio-side Rojo plugin initial sync evidence. Not used by the default helper2 route matrix.")
     return parser.parse_args()
 
 
