@@ -17,7 +17,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 GO_HELPER = ROOT / "go-helper"
-MACHINE_NAME = "phase10-win"
+MACHINE_NAME = "task-session-win"
 PLACE_ID = "134795435066737"
 
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -25,7 +25,7 @@ PROCESS_TERMINATE = 0x0001
 STILL_ACTIVE = 259
 
 
-class Phase10Error(RuntimeError):
+class TaskSessionGateError(RuntimeError):
     pass
 
 
@@ -65,8 +65,8 @@ def wait_until(label: str, timeout: float, fn) -> Any:
             last_error = exc
         time.sleep(0.25)
     if last_error is not None:
-        raise Phase10Error(f"timed out waiting for {label}: {last_error}") from last_error
-    raise Phase10Error(f"timed out waiting for {label}")
+        raise TaskSessionGateError(f"timed out waiting for {label}: {last_error}") from last_error
+    raise TaskSessionGateError(f"timed out waiting for {label}")
 
 
 def wait_process_exit(pid: int, timeout: float) -> None:
@@ -82,7 +82,7 @@ def free_port() -> int:
 def run_command(args: list[str], *, cwd: Path, timeout: float) -> None:
     completed = subprocess.run(args, cwd=cwd, text=True, capture_output=True, timeout=timeout)
     if completed.returncode != 0:
-        raise Phase10Error(
+        raise TaskSessionGateError(
             f"command failed ({completed.returncode}): {' '.join(args)}\n"
             f"stdout={completed.stdout}\nstderr={completed.stderr}"
         )
@@ -108,12 +108,12 @@ def http_json(
         with urllib.request.urlopen(request, timeout=5) as response:
             body = response.read().decode("utf-8")
             if response.status != expected:
-                raise Phase10Error(f"{method} {url} returned HTTP {response.status}, want {expected}: {body}")
+                raise TaskSessionGateError(f"{method} {url} returned HTTP {response.status}, want {expected}: {body}")
             return json.loads(body)
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8")
         if exc.code != expected:
-            raise Phase10Error(f"{method} {url} returned HTTP {exc.code}, want {expected}: {body}") from exc
+            raise TaskSessionGateError(f"{method} {url} returned HTTP {exc.code}, want {expected}: {body}") from exc
         return json.loads(body)
 
 
@@ -151,7 +151,7 @@ def start_helper(helper_bin: Path, run_root: Path, name: str, check_interval: st
 
     def healthy() -> dict[str, Any] | None:
         if process.poll() is not None:
-            raise Phase10Error(f"helper exited early with code {process.returncode}; log_tail={log_tail(log_path)!r}")
+            raise TaskSessionGateError(f"helper exited early with code {process.returncode}; log_tail={log_tail(log_path)!r}")
         payload = http_json("GET", base_url + "/healthz")
         return payload if payload.get("ok") else None
 
@@ -176,14 +176,14 @@ def code_sync_binding(task_id: str, *, place_id: str = PLACE_ID, config_hash: st
         "workspace_id": f"workspace-{task_id}",
         "place_id": place_id,
         "machine_name": MACHINE_NAME,
-        "project_id": "phase10",
+        "project_id": "task-session",
         "mapping_profile": "sync_lua_v1",
         "code_sync_config_hash": config_hash or f"config-{task_id}",
         "roots_authority_hash": f"roots-{task_id}",
         "roots": [
             {
                 "root_id": "app",
-                "studio_path": ["ReplicatedStorage", "ClockPPhase10"],
+                "studio_path": ["ReplicatedStorage", "ClockPTaskSession"],
             }
         ],
     }
@@ -243,11 +243,11 @@ def desired_owner_ids(payload: dict[str, Any]) -> list[str]:
 
 def require(condition: bool, message: str) -> None:
     if not condition:
-        raise Phase10Error(message)
+        raise TaskSessionGateError(message)
 
 
-def run_phase10(args: argparse.Namespace) -> dict[str, Any]:
-    run_root = Path(tempfile.mkdtemp(prefix="helper2-phase10-"))
+def run_task_session_gate(args: argparse.Namespace) -> dict[str, Any]:
+    run_root = Path(tempfile.mkdtemp(prefix="helper2-task-session-"))
     bin_dir = run_root / "bin"
     bin_dir.mkdir(parents=True)
     helper_bin = bin_dir / "studio-helper.exe"
@@ -325,7 +325,7 @@ def run_phase10(args: argparse.Namespace) -> dict[str, Any]:
             "tasks": ["task-a", "task-b", "task-c"],
         }
     except Exception:
-        print(f"phase10 run dir retained for diagnostics: {run_root}", file=sys.stderr)
+        print(f"task-session gate run dir retained for diagnostics: {run_root}", file=sys.stderr)
         raise
     finally:
         for helper in list(helpers):
@@ -344,7 +344,7 @@ def wait_for_task_c_expiry_while_refreshing_a(base_url: str, timeout: float) -> 
         if payload.get("state") == "expired":
             return
         time.sleep(0.5)
-    raise Phase10Error("timed out waiting for task C expiry while refreshing task A")
+    raise TaskSessionGateError("timed out waiting for task C expiry while refreshing task A")
 
 
 def main() -> int:
@@ -353,11 +353,11 @@ def main() -> int:
     parser.add_argument("--expiry-timeout", type=float, default=40.0)
     args = parser.parse_args()
     try:
-        result = run_phase10(args)
+        result = run_task_session_gate(args)
     except Exception as exc:  # noqa: BLE001
-        print(f"PHASE10_FAIL {exc}", file=sys.stderr)
+        print(f"TASK_SESSION_GATE_FAIL {exc}", file=sys.stderr)
         return 1
-    print("PHASE10_OK " + json.dumps(result, ensure_ascii=False, default=str))
+    print("TASK_SESSION_GATE_OK " + json.dumps(result, ensure_ascii=False, default=str))
     return 0
 
 

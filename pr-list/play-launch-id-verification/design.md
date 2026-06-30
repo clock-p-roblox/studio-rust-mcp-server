@@ -93,7 +93,7 @@ helper2 往 mcp2 发起 `studio_play` 时，固定携带：
 - helper2 HTTP/MCP 协议是结构化内部协议，承载完整 `play_args`。
 - `/studio/mode` 在 `edit` 模式下不得回传历史 `launch_id`；只有当前 live play runtime 确实读到了 `launch_id` 时才返回。
 
-## Phase 1: bridge2 负责外部输入归一化
+## 步骤 1：bridge2 负责外部输入归一化
 
 bridge2 `play` 命令新增：
 
@@ -120,7 +120,7 @@ bridge2 调 helper2 `/studio/play` 时，body 为：
 }
 ```
 
-## Phase 2: helper2 负责结构化转发与 live 结果透传
+## 步骤 2：helper2 负责结构化转发与 live 结果透传
 
 helper2 新职责：
 
@@ -138,7 +138,7 @@ helper2 不做的事：
 
 helper2 只把当前查询到的 `launch_id` 回给调用方。
 
-## Phase 3: edit 态 mcp2 负责受理前校验与 ExecutePlayModeAsync
+## 步骤 3：edit 态 mcp2 负责受理前校验与 ExecutePlayModeAsync
 
 edit 态 mcp2 收到 `studio_play` 后：
 
@@ -159,7 +159,7 @@ StudioTestService:ExecutePlayModeAsync(playArgs)
 
 校验失败时，直接在 edit 态返回明确错误，不进入 play。
 
-## Phase 4: play 态 mcp2 负责从当前 runtime 读取 launch_id
+## 步骤 4：play 态 mcp2 负责从当前 runtime 读取 launch_id
 
 当前 runtime 在 `play_server` 模式下，通过：
 

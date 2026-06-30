@@ -181,7 +181,7 @@ func (m *mcpRuntime) runTool(ctx context.Context, name string, args map[string]a
 	case "helper2_studio_play":
 		mode, _ := optionalStringArg(args, "mode")
 		if mode != "" && mode != "start_play" {
-			return nil, fmt.Errorf("helper2 MCP play supports start_play only in this phase, got %s", mode)
+			return nil, fmt.Errorf("helper2 MCP play supports start_play only, got %s", mode)
 		}
 		playArgs, err := requiredPlayArgsArg(args, "play_args")
 		if err != nil {
@@ -191,7 +191,7 @@ func (m *mcpRuntime) runTool(ctx context.Context, name string, args map[string]a
 	case "helper2_studio_stop":
 		mode, _ := optionalStringArg(args, "mode")
 		if mode != "" && mode != "stop" {
-			return nil, fmt.Errorf("helper2 MCP stop supports stop only in this phase, got %s", mode)
+			return nil, fmt.Errorf("helper2 MCP stop supports stop only, got %s", mode)
 		}
 		return m.runStudioCommand(ctx, taskID, mcp2CommandStudioStop, nil)
 	case "helper2_studio_screenshot":

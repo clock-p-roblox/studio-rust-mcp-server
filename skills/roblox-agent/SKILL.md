@@ -178,5 +178,5 @@ go test -count=1 ./...
 
 ```powershell
 cd K:\roblox_space\studio-rust-mcp-server
-py -3 util\helper2_phase10_session_test.py
+py -3 util\helper2_task_session_gate_test.py
 ```

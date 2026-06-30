@@ -320,7 +320,7 @@ py -3 -m unittest discover tools\bridge2 -p "test*.py"
 
 ```powershell
 cd K:\roblox_space\studio-rust-mcp-server
-py -3 util\helper2_phase10_session_test.py
+py -3 util\helper2_task_session_gate_test.py
 ```
 
 公网矩阵必须覆盖：
