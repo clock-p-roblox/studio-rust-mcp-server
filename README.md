@@ -135,7 +135,7 @@ K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe start `
     "place_id": "113577273791190",
     "machine_name": "sunjun2",
     "project_id": "test_game3",
-    "mapping_profile": "code_sync_lua_v1",
+    "mapping_profile": "sync_lua_v1",
     "code_sync_config_hash": "hex-hash",
     "roots_authority_hash": "hex-hash",
     "config_path": "code-sync.roots.json",

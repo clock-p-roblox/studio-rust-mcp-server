@@ -177,7 +177,7 @@ def code_sync_binding(task_id: str, *, place_id: str = PLACE_ID, config_hash: st
         "place_id": place_id,
         "machine_name": MACHINE_NAME,
         "project_id": "phase10",
-        "mapping_profile": "code_sync_lua_v1",
+        "mapping_profile": "sync_lua_v1",
         "code_sync_config_hash": config_hash or f"config-{task_id}",
         "roots_authority_hash": f"roots-{task_id}",
         "roots": [

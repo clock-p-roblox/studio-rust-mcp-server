@@ -201,7 +201,7 @@ func testCodeSyncBinding() CodeSyncBinding {
 		PlaceID:            "123",
 		MachineName:        "win-a",
 		ProjectID:          "game",
-		MappingProfile:     "code_sync_lua_v1",
+		MappingProfile:     "sync_lua_v1",
 		CodeSyncConfigHash: "config",
 		RootsAuthorityHash: "roots",
 		ConfigPath:         "code-sync.roots.json",

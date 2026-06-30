@@ -15,7 +15,7 @@ import (
 )
 
 const codeSyncProtocolVersion = 1
-const codeSyncMappingProfile = "code_sync_lua_v1"
+const codeSyncMappingProfile = "sync_lua_v1"
 
 type CodeSyncBinding struct {
 	ProtocolVersion    int                 `json:"protocol_version"`

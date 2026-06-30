@@ -94,7 +94,7 @@ class CodeSyncTests(unittest.TestCase):
                     json.dumps(
                         {
                             "project_id": "x",
-                            "mapping_profile": "code_sync_lua_v1",
+                            "mapping_profile": "sync_lua_v1",
                             "roots": [{"root_id": "x", "local_path": "K:/outside", "studio_path": ["Workspace"], "include": [], "exclude": []}],
                         }
                     ),
@@ -111,7 +111,7 @@ class CodeSyncTests(unittest.TestCase):
                 json.dumps(
                     {
                         "project_id": "x",
-                        "mapping_profile": "code_sync_lua_v1",
+                        "mapping_profile": "sync_lua_v1",
                         "roots": [
                             {"root_id": "a", "local_path": "a", "studio_path": ["Workspace", "A"], "include": [], "exclude": []},
                             {"root_id": "b", "local_path": "b", "studio_path": ["Workspace", "A", "B"], "include": [], "exclude": []},

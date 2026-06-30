@@ -93,7 +93,7 @@ def _live_manifest_luau(roots: list[dict]) -> str:
 local HttpService = game:GetService("HttpService")
 local EncodingService = game:GetService("EncodingService")
 local roots = HttpService:JSONDecode({long_string_literal(roots_json)})
-local mappingProfile = "code_sync_lua_v1"
+local mappingProfile = "sync_lua_v1"
 
 local function S(value)
     local text = tostring(value)

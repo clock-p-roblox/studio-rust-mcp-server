@@ -35,7 +35,7 @@ func validHeartbeat(taskID string) HeartbeatRequest {
 			PlaceID:            "123",
 			MachineName:        "win-a",
 			ProjectID:          "game",
-			MappingProfile:     "code_sync_lua_v1",
+			MappingProfile:     "sync_lua_v1",
 			CodeSyncConfigHash: "config-hash-" + taskID,
 			RootsAuthorityHash: "roots-hash-" + taskID,
 			Roots: []CodeSyncRootRoute{

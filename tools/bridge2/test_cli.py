@@ -164,7 +164,7 @@ def test_session_payload(helper_base_url: str) -> dict:
             "place_id": "134795435066737",
             "machine_name": "test-machine",
             "project_id": "cli-test",
-            "mapping_profile": "code_sync_lua_v1",
+            "mapping_profile": "sync_lua_v1",
             "code_sync_config_hash": "config-hash",
             "roots_authority_hash": "roots-hash",
             "roots": [
@@ -264,7 +264,7 @@ class Bridge2CLITest(unittest.TestCase):
             json.dumps(
                 {
                     "project_id": "cli-test",
-                    "mapping_profile": "code_sync_lua_v1",
+                    "mapping_profile": "sync_lua_v1",
                     "roots": [
                         {
                             "root_id": "app",
@@ -308,7 +308,7 @@ class Bridge2CLITest(unittest.TestCase):
             json.dumps(
                 {
                     "project_id": "cli-test",
-                    "mapping_profile": "code_sync_lua_v1",
+                    "mapping_profile": "sync_lua_v1",
                     "roots": [
                         {
                             "root_id": "app",
