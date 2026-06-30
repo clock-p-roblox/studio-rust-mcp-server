@@ -36,6 +36,8 @@ def _request_json(method: str, url: str, payload: dict | None, timeout: float, s
     auth_header = _public_helper_auth_header(url, session)
     if auth_header:
         headers["Authorization"] = auth_header
+    if session is not None and session.task_session_token:
+        headers["X-ClockP-Task-Token"] = session.task_session_token
     req = request.Request(url, data=body, headers=headers, method=method)
     try:
         with request.urlopen(req, timeout=timeout) as resp:

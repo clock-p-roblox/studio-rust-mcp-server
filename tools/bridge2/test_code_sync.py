@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import tempfile
@@ -9,7 +9,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from clockp_bridge2.code_sync.mapping import build_logical_tree
-from clockp_bridge2.code_sync.rojo_project import load_project_targets, validate_studio_path_allowed
+from clockp_bridge2.code_sync.project import load_project_targets, validate_studio_path_allowed
 from clockp_bridge2.code_sync.config import CodeSyncRoot
 from clockp_bridge2.code_sync.diff import diff_manifests
 from clockp_bridge2.code_sync.hashing import LogicalNode
@@ -18,7 +18,7 @@ from clockp_bridge2.errors import BridgeError
 
 
 class CodeSyncTests(unittest.TestCase):
-    def test_game1_style_rojo_targets_allow_workspace_and_declared_container(self) -> None:
+    def test_game1_style_project_targets_allow_workspace_and_declared_container(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "default.project.json"
             project.write_text(
@@ -94,7 +94,7 @@ class CodeSyncTests(unittest.TestCase):
                     json.dumps(
                         {
                             "project_id": "x",
-                            "mapping_profile": "rojo_lua_v1",
+                            "mapping_profile": "code_sync_lua_v1",
                             "roots": [{"root_id": "x", "local_path": "K:/outside", "studio_path": ["Workspace"], "include": [], "exclude": []}],
                         }
                     ),
@@ -111,7 +111,7 @@ class CodeSyncTests(unittest.TestCase):
                 json.dumps(
                     {
                         "project_id": "x",
-                        "mapping_profile": "rojo_lua_v1",
+                        "mapping_profile": "code_sync_lua_v1",
                         "roots": [
                             {"root_id": "a", "local_path": "a", "studio_path": ["Workspace", "A"], "include": [], "exclude": []},
                             {"root_id": "b", "local_path": "b", "studio_path": ["Workspace", "A", "B"], "include": [], "exclude": []},

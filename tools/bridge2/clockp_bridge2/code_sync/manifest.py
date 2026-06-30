@@ -7,16 +7,16 @@ from pathlib import Path
 from .config import load_config
 from .hashing import combined_hash, config_hash, root_hash
 from .mapping import build_logical_tree
-from .rojo_project import load_project_targets
+from .project import load_project_targets
 from .scanner import scan_root
 
 
 PROTOCOL_VERSION = 1
 
 
-def build_local_manifest(workspace: Path, config_path: Path, rojo_project_path: Path) -> dict:
+def build_local_manifest(workspace: Path, config_path: Path, project_path: Path) -> dict:
     workspace = workspace.resolve()
-    targets = load_project_targets(rojo_project_path)
+    targets = load_project_targets(project_path)
     config = load_config(config_path, targets)
     config_dicts = [root.as_config_dict() for root in config.roots]
     cfg_hash = config_hash(PROTOCOL_VERSION, config.project_id, config.mapping_profile, targets, config_dicts)

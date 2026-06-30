@@ -305,10 +305,6 @@ func (m *mcpRuntime) taskStatusPayload(taskID string) (map[string]any, int) {
 			studios = append(studios, process)
 		}
 	}
-	rojoUpstreamURL := ""
-	if status.Contract != nil {
-		rojoUpstreamURL = status.Contract.RojoUpstreamURL
-	}
 	return map[string]any{
 		"ok":                status.OK,
 		"service":           "studio-helper2-mcp",
@@ -318,7 +314,6 @@ func (m *mcpRuntime) taskStatusPayload(taskID string) (map[string]any, int) {
 		"last_heartbeat_at": status.LastHeartbeatAt,
 		"lease_age_ms":      status.LeaseAgeMS,
 		"lease_timeout_ms":  status.LeaseTimeoutMS,
-		"rojo_upstream_url": rojoUpstreamURL,
 		"desired_studio":    desired,
 		"studios":           studios,
 		"mcp2_channel":      m.commandBroker.summaryForTask(taskID),

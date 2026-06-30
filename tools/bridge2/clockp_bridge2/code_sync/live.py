@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from pathlib import Path
@@ -9,12 +9,12 @@ from ..studio import code_sync_get_manifest as helper_code_sync_get_manifest
 from ..session import Session
 from .config import load_config
 from .luau import long_string_literal
-from .rojo_project import load_project_targets
+from .project import load_project_targets
 
 
-def query_live_manifest(session: Session, workspace: Path, config_path: Path, rojo_project_path: Path, *, legacy_run_code: bool = False) -> dict:
+def query_live_manifest(session: Session, workspace: Path, config_path: Path, project_path: Path, *, legacy_run_code: bool = False) -> dict:
     before_mode = _require_stable_edit_mode(mode(session))
-    targets = load_project_targets(rojo_project_path)
+    targets = load_project_targets(project_path)
     config = load_config(config_path, targets)
     roots = [
         {
@@ -93,7 +93,7 @@ def _live_manifest_luau(roots: list[dict]) -> str:
 local HttpService = game:GetService("HttpService")
 local EncodingService = game:GetService("EncodingService")
 local roots = HttpService:JSONDecode({long_string_literal(roots_json)})
-local mappingProfile = "rojo_lua_v1"
+local mappingProfile = "code_sync_lua_v1"
 
 local function S(value)
     local text = tostring(value)

@@ -47,10 +47,9 @@ func runStart(args []string) error {
 	userName := fs.String("user", "", "clock-p user name for public helper URL derivation")
 	placeID := fs.String("place_id", "", "Roblox place id")
 	helperBaseURL := fs.String("helper-base-url", "", "local helper2 base URL")
-	registerDomain := fs.Bool("register-domain", true, "register task-agent Rojo public domain through embedded clockbridge")
-	publicDomainSuffix := fs.String("public-domain-suffix", "dev.clock-p.com", "domain suffix for public helper and Rojo exposure")
-	rojoBin := fs.String("rojo-bin", "rojo", "Rojo executable")
-	projectPath := fs.String("project", "", "Rojo project path")
+	publicDomainSuffix := fs.String("public-domain-suffix", "dev.clock-p.com", "domain suffix for public helper URL derivation")
+	codeSyncConfigPath := fs.String("code-sync-config", "code-sync.roots.json", "code-sync roots config path, relative to workspace unless absolute")
+	codeSyncProjectPath := fs.String("code-sync-project", "default.project.json", "project DataModel declaration path, relative to workspace unless absolute")
 	statusAddr := fs.String("status-addr", "127.0.0.1:0", "task-agent status listen address")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -90,18 +89,17 @@ func runStart(args []string) error {
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	agent, err := taskagent.New(taskagent.Config{
-		Workspace:       *workspace,
-		Environment:     *environment,
-		MachineName:     *machineName,
-		UserName:        *userName,
-		PlaceID:         *placeID,
-		HelperBaseURL:   resolvedHelperBaseURL,
-		HelperPublicURL: resolvedHelperPublicURL,
-		RegisterDomain:  *registerDomain,
-		DomainSuffix:    *publicDomainSuffix,
-		RojoBin:         *rojoBin,
-		ProjectPath:     *projectPath,
-		StatusAddr:      *statusAddr,
+		Workspace:           *workspace,
+		Environment:         *environment,
+		MachineName:         *machineName,
+		UserName:            *userName,
+		PlaceID:             *placeID,
+		HelperBaseURL:       resolvedHelperBaseURL,
+		HelperPublicURL:     resolvedHelperPublicURL,
+		DomainSuffix:        *publicDomainSuffix,
+		CodeSyncConfigPath:  *codeSyncConfigPath,
+		CodeSyncProjectPath: *codeSyncProjectPath,
+		StatusAddr:          *statusAddr,
 	}, logger)
 	if err != nil {
 		return err

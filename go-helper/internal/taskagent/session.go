@@ -16,26 +16,21 @@ import (
 var ErrDescriptorIdentityMismatch = errors.New("descriptor identity mismatch")
 
 type Descriptor struct {
-	TaskID               string      `json:"task_id"`
-	Environment          string      `json:"environment"`
-	MachineName          string      `json:"machine_name"`
-	PlaceID              string      `json:"place_id"`
-	TaskAgentPID         int         `json:"task_agent_pid"`
-	TaskAgentStartedAtMS int64       `json:"task_agent_started_at_ms"`
-	TaskAgentStatusURL   string      `json:"task_agent_status_url"`
-	Helper               HelperRoute `json:"helper"`
-	Rojo                 RojoRoute   `json:"rojo"`
+	TaskID               string          `json:"task_id"`
+	Environment          string          `json:"environment"`
+	MachineName          string          `json:"machine_name"`
+	PlaceID              string          `json:"place_id"`
+	TaskAgentPID         int             `json:"task_agent_pid"`
+	TaskAgentStartedAtMS int64           `json:"task_agent_started_at_ms"`
+	TaskAgentStatusURL   string          `json:"task_agent_status_url"`
+	TaskSessionToken     string          `json:"task_session_token"`
+	Helper               HelperRoute     `json:"helper"`
+	CodeSync             CodeSyncBinding `json:"code_sync"`
 }
 
 type HelperRoute struct {
 	BaseURL   string `json:"base_url"`
 	PublicURL string `json:"public_url,omitempty"`
-}
-
-type RojoRoute struct {
-	LocalURL    string `json:"local_url"`
-	UpstreamURL string `json:"upstream_url"`
-	PublicURL   string `json:"public_url,omitempty"`
 }
 
 func SessionPath(workspace string) string {
@@ -198,18 +193,6 @@ func ResolveDomainSuffix(explicit string) string {
 		return "dev.clock-p.com"
 	}
 	return value
-}
-
-func RojoPublicHost(placeID string, taskID string, userName string, domainSuffix string) string {
-	return fmt.Sprintf("%s-%s-rojo-%s-user.%s", placeID, taskID, userName, ResolveDomainSuffix(domainSuffix))
-}
-
-func RojoPublicURL(placeID string, taskID string, userName string, domainSuffix string) string {
-	return "https://" + RojoPublicHost(placeID, taskID, userName, domainSuffix)
-}
-
-func ClockbridgeRegisterHost(domainSuffix string) string {
-	return "register-https-proxy." + ResolveDomainSuffix(domainSuffix)
 }
 
 func ResolveUserName(explicit string) (string, error) {

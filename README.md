@@ -14,15 +14,12 @@ LLM / 脚本
 
 task-agent
   -> 维护 .clock-p/session.json
-  -> 启动 Rojo
   -> 向 helper2 心跳
-  -> 在需要公网访问时注册 Rojo 诊断域名
 ```
 
 职责边界：
 
 - `task-agent`：工作区侧会话 owner。启动后写入 `.clock-p/session.json`，后续命令只读该文件，不再手动传会话身份。
-- `helper2`：Windows 客户端侧稳定原语。负责 Studio 插件长轮询、task 会话、play/stop、截图、Studio 日志、Rojo 转发和官方 Studio MCP adapter。
 - `plugin-mcp2`：Studio 内插件。只和 helper2 通信，负责执行 helper2 下发的 Studio 命令。
 - `bridge2`：LLM / 脚本使用的 CLI 层。只做会话读取、JSON 输出和命令编排。
 - `clockbridge`：公网转发能力。helper2 内嵌调用库，不依赖外部 `clockbridge-cli` 二进制。
@@ -88,10 +85,10 @@ K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe start `
   --place_id 113577273791190 `
   --machine_name sunjun2 `
   --helper-base-url http://127.0.0.1:<helper2_port> `
-  --register-domain=false
+  --code-sync-config code-sync.roots.json `
+  --code-sync-project default.project.json
 ```
 
-`task-agent` 的 `--register-domain` 默认也是开启的。纯本地测试建议显式传 `--register-domain=false`，避免因为没有 `feishu-user_name` 或 `feishu-token` 身份文件而影响启动。
 
 查看和停止当前 workspace 的 task-agent：
 
@@ -109,11 +106,10 @@ K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe start `
   --place_id 113577273791190 `
   --machine_name sunjun2 `
   --user <feishu-user_name> `
-  --rojo-bin K:\roblox_space\rojo\target\release\rojo.exe `
-  --project K:\roblox_space\test_game3\default.project.json
+  --code-sync-config code-sync.roots.json `
+  --code-sync-project default.project.json
 ```
 
-`--user` 可省略，此时 task-agent 会读取本机 `feishu-user_name`。helper2 自身的 HTTP handler 不做 Bearer 鉴权；但当 `bridge2` 通过公网 `helper.base_url` 访问时，外层 `dev.clock-p.com` 入口仍要求 `Authorization: Bearer <feishu-token>`。`bridge2` 会自动从 workspace 或身份目录读取 `feishu-token` 注入。`--register-domain` 默认开启，会注册 Rojo 诊断域名，并在 `.clock-p/session.json` 中写入 `rojo.public_url`。
 
 ## session.json
 
@@ -132,10 +128,24 @@ K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe start `
     "base_url": "https://roblox-helper-sunjun2-user-user.dev.clock-p.com",
     "public_url": "https://roblox-helper-sunjun2-user-user.dev.clock-p.com"
   },
-  "rojo": {
-    "local_url": "http://127.0.0.1:34872",
-    "upstream_url": "https://113577273791190-t0123abcd45-rojo-user-user.dev.clock-p.com",
-    "public_url": "https://113577273791190-t0123abcd45-rojo-user-user.dev.clock-p.com"
+  "task_session_token": "opaque-random-token",
+  "code_sync": {
+    "protocol_version": 1,
+    "workspace_id": "workspace-id",
+    "place_id": "113577273791190",
+    "machine_name": "sunjun2",
+    "project_id": "test_game3",
+    "mapping_profile": "code_sync_lua_v1",
+    "code_sync_config_hash": "hex-hash",
+    "roots_authority_hash": "hex-hash",
+    "config_path": "code-sync.roots.json",
+    "project_path": "default.project.json",
+    "roots": [
+      {
+        "root_id": "workspace-test",
+        "studio_path": ["Workspace", "ClockPTest"]
+      }
+    ]
   }
 }
 ```
@@ -143,9 +153,6 @@ K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe start `
 约束：
 
 - `helper.base_url` 是 bridge2 控制面的目标地址；公网验收时必须是真实公网 helper URL。
-- `rojo.local_url` 是 task-agent 本机 Rojo 监听地址，只给 task-agent 自己和内嵌 clockbridge 使用。
-- `rojo.upstream_url` 是 helper2 实际拨号的权威 Rojo 上游：本地模式下等于本地 `127.0.0.1`，公网模式下必须等于 helper2 可访问的公网 Rojo URL。
-- `rojo.public_url` 只用于诊断公网注册结果，不作为 Studio 初始同步的权威判据。
 - 后续命令不得重新拼 machine、user、token 或 task 身份。
 
 ## bridge2 CLI
@@ -179,7 +186,6 @@ tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 code-
 tools\bridge2\clockp-roblox-cli.cmd --workspace K:\roblox_space\test_game3 code-sync-apply
 ```
 
-`code-sync-manifest` 只扫描本地 `code-sync.roots.json` 和 Rojo project，不需要 session。其他 code-sync 命令走当前 `.clock-p/session.json` 绑定的 helper2 / mcp2 / Studio 链路，只允许稳定 edit 态执行。Studio 侧使用 `EncodingService:ComputeStringHash(..., Enum.HashAlgorithm.Blake3)` 与本地 manifest 做 hash 对账。
 
 Lua 执行：
 
@@ -269,16 +275,12 @@ helper2_official_insert_from_creator_store
 
 MCP 工具与 bridge2 都使用相同的 task-scoped helper2 语义。
 
-## Rojo 与公网
 
-Rojo 由 `task-agent` 启动和看护。helper2 通过 `rojo.upstream_url` 连接 Rojo，并向 Studio 插件提供本机转发入口。
 
 公网验收时需要确认两件事：
 
 - bridge2 控制面确实走 `helper.base_url` 的公网地址。
-- Studio 日志里出现 Rojo initial sync 成功记录，证明游戏内容已实际同步进 Studio。
 
-不能只用 HTTP 状态码判断 Rojo 是否可用；需要结合 Studio 日志确认初始同步完成。
 
 ## 测试工作区
 
@@ -311,17 +313,14 @@ bridge2 Python：
 ```powershell
 cd K:\roblox_space\studio-rust-mcp-server
 py -3 -m py_compile tools\bridge2\cli.py
+py -3 -m unittest discover tools\bridge2 -p "test*.py"
 ```
 
 公网矩阵：
 
 ```powershell
 cd K:\roblox_space\studio-rust-mcp-server
-py -3 util\helper2_public_route_matrix_test.py `
-  --place-id 113577273791190 `
-  --kill-existing `
-  --public-ready-timeout 120 `
-  --initial-mode-timeout 240
+py -3 util\helper2_phase10_session_test.py
 ```
 
 公网矩阵必须覆盖：
@@ -329,7 +328,6 @@ py -3 util\helper2_public_route_matrix_test.py `
 - helper2 公网 URL 鉴权和 task 可见性。
 - play / stop / screenshot 的 bridge2 直连路径。
 - MCP play / stop / screenshot / log。
-- Studio 日志里的 Rojo initial sync。
 
 ## 文档原则
 

@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"bufio"
@@ -9,9 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -35,148 +33,6 @@ func testPlayArgs() *studioPlayArgs {
 	return &studioPlayArgs{
 		LaunchID: 101,
 		Data:     map[string]any{"kind": "test"},
-	}
-}
-
-func TestRojoForwardTargetHTTPURLPreservesPathAndQuery(t *testing.T) {
-	target, err := rojoForwardTargetHTTPURL("http://127.0.0.1:5000/base", "api/rojo", "cursor=next&limit=1")
-	if err != nil {
-		t.Fatalf("target URL failed: %v", err)
-	}
-	if target != "http://127.0.0.1:5000/base/api/rojo?cursor=next&limit=1" {
-		t.Fatalf("target URL = %q", target)
-	}
-
-	root, err := rojoForwardTargetHTTPURL("http://127.0.0.1:5000", "", "")
-	if err != nil {
-		t.Fatalf("root target URL failed: %v", err)
-	}
-	if root != "http://127.0.0.1:5000/" {
-		t.Fatalf("root target URL = %q", root)
-	}
-}
-
-func TestRojoForwardTargetWSURLUsesWebSocketScheme(t *testing.T) {
-	target, err := rojoForwardTargetWSURL("https://example.test/rojo", "api/socket/0", "cursor=next")
-	if err != nil {
-		t.Fatalf("target WS URL failed: %v", err)
-	}
-	if target != "wss://example.test/rojo/api/socket/0?cursor=next" {
-		t.Fatalf("target WS URL = %q", target)
-	}
-}
-
-func TestLocalRojoForwardBaseURLUsesHelperPortAndTaskPath(t *testing.T) {
-	baseURL, err := localRojoForwardBaseURL("127.0.0.1:44750", "", "1818", "task-a")
-	if err != nil {
-		t.Fatalf("local base URL failed: %v", err)
-	}
-	if baseURL != "http://127.0.0.1:44750/rojo-forward/1818/task/task-a" {
-		t.Fatalf("local base URL = %q", baseURL)
-	}
-}
-
-func TestProxyRojoHTTPRequestForcesIdentityEncoding(t *testing.T) {
-	msgpackBody := []byte{0x81, 0xaf, 'p', 'r', 'o', 't', 'o', 'c', 'o', 'l', 'V', 'e', 'r', 's', 'i', 'o', 'n', 0x05}
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Accept-Encoding"); got != "identity" {
-			t.Fatalf("upstream Accept-Encoding = %q, want identity", got)
-		}
-		w.Header().Set("Content-Type", "application/msgpack")
-		_, _ = w.Write(msgpackBody)
-	}))
-	defer upstream.Close()
-
-	request := httptest.NewRequest(http.MethodGet, "/rojo-forward/113/task/task-a/api/rojo", nil)
-	request.Header.Set("Accept-Encoding", "gzip")
-	recorder := httptest.NewRecorder()
-	status, written, err := proxyRojoHTTPRequest(context.Background(), recorder, request, upstream.URL+"/api/rojo", "")
-	if err != nil {
-		t.Fatalf("proxy request failed: %v", err)
-	}
-	if status != http.StatusOK || recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d recorder=%d, want 200", status, recorder.Code)
-	}
-	if written != int64(len(msgpackBody)) {
-		t.Fatalf("written = %d, want %d", written, len(msgpackBody))
-	}
-	if !bytes.Equal(recorder.Body.Bytes(), msgpackBody) {
-		t.Fatalf("proxied body = % X, want % X", recorder.Body.Bytes(), msgpackBody)
-	}
-}
-
-func TestPublicBearerHeaderForRojoUpstream(t *testing.T) {
-	tokenFile := filepath.Join(t.TempDir(), "feishu-token")
-	if err := os.WriteFile(tokenFile, []byte("secret-token\n"), 0o600); err != nil {
-		t.Fatalf("write token file: %v", err)
-	}
-
-	localTarget, err := url.Parse("http://127.0.0.1:34872/api/rojo")
-	if err != nil {
-		t.Fatalf("parse local target: %v", err)
-	}
-	localHeader, err := publicBearerHeaderForRojoUpstream(localTarget, tokenFile)
-	if err != nil {
-		t.Fatalf("local target header failed: %v", err)
-	}
-	if localHeader != "" {
-		t.Fatalf("local target header = %q, want empty", localHeader)
-	}
-
-	publicTarget, err := url.Parse("https://demo.dev.clock-p.com/api/rojo")
-	if err != nil {
-		t.Fatalf("parse public target: %v", err)
-	}
-	publicHeader, err := publicBearerHeaderForRojoUpstream(publicTarget, tokenFile)
-	if err != nil {
-		t.Fatalf("public target header failed: %v", err)
-	}
-	if publicHeader != "Bearer secret-token" {
-		t.Fatalf("public target header = %q, want bearer token", publicHeader)
-	}
-}
-
-func TestRojoBindingRejectsCrossTaskOrPlaceRequests(t *testing.T) {
-	runtime := newTestMCPRuntime(t)
-	registerTestTask(t, runtime, "task-a", "111")
-	registerTestTask(t, runtime, "task-b", "111")
-	managedStudio := studio.ManagedProcess{
-		PlaceID:   "111",
-		Source:    studio.LaunchSourceTask,
-		OwnerKind: "task",
-		OwnerID:   "task-a",
-		PID:       101,
-	}
-
-	taskMismatch := httptest.NewRecorder()
-	if _, ok := resolveRojoPluginBindingForManagedStudio(taskMismatch, managedStudio, runtime.taskSessions, "111", "task-b"); ok {
-		t.Fatal("expected cross-task Rojo binding to be rejected")
-	}
-	if taskMismatch.Code != http.StatusForbidden {
-		t.Fatalf("cross-task status = %d, want 403", taskMismatch.Code)
-	}
-	if payload := decodeJSONMap(t, taskMismatch.Body.Bytes()); payload["code"] != "task_binding_mismatch" {
-		t.Fatalf("cross-task payload = %+v, want task_binding_mismatch", payload)
-	}
-
-	placeMismatch := httptest.NewRecorder()
-	if _, ok := resolveRojoPluginBindingForManagedStudio(placeMismatch, managedStudio, runtime.taskSessions, "222", "task-a"); ok {
-		t.Fatal("expected cross-place Rojo binding to be rejected")
-	}
-	if placeMismatch.Code != http.StatusForbidden {
-		t.Fatalf("cross-place status = %d, want 403", placeMismatch.Code)
-	}
-	if payload := decodeJSONMap(t, placeMismatch.Body.Bytes()); payload["code"] != "place_binding_mismatch" {
-		t.Fatalf("cross-place payload = %+v, want place_binding_mismatch", payload)
-	}
-
-	success := httptest.NewRecorder()
-	binding, ok := resolveRojoPluginBindingForManagedStudio(success, managedStudio, runtime.taskSessions, "111", "task-a")
-	if !ok {
-		t.Fatalf("expected matching Rojo binding to succeed, response=%s", success.Body.String())
-	}
-	if binding.TaskID != "task-a" || binding.PlaceID != "111" || binding.StudioPID != 101 {
-		t.Fatalf("binding = %+v, want task-a place 111 pid 101", binding)
 	}
 }
 
@@ -283,6 +139,52 @@ func TestModePayloadAcceptsRunServiceFlagsAlias(t *testing.T) {
 	runService, ok := payload["run_service"].(map[string]any)
 	if !ok || runService["IsEdit"] != true {
 		t.Fatalf("run_service alias missing from payload: %+v", payload)
+	}
+}
+
+func TestRequireTaskSessionToken(t *testing.T) {
+	status := tasksession.StatusResponse{
+		OK:     true,
+		TaskID: "task-a",
+		State:  "live",
+		Contract: &tasksession.Contract{
+			TaskID:           "task-a",
+			TaskSessionToken: "secret-token",
+		},
+	}
+	cases := []struct {
+		name       string
+		token      string
+		wantOK     bool
+		wantStatus int
+		wantCode   string
+	}{
+		{name: "missing", wantStatus: http.StatusUnauthorized, wantCode: "task_token_missing"},
+		{name: "mismatch", token: "wrong-token", wantStatus: http.StatusForbidden, wantCode: "task_token_mismatch"},
+		{name: "match", token: "secret-token", wantOK: true, wantStatus: http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "/session/task-a/status", nil)
+			if tc.token != "" {
+				request.Header.Set(taskSessionTokenHeader, tc.token)
+			}
+			response := httptest.NewRecorder()
+			ok := requireTaskSessionToken(response, request, "task-a", status)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if tc.wantOK {
+				return
+			}
+			if response.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", response.Code, tc.wantStatus)
+			}
+			payload := decodeJSONMap(t, response.Body.Bytes())
+			if payload["code"] != tc.wantCode {
+				t.Fatalf("payload = %+v, want code %s", payload, tc.wantCode)
+			}
+		})
 	}
 }
 
@@ -644,11 +546,11 @@ func TestStudioRunCodeRoutesTaskScopedCommand(t *testing.T) {
 func TestCodeSyncCommandsRequireEditMode(t *testing.T) {
 	broker := newMCP2CommandBroker()
 	initializeBroker(t, broker, "play_server", 11, 101)
-	manifestRequest := codeSyncGetManifestCommandArgs{ProtocolVersion: 1, MappingProfile: "rojo_lua_v1", Roots: []map[string]any{{"root_id": "r"}}}
+	manifestRequest := codeSyncGetManifestCommandArgs{ProtocolVersion: 1, MappingProfile: "code_sync_lua_v1", Roots: []map[string]any{{"root_id": "r"}}}
 	if _, err := broker.enqueueCodeSyncGetManifest("111", manifestRequest); err == nil {
 		t.Fatalf("enqueueCodeSyncGetManifest succeeded in play_server mode")
 	}
-	applyRequest := codeSyncApplyCommandArgs{ProtocolVersion: 1, MappingProfile: "rojo_lua_v1", Roots: []map[string]any{{"root_id": "r"}}}
+	applyRequest := codeSyncApplyCommandArgs{ProtocolVersion: 1, MappingProfile: "code_sync_lua_v1", Roots: []map[string]any{{"root_id": "r"}}}
 	if _, err := broker.enqueueCodeSyncApply("111", applyRequest); err == nil {
 		t.Fatalf("enqueueCodeSyncApply succeeded in play_server mode")
 	}
@@ -657,7 +559,7 @@ func TestCodeSyncCommandsRequireEditMode(t *testing.T) {
 func TestCodeSyncCommandsRouteTaskScopedCommand(t *testing.T) {
 	broker := newMCP2CommandBroker()
 	initializeBroker(t, broker, "edit", 11, 101)
-	manifestRequest := codeSyncGetManifestCommandArgs{ProtocolVersion: 1, ProjectID: "game", MappingProfile: "rojo_lua_v1", Roots: []map[string]any{{"root_id": "r"}}}
+	manifestRequest := codeSyncGetManifestCommandArgs{ProtocolVersion: 1, ProjectID: "game", MappingProfile: "code_sync_lua_v1", Roots: []map[string]any{{"root_id": "r"}}}
 	manifestCommand, err := broker.enqueueCodeSyncGetManifest("111", manifestRequest)
 	if err != nil {
 		t.Fatalf("enqueueCodeSyncGetManifest failed: %v", err)
@@ -670,7 +572,7 @@ func TestCodeSyncCommandsRouteTaskScopedCommand(t *testing.T) {
 	if !ok || args.PlaceID != "111" || args.ProjectID != "game" {
 		t.Fatalf("manifest args = %+v type_ok=%v", pulled.Args, ok)
 	}
-	applyRequest := codeSyncApplyCommandArgs{ProtocolVersion: 1, ProjectID: "game", MappingProfile: "rojo_lua_v1", Roots: []map[string]any{{"root_id": "r"}}}
+	applyRequest := codeSyncApplyCommandArgs{ProtocolVersion: 1, ProjectID: "game", MappingProfile: "code_sync_lua_v1", Roots: []map[string]any{{"root_id": "r"}}}
 	applyCommand, err := broker.enqueueCodeSyncApply("222", applyRequest)
 	if err != nil {
 		t.Fatalf("enqueueCodeSyncApply failed: %v", err)
@@ -1134,7 +1036,20 @@ func registerTestTask(t *testing.T, runtime *mcpRuntime, taskID string, placeID 
 		PlaceID:              placeID,
 		TaskAgentPID:         1234,
 		TaskAgentStartedAtMS: time.Now().UnixMilli(),
-		RojoUpstreamURL:      "http://127.0.0.1:34872",
+		TaskSessionToken:     "token-" + taskID,
+		CodeSync: tasksession.CodeSyncBinding{
+			ProtocolVersion:    1,
+			WorkspaceID:        "workspace-" + taskID,
+			PlaceID:            placeID,
+			MachineName:        "test-machine",
+			ProjectID:          "game",
+			MappingProfile:     "code_sync_lua_v1",
+			CodeSyncConfigHash: "config-" + taskID,
+			RootsAuthorityHash: "roots-" + taskID,
+			Roots: []tasksession.CodeSyncRootRoute{
+				{RootID: "root", StudioPath: []string{"Workspace", "ClockPTest"}},
+			},
+		},
 	})
 	if err != nil {
 		t.Fatalf("heartbeat failed: %v", err)

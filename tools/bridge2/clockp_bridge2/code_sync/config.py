@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import re
@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import BridgeError
-from .rojo_project import validate_studio_path_allowed
+from .project import validate_studio_path_allowed
 
 
 @dataclass(frozen=True)
@@ -46,8 +46,8 @@ def load_config(config_path: Path, targets: list[list[str]]) -> CodeSyncConfig:
         raise BridgeError("code_sync_invalid_config", "code-sync config must be a JSON object", {"path": str(config_path)})
     project_id = _required_string(payload, "project_id")
     mapping_profile = _required_string(payload, "mapping_profile")
-    if mapping_profile != "rojo_lua_v1":
-        raise BridgeError("code_sync_unsupported_mapping", "only mapping_profile=rojo_lua_v1 is supported", {"mapping_profile": mapping_profile})
+    if mapping_profile != "code_sync_lua_v1":
+        raise BridgeError("code_sync_unsupported_mapping", "only mapping_profile=code_sync_lua_v1 is supported", {"mapping_profile": mapping_profile})
     raw_roots = payload.get("roots")
     if not isinstance(raw_roots, list) or not raw_roots:
         raise BridgeError("code_sync_invalid_config", "roots must be a non-empty array", {"path": str(config_path)})

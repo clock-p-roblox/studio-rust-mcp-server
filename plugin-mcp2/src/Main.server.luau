@@ -1,4 +1,4 @@
-local HttpService = game:GetService("HttpService")
+﻿local HttpService = game:GetService("HttpService")
 local EncodingService = game:GetService("EncodingService")
 local RunService = game:GetService("RunService")
 local ServerScriptService = game:GetService("ServerScriptService")
@@ -513,7 +513,7 @@ local function codeSyncGetManifest(args)
 	if args.protocol_version ~= 1 then
 		return false, nil, "code_sync_protocol_version_unsupported"
 	end
-	if args.mapping_profile ~= "rojo_lua_v1" then
+	if args.mapping_profile ~= "code_sync_lua_v1" then
 		return false, nil, "code_sync_unsupported_mapping"
 	end
 	local result = {
@@ -604,7 +604,7 @@ local function codeSyncApply(args)
 	if args.protocol_version ~= 1 then
 		return false, nil, "code_sync_protocol_version_unsupported"
 	end
-	if args.mapping_profile ~= "rojo_lua_v1" then
+	if args.mapping_profile ~= "code_sync_lua_v1" then
 		return false, nil, "code_sync_unsupported_mapping"
 	end
 	local applied = {}

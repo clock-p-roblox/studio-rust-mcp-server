@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import contextlib
 import io
@@ -153,6 +153,30 @@ class FakeURLResponse:
         return None
 
 
+def test_session_payload(helper_base_url: str) -> dict:
+    return {
+        "task_id": "task-a",
+        "task_session_token": "token-task-a",
+        "helper": {"base_url": helper_base_url},
+        "code_sync": {
+            "protocol_version": 1,
+            "workspace_id": "workspace-test",
+            "place_id": "134795435066737",
+            "machine_name": "test-machine",
+            "project_id": "cli-test",
+            "mapping_profile": "code_sync_lua_v1",
+            "code_sync_config_hash": "config-hash",
+            "roots_authority_hash": "roots-hash",
+            "roots": [
+                {
+                    "root_id": "app",
+                    "studio_path": ["ReplicatedStorage", "ClockPRealTest"],
+                }
+            ],
+        },
+    }
+
+
 class Bridge2CLITest(unittest.TestCase):
     def setUp(self) -> None:
         FakeHelper.mode = "edit"
@@ -178,12 +202,7 @@ class Bridge2CLITest(unittest.TestCase):
         session_dir = root / ".clock-p"
         session_dir.mkdir()
         (session_dir / "session.json").write_text(
-            json.dumps(
-                {
-                    "task_id": "task-a",
-                    "helper": {"base_url": f"http://127.0.0.1:{self.server.server_address[1]}"},
-                }
-            ),
+            json.dumps(test_session_payload(f"http://127.0.0.1:{self.server.server_address[1]}")),
             encoding="utf-8",
         )
         self.workspace = str(root)
@@ -245,7 +264,7 @@ class Bridge2CLITest(unittest.TestCase):
             json.dumps(
                 {
                     "project_id": "cli-test",
-                    "mapping_profile": "rojo_lua_v1",
+                    "mapping_profile": "code_sync_lua_v1",
                     "roots": [
                         {
                             "root_id": "app",
@@ -289,7 +308,7 @@ class Bridge2CLITest(unittest.TestCase):
             json.dumps(
                 {
                     "project_id": "cli-test",
-                    "mapping_profile": "rojo_lua_v1",
+                    "mapping_profile": "code_sync_lua_v1",
                     "roots": [
                         {
                             "root_id": "app",
@@ -532,12 +551,7 @@ class Bridge2CLITest(unittest.TestCase):
         (token_dir / "feishu-token").write_text("secret-token\n", encoding="utf-8")
         session_path = Path(self.workspace) / ".clock-p" / "session.json"
         session_path.write_text(
-            json.dumps(
-                {
-                    "task_id": "task-a",
-                    "helper": {"base_url": "https://roblox-helper-sunjun2-sunjun-user.dev.clock-p.com"},
-                }
-            ),
+            json.dumps(test_session_payload("https://roblox-helper-sunjun2-sunjun-user.dev.clock-p.com")),
             encoding="utf-8",
         )
 

@@ -1,9 +1,8 @@
-package main
+﻿package main
 
 import (
-	"bufio"
 	"context"
-	"crypto/tls"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -12,7 +11,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"sort"
@@ -35,6 +33,7 @@ const (
 	taskStudioCommandQueuedTimeout   = 30 * time.Second
 	taskStudioCommandResponseTimeout = 60 * time.Second
 	taskStudioCommandWaitTimeout     = taskStudioCommandQueuedTimeout + taskStudioCommandResponseTimeout + 5*time.Second
+	taskSessionTokenHeader           = "X-ClockP-Task-Token"
 )
 
 type healthResponse struct {
@@ -153,13 +152,6 @@ type mcp2CommandTerminal struct {
 	CompletedAt time.Time           `json:"completed_at"`
 	Reason      string              `json:"reason"`
 	Result      *mcp2ResponseResult `json:"result,omitempty"`
-}
-
-type rojoPluginBinding struct {
-	TaskID      string
-	PlaceID     string
-	UpstreamURL string
-	StudioPID   int
 }
 
 type mcp2CommandBroker struct {
@@ -918,7 +910,6 @@ func main() {
 			"machine_name", request.MachineName,
 			"place_id", request.PlaceID,
 			"task_agent_pid", request.TaskAgentPID,
-			"rojo_upstream_url", request.RojoUpstreamURL,
 		)
 		writeJSON(w, http.StatusOK, response)
 	})
@@ -931,6 +922,10 @@ func main() {
 				"code":    "bad_request",
 				"message": err.Error(),
 			})
+			return
+		}
+		status := taskSessions.Status(taskID)
+		if status.OK && status.Contract != nil && !requireTaskSessionToken(w, r, taskID, status) {
 			return
 		}
 		response, err := taskSessions.Release(taskID, request)
@@ -950,6 +945,9 @@ func main() {
 			writeJSON(w, http.StatusNotFound, status)
 			return
 		}
+		if !requireTaskSessionToken(w, r, taskID, status) {
+			return
+		}
 		studioSummary := studioManager.Summary()
 		desired := make([]studio.DesiredStudio, 0)
 		for _, target := range studioSummary.Desired {
@@ -963,10 +961,6 @@ func main() {
 				studios = append(studios, process)
 			}
 		}
-		rojoUpstreamURL := ""
-		if status.Contract != nil {
-			rojoUpstreamURL = status.Contract.RojoUpstreamURL
-		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":                status.OK,
 			"task_id":           status.TaskID,
@@ -975,7 +969,6 @@ func main() {
 			"last_heartbeat_at": status.LastHeartbeatAt,
 			"lease_age_ms":      status.LeaseAgeMS,
 			"lease_timeout_ms":  status.LeaseTimeoutMS,
-			"rojo_upstream_url": rojoUpstreamURL,
 			"desired_studio":    desired,
 			"studios":           studios,
 			"mcp2_channel":      commandBrokers.summaryForTask(taskID),
@@ -987,6 +980,9 @@ func main() {
 		status := taskSessions.Status(taskID)
 		if !status.OK || status.Contract == nil {
 			writeJSON(w, http.StatusNotFound, status)
+			return
+		}
+		if !requireTaskSessionToken(w, r, taskID, status) {
 			return
 		}
 		limit, err := parseRuntimeLogLimit(r.URL.Query().Get("limit"))
@@ -1011,6 +1007,9 @@ func main() {
 		status := taskSessions.Status(taskID)
 		if !status.OK || status.Contract == nil {
 			writeJSON(w, http.StatusNotFound, status)
+			return
+		}
+		if !requireTaskSessionToken(w, r, taskID, status) {
 			return
 		}
 		if status.State != "live" {
@@ -1051,6 +1050,9 @@ func main() {
 			writeJSON(w, http.StatusNotFound, status)
 			return
 		}
+		if !requireTaskSessionToken(w, r, taskID, status) {
+			return
+		}
 		if status.State != "live" {
 			writeTaskAPIError(w, http.StatusConflict, taskID, "task_not_live", "task session is not live", "restart_task_agent", map[string]any{"state": status.State})
 			return
@@ -1076,6 +1078,9 @@ func main() {
 		status := taskSessions.Status(taskID)
 		if !status.OK || status.Contract == nil {
 			writeJSON(w, http.StatusNotFound, status)
+			return
+		}
+		if !requireTaskSessionToken(w, r, taskID, status) {
 			return
 		}
 		if status.State != "live" {
@@ -1126,6 +1131,9 @@ func main() {
 			writeJSON(w, http.StatusNotFound, status)
 			return
 		}
+		if !requireTaskSessionToken(w, r, taskID, status) {
+			return
+		}
 		if status.State != "live" {
 			writeTaskAPIError(w, http.StatusConflict, taskID, "task_not_live", "task session is not live", "restart_task_agent", map[string]any{"state": status.State})
 			return
@@ -1168,6 +1176,9 @@ func main() {
 			writeJSON(w, http.StatusNotFound, status)
 			return
 		}
+		if !requireTaskSessionToken(w, r, taskID, status) {
+			return
+		}
 		if status.State != "live" {
 			writeTaskAPIError(w, http.StatusConflict, taskID, "task_not_live", "task session is not live", "restart_task_agent", map[string]any{"state": status.State})
 			return
@@ -1181,8 +1192,8 @@ func main() {
 			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_protocol_version_unsupported", "code-sync protocol_version must be 1", "fix_request", map[string]any{"protocol_version": request.ProtocolVersion})
 			return
 		}
-		if request.MappingProfile != "rojo_lua_v1" {
-			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_unsupported_mapping", "only mapping_profile=rojo_lua_v1 is supported", "fix_request", map[string]any{"mapping_profile": request.MappingProfile})
+		if request.MappingProfile != "code_sync_lua_v1" {
+			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_unsupported_mapping", "only mapping_profile=code_sync_lua_v1 is supported", "fix_request", map[string]any{"mapping_profile": request.MappingProfile})
 			return
 		}
 		if len(request.Roots) == 0 {
@@ -1216,6 +1227,9 @@ func main() {
 			writeJSON(w, http.StatusNotFound, status)
 			return
 		}
+		if !requireTaskSessionToken(w, r, taskID, status) {
+			return
+		}
 		if status.State != "live" {
 			writeTaskAPIError(w, http.StatusConflict, taskID, "task_not_live", "task session is not live", "restart_task_agent", map[string]any{"state": status.State})
 			return
@@ -1229,8 +1243,8 @@ func main() {
 			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_protocol_version_unsupported", "code-sync protocol_version must be 1", "fix_request", map[string]any{"protocol_version": request.ProtocolVersion})
 			return
 		}
-		if request.MappingProfile != "rojo_lua_v1" {
-			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_unsupported_mapping", "only mapping_profile=rojo_lua_v1 is supported", "fix_request", map[string]any{"mapping_profile": request.MappingProfile})
+		if request.MappingProfile != "code_sync_lua_v1" {
+			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_unsupported_mapping", "only mapping_profile=code_sync_lua_v1 is supported", "fix_request", map[string]any{"mapping_profile": request.MappingProfile})
 			return
 		}
 		if len(request.Roots) == 0 {
@@ -1264,6 +1278,9 @@ func main() {
 			writeJSON(w, http.StatusNotFound, status)
 			return
 		}
+		if !requireTaskSessionToken(w, r, taskID, status) {
+			return
+		}
 		if status.State != "live" {
 			writeTaskAPIError(w, http.StatusConflict, taskID, "task_not_live", "task session is not live", "restart_task_agent", map[string]any{"state": status.State})
 			return
@@ -1286,66 +1303,6 @@ func main() {
 			"screenshot": result,
 		})
 	})
-	mux.HandleFunc("GET /v1/rojo/config", func(w http.ResponseWriter, r *http.Request) {
-		requestedPlaceID := strings.TrimSpace(r.URL.Query().Get("place_id"))
-		requestedTaskID := strings.TrimSpace(r.URL.Query().Get("task_id"))
-		binding, ok := resolveRojoPluginBinding(w, r, effectiveListenAddr, studioManager, taskSessions, logger, requestedPlaceID, requestedTaskID)
-		if !ok {
-			return
-		}
-		baseURL, err := localRojoForwardBaseURL(effectiveListenAddr, r.Host, binding.PlaceID, binding.TaskID)
-		if err != nil {
-			writeRojoAPIError(w, http.StatusInternalServerError, "helper_addr_unavailable", err.Error(), map[string]any{"task_id": binding.TaskID})
-			return
-		}
-		logger.Info("resolved task-bound Rojo config", "task_id", binding.TaskID, "place_id", binding.PlaceID, "studio_pid", binding.StudioPID, "base_url", baseURL)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":          true,
-			"place_id":    binding.PlaceID,
-			"task_id":     binding.TaskID,
-			"base_url":    baseURL,
-			"auth_header": "",
-		})
-	})
-	mux.HandleFunc("GET /rojo-forward/{place_id}/task/{task_id}/api/socket/{cursor}", func(w http.ResponseWriter, r *http.Request) {
-		placeID := r.PathValue("place_id")
-		taskID := r.PathValue("task_id")
-		cursor := r.PathValue("cursor")
-		binding, ok := resolveRojoPluginBinding(w, r, effectiveListenAddr, studioManager, taskSessions, logger, placeID, taskID)
-		if !ok {
-			return
-		}
-		targetURL, err := rojoForwardTargetWSURL(binding.UpstreamURL, "api/socket/"+cursor, r.URL.RawQuery)
-		if err != nil {
-			writeRojoAPIError(w, http.StatusBadGateway, "invalid_rojo_upstream", err.Error(), map[string]any{"task_id": binding.TaskID})
-			return
-		}
-		logger.Info("proxying task-bound Rojo websocket", "task_id", binding.TaskID, "place_id", binding.PlaceID, "studio_pid", binding.StudioPID, "target", targetURL)
-		proxyRojoWebSocket(w, r, targetURL, publicExposure.config.TokenFile)
-	})
-	rojoForwardHTTP := func(w http.ResponseWriter, r *http.Request) {
-		placeID := r.PathValue("place_id")
-		taskID := r.PathValue("task_id")
-		path := r.PathValue("path")
-		binding, ok := resolveRojoPluginBinding(w, r, effectiveListenAddr, studioManager, taskSessions, logger, placeID, taskID)
-		if !ok {
-			return
-		}
-		targetURL, err := rojoForwardTargetHTTPURL(binding.UpstreamURL, path, r.URL.RawQuery)
-		if err != nil {
-			writeRojoAPIError(w, http.StatusBadGateway, "invalid_rojo_upstream", err.Error(), map[string]any{"task_id": binding.TaskID})
-			return
-		}
-		status, bytes, err := proxyRojoHTTPRequest(r.Context(), w, r, targetURL, publicExposure.config.TokenFile)
-		if err != nil {
-			logger.Warn("failed to proxy task-bound Rojo HTTP request", "task_id", binding.TaskID, "place_id", binding.PlaceID, "target", targetURL, "error", err)
-			writeRojoAPIError(w, http.StatusBadGateway, "rojo_proxy_failed", err.Error(), map[string]any{"task_id": binding.TaskID})
-			return
-		}
-		logger.Info("proxied task-bound Rojo HTTP request", "task_id", binding.TaskID, "place_id", binding.PlaceID, "method", r.Method, "target", targetURL, "status", status, "bytes", bytes)
-	}
-	mux.HandleFunc("/rojo-forward/{place_id}/task/{task_id}", rojoForwardHTTP)
-	mux.HandleFunc("/rojo-forward/{place_id}/task/{task_id}/{path...}", rojoForwardHTTP)
 	mux.HandleFunc("GET /plugin/mcp2/pull_command", func(w http.ResponseWriter, r *http.Request) {
 		mode := r.URL.Query().Get("mode")
 		modeSeq := r.URL.Query().Get("mode_seq")
@@ -1841,384 +1798,6 @@ func parseRuntimeLogLimit(value string) (int, error) {
 	return limit, nil
 }
 
-func resolveRojoPluginBinding(
-	w http.ResponseWriter,
-	r *http.Request,
-	listenAddr string,
-	studioManager *studio.Manager,
-	taskSessions *tasksession.Registry,
-	logger *slog.Logger,
-	requestedPlaceID string,
-	requestedTaskID string,
-) (rojoPluginBinding, bool) {
-	managedStudio, ok := resolvePeerManagedStudioProcess(r, listenAddr, studioManager, logger)
-	if !ok {
-		writeRojoAPIError(w, http.StatusForbidden, "invalid_plugin_binding", "request is not from a helper-managed Roblox Studio process", nil)
-		return rojoPluginBinding{}, false
-	}
-	return resolveRojoPluginBindingForManagedStudio(w, managedStudio, taskSessions, requestedPlaceID, requestedTaskID)
-}
-
-func resolveRojoPluginBindingForManagedStudio(
-	w http.ResponseWriter,
-	managedStudio studio.ManagedProcess,
-	taskSessions *tasksession.Registry,
-	requestedPlaceID string,
-	requestedTaskID string,
-) (rojoPluginBinding, bool) {
-	if managedStudio.OwnerKind != "task" || managedStudio.OwnerID == "" {
-		writeRojoAPIError(w, http.StatusForbidden, "task_binding_required", "managed Studio is not bound to a task session", map[string]any{"studio_pid": managedStudio.PID})
-		return rojoPluginBinding{}, false
-	}
-	status := taskSessions.Status(managedStudio.OwnerID)
-	if !status.OK || status.State != "live" || status.Contract == nil {
-		writeRojoAPIError(w, http.StatusForbidden, "task_not_live", "managed Studio is not bound to a live task session", map[string]any{
-			"task_id":    managedStudio.OwnerID,
-			"state":      status.State,
-			"studio_pid": managedStudio.PID,
-		})
-		return rojoPluginBinding{}, false
-	}
-	if requestedTaskID != "" && requestedTaskID != status.Contract.TaskID {
-		writeRojoAPIError(w, http.StatusForbidden, "task_binding_mismatch", "requested task does not match the Studio task binding", map[string]any{
-			"requested_task_id": requestedTaskID,
-			"bound_task_id":     status.Contract.TaskID,
-			"studio_pid":        managedStudio.PID,
-		})
-		return rojoPluginBinding{}, false
-	}
-	if requestedPlaceID != "" && requestedPlaceID != status.Contract.PlaceID {
-		writeRojoAPIError(w, http.StatusForbidden, "place_binding_mismatch", "requested place does not match the Studio task binding", map[string]any{
-			"requested_place_id": requestedPlaceID,
-			"bound_place_id":     status.Contract.PlaceID,
-			"task_id":            status.Contract.TaskID,
-			"studio_pid":         managedStudio.PID,
-		})
-		return rojoPluginBinding{}, false
-	}
-	if strings.TrimSpace(status.Contract.RojoUpstreamURL) == "" {
-		writeRojoAPIError(w, http.StatusConflict, "rojo_upstream_unavailable", "task session has no Rojo upstream URL", map[string]any{"task_id": status.Contract.TaskID})
-		return rojoPluginBinding{}, false
-	}
-	return rojoPluginBinding{
-		TaskID:      status.Contract.TaskID,
-		PlaceID:     status.Contract.PlaceID,
-		UpstreamURL: status.Contract.RojoUpstreamURL,
-		StudioPID:   managedStudio.PID,
-	}, true
-}
-
-func localRojoForwardBaseURL(listenAddr string, requestHost string, placeID string, taskID string) (string, error) {
-	port, err := listenPort(listenAddr)
-	if err != nil && requestHost != "" {
-		_, portText, splitErr := net.SplitHostPort(requestHost)
-		if splitErr == nil {
-			port, err = strconv.Atoi(portText)
-		}
-	}
-	if err != nil || port <= 0 {
-		return "", fmt.Errorf("could not resolve helper listen port from %q", listenAddr)
-	}
-	return fmt.Sprintf("http://127.0.0.1:%d/rojo-forward/%s/task/%s", port, url.PathEscape(placeID), url.PathEscape(taskID)), nil
-}
-
-func rojoForwardTargetHTTPURL(baseURL string, path string, rawQuery string) (string, error) {
-	return rojoForwardTargetURL(baseURL, "http", "https", path, rawQuery)
-}
-
-func rojoForwardTargetWSURL(baseURL string, path string, rawQuery string) (string, error) {
-	parsed, err := url.Parse(strings.TrimSpace(baseURL))
-	if err != nil {
-		return "", err
-	}
-	switch parsed.Scheme {
-	case "http":
-		parsed.Scheme = "ws"
-	case "https":
-		parsed.Scheme = "wss"
-	case "ws", "wss":
-	default:
-		return "", fmt.Errorf("Rojo upstream URL must use http(s) or ws(s): %s", baseURL)
-	}
-	parsed.Path = rojoForwardJoinedPath(parsed.Path, path)
-	parsed.RawQuery = rawQuery
-	return parsed.String(), nil
-}
-
-func rojoForwardTargetURL(baseURL string, allowedSchemeA string, allowedSchemeB string, path string, rawQuery string) (string, error) {
-	parsed, err := url.Parse(strings.TrimSpace(baseURL))
-	if err != nil {
-		return "", err
-	}
-	if parsed.Scheme != allowedSchemeA && parsed.Scheme != allowedSchemeB {
-		return "", fmt.Errorf("Rojo upstream URL must use %s or %s: %s", allowedSchemeA, allowedSchemeB, baseURL)
-	}
-	if parsed.Host == "" {
-		return "", fmt.Errorf("Rojo upstream URL must include host: %s", baseURL)
-	}
-	parsed.Path = rojoForwardJoinedPath(parsed.Path, path)
-	parsed.RawQuery = rawQuery
-	return parsed.String(), nil
-}
-
-func rojoForwardJoinedPath(basePath string, path string) string {
-	basePath = strings.TrimRight(basePath, "/")
-	path = strings.TrimLeft(path, "/")
-	if path == "" {
-		if basePath == "" {
-			return "/"
-		}
-		return basePath + "/"
-	}
-	if basePath == "" {
-		return "/" + path
-	}
-	return basePath + "/" + path
-}
-
-func proxyRojoHTTPRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, targetURL string, tokenFile string) (int, int64, error) {
-	var body io.Reader
-	if r.Body != nil {
-		body = r.Body
-	}
-	req, err := http.NewRequestWithContext(ctx, r.Method, targetURL, body)
-	if err != nil {
-		return 0, 0, err
-	}
-	copyRojoForwardRequestHeaders(req.Header, r.Header)
-	req.Header.Set("Accept-Encoding", "identity")
-	if err := applyRojoUpstreamAuthorization(req, tokenFile); err != nil {
-		return 0, 0, err
-	}
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return 0, 0, err
-	}
-	defer response.Body.Close()
-
-	copyRojoForwardResponseHeaders(w.Header(), response.Header)
-	w.WriteHeader(response.StatusCode)
-	written, err := io.Copy(w, response.Body)
-	if err != nil {
-		return response.StatusCode, written, err
-	}
-	return response.StatusCode, written, nil
-}
-
-func copyRojoForwardRequestHeaders(dst http.Header, src http.Header) {
-	for key, values := range src {
-		if rojoHopByHopHeader(key) || strings.EqualFold(key, "Host") || strings.EqualFold(key, "Accept-Encoding") {
-			continue
-		}
-		for _, value := range values {
-			dst.Add(key, value)
-		}
-	}
-}
-
-func copyRojoForwardResponseHeaders(dst http.Header, src http.Header) {
-	for key, values := range src {
-		if rojoHopByHopHeader(key) {
-			continue
-		}
-		for _, value := range values {
-			dst.Add(key, value)
-		}
-	}
-}
-
-func rojoHopByHopHeader(key string) bool {
-	switch strings.ToLower(key) {
-	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
-		return true
-	default:
-		return false
-	}
-}
-
-func proxyRojoWebSocket(w http.ResponseWriter, r *http.Request, targetURL string, tokenFile string) {
-	if !headerContainsToken(r.Header, "Connection", "upgrade") || !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-		writeRojoAPIError(w, http.StatusBadRequest, "websocket_upgrade_required", "Rojo socket endpoint requires a WebSocket upgrade request", nil)
-		return
-	}
-	target, err := url.Parse(targetURL)
-	if err != nil {
-		writeRojoAPIError(w, http.StatusBadGateway, "invalid_rojo_upstream", err.Error(), nil)
-		return
-	}
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		writeRojoAPIError(w, http.StatusInternalServerError, "websocket_hijack_unavailable", "HTTP server does not support connection hijacking", nil)
-		return
-	}
-	clientConn, clientRW, err := hijacker.Hijack()
-	if err != nil {
-		return
-	}
-	defer clientConn.Close()
-
-	remoteConn, err := dialRojoWebSocketTarget(r.Context(), target)
-	if err != nil {
-		writeRawHTTPError(clientRW.Writer, http.StatusBadGateway, "failed to connect Rojo websocket upstream")
-		return
-	}
-	defer remoteConn.Close()
-
-	if err := writeRojoWebSocketHandshake(remoteConn, r, target, tokenFile); err != nil {
-		writeRawHTTPError(clientRW.Writer, http.StatusBadGateway, "failed to write Rojo websocket handshake")
-		return
-	}
-	remoteReader := bufio.NewReader(remoteConn)
-	response, err := http.ReadResponse(remoteReader, r)
-	if err != nil {
-		writeRawHTTPError(clientRW.Writer, http.StatusBadGateway, "failed to read Rojo websocket handshake")
-		return
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusSwitchingProtocols {
-		if err := response.Write(clientRW.Writer); err == nil {
-			_ = clientRW.Writer.Flush()
-		}
-		return
-	}
-	if err := response.Write(clientRW.Writer); err != nil {
-		return
-	}
-	if err := clientRW.Writer.Flush(); err != nil {
-		return
-	}
-
-	done := make(chan struct{}, 2)
-	go func() {
-		_, _ = io.Copy(remoteConn, clientRW)
-		done <- struct{}{}
-	}()
-	go func() {
-		_, _ = io.Copy(clientConn, io.MultiReader(remoteReader, remoteConn))
-		done <- struct{}{}
-	}()
-	<-done
-}
-
-func dialRojoWebSocketTarget(ctx context.Context, target *url.URL) (net.Conn, error) {
-	host := target.Host
-	if _, _, err := net.SplitHostPort(host); err != nil {
-		switch target.Scheme {
-		case "ws":
-			host = net.JoinHostPort(host, "80")
-		case "wss":
-			host = net.JoinHostPort(host, "443")
-		}
-	}
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	if target.Scheme == "wss" {
-		return tls.DialWithDialer(dialer, "tcp", host, &tls.Config{ServerName: target.Hostname(), MinVersion: tls.VersionTLS12})
-	}
-	return dialer.DialContext(ctx, "tcp", host)
-}
-
-func writeRojoWebSocketHandshake(conn net.Conn, original *http.Request, target *url.URL, tokenFile string) error {
-	path := target.EscapedPath()
-	if path == "" {
-		path = "/"
-	}
-	if target.RawQuery != "" {
-		path += "?" + target.RawQuery
-	}
-	request := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n", path, target.Host)
-	for _, key := range []string{"Sec-WebSocket-Key", "Sec-WebSocket-Version", "Sec-WebSocket-Protocol", "Sec-WebSocket-Extensions", "Origin"} {
-		for _, value := range original.Header.Values(key) {
-			request += key + ": " + value + "\r\n"
-		}
-	}
-	authHeader, err := publicBearerHeaderForRojoUpstream(target, tokenFile)
-	if err != nil {
-		return err
-	}
-	if authHeader != "" {
-		request += "Authorization: " + authHeader + "\r\n"
-	}
-	request += "\r\n"
-	_, err = io.WriteString(conn, request)
-	return err
-}
-
-func applyRojoUpstreamAuthorization(req *http.Request, tokenFile string) error {
-	authHeader, err := publicBearerHeaderForRojoUpstream(req.URL, tokenFile)
-	if err != nil {
-		return err
-	}
-	if authHeader != "" {
-		req.Header.Set("Authorization", authHeader)
-	}
-	return nil
-}
-
-func publicBearerHeaderForRojoUpstream(target *url.URL, tokenFile string) (string, error) {
-	if !rojoUpstreamNeedsPublicBearer(target) {
-		return "", nil
-	}
-	token, err := readRojoUpstreamBearerToken(tokenFile)
-	if err != nil {
-		return "", err
-	}
-	return "Bearer " + token, nil
-}
-
-func rojoUpstreamNeedsPublicBearer(target *url.URL) bool {
-	if target == nil {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(target.Scheme)) {
-	case "https", "wss":
-	default:
-		return false
-	}
-	host := strings.ToLower(strings.TrimSpace(target.Hostname()))
-	return host != "" && strings.HasSuffix(host, ".dev.clock-p.com")
-}
-
-func readRojoUpstreamBearerToken(tokenFile string) (string, error) {
-	body, err := os.ReadFile(strings.TrimSpace(tokenFile))
-	if err != nil {
-		return "", err
-	}
-	token := strings.TrimSpace(string(body))
-	if token == "" {
-		return "", errors.New("rojo upstream bearer token file is empty")
-	}
-	return token, nil
-}
-
-func headerContainsToken(header http.Header, key string, token string) bool {
-	for _, value := range header.Values(key) {
-		for _, part := range strings.Split(value, ",") {
-			if strings.EqualFold(strings.TrimSpace(part), token) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func writeRawHTTPError(writer *bufio.Writer, status int, message string) {
-	body := fmt.Sprintf("{\"ok\":false,\"code\":\"rojo_websocket_proxy_failed\",\"message\":%q}\n", message)
-	_, _ = fmt.Fprintf(writer, "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", status, http.StatusText(status), len(body), body)
-	_ = writer.Flush()
-}
-
-func writeRojoAPIError(w http.ResponseWriter, status int, code string, message string, extra map[string]any) {
-	body := map[string]any{
-		"ok":      false,
-		"code":    code,
-		"message": message,
-	}
-	for key, value := range extra {
-		body[key] = value
-	}
-	writeJSON(w, status, body)
-}
-
 func writeRuntimeLogAPIError(w http.ResponseWriter, status int, code string, message string, extra map[string]any) {
 	body := map[string]any{
 		"ok":      false,
@@ -2373,6 +1952,24 @@ func writeTaskAPIError(w http.ResponseWriter, status int, taskID string, code st
 		body[key] = value
 	}
 	writeJSON(w, status, body)
+}
+
+func requireTaskSessionToken(w http.ResponseWriter, r *http.Request, taskID string, status tasksession.StatusResponse) bool {
+	if status.Contract == nil {
+		writeJSON(w, http.StatusNotFound, status)
+		return false
+	}
+	expected := status.Contract.TaskSessionToken
+	actual := strings.TrimSpace(r.Header.Get(taskSessionTokenHeader))
+	if actual == "" {
+		writeTaskAPIError(w, http.StatusUnauthorized, taskID, "task_token_missing", "task session token is required", "restart_task_agent", nil)
+		return false
+	}
+	if subtle.ConstantTimeCompare([]byte(actual), []byte(expected)) != 1 {
+		writeTaskAPIError(w, http.StatusForbidden, taskID, "task_token_mismatch", "task session token does not match", "restart_task_agent", nil)
+		return false
+	}
+	return true
 }
 
 func defaultAddr() string {

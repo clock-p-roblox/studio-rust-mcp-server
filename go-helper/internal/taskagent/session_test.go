@@ -1,4 +1,4 @@
-package taskagent
+﻿package taskagent
 
 import (
 	"encoding/json"
@@ -21,8 +21,9 @@ func TestSaveDescriptorDoesNotStoreWorkspace(t *testing.T) {
 		TaskAgentPID:         42,
 		TaskAgentStartedAtMS: 1000,
 		TaskAgentStatusURL:   "http://127.0.0.1:1/status",
+		TaskSessionToken:     "token",
 		Helper:               HelperRoute{BaseURL: "http://127.0.0.1:44750"},
-		Rojo:                 RojoRoute{LocalURL: "http://127.0.0.1:5000", UpstreamURL: "http://127.0.0.1:5000"},
+		CodeSync:             testCodeSyncBinding(),
 	}
 	if err := SaveDescriptor(workspace, descriptor); err != nil {
 		t.Fatalf("save descriptor failed: %v", err)
@@ -133,28 +134,6 @@ func TestResolveHelperBaseURLPublicNeverReadsMachineNameFile(t *testing.T) {
 	}
 }
 
-func TestHelperFacingRojoUpstreamURLUsesLocalURLForLocalHelper(t *testing.T) {
-	got := helperFacingRojoUpstreamURL(
-		"http://127.0.0.1:44750",
-		"http://127.0.0.1:5000",
-		"https://123-tabc-rojo-sunjun-user.dev.clock-p.com",
-	)
-	if got != "http://127.0.0.1:5000" {
-		t.Fatalf("unexpected local helper upstream URL: %q", got)
-	}
-}
-
-func TestHelperFacingRojoUpstreamURLUsesPublicURLForPublicHelper(t *testing.T) {
-	got := helperFacingRojoUpstreamURL(
-		"https://roblox-helper-win-a-sunjun-user.dev.clock-p.com",
-		"http://127.0.0.1:5000",
-		"https://123-tabc-rojo-sunjun-user.dev.clock-p.com",
-	)
-	if got != "https://123-tabc-rojo-sunjun-user.dev.clock-p.com" {
-		t.Fatalf("unexpected public helper upstream URL: %q", got)
-	}
-}
-
 func TestRequestExistingShutdownUsesStatusURLAndTaskID(t *testing.T) {
 	shutdownCalled := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -186,6 +165,24 @@ func TestRequestExistingShutdownUsesStatusURLAndTaskID(t *testing.T) {
 	}
 	if !stopped || !shutdownCalled {
 		t.Fatalf("expected shutdown to be requested, stopped=%v called=%v", stopped, shutdownCalled)
+	}
+}
+
+func testCodeSyncBinding() CodeSyncBinding {
+	return CodeSyncBinding{
+		ProtocolVersion:    1,
+		WorkspaceID:        "workspace",
+		PlaceID:            "123",
+		MachineName:        "win-a",
+		ProjectID:          "game",
+		MappingProfile:     "code_sync_lua_v1",
+		CodeSyncConfigHash: "config",
+		RootsAuthorityHash: "roots",
+		ConfigPath:         "code-sync.roots.json",
+		ProjectPath:        "default.project.json",
+		Roots: []CodeSyncRootRoute{
+			{RootID: "root", StudioPath: []string{"Workspace", "ClockPTest"}},
+		},
 	}
 }
 

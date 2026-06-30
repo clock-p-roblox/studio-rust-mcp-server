@@ -13,14 +13,14 @@ from .live import _require_stable_edit_mode, query_live_manifest
 from .luau import long_string_literal
 from .manifest import build_local_manifest
 from .mapping import build_logical_tree
-from .rojo_project import load_project_targets
+from .project import load_project_targets
 from .scanner import scan_root
 
 
-def apply_code_sync(session: Session, workspace: Path, config_path: Path, rojo_project_path: Path, *, legacy_run_code: bool = False) -> dict:
+def apply_code_sync(session: Session, workspace: Path, config_path: Path, project_path: Path, *, legacy_run_code: bool = False) -> dict:
     before_mode = _require_stable_edit_mode(mode(session))
-    local_manifest = build_local_manifest(workspace, config_path, rojo_project_path)
-    roots_payload = _build_roots_payload(workspace, config_path, rojo_project_path)
+    local_manifest = build_local_manifest(workspace, config_path, project_path)
+    roots_payload = _build_roots_payload(workspace, config_path, project_path)
     if legacy_run_code:
         code = _apply_luau(roots_payload)
         result = run_code_direct(session, code)
@@ -38,15 +38,15 @@ def apply_code_sync(session: Session, workspace: Path, config_path: Path, rojo_p
     after_mode = _require_stable_edit_mode(mode(session))
     if before_mode.get("mode_seq") != after_mode.get("mode_seq"):
         raise BridgeError("code_sync_state_stale", "Studio mode_seq changed during apply", {"before_mode": before_mode, "after_mode": after_mode})
-    live_manifest = query_live_manifest(session, workspace, config_path, rojo_project_path)
+    live_manifest = query_live_manifest(session, workspace, config_path, project_path)
     diff = diff_manifests(local_manifest, live_manifest)
     if not diff["matched"]:
         raise BridgeError("code_sync_verify_failed", "live Studio manifest hash does not match local manifest after apply", {"local": local_manifest, "live": live_manifest, "diff": diff})
     return {"applied": True, "local": local_manifest, "live": live_manifest, "diff": diff, "apply_result": result}
 
 
-def _build_roots_payload(workspace: Path, config_path: Path, rojo_project_path: Path) -> list[dict]:
-    targets = load_project_targets(rojo_project_path)
+def _build_roots_payload(workspace: Path, config_path: Path, project_path: Path) -> list[dict]:
+    targets = load_project_targets(project_path)
     config = load_config(config_path, targets)
     roots = []
     for root in config.roots:

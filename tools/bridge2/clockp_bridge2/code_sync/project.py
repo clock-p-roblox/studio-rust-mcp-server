@@ -16,7 +16,7 @@ def load_project_targets(project_path: Path) -> list[list[str]]:
         raise BridgeError("code_sync_invalid_config", str(exc), {"path": str(project_path)}) from exc
     tree = payload.get("tree")
     if not isinstance(tree, dict):
-        raise BridgeError("code_sync_invalid_config", "Rojo project missing tree object", {"path": str(project_path)})
+        raise BridgeError("code_sync_invalid_config", "project declaration missing tree object", {"path": str(project_path)})
     targets: list[list[str]] = []
     for name, child in tree.items():
         if name.startswith("$") or not isinstance(child, dict):
@@ -59,6 +59,6 @@ def validate_studio_path_allowed(studio_path: list[str], targets: list[list[str]
             return
     raise BridgeError(
         "code_sync_invalid_config",
-        "studio_path is not declared by the Rojo project target allowlist",
+        "studio_path is not declared by the project target allowlist",
         {"studio_path": studio_path, "studio_target_allowlist": targets},
     )

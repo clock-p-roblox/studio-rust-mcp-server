@@ -3,6 +3,7 @@ package tasksession
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"regexp"
 	"sort"
 	"sync"
@@ -23,12 +24,13 @@ type DesiredStudioStore interface {
 }
 
 type HeartbeatRequest struct {
-	TaskID               string `json:"task_id"`
-	MachineName          string `json:"machine_name"`
-	PlaceID              string `json:"place_id"`
-	TaskAgentPID         int    `json:"task_agent_pid"`
-	TaskAgentStartedAtMS int64  `json:"task_agent_started_at_ms"`
-	RojoUpstreamURL      string `json:"rojo_upstream_url"`
+	TaskID               string          `json:"task_id"`
+	MachineName          string          `json:"machine_name"`
+	PlaceID              string          `json:"place_id"`
+	TaskAgentPID         int             `json:"task_agent_pid"`
+	TaskAgentStartedAtMS int64           `json:"task_agent_started_at_ms"`
+	TaskSessionToken     string          `json:"task_session_token"`
+	CodeSync             CodeSyncBinding `json:"code_sync"`
 }
 
 type HeartbeatResponse struct {
@@ -74,12 +76,32 @@ type SessionSnapshot struct {
 }
 
 type Contract struct {
-	TaskID               string `json:"task_id"`
-	MachineName          string `json:"machine_name"`
-	PlaceID              string `json:"place_id"`
-	TaskAgentPID         int    `json:"task_agent_pid"`
-	TaskAgentStartedAtMS int64  `json:"task_agent_started_at_ms"`
-	RojoUpstreamURL      string `json:"rojo_upstream_url"`
+	TaskID               string          `json:"task_id"`
+	MachineName          string          `json:"machine_name"`
+	PlaceID              string          `json:"place_id"`
+	TaskAgentPID         int             `json:"task_agent_pid"`
+	TaskAgentStartedAtMS int64           `json:"task_agent_started_at_ms"`
+	TaskSessionToken     string          `json:"-"`
+	CodeSync             CodeSyncBinding `json:"code_sync"`
+}
+
+type CodeSyncBinding struct {
+	ProtocolVersion    int                 `json:"protocol_version"`
+	WorkspaceID        string              `json:"workspace_id"`
+	PlaceID            string              `json:"place_id"`
+	MachineName        string              `json:"machine_name"`
+	ProjectID          string              `json:"project_id"`
+	MappingProfile     string              `json:"mapping_profile"`
+	CodeSyncConfigHash string              `json:"code_sync_config_hash"`
+	RootsAuthorityHash string              `json:"roots_authority_hash"`
+	ConfigPath         string              `json:"config_path,omitempty"`
+	ProjectPath        string              `json:"project_path,omitempty"`
+	Roots              []CodeSyncRootRoute `json:"roots"`
+}
+
+type CodeSyncRootRoute struct {
+	RootID     string   `json:"root_id"`
+	StudioPath []string `json:"studio_path"`
 }
 
 type Session struct {
@@ -355,8 +377,11 @@ func contractFromHeartbeat(pathTaskID string, request HeartbeatRequest) (Contrac
 	if request.TaskAgentStartedAtMS <= 0 {
 		return Contract{}, errors.New("task_agent_started_at_ms must be positive")
 	}
-	if request.RojoUpstreamURL == "" {
-		return Contract{}, errors.New("rojo_upstream_url must not be empty")
+	if request.TaskSessionToken == "" {
+		return Contract{}, errors.New("task_session_token must not be empty")
+	}
+	if err := validateCodeSyncBinding(request.MachineName, request.PlaceID, request.CodeSync); err != nil {
+		return Contract{}, err
 	}
 	return Contract{
 		TaskID:               taskID,
@@ -364,12 +389,13 @@ func contractFromHeartbeat(pathTaskID string, request HeartbeatRequest) (Contrac
 		PlaceID:              request.PlaceID,
 		TaskAgentPID:         request.TaskAgentPID,
 		TaskAgentStartedAtMS: request.TaskAgentStartedAtMS,
-		RojoUpstreamURL:      request.RojoUpstreamURL,
+		TaskSessionToken:     request.TaskSessionToken,
+		CodeSync:             request.CodeSync,
 	}, nil
 }
 
 func requireSameContract(existing Contract, incoming Contract) error {
-	if existing == incoming {
+	if reflect.DeepEqual(existing, incoming) {
 		return nil
 	}
 	return &Error{
@@ -379,6 +405,55 @@ func requireSameContract(existing Contract, incoming Contract) error {
 			existing.TaskID,
 		),
 	}
+}
+
+func validateCodeSyncBinding(machineName string, placeID string, binding CodeSyncBinding) error {
+	if binding.ProtocolVersion != 1 {
+		return errors.New("code_sync.protocol_version must be 1")
+	}
+	if binding.WorkspaceID == "" {
+		return errors.New("code_sync.workspace_id must not be empty")
+	}
+	if binding.PlaceID != placeID {
+		return errors.New("code_sync.place_id must match place_id")
+	}
+	if binding.MachineName != machineName {
+		return errors.New("code_sync.machine_name must match machine_name")
+	}
+	if binding.ProjectID == "" {
+		return errors.New("code_sync.project_id must not be empty")
+	}
+	if binding.MappingProfile == "" {
+		return errors.New("code_sync.mapping_profile must not be empty")
+	}
+	if binding.CodeSyncConfigHash == "" {
+		return errors.New("code_sync.code_sync_config_hash must not be empty")
+	}
+	if binding.RootsAuthorityHash == "" {
+		return errors.New("code_sync.roots_authority_hash must not be empty")
+	}
+	if len(binding.Roots) == 0 {
+		return errors.New("code_sync.roots must not be empty")
+	}
+	seen := make(map[string]struct{})
+	for _, root := range binding.Roots {
+		if root.RootID == "" {
+			return errors.New("code_sync.roots[].root_id must not be empty")
+		}
+		if len(root.StudioPath) == 0 {
+			return errors.New("code_sync.roots[].studio_path must not be empty")
+		}
+		if _, ok := seen[root.RootID]; ok {
+			return fmt.Errorf("duplicate code_sync root_id %s", root.RootID)
+		}
+		seen[root.RootID] = struct{}{}
+		for _, segment := range root.StudioPath {
+			if segment == "" {
+				return fmt.Errorf("code_sync root %s has empty studio_path segment", root.RootID)
+			}
+		}
+	}
+	return nil
 }
 
 func sortSnapshots(values []SessionSnapshot) {

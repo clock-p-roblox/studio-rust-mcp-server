@@ -164,6 +164,20 @@ func runOfficialHTTP(
 	args map[string]any,
 ) {
 	taskID := r.PathValue("task_id")
+	status := taskSessions.Status(taskID)
+	if !status.OK || status.Contract == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"ok":      false,
+			"code":    "task_not_registered",
+			"message": fmt.Sprintf("helper2 has no registered session for task_id %s", taskID),
+			"task_id": taskID,
+			"state":   status.State,
+		})
+		return
+	}
+	if !requireTaskSessionToken(w, r, taskID, status) {
+		return
+	}
 	payload, statusCode := runOfficialTaskTool(r.Context(), taskID, taskSessions, studioManager, runner, toolName, args)
 	writeJSON(w, statusCode, payload)
 }

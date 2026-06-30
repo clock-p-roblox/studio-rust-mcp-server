@@ -19,7 +19,6 @@ LLM / 脚本
 
 task-agent
   -> 写 session.json
-  -> 启动 Rojo
   -> 向 helper2 心跳
 ```
 
@@ -80,10 +79,10 @@ K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe start `
   --place_id 113577273791190 `
   --machine_name sunjun2 `
   --helper-base-url http://127.0.0.1:<helper2_port> `
-  --register-domain=false
+  --code-sync-config code-sync.roots.json `
+  --code-sync-project default.project.json
 ```
 
-`task-agent` 的 `--register-domain` 默认也是开启的。纯本地测试建议显式传 `--register-domain=false`。
 
 查看和停止：
 
@@ -94,7 +93,6 @@ K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe stop --works
 
 ## 公网启动
 
-helper2 默认 `--register-domain=true`。task-agent 公网模式示例：
 
 ```powershell
 K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe start `
@@ -103,13 +101,12 @@ K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe start `
   --place_id 113577273791190 `
   --machine_name sunjun2 `
   --user <feishu-user_name> `
-  --rojo-bin K:\roblox_space\rojo\target\release\rojo.exe `
-  --project K:\roblox_space\test_game3\default.project.json
+  --code-sync-config code-sync.roots.json `
+  --code-sync-project default.project.json
 ```
 
 helper2 自身的 HTTP handler 不做 Bearer 鉴权；但当 `bridge2` 通过公网 `helper.base_url` 访问时，外层 `dev.clock-p.com` 入口仍要求 `Authorization: Bearer <feishu-token>`。`bridge2` 会自动从 workspace 或身份目录读取 `feishu-token` 注入。
 
-公网验收必须确认 bridge2 控制面走 `helper.base_url` 公网地址，并且 Studio 日志出现 Rojo initial sync 成功记录。不要只看 HTTP 状态码。
 
 ## bridge2 命令
 
@@ -181,9 +178,5 @@ go test -count=1 ./...
 
 ```powershell
 cd K:\roblox_space\studio-rust-mcp-server
-py -3 util\helper2_public_route_matrix_test.py `
-  --place-id 113577273791190 `
-  --kill-existing `
-  --public-ready-timeout 120 `
-  --initial-mode-timeout 240
+py -3 util\helper2_phase10_session_test.py
 ```

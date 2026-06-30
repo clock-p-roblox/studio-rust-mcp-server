@@ -1,4 +1,4 @@
-package tasksession
+﻿package tasksession
 
 import (
 	"testing"
@@ -28,7 +28,20 @@ func validHeartbeat(taskID string) HeartbeatRequest {
 		PlaceID:              "123",
 		TaskAgentPID:         42,
 		TaskAgentStartedAtMS: 1000,
-		RojoUpstreamURL:      "http://127.0.0.1:5000",
+		TaskSessionToken:     "token-" + taskID,
+		CodeSync: CodeSyncBinding{
+			ProtocolVersion:    1,
+			WorkspaceID:        "workspace-" + taskID,
+			PlaceID:            "123",
+			MachineName:        "win-a",
+			ProjectID:          "game",
+			MappingProfile:     "code_sync_lua_v1",
+			CodeSyncConfigHash: "config-hash-" + taskID,
+			RootsAuthorityHash: "roots-hash-" + taskID,
+			Roots: []CodeSyncRootRoute{
+				{RootID: "root", StudioPath: []string{"Workspace", "ClockPTest"}},
+			},
+		},
 	}
 }
 
@@ -64,12 +77,14 @@ func TestHeartbeatRejectsImmutableChanges(t *testing.T) {
 			name: "machine_name",
 			mutate: func(request *HeartbeatRequest) {
 				request.MachineName = "win-b"
+				request.CodeSync.MachineName = "win-b"
 			},
 		},
 		{
 			name: "place_id",
 			mutate: func(request *HeartbeatRequest) {
 				request.PlaceID = "456"
+				request.CodeSync.PlaceID = "456"
 			},
 		},
 		{
@@ -85,9 +100,9 @@ func TestHeartbeatRejectsImmutableChanges(t *testing.T) {
 			},
 		},
 		{
-			name: "rojo_upstream_url",
+			name: "code_sync_config_hash",
 			mutate: func(request *HeartbeatRequest) {
-				request.RojoUpstreamURL = "http://127.0.0.1:6000"
+				request.CodeSync.CodeSyncConfigHash = "changed"
 			},
 		},
 	}
@@ -196,12 +211,14 @@ func TestLeaseExpiryRejectsChangedContract(t *testing.T) {
 			name: "machine_name",
 			mutate: func(request *HeartbeatRequest) {
 				request.MachineName = "win-b"
+				request.CodeSync.MachineName = "win-b"
 			},
 		},
 		{
 			name: "place_id",
 			mutate: func(request *HeartbeatRequest) {
 				request.PlaceID = "456"
+				request.CodeSync.PlaceID = "456"
 			},
 		},
 		{
@@ -217,9 +234,9 @@ func TestLeaseExpiryRejectsChangedContract(t *testing.T) {
 			},
 		},
 		{
-			name: "rojo_upstream_url",
+			name: "roots_authority_hash",
 			mutate: func(request *HeartbeatRequest) {
-				request.RojoUpstreamURL = "http://127.0.0.1:6000"
+				request.CodeSync.RootsAuthorityHash = "changed"
 			},
 		},
 	}
@@ -264,11 +281,9 @@ func TestSamePlaceTasksRemainIndependentThroughReleaseAndExpiry(t *testing.T) {
 	taskA := validHeartbeat("task-a")
 	taskA.TaskAgentPID = 101
 	taskA.TaskAgentStartedAtMS = 1001
-	taskA.RojoUpstreamURL = "http://127.0.0.1:5001"
 	taskB := validHeartbeat("task-b")
 	taskB.TaskAgentPID = 102
 	taskB.TaskAgentStartedAtMS = 1002
-	taskB.RojoUpstreamURL = "http://127.0.0.1:5002"
 	if _, err := registry.Heartbeat("task-a", taskA); err != nil {
 		t.Fatalf("task A heartbeat failed: %v", err)
 	}
