@@ -8,6 +8,8 @@ from urllib import error, parse, request
 from .errors import BridgeError
 from .session import Session
 
+_NO_PROXY_OPENER = request.build_opener(request.ProxyHandler({}))
+
 
 def task_url(session: Session, path: str, query: dict[str, str | int | None] | None = None) -> str:
     quoted_task = parse.quote(session.task_id, safe="")
@@ -40,7 +42,7 @@ def _request_json(method: str, url: str, payload: dict | None, timeout: float, s
         headers["X-ClockP-Task-Token"] = session.task_session_token
     req = request.Request(url, data=body, headers=headers, method=method)
     try:
-        with request.urlopen(req, timeout=timeout) as resp:
+        with _NO_PROXY_OPENER.open(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8")
             status = resp.status
     except error.HTTPError as exc:

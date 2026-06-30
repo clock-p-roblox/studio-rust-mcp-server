@@ -562,7 +562,7 @@ class Bridge2CLITest(unittest.TestCase):
             seen_headers = dict(req.header_items())
             return FakeURLResponse({"ok": True, "state": "live", "task_id": "task-a"})
 
-        with mock.patch.object(bridge_http.request, "urlopen", side_effect=fake_urlopen):
+        with mock.patch.object(bridge_http._NO_PROXY_OPENER, "open", side_effect=fake_urlopen):
             code, payload, stderr = self.run_cli("status")
 
         self.assertEqual(code, 0)
