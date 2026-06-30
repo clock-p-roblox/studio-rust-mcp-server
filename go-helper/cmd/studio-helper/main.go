@@ -2099,7 +2099,8 @@ func writeRuntimeLogAPIError(w http.ResponseWriter, status int, code string, mes
 
 func writeTaskStudioCommandTerminal(w http.ResponseWriter, taskID string, command mcp2Command, terminal mcp2CommandTerminal) {
 	if terminal.Result == nil {
-		writeTaskAPIError(w, http.StatusConflict, taskID, terminal.Reason, "mcp2 command ended before a response was received", "retry", map[string]any{
+		code, message, action := studioCommandTerminalReason(command, terminal.Reason)
+		writeTaskAPIError(w, http.StatusConflict, taskID, code, message, action, map[string]any{
 			"command_id": command.CommandID,
 			"accepted":   false,
 			"terminal":   terminal,
@@ -2252,6 +2253,18 @@ func requestedLaunchIDFromCommand(command mcp2Command) (int64, bool) {
 		return launchIDFromAny(playArgs["launch_id"])
 	}
 	return 0, false
+}
+
+func studioCommandTerminalReason(command mcp2Command, reason string) (string, string, string) {
+	if reason == "mode_seq_changed" {
+		switch command.Kind {
+		case mcp2CommandStudioPlay:
+			return "play_request_superseded", "Studio mode changed before this play request produced a response", "refresh_mode"
+		case mcp2CommandStudioStop:
+			return "stop_request_superseded", "Studio mode changed before this stop request produced a response", "refresh_mode"
+		}
+	}
+	return reason, "mcp2 command ended before a response was received", "retry"
 }
 
 func launchIDFromResultMap(result map[string]any) (int64, bool) {

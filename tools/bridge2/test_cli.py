@@ -26,6 +26,7 @@ class FakeHelper(BaseHTTPRequestHandler):
     launch_id: int | None = None
     state = "live"
     available = True
+    play_error_payload: dict | None = None
     play_changes_mode = True
     play_launch_behavior = "match"
     stop_changes_mode = True
@@ -75,6 +76,9 @@ class FakeHelper(BaseHTTPRequestHandler):
         payload = json.loads(body) if body else {}
         self._record(payload)
         if self.path.endswith("/studio/play"):
+            if type(self).play_error_payload is not None:
+                self._json(type(self).play_error_payload, status=409)
+                return
             requested_launch_id = int(payload["play_args"]["launch_id"])
             if type(self).play_changes_mode:
                 type(self).mode = "play_server"
@@ -149,6 +153,7 @@ class Bridge2CLITest(unittest.TestCase):
         FakeHelper.launch_id = None
         FakeHelper.state = "live"
         FakeHelper.available = True
+        FakeHelper.play_error_payload = None
         FakeHelper.play_changes_mode = True
         FakeHelper.play_launch_behavior = "match"
         FakeHelper.stop_changes_mode = True
@@ -297,6 +302,17 @@ class Bridge2CLITest(unittest.TestCase):
         code, payload, _stderr = self.run_cli("play")
         self.assertNotEqual(code, 0)
         self.assertEqual(payload["code"], "launch_id_missing")
+
+    def test_play_helper_superseded_error_is_json_failure(self) -> None:
+        FakeHelper.play_error_payload = {
+            "ok": False,
+            "code": "play_request_superseded",
+            "message": "Studio mode changed before this play request produced a response",
+        }
+        code, payload, _stderr = self.run_cli("play")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(payload["code"], "play_request_superseded")
+        self.assertEqual(payload["message"], "Studio mode changed before this play request produced a response")
 
     def test_play_tolerates_transient_mode_seq_changed_unavailable(self) -> None:
         FakeHelper.mode_unavailable_on_query_number = 2

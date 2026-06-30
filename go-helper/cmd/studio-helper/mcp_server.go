@@ -506,12 +506,13 @@ func (m *mcpRuntime) runOfficial(ctx context.Context, taskID string, toolName st
 
 func taskStudioCommandTerminalPayload(taskID string, command mcp2Command, terminal mcp2CommandTerminal) (map[string]any, bool) {
 	if terminal.Result == nil {
+		code, message, action := studioCommandTerminalReason(command, terminal.Reason)
 		return map[string]any{
 			"ok":         false,
 			"task_id":    taskID,
-			"code":       terminal.Reason,
-			"message":    "mcp2 command ended before a response was received",
-			"action":     "retry",
+			"code":       code,
+			"message":    message,
+			"action":     action,
 			"command_id": command.CommandID,
 			"accepted":   false,
 			"terminal":   terminal,

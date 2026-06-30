@@ -469,6 +469,32 @@ func TestModeSeqChangeCompletesPendingAndWaitingCommands(t *testing.T) {
 	}
 }
 
+func TestStudioCommandTerminalReasonForSupersededPlayAndStop(t *testing.T) {
+	playCode, playMessage, playAction := studioCommandTerminalReason(mcp2Command{Kind: mcp2CommandStudioPlay}, "mode_seq_changed")
+	if playCode != "play_request_superseded" || playAction != "refresh_mode" {
+		t.Fatalf("play terminal reason = (%q, %q, %q)", playCode, playMessage, playAction)
+	}
+	if playMessage != "Studio mode changed before this play request produced a response" {
+		t.Fatalf("play terminal message = %q", playMessage)
+	}
+
+	stopCode, stopMessage, stopAction := studioCommandTerminalReason(mcp2Command{Kind: mcp2CommandStudioStop}, "mode_seq_changed")
+	if stopCode != "stop_request_superseded" || stopAction != "refresh_mode" {
+		t.Fatalf("stop terminal reason = (%q, %q, %q)", stopCode, stopMessage, stopAction)
+	}
+	if stopMessage != "Studio mode changed before this stop request produced a response" {
+		t.Fatalf("stop terminal message = %q", stopMessage)
+	}
+
+	fallbackCode, fallbackMessage, fallbackAction := studioCommandTerminalReason(mcp2Command{Kind: mcp2CommandStudioPlay}, "command_timeout")
+	if fallbackCode != "command_timeout" || fallbackAction != "retry" {
+		t.Fatalf("fallback terminal reason = (%q, %q, %q)", fallbackCode, fallbackMessage, fallbackAction)
+	}
+	if fallbackMessage != "mcp2 command ended before a response was received" {
+		t.Fatalf("fallback terminal message = %q", fallbackMessage)
+	}
+}
+
 func TestPlayServerRejectsStaleEditLifecycleUntilStopRequested(t *testing.T) {
 	broker := newMCP2CommandBroker()
 	initializeBroker(t, broker, "edit", 11, 101)
