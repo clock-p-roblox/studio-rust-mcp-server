@@ -411,10 +411,10 @@ local function codeSyncKind(instance)
 		return "Folder"
 	elseif instance:IsA("ModuleScript") then
 		return "ModuleScript"
-	elseif instance:IsA("Script") then
-		return "Script"
 	elseif instance:IsA("LocalScript") then
 		return "LocalScript"
+	elseif instance:IsA("Script") then
+		return "Script"
 	end
 	return nil
 end
