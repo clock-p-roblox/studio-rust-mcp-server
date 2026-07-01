@@ -7,6 +7,8 @@ import re
 from ..errors import BridgeError
 from .config import CodeSyncRoot
 
+MAX_STUDIO_SOURCE_CHARS = 200000
+
 
 @dataclass(frozen=True)
 class SourceFile:
@@ -37,6 +39,19 @@ def scan_root(workspace: Path, root: CodeSyncRoot) -> list[SourceFile]:
         except UnicodeDecodeError as exc:
             raise BridgeError("code_sync_unsupported_encoding", "code-sync only supports UTF-8 text files", {"root_id": root.root_id, "path": str(path)}) from exc
         normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        source_chars = len(normalized)
+        if source_chars >= MAX_STUDIO_SOURCE_CHARS:
+            raise BridgeError(
+                "code_sync_source_too_large",
+                "code-sync source must stay below Roblox Studio Source size limit",
+                {
+                    "root_id": root.root_id,
+                    "path": str(path),
+                    "relative_path": rel,
+                    "source_chars": source_chars,
+                    "max_source_chars_exclusive": MAX_STUDIO_SOURCE_CHARS,
+                },
+            )
         result.append(SourceFile(relative_path=rel, source=normalized, source_bytes=len(normalized.encode("utf-8"))))
     return result
 
