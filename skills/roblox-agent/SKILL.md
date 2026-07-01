@@ -155,7 +155,6 @@ tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> ensure-edit
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> play
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> stop
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> screenshot
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> play-mode-logs
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> run-code-direct --file code.lua
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> run-code --file code.lua
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> code-sync-manifest
@@ -165,6 +164,15 @@ tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> code-sync-apply
 ```
 
 `run-code-direct` 不做模式切换。`run-code` 会先 ensure edit。需要 edit 的子命令自己决定是否 ensure；CLI 顶层不做全局 ensure。
+
+`play` 的成功判据不读日志，也不靠截图：
+
+- bridge2 生成本次随机 `launch_id`，随 play args 下发。
+- helper2 response 必须 echo 同一个 `requested_launch_id`。
+- plugin-mcp2 command result 必须 echo 同一个 `launch_id`。
+- 最终 Studio mode 必须变为 `play_server`。
+- 最终 `mode_seq` 必须不同于 play 前的 edit `mode_seq`。
+- 最终 mode payload 的 `launch_id` 必须等于本次请求的 `launch_id`。
 
 `code-sync-manifest` 是本地扫描，不需要 `.clock-p/session.json`。`code-sync-live-manifest`、`code-sync-dry-run`、`code-sync-apply` 走 task-scoped helper2 / mcp2 链路，只允许稳定 edit 态，并用 BLAKE3 hash 验证 Studio live tree。
 
@@ -190,7 +198,6 @@ tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> code-sync-apply
 - `helper2_studio_stop`
 - `helper2_studio_screenshot`
 - `helper2_studio_run_code`
-- `helper2_runtime_log`
 - `helper2_official_ping`
 - `helper2_official_store_image`
 - `helper2_official_generate_mesh`

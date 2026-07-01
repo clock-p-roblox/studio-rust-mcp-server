@@ -218,8 +218,18 @@ tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> ensure-edit
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> play
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> stop
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> screenshot
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> play-mode-logs
 ```
+
+`play` 的成功判据是程序化状态链，不读日志：
+
+- bridge2 生成本次随机 `launch_id`，随 play args 下发。
+- helper2 response 必须 echo 同一个 `requested_launch_id`。
+- plugin-mcp2 command result 必须 echo 同一个 `launch_id`。
+- 最终 Studio mode 必须变为 `play_server`。
+- 最终 `mode_seq` 必须不同于 play 前的 edit `mode_seq`。
+- 最终 mode payload 的 `launch_id` 必须等于本次请求的 `launch_id`。
+
+截图只作为可选视觉检查，不作为 play 成功的主判据。
 
 代码 flush：
 
@@ -282,7 +292,6 @@ POST /session/{task_id}/studio/play
 POST /session/{task_id}/studio/stop
 GET  /session/{task_id}/studio/screenshot
 POST /session/{task_id}/studio/run-code-direct
-GET  /session/{task_id}/runtime-log
 POST /session/{task_id}/code-sync/get-manifest
 POST /session/{task_id}/code-sync/apply
 POST /session/{task_id}/official/ping
@@ -293,8 +302,6 @@ POST /session/{task_id}/official/wait-job
 POST /session/{task_id}/official/search-creator-store
 POST /session/{task_id}/official/insert-from-creator-store
 ```
-
-Studio 日志读取是 helper2 能力。bridge2 对外命令名是 `play-mode-logs`，语义是从 helper2 读取当前 task/play 日志。
 
 ## helper2 MCP 工具
 
@@ -307,7 +314,6 @@ helper2_studio_play
 helper2_studio_stop
 helper2_studio_screenshot
 helper2_studio_run_code
-helper2_runtime_log
 helper2_official_ping
 helper2_official_store_image
 helper2_official_generate_mesh
@@ -366,7 +372,7 @@ py -3 util\helper2_task_session_gate_test.py --place-id <place_id>
 
 - helper2 公网 URL 鉴权和 task 可见性。
 - play / stop / screenshot 的 bridge2 直连路径。
-- MCP play / stop / screenshot / log。
+- MCP play / stop / screenshot。
 
 ## 文档原则
 
