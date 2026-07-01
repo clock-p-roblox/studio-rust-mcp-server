@@ -6,6 +6,7 @@ local StudioTestService = game:GetService("StudioTestService")
 
 local LOG_PREFIX = "[MCP2 Plugin]"
 local RUNTIME_SCRIPT_NAME = "MCP2Runtime"
+local LEGACY_RUNTIME_SCRIPT_NAME = "MCPStudioSessionControl"
 local RUNTIME_SCRIPT_MARKER = "clockp_mcp2_runtime_v1"
 local MAX_SAFE_INTEGER = 9007199254740991
 
@@ -156,9 +157,16 @@ end
 local HELPER_BASE_URL = "http://127.0.0.1:44750"
 local RESPONSE_RESULT_URL = HELPER_BASE_URL .. "/plugin/mcp2/response_result"
 
+local function isReservedRuntimeScriptName(name)
+	return name == RUNTIME_SCRIPT_NAME or name == LEGACY_RUNTIME_SCRIPT_NAME
+end
+
 local function isManagedRuntimeScript(instance)
-	if instance.Name ~= RUNTIME_SCRIPT_NAME or not instance:IsA("Script") then
+	if not isReservedRuntimeScriptName(instance.Name) or not instance:IsA("Script") then
 		return false
+	end
+	if instance.Name == LEGACY_RUNTIME_SCRIPT_NAME then
+		return true
 	end
 	if instance:GetAttribute(RUNTIME_SCRIPT_MARKER) == true then
 		return true
@@ -471,6 +479,23 @@ local function codeSyncFindPath(path)
 	return current
 end
 
+local function codeSyncIsReservedChild(parent, child)
+	return parent == ServerScriptService and isManagedRuntimeScript(child)
+end
+
+local function codeSyncReservedPathError(path)
+	if path[1] ~= "ServerScriptService" then
+		return nil
+	end
+	for index = 2, #path do
+		local segment = tostring(path[index])
+		if isReservedRuntimeScriptName(segment) then
+			return "code_sync_reserved_child_conflict: ServerScriptService." .. segment
+		end
+	end
+	return nil
+end
+
 local function codeSyncSummarize(instance)
 	if instance == nil then
 		return nil
@@ -482,6 +507,9 @@ local function codeSyncSummarize(instance)
 	local seen = {}
 	local children = {}
 	for _, child in instance:GetChildren() do
+		if codeSyncIsReservedChild(instance, child) then
+			continue
+		end
 		local childEntryKind = codeSyncKind(child)
 		if seen[child.Name] then
 			error("code_sync_ambiguous_remote_tree: duplicate child name " .. child.Name)
@@ -565,6 +593,10 @@ local function codeSyncGetManifest(args)
 		if typeof(target) ~= "table" or typeof(target.studio_path) ~= "table" then
 			return false, nil, "code_sync_invalid_config: target must include studio_path"
 		end
+		local reservedPathError = codeSyncReservedPathError(target.studio_path)
+		if reservedPathError ~= nil then
+			return false, nil, reservedPathError
+		end
 		local summary = codeSyncSummarize(codeSyncFindPath(target.studio_path))
 		local currentTargetHash = nil
 		local targetId = codeSyncCanonicalStudioPath(target.studio_path)
@@ -634,6 +666,10 @@ local function codeSyncEnsureChild(parent, name, className)
 end
 
 local function codeSyncEnsureRoot(path, tree)
+	local reservedPathError = codeSyncReservedPathError(path)
+	if reservedPathError ~= nil then
+		return nil, reservedPathError
+	end
 	local current = game:GetService(path[1])
 	for index = 2, #path - 1 do
 		local className = "Folder"
@@ -697,6 +733,9 @@ local function codeSyncReconcileNode(instance, node)
 		if not childValid then
 			return false, childValidationError
 		end
+		if instance == ServerScriptService and isReservedRuntimeScriptName(child.name) then
+			return false, "code_sync_reserved_child_conflict: " .. instance:GetFullName() .. "." .. child.name
+		end
 		if targetByName[child.name] ~= nil then
 			return false, "code_sync_invalid_config: duplicate target child name " .. child.name
 		end
@@ -704,6 +743,12 @@ local function codeSyncReconcileNode(instance, node)
 	end
 	local existingByName = {}
 	for _, child in instance:GetChildren() do
+		if codeSyncIsReservedChild(instance, child) then
+			if targetByName[child.Name] ~= nil then
+				return false, "code_sync_reserved_child_conflict: " .. child:GetFullName()
+			end
+			continue
+		end
 		if existingByName[child.Name] ~= nil then
 			return false, "code_sync_ambiguous_path: duplicate child name " .. child.Name
 		end

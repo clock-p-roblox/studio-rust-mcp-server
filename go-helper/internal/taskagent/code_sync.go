@@ -37,6 +37,11 @@ var allowedManagedServiceNodes = map[string]struct{}{
 	"ServerScriptService": {},
 }
 
+var reservedServerScriptServiceChildren = map[string]struct{}{
+	"MCP2Runtime":            {},
+	"MCPStudioSessionControl": {},
+}
+
 var allowedCodeSyncNodeMetaKeys = map[string]struct{}{
 	"$local_path": {},
 	"$kind":       {},
@@ -237,6 +242,9 @@ func parseCodeSyncTreeNode(value map[string]any, studioPath []string, isService 
 			return fmt.Errorf("managed Studio service nodes cannot declare $kind: %v", studioPath)
 		}
 	}
+	if hasReservedServerScriptServiceSegment(studioPath) {
+		return fmt.Errorf("code-sync path uses a reserved ServerScriptService child: %v", studioPath)
+	}
 	if isNode {
 		node, err := parseCodeSyncNode(value, studioPath)
 		if err != nil {
@@ -257,6 +265,18 @@ func parseCodeSyncTreeNode(value map[string]any, studioPath []string, isService 
 		}
 	}
 	return nil
+}
+
+func hasReservedServerScriptServiceSegment(studioPath []string) bool {
+	if len(studioPath) < 2 || studioPath[0] != "ServerScriptService" {
+		return false
+	}
+	for _, segment := range studioPath[1:] {
+		if _, ok := reservedServerScriptServiceChildren[segment]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func parseCodeSyncNode(value map[string]any, studioPath []string) (codeSyncNodeConfig, error) {

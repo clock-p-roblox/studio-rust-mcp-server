@@ -96,6 +96,18 @@ func TestBuildCodeSyncBindingRejectsUnsupportedManagedServiceNode(t *testing.T) 
 	}
 }
 
+func TestBuildCodeSyncBindingRejectsReservedServerScriptServicePath(t *testing.T) {
+	workspace := t.TempDir()
+	body := `{"tree":{"ServerScriptService":{"MCPStudioSessionControl":{"Foo":{"$local_path":"src"}}}}}`
+	if err := os.WriteFile(filepath.Join(workspace, "code-sync.tree.json"), []byte(body), 0o644); err != nil {
+		t.Fatalf("write code-sync config failed: %v", err)
+	}
+	_, err := BuildCodeSyncBinding(workspace, "code-sync.tree.json", "win-a", "123")
+	if err == nil || !strings.Contains(err.Error(), "reserved ServerScriptService child") {
+		t.Fatalf("expected reserved child error, got %v", err)
+	}
+}
+
 func TestBuildCodeSyncBindingRejectsOldRootsConfig(t *testing.T) {
 	workspace := t.TempDir()
 	body := `{"roots":[]}`

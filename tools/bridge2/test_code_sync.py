@@ -65,6 +65,19 @@ class CodeSyncTests(unittest.TestCase):
                 load_config(path)
         self.assertEqual(ctx.exception.code, "code_sync_invalid_config")
 
+    def test_load_config_rejects_reserved_server_script_service_path(self) -> None:
+        from clockp_bridge2.code_sync.config import load_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "code-sync.tree.json"
+            path.write_text(
+                json.dumps({"tree": {"ServerScriptService": {"MCPStudioSessionControl": {"Foo": {"$local_path": "src"}}}}}),
+                encoding="utf-8",
+            )
+            with self.assertRaises(BridgeError) as ctx:
+                load_config(path)
+        self.assertEqual(ctx.exception.code, "code_sync_invalid_config")
+
     def test_load_config_rejects_unknown_service_root(self) -> None:
         from clockp_bridge2.code_sync.config import load_config
 

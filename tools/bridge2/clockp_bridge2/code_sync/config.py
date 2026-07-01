@@ -23,6 +23,7 @@ ALLOWED_STUDIO_SERVICES = {
     "Workspace",
 }
 ALLOWED_MANAGED_SERVICE_NODES = {"ReplicatedStorage", "ServerScriptService"}
+RESERVED_SERVER_SCRIPT_SERVICE_CHILDREN = {"MCP2Runtime", "MCPStudioSessionControl"}
 
 
 @dataclass(frozen=True)
@@ -106,6 +107,8 @@ def _parse_tree_node(value: dict, studio_path: list[str], nodes: list[CodeSyncNo
         raise BridgeError("code_sync_invalid_config", "this Studio service cannot be a managed code-sync node", {"studio_path": studio_path, "service": studio_path[0]})
     if is_service and "$kind" in meta_keys:
         raise BridgeError("code_sync_invalid_config", "managed Studio service nodes cannot declare $kind", {"studio_path": studio_path})
+    if _has_reserved_server_script_service_segment(studio_path):
+        raise BridgeError("code_sync_invalid_config", "code-sync path uses a reserved ServerScriptService child", {"studio_path": studio_path})
     if is_node:
         nodes.append(_parse_node(value, studio_path))
     for child_name, child_value in value.items():
@@ -118,6 +121,10 @@ def _parse_tree_node(value: dict, studio_path: list[str], nodes: list[CodeSyncNo
         if not isinstance(child_value, dict):
             raise BridgeError("code_sync_invalid_config", "Studio child entry must be an object", {"studio_path": studio_path + [child_name]})
         _parse_tree_node(child_value, studio_path + [child_name], nodes)
+
+
+def _has_reserved_server_script_service_segment(studio_path: list[str]) -> bool:
+    return len(studio_path) >= 2 and studio_path[0] == "ServerScriptService" and any(segment in RESERVED_SERVER_SCRIPT_SERVICE_CHILDREN for segment in studio_path[1:])
 
 
 def _parse_node(value: dict, studio_path: list[str]) -> CodeSyncNode:
