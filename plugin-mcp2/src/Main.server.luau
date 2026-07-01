@@ -401,6 +401,14 @@ end
 local function codeSyncKind(instance)
 	if instance:IsA("Folder") then
 		return "Folder"
+	elseif instance.ClassName == "ServerScriptService" then
+		return "Folder"
+	elseif instance.ClassName == "StarterPlayerScripts" then
+		return "Folder"
+	elseif instance.ClassName == "StarterCharacterScripts" then
+		return "Folder"
+	elseif instance.ClassName == "ReplicatedStorage" then
+		return "Folder"
 	elseif instance:IsA("ModuleScript") then
 		return "ModuleScript"
 	elseif instance:IsA("Script") then
@@ -602,6 +610,9 @@ local function codeSyncEnsureChild(parent, name, className)
 		return nil, findError
 	end
 	if existing ~= nil and existing.ClassName ~= className then
+		if className == "Folder" and codeSyncKind(existing) == "Folder" then
+			return existing, nil
+		end
 		return nil, "code_sync_class_mismatch: " .. name .. " is " .. existing.ClassName .. ", want " .. className
 	end
 	if existing == nil then

@@ -137,6 +137,19 @@ class CodeSyncTests(unittest.TestCase):
                 scan_root(workspace, root)
         self.assertEqual(ctx.exception.code, "code_sync_unsupported_encoding")
 
+    def test_source_too_large_rejected_before_flush(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            src = workspace / "src"
+            src.mkdir()
+            (src / "Huge.lua").write_text("a" * 200000, encoding="utf-8")
+            root = CodeSyncRoot("app", "src", ["Workspace"], ["**/*.lua"], [])
+            with self.assertRaises(BridgeError) as ctx:
+                scan_root(workspace, root)
+        self.assertEqual(ctx.exception.code, "code_sync_source_too_large")
+        self.assertEqual(ctx.exception.details["relative_path"], "Huge.lua")
+        self.assertEqual(ctx.exception.details["source_chars"], 200000)
+
     def test_hash_fixture(self) -> None:
         script = LogicalNode("Main", "ModuleScript", "return 1\n")
         self.assertEqual(script.entry_hash(), "6520c8981971c534640f33cd4664b94b77ae9d2b9e6c3d3e7da744f13639a209")
