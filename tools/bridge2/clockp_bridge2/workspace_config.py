@@ -35,5 +35,5 @@ def load_workspace_config(workspace: Path) -> WorkspaceConfig:
     if not place_id.isdigit():
         raise BridgeError("workspace_config_invalid_place_id", "clock-p.workspace.json place_id must contain digits only", {"path": str(path), "place_id": place_id})
 
-    code_sync_config = str(data.get("code_sync_config") or "code-sync.roots.json").strip() or "code-sync.roots.json"
+    code_sync_config = str(data.get("code_sync_config") or "code-sync.tree.json").strip() or "code-sync.tree.json"
     return WorkspaceConfig(place_id=place_id, code_sync_config=code_sync_config)

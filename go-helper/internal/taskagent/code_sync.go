@@ -1,10 +1,12 @@
 package taskagent
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -30,41 +32,40 @@ var allowedStudioServices = map[string]struct{}{
 	"Workspace":           {},
 }
 
-type CodeSyncBinding struct {
-	ProtocolVersion    int                 `json:"protocol_version"`
-	WorkspaceID        string              `json:"workspace_id"`
-	PlaceID            string              `json:"place_id"`
-	MachineName        string              `json:"machine_name"`
-	MappingProfile     string              `json:"mapping_profile"`
-	CodeSyncConfigHash string              `json:"code_sync_config_hash"`
-	RootsAuthorityHash string              `json:"roots_authority_hash"`
-	ConfigPath         string              `json:"config_path"`
-	Roots              []CodeSyncRootRoute `json:"roots"`
+var allowedManagedServiceNodes = map[string]struct{}{
+	"ReplicatedStorage":   {},
+	"ServerScriptService": {},
 }
 
-type CodeSyncRootRoute struct {
-	RootID     string   `json:"root_id"`
+var allowedCodeSyncNodeMetaKeys = map[string]struct{}{
+	"$local_path": {},
+	"$kind":       {},
+	"$include":    {},
+	"$exclude":    {},
+}
+
+type CodeSyncBinding struct {
+	ProtocolVersion     int                   `json:"protocol_version"`
+	WorkspaceID         string                `json:"workspace_id"`
+	PlaceID             string                `json:"place_id"`
+	MachineName         string                `json:"machine_name"`
+	MappingProfile      string                `json:"mapping_profile"`
+	CodeSyncConfigHash  string                `json:"code_sync_config_hash"`
+	TargetAuthorityHash string                `json:"target_authority_hash"`
+	ConfigPath          string                `json:"config_path"`
+	Targets             []CodeSyncTargetRoute `json:"targets"`
+}
+
+type CodeSyncTargetRoute struct {
 	StudioPath []string `json:"studio_path"`
 }
 
-type codeSyncRootConfig struct {
-	RootID     string
+type codeSyncNodeConfig struct {
 	LocalPath  string
 	StudioPath []string
+	Kind       string
 	Include    []string
 	Exclude    []string
-}
-
-type codeSyncConfigPayload struct {
-	Roots []codeSyncRootPayload `json:"roots"`
-}
-
-type codeSyncRootPayload struct {
-	RootID     string   `json:"root_id"`
-	LocalPath  string   `json:"local_path"`
-	StudioPath []string `json:"studio_path"`
-	Include    []string `json:"include"`
-	Exclude    []string `json:"exclude"`
 }
 
 func BuildCodeSyncBinding(workspace string, configPath string, machineName string, placeID string) (CodeSyncBinding, error) {
@@ -72,36 +73,22 @@ func BuildCodeSyncBinding(workspace string, configPath string, machineName strin
 	if err != nil {
 		return CodeSyncBinding{}, err
 	}
-	configRel, configAbs := normalizeWorkspacePath(workspaceAbs, configPath, "code-sync.roots.json")
-	roots, err := loadCodeSyncConfig(configAbs)
+	configRel, configAbs := normalizeWorkspacePath(workspaceAbs, configPath, "code-sync.tree.json")
+	nodes, err := loadCodeSyncConfig(configAbs)
 	if err != nil {
 		return CodeSyncBinding{}, err
 	}
-	rootRoutes := make([]CodeSyncRootRoute, 0, len(roots))
-	rootDicts := make([]map[string]any, 0, len(roots))
-	for _, root := range roots {
-		rootRoutes = append(rootRoutes, CodeSyncRootRoute{
-			RootID:     root.RootID,
-			StudioPath: append([]string(nil), root.StudioPath...),
-		})
-		rootDicts = append(rootDicts, map[string]any{
-			"root_id":     root.RootID,
-			"local_path":  root.LocalPath,
-			"studio_path": root.StudioPath,
-			"include":     root.Include,
-			"exclude":     root.Exclude,
-		})
-	}
+	targets := topLevelTargets(nodes)
 	return CodeSyncBinding{
-		ProtocolVersion:    codeSyncProtocolVersion,
-		WorkspaceID:        workspaceID(workspaceAbs),
-		PlaceID:            placeID,
-		MachineName:        machineName,
-		MappingProfile:     codeSyncMappingProfile,
-		CodeSyncConfigHash: configHash(codeSyncProtocolVersion, codeSyncMappingProfile, rootDicts),
-		RootsAuthorityHash: rootsAuthorityHash(rootRoutes),
-		ConfigPath:         configRel,
-		Roots:              rootRoutes,
+		ProtocolVersion:     codeSyncProtocolVersion,
+		WorkspaceID:         workspaceID(workspaceAbs),
+		PlaceID:             placeID,
+		MachineName:         machineName,
+		MappingProfile:      codeSyncMappingProfile,
+		CodeSyncConfigHash:  configHash(codeSyncProtocolVersion, codeSyncMappingProfile, nodes),
+		TargetAuthorityHash: targetAuthorityHash(targets),
+		ConfigPath:          configRel,
+		Targets:             targets,
 	}, nil
 }
 
@@ -131,59 +118,189 @@ func workspaceID(workspace string) string {
 	return hex.EncodeToString(sum[:])[:24]
 }
 
-func loadCodeSyncConfig(path string) ([]codeSyncRootConfig, error) {
+func loadCodeSyncConfig(path string) ([]codeSyncNodeConfig, error) {
 	body, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	var payload codeSyncConfigPayload
+	if err := rejectDuplicateJSONKeys(body); err != nil {
+		return nil, err
+	}
+	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, err
 	}
-	if len(payload.Roots) == 0 {
-		return nil, fmt.Errorf("roots must be a non-empty array")
+	if _, ok := payload["roots"]; ok {
+		return nil, fmt.Errorf("old roots format is not supported; use tree")
 	}
-	roots := make([]codeSyncRootConfig, 0, len(payload.Roots))
-	for _, item := range payload.Roots {
-		root, err := parseCodeSyncRoot(item)
-		if err != nil {
+	rawTree, ok := payload["tree"].(map[string]any)
+	if !ok || len(rawTree) == 0 {
+		return nil, fmt.Errorf("tree must be a non-empty object")
+	}
+	nodes := []codeSyncNodeConfig{}
+	for service, rawServiceTree := range rawTree {
+		if _, ok := allowedStudioServices[service]; !ok {
+			return nil, fmt.Errorf("tree key must be a supported DataModel service: %s", service)
+		}
+		serviceTree, ok := rawServiceTree.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("Studio service entry must be an object: %s", service)
+		}
+		if err := parseCodeSyncTreeNode(serviceTree, []string{service}, true, &nodes); err != nil {
 			return nil, err
 		}
-		roots = append(roots, root)
 	}
-	if err := validateUniqueCodeSyncRoots(roots); err != nil {
+	if len(nodes) == 0 {
+		return nil, fmt.Errorf("tree must contain at least one node with $local_path")
+	}
+	if err := validateUniqueCodeSyncNodes(nodes); err != nil {
 		return nil, err
 	}
-	return roots, nil
+	return nodes, nil
 }
 
-func parseCodeSyncRoot(item codeSyncRootPayload) (codeSyncRootConfig, error) {
-	rootID := strings.TrimSpace(item.RootID)
-	if rootID == "" {
-		return codeSyncRootConfig{}, fmt.Errorf("root_id must be a non-empty string")
+func rejectDuplicateJSONKeys(body []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	return rejectDuplicateJSONKeysValue(decoder)
+}
+
+func rejectDuplicateJSONKeysValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		if err == io.EOF {
+			return nil
+		}
+		return err
 	}
-	localPath := strings.ReplaceAll(strings.TrimSpace(item.LocalPath), "\\", "/")
-	if localPath == "" {
-		return codeSyncRootConfig{}, fmt.Errorf("local_path must be a non-empty string for root_id %s", rootID)
-	}
-	if escapesWorkspace(localPath) {
-		return codeSyncRootConfig{}, fmt.Errorf("local_path must be workspace-relative and cannot escape workspace for root_id %s", rootID)
-	}
-	if len(item.StudioPath) == 0 {
-		return codeSyncRootConfig{}, fmt.Errorf("studio_path must be a non-empty string array for root_id %s", rootID)
-	}
-	studioPath := append([]string(nil), item.StudioPath...)
-	for _, segment := range studioPath {
-		if strings.TrimSpace(segment) == "" {
-			return codeSyncRootConfig{}, fmt.Errorf("studio_path must not contain empty segments for root_id %s", rootID)
+	if delimiter, ok := token.(json.Delim); ok {
+		switch delimiter {
+		case '{':
+			seen := map[string]struct{}{}
+			for decoder.More() {
+				keyToken, err := decoder.Token()
+				if err != nil {
+					return err
+				}
+				key, ok := keyToken.(string)
+				if !ok {
+					return fmt.Errorf("object key must be a string")
+				}
+				if _, exists := seen[key]; exists {
+					return fmt.Errorf("duplicate JSON key: %s", key)
+				}
+				seen[key] = struct{}{}
+				if err := rejectDuplicateJSONKeysValue(decoder); err != nil {
+					return err
+				}
+			}
+			_, err := decoder.Token()
+			return err
+		case '[':
+			for decoder.More() {
+				if err := rejectDuplicateJSONKeysValue(decoder); err != nil {
+					return err
+				}
+			}
+			_, err := decoder.Token()
+			return err
 		}
 	}
-	if _, ok := allowedStudioServices[studioPath[0]]; !ok {
-		return codeSyncRootConfig{}, fmt.Errorf("studio_path must start from a supported DataModel service for root_id %s", rootID)
+	return nil
+}
+
+func parseCodeSyncTreeNode(value map[string]any, studioPath []string, isService bool, nodes *[]codeSyncNodeConfig) error {
+	metaKeys := []string{}
+	for key := range value {
+		if strings.HasPrefix(key, "$") {
+			metaKeys = append(metaKeys, key)
+		}
 	}
-	include := normalizePatterns(item.Include, []string{"**/*.lua", "**/*.luau"})
-	exclude := normalizePatterns(item.Exclude, nil)
-	return codeSyncRootConfig{RootID: rootID, LocalPath: localPath, StudioPath: studioPath, Include: include, Exclude: exclude}, nil
+	_, isNode := value["$local_path"]
+	if isService && len(metaKeys) > 0 && !isNode {
+		return fmt.Errorf("Studio service entries cannot declare metadata unless they are managed nodes: %v", studioPath)
+	}
+	if !isNode && len(metaKeys) > 0 {
+		return fmt.Errorf("only nodes with $local_path can declare metadata: %v", studioPath)
+	}
+	for _, key := range metaKeys {
+		if _, ok := allowedCodeSyncNodeMetaKeys[key]; !ok {
+			return fmt.Errorf("unknown code-sync node metadata %q for %v", key, studioPath)
+		}
+	}
+	if isService && isNode {
+		if _, ok := allowedManagedServiceNodes[studioPath[0]]; !ok {
+			return fmt.Errorf("this Studio service cannot be a managed code-sync node: %v", studioPath)
+		}
+	}
+	if isService {
+		if _, ok := value["$kind"]; ok {
+			return fmt.Errorf("managed Studio service nodes cannot declare $kind: %v", studioPath)
+		}
+	}
+	if isNode {
+		node, err := parseCodeSyncNode(value, studioPath)
+		if err != nil {
+			return err
+		}
+		*nodes = append(*nodes, node)
+	}
+	for childName, rawChild := range value {
+		if strings.HasPrefix(childName, "$") {
+			continue
+		}
+		childTree, ok := rawChild.(map[string]any)
+		if !ok {
+			return fmt.Errorf("Studio child entry must be an object: %v", appendPath(studioPath, childName))
+		}
+		if err := parseCodeSyncTreeNode(childTree, appendPath(studioPath, childName), false, nodes); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func parseCodeSyncNode(value map[string]any, studioPath []string) (codeSyncNodeConfig, error) {
+	localPath, ok := value["$local_path"].(string)
+	localPath = strings.ReplaceAll(strings.TrimSpace(localPath), "\\", "/")
+	if !ok || localPath == "" {
+		return codeSyncNodeConfig{}, fmt.Errorf("$local_path must be a non-empty string for %v", studioPath)
+	}
+	if escapesWorkspace(localPath) {
+		return codeSyncNodeConfig{}, fmt.Errorf("$local_path must be workspace-relative and cannot escape workspace for %v", studioPath)
+	}
+	kind := ""
+	if rawKind, ok := value["$kind"]; ok {
+		kind, ok = rawKind.(string)
+		if !ok || !validCodeSyncKind(kind) {
+			return codeSyncNodeConfig{}, fmt.Errorf("$kind must be Folder, ModuleScript, Script or LocalScript for %v", studioPath)
+		}
+	}
+	include := normalizePatterns(anyStringSlice(value["$include"]), []string{"**/*.lua", "**/*.luau"})
+	exclude := normalizePatterns(anyStringSlice(value["$exclude"]), nil)
+	return codeSyncNodeConfig{LocalPath: localPath, StudioPath: append([]string(nil), studioPath...), Kind: kind, Include: include, Exclude: exclude}, nil
+}
+
+func validCodeSyncKind(kind string) bool {
+	return kind == "Folder" || kind == "ModuleScript" || kind == "Script" || kind == "LocalScript"
+}
+
+func anyStringSlice(value any) []string {
+	if value == nil {
+		return nil
+	}
+	items, ok := value.([]any)
+	if !ok {
+		return []string{"\x00-invalid"}
+	}
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		text, ok := item.(string)
+		if !ok {
+			return []string{"\x00-invalid"}
+		}
+		result = append(result, text)
+	}
+	return result
 }
 
 func escapesWorkspace(path string) bool {
@@ -199,31 +316,62 @@ func normalizePatterns(values []string, defaultValues []string) []string {
 	}
 	result := make([]string, 0, len(values))
 	for _, value := range values {
+		if value == "\x00-invalid" {
+			return []string{value}
+		}
 		result = append(result, strings.ReplaceAll(value, "\\", "/"))
 	}
 	return result
 }
 
-func validateUniqueCodeSyncRoots(roots []codeSyncRootConfig) error {
-	seenIDs := make(map[string]struct{})
-	var seenPaths [][]string
-	for _, root := range roots {
-		if _, ok := seenIDs[root.RootID]; ok {
-			return fmt.Errorf("duplicate root_id %s", root.RootID)
+func validateUniqueCodeSyncNodes(nodes []codeSyncNodeConfig) error {
+	seenPaths := make(map[string]struct{})
+	for _, node := range nodes {
+		key := canonicalStudioPath(node.StudioPath)
+		if _, ok := seenPaths[key]; ok {
+			return fmt.Errorf("duplicate studio_path: %v", node.StudioPath)
 		}
-		seenIDs[root.RootID] = struct{}{}
-		for _, existing := range seenPaths {
-			if samePath(existing, root.StudioPath) || pathPrefix(existing, root.StudioPath) || pathPrefix(root.StudioPath, existing) {
-				return fmt.Errorf("managed root studio_path cannot overlap: %v", root.StudioPath)
+		seenPaths[key] = struct{}{}
+		for _, pattern := range append(append([]string{}, node.Include...), node.Exclude...) {
+			if pattern == "\x00-invalid" {
+				return fmt.Errorf("$include and $exclude must be string arrays for %v", node.StudioPath)
 			}
 		}
-		seenPaths = append(seenPaths, root.StudioPath)
 	}
 	return nil
 }
 
-func samePath(left []string, right []string) bool {
-	return len(left) == len(right) && pathPrefix(left, right)
+func topLevelTargets(nodes []codeSyncNodeConfig) []CodeSyncTargetRoute {
+	result := []CodeSyncTargetRoute{}
+	for _, node := range nodes {
+		if nearestParentNode(node.StudioPath, nodes) != nil {
+			continue
+		}
+		result = append(result, CodeSyncTargetRoute{StudioPath: append([]string(nil), node.StudioPath...)})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return canonicalStudioPath(result[i].StudioPath) < canonicalStudioPath(result[j].StudioPath)
+	})
+	return result
+}
+
+func nearestParentNode(path []string, nodes []codeSyncNodeConfig) []string {
+	var best []string
+	for _, node := range nodes {
+		candidate := node.StudioPath
+		if len(candidate) >= len(path) || !pathPrefix(candidate, path) {
+			continue
+		}
+		if best == nil || len(candidate) > len(best) {
+			best = candidate
+		}
+	}
+	return best
+}
+
+func appendPath(path []string, segment string) []string {
+	next := append([]string(nil), path...)
+	return append(next, segment)
 }
 
 func pathPrefix(prefix []string, path []string) bool {
@@ -238,74 +386,66 @@ func pathPrefix(prefix []string, path []string) bool {
 	return true
 }
 
-func comparePath(left []string, right []string) int {
-	for i := 0; i < len(left) && i < len(right); i++ {
-		if left[i] < right[i] {
-			return -1
-		}
-		if left[i] > right[i] {
-			return 1
-		}
-	}
-	if len(left) < len(right) {
-		return -1
-	}
-	if len(left) > len(right) {
-		return 1
-	}
-	return 0
-}
-
-func configHash(protocolVersion int, mappingProfile string, roots []map[string]any) string {
-	rootsCopy := append([]map[string]any(nil), roots...)
-	sort.Slice(rootsCopy, func(i, j int) bool { return fmt.Sprint(rootsCopy[i]["root_id"]) < fmt.Sprint(rootsCopy[j]["root_id"]) })
-	var rootBytes []byte
-	for _, root := range rootsCopy {
-		studioPath := stringSlice(root["studio_path"])
-		include := stringSlice(root["include"])
-		exclude := stringSlice(root["exclude"])
+func configHash(protocolVersion int, mappingProfile string, nodes []codeSyncNodeConfig) string {
+	nodesCopy := append([]codeSyncNodeConfig(nil), nodes...)
+	sort.Slice(nodesCopy, func(i, j int) bool {
+		return canonicalStudioPath(nodesCopy[i].StudioPath) < canonicalStudioPath(nodesCopy[j].StudioPath)
+	})
+	var nodeBytes []byte
+	for _, node := range nodesCopy {
+		include := append([]string(nil), node.Include...)
+		exclude := append([]string(nil), node.Exclude...)
 		sort.Strings(include)
 		sort.Strings(exclude)
-		rootBytes = append(rootBytes, canonicalString(fmt.Sprint(root["root_id"]))...)
-		rootBytes = append(rootBytes, canonicalString(strings.ReplaceAll(fmt.Sprint(root["local_path"]), "\\", "/"))...)
-		rootBytes = append(rootBytes, canonicalString(len(studioPath))...)
-		for _, segment := range studioPath {
-			rootBytes = append(rootBytes, canonicalString(segment)...)
+		nodeBytes = append(nodeBytes, canonicalString(canonicalStudioPath(node.StudioPath))...)
+		nodeBytes = append(nodeBytes, canonicalString(node.Kind)...)
+		nodeBytes = append(nodeBytes, canonicalString(strings.ReplaceAll(node.LocalPath, "\\", "/"))...)
+		nodeBytes = append(nodeBytes, canonicalString(len(node.StudioPath))...)
+		for _, segment := range node.StudioPath {
+			nodeBytes = append(nodeBytes, canonicalString(segment)...)
 		}
-		rootBytes = append(rootBytes, canonicalString(len(include))...)
+		nodeBytes = append(nodeBytes, canonicalString(len(include))...)
 		for _, pattern := range include {
-			rootBytes = append(rootBytes, canonicalString(pattern)...)
+			nodeBytes = append(nodeBytes, canonicalString(pattern)...)
 		}
-		rootBytes = append(rootBytes, canonicalString(len(exclude))...)
+		nodeBytes = append(nodeBytes, canonicalString(len(exclude))...)
 		for _, pattern := range exclude {
-			rootBytes = append(rootBytes, canonicalString(pattern)...)
+			nodeBytes = append(nodeBytes, canonicalString(pattern)...)
 		}
 	}
 	return blake3Hex(joinBytes(
-		canonicalString("clockp.code_sync.v1.config"),
+		canonicalString("clockp.code_sync.v2.config"),
 		canonicalString(protocolVersion),
 		canonicalString(mappingProfile),
-		canonicalString(len(rootsCopy)),
-		rootBytes,
+		canonicalString(len(nodesCopy)),
+		nodeBytes,
 	))
 }
 
-func rootsAuthorityHash(roots []CodeSyncRootRoute) string {
-	rootsCopy := append([]CodeSyncRootRoute(nil), roots...)
-	sort.Slice(rootsCopy, func(i, j int) bool { return rootsCopy[i].RootID < rootsCopy[j].RootID })
-	var rootBytes []byte
-	for _, root := range rootsCopy {
-		rootBytes = append(rootBytes, canonicalString(root.RootID)...)
-		rootBytes = append(rootBytes, canonicalString(len(root.StudioPath))...)
-		for _, segment := range root.StudioPath {
-			rootBytes = append(rootBytes, canonicalString(segment)...)
-		}
+func targetAuthorityHash(targets []CodeSyncTargetRoute) string {
+	targetIDs := make([]string, 0, len(targets))
+	for _, target := range targets {
+		targetIDs = append(targetIDs, canonicalStudioPath(target.StudioPath))
+	}
+	sort.Strings(targetIDs)
+	var targetBytes []byte
+	for _, targetID := range targetIDs {
+		targetBytes = append(targetBytes, canonicalString(targetID)...)
 	}
 	return blake3Hex(joinBytes(
-		canonicalString("clockp.code_sync.v1.roots_authority"),
-		canonicalString(len(rootsCopy)),
-		rootBytes,
+		canonicalString("clockp.code_sync.v2.target_authority"),
+		canonicalString(len(targetIDs)),
+		targetBytes,
 	))
+}
+
+func canonicalStudioPath(studioPath []string) string {
+	var builder strings.Builder
+	builder.WriteString("studio-path-v1:")
+	for _, segment := range studioPath {
+		builder.WriteString(fmt.Sprintf("%d:%s", len([]byte(segment)), segment))
+	}
+	return builder.String()
 }
 
 func canonicalString(value any) []byte {
@@ -328,19 +468,4 @@ func joinBytes(parts ...[]byte) []byte {
 func blake3Hex(data []byte) string {
 	sum := blake3.Sum256(data)
 	return hex.EncodeToString(sum[:])
-}
-
-func stringSlice(value any) []string {
-	switch typed := value.(type) {
-	case []string:
-		return append([]string(nil), typed...)
-	case []any:
-		result := make([]string, 0, len(typed))
-		for _, item := range typed {
-			result = append(result, fmt.Sprint(item))
-		}
-		return result
-	default:
-		return nil
-	}
 }

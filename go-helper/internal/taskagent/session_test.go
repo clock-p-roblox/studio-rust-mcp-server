@@ -173,9 +173,9 @@ func TestValidateWorkspaceBindingFilesExplainsConfigRole(t *testing.T) {
 	workspace := t.TempDir()
 	err := ValidateWorkspaceBindingFiles(workspace, WorkspaceConfig{
 		PlaceID:        "123",
-		CodeSyncConfig: "code-sync.roots.json",
+		CodeSyncConfig: "code-sync.tree.json",
 	})
-	if err == nil || !strings.Contains(err.Error(), "which local directories code-sync manages") {
+	if err == nil || !strings.Contains(err.Error(), "Studio node tree") {
 		t.Fatalf("expected helpful config message, got %v", err)
 	}
 }
@@ -216,16 +216,16 @@ func TestRequestExistingShutdownUsesStatusURLAndTaskID(t *testing.T) {
 
 func testCodeSyncBinding() CodeSyncBinding {
 	return CodeSyncBinding{
-		ProtocolVersion:    2,
-		WorkspaceID:        "workspace",
-		PlaceID:            "123",
-		MachineName:        "win-a",
-		MappingProfile:     "sync_lua_v1",
-		CodeSyncConfigHash: "config",
-		RootsAuthorityHash: "roots",
-		ConfigPath:         "code-sync.roots.json",
-		Roots: []CodeSyncRootRoute{
-			{RootID: "root", StudioPath: []string{"Workspace", "ClockPTest"}},
+		ProtocolVersion:     2,
+		WorkspaceID:         "workspace",
+		PlaceID:             "123",
+		MachineName:         "win-a",
+		MappingProfile:      "sync_lua_v1",
+		CodeSyncConfigHash:  "config",
+		TargetAuthorityHash: "targets",
+		ConfigPath:          "code-sync.tree.json",
+		Targets: []CodeSyncTargetRoute{
+			{StudioPath: []string{"Workspace", "ClockPTest"}},
 		},
 	}
 }

@@ -65,14 +65,9 @@ go build -o bin\task-agent.exe ./cmd/task-agent
 
 ## 构建并安装 plugin-mcp2
 
-Studio 侧插件也必须使用本仓当前源码构建。更新 `plugin-mcp2` 后，先停止当前 Studio / task-agent，再安装插件：
+Studio 侧插件必须使用本仓当前源码构建。更新 `plugin-mcp2` 后，先停止当前 Studio / task-agent，再按 Windows 侧当前插件打包流程生成并安装 `MCP2Plugin.rbxm`。
 
-```powershell
-cd <mcp_repo>\plugin-mcp2
-rojo build default.project.json --plugin MCP2Plugin.rbxm
-```
-
-如果 `rojo` 不在 PATH 中，使用本机实际的 `rojo.exe` 路径执行同一条 build 命令。
+server 侧不再把插件打包工具作为 code-sync / flush 运行时依赖；本机只能做源码、Python、Go 与静态检查，最终插件包由 Windows 侧部署验证。
 
 ## 本地启动
 
@@ -94,7 +89,7 @@ rojo build default.project.json --plugin MCP2Plugin.rbxm
 
 ```text
 clock-p.workspace.json
-code-sync.roots.json
+code-sync.tree.json
 ```
 
 workspace 根的 `clock-p.workspace.json` 至少要有：
@@ -102,16 +97,16 @@ workspace 根的 `clock-p.workspace.json` 至少要有：
 ```json
 {
   "place_id": "93795519121520",
-  "code_sync_config": "code-sync.roots.json"
+  "code_sync_config": "code-sync.tree.json"
 }
 ```
 
 说明：
 
 - `place_id` 必填。
-- `code_sync_config` 可省略；省略后默认去 workspace 根找 `code-sync.roots.json`。
-- 所以如果你只写了 `place_id`，但默认 `code-sync.roots.json` 不存在，`task-agent` / `bridge2 code-sync-*` 仍会失败。
-- `code-sync.roots.json` 负责声明“同步哪些本地目录、各自映射到 Studio 哪些路径”。
+- `code_sync_config` 可省略；省略后默认去 workspace 根找 `code-sync.tree.json`。
+- 所以如果你只写了 `place_id`，但默认 `code-sync.tree.json` 不存在，`task-agent` / `bridge2 code-sync-*` 仍会失败。
+- `code-sync.tree.json` 负责按 Studio DataModel 树声明 code-sync 托管节点。
 
 当前默认 `--environment public`。若要走本地 helper2，显式传：
 
@@ -211,8 +206,6 @@ tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> code-sync-apply
 ```powershell
 cd <mcp_repo>
 py -3 -m py_compile tools\bridge2\cli.py
-cd plugin-mcp2
-rojo build default.project.json -o ..\output\MCP2Plugin.rbxm
 cd go-helper
 go test -count=1 ./...
 ```

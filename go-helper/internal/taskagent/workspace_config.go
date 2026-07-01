@@ -38,7 +38,7 @@ func LoadWorkspaceConfig(workspace string) (WorkspaceConfig, error) {
 	if !regexp.MustCompile(`^[0-9]+$`).MatchString(config.PlaceID) {
 		return WorkspaceConfig{}, fmt.Errorf("%s place_id must contain digits only", path)
 	}
-	config.CodeSyncConfig = normalizeWorkspaceConfigPath(config.CodeSyncConfig, "code-sync.roots.json")
+	config.CodeSyncConfig = normalizeWorkspaceConfigPath(config.CodeSyncConfig, "code-sync.tree.json")
 	return config, nil
 }
 
@@ -51,7 +51,7 @@ func ValidateWorkspaceBindingFiles(workspace string, config WorkspaceConfig) err
 	if _, err := os.Stat(configPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf(
-				"missing %s; clock-p.workspace.json code_sync_config points here. This file declares which local directories code-sync manages and which Studio paths they map to",
+				"missing %s; clock-p.workspace.json code_sync_config points here. This file declares the Studio node tree managed by code-sync",
 				configPath,
 			)
 		}

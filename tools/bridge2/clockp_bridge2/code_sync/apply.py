@@ -6,12 +6,11 @@ from ..errors import BridgeError
 from ..session import Session
 from ..studio import code_sync_apply as helper_code_sync_apply
 from ..studio import mode
-from .config import MAPPING_PROFILE, load_config
+from .config import MAPPING_PROFILE
 from .diff import diff_manifests
 from .live import _require_stable_edit_mode, query_live_manifest
 from .manifest import build_local_manifest
-from .mapping import build_logical_tree
-from .scanner import scan_root
+from .targets import build_targets
 
 
 def apply_code_sync(session: Session, workspace: Path, config_path: Path) -> dict:
@@ -23,7 +22,7 @@ def apply_code_sync(session: Session, workspace: Path, config_path: Path) -> dic
         {
             "protocol_version": 2,
             "mapping_profile": MAPPING_PROFILE,
-            "roots": roots_payload,
+            "targets": roots_payload,
         },
     )
     after_mode = _require_stable_edit_mode(mode(session))
@@ -37,10 +36,5 @@ def apply_code_sync(session: Session, workspace: Path, config_path: Path) -> dic
 
 
 def _build_roots_payload(workspace: Path, config_path: Path) -> list[dict]:
-    config = load_config(config_path)
-    roots = []
-    for root in config.roots:
-        files = scan_root(workspace, root)
-        logical = build_logical_tree(root.studio_path[-1], files)
-        roots.append({"root_id": root.root_id, "studio_path": root.studio_path, "tree": logical.to_payload()})
-    return roots
+    _config, targets = build_targets(workspace, config_path)
+    return [target.apply_payload() for target in targets]

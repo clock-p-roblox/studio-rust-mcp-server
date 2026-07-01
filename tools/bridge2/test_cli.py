@@ -109,7 +109,7 @@ class FakeHelper(BaseHTTPRequestHandler):
         elif self.path.endswith("/studio/run-code-direct"):
             if type(self).run_code_ok:
                 if "code_sync" in str(payload.get("code")):
-                    self._json({"ok": True, "result": {"returns": [json.dumps({"combined_hash": "remote-hash", "roots": []})]}})
+                    self._json({"ok": True, "result": {"returns": [json.dumps({"combined_hash": "remote-hash", "targets": []})]}})
                 else:
                     self._json({"ok": True, "result": {"prints": ["hello"], "code": payload.get("code")}})
             else:
@@ -120,9 +120,9 @@ class FakeHelper(BaseHTTPRequestHandler):
             else:
                 self._json({"ok": False, "code": "official_tool_error", "message": "official failed"})
         elif self.path.endswith("/code-sync/get-manifest"):
-            self._json({"ok": True, "combined_hash": "remote-hash", "roots": [], "mode": "edit", "mode_seq": type(self).mode_seq})
+            self._json({"ok": True, "combined_hash": "remote-hash", "targets": [], "mode": "edit", "mode_seq": type(self).mode_seq})
         elif self.path.endswith("/code-sync/apply"):
-            self._json({"ok": True, "applied_roots": [root.get("root_id") for root in payload.get("roots", [])], "mode": "edit", "mode_seq": type(self).mode_seq})
+            self._json({"ok": True, "applied_targets": [target.get("studio_path") for target in payload.get("targets", [])], "mode": "edit", "mode_seq": type(self).mode_seq})
         else:
             self._json({"code": "not_found", "message": self.path}, status=404)
 
@@ -150,10 +150,9 @@ def test_session_payload(helper_url: str) -> dict:
             "machine_name": "test-machine",
             "mapping_profile": "sync_lua_v1",
             "code_sync_config_hash": "config-hash",
-            "roots_authority_hash": "roots-hash",
-            "roots": [
+            "target_authority_hash": "targets-hash",
+            "targets": [
                 {
-                    "root_id": "app",
                     "studio_path": ["ReplicatedStorage", "ClockPRealTest"],
                 }
             ],
@@ -189,7 +188,7 @@ class Bridge2CLITest(unittest.TestCase):
             json.dumps(
                 {
                     "place_id": "134795435066737",
-                    "code_sync_config": "code-sync.roots.json",
+                    "code_sync_config": "code-sync.tree.json",
                 }
             ),
             encoding="utf-8",
@@ -239,18 +238,18 @@ class Bridge2CLITest(unittest.TestCase):
     def test_code_sync_manifest_does_not_require_session(self) -> None:
         workspace = Path(self.workspace)
         (workspace / ".clock-p" / "session.json").unlink()
-        (workspace / "code-sync.roots.json").write_text(
+        (workspace / "code-sync.tree.json").write_text(
             json.dumps(
                 {
-                    "roots": [
-                        {
-                            "root_id": "app",
-                            "local_path": "src",
-                            "studio_path": ["ReplicatedStorage", "ClockPRealTest"],
-                            "include": ["**/*.lua"],
-                            "exclude": [],
+                    "tree": {
+                        "ReplicatedStorage": {
+                            "ClockPRealTest": {
+                                "$local_path": "src",
+                                "$include": ["**/*.lua"],
+                                "$exclude": [],
+                            }
                         }
-                    ],
+                    },
                 }
             ),
             encoding="utf-8",
@@ -267,18 +266,18 @@ class Bridge2CLITest(unittest.TestCase):
 
     def test_code_sync_live_manifest_uses_session(self) -> None:
         workspace = Path(self.workspace)
-        (workspace / "code-sync.roots.json").write_text(
+        (workspace / "code-sync.tree.json").write_text(
             json.dumps(
                 {
-                    "roots": [
-                        {
-                            "root_id": "app",
-                            "local_path": "src",
-                            "studio_path": ["ReplicatedStorage", "ClockPRealTest"],
-                            "include": ["**/*.lua"],
-                            "exclude": [],
+                    "tree": {
+                        "ReplicatedStorage": {
+                            "ClockPRealTest": {
+                                "$local_path": "src",
+                                "$include": ["**/*.lua"],
+                                "$exclude": [],
+                            }
                         }
-                    ],
+                    },
                 }
             ),
             encoding="utf-8",

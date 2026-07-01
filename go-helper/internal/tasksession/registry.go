@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -86,19 +87,18 @@ type Contract struct {
 }
 
 type CodeSyncBinding struct {
-	ProtocolVersion    int                 `json:"protocol_version"`
-	WorkspaceID        string              `json:"workspace_id"`
-	PlaceID            string              `json:"place_id"`
-	MachineName        string              `json:"machine_name"`
-	MappingProfile     string              `json:"mapping_profile"`
-	CodeSyncConfigHash string              `json:"code_sync_config_hash"`
-	RootsAuthorityHash string              `json:"roots_authority_hash"`
-	ConfigPath         string              `json:"config_path,omitempty"`
-	Roots              []CodeSyncRootRoute `json:"roots"`
+	ProtocolVersion     int                   `json:"protocol_version"`
+	WorkspaceID         string                `json:"workspace_id"`
+	PlaceID             string                `json:"place_id"`
+	MachineName         string                `json:"machine_name"`
+	MappingProfile      string                `json:"mapping_profile"`
+	CodeSyncConfigHash  string                `json:"code_sync_config_hash"`
+	TargetAuthorityHash string                `json:"target_authority_hash"`
+	ConfigPath          string                `json:"config_path,omitempty"`
+	Targets             []CodeSyncTargetRoute `json:"targets"`
 }
 
-type CodeSyncRootRoute struct {
-	RootID     string   `json:"root_id"`
+type CodeSyncTargetRoute struct {
 	StudioPath []string `json:"studio_path"`
 }
 
@@ -424,27 +424,25 @@ func validateCodeSyncBinding(machineName string, placeID string, binding CodeSyn
 	if binding.CodeSyncConfigHash == "" {
 		return errors.New("code_sync.code_sync_config_hash must not be empty")
 	}
-	if binding.RootsAuthorityHash == "" {
-		return errors.New("code_sync.roots_authority_hash must not be empty")
+	if binding.TargetAuthorityHash == "" {
+		return errors.New("code_sync.target_authority_hash must not be empty")
 	}
-	if len(binding.Roots) == 0 {
-		return errors.New("code_sync.roots must not be empty")
+	if len(binding.Targets) == 0 {
+		return errors.New("code_sync.targets must not be empty")
 	}
 	seen := make(map[string]struct{})
-	for _, root := range binding.Roots {
-		if root.RootID == "" {
-			return errors.New("code_sync.roots[].root_id must not be empty")
+	for _, target := range binding.Targets {
+		if len(target.StudioPath) == 0 {
+			return errors.New("code_sync.targets[].studio_path must not be empty")
 		}
-		if len(root.StudioPath) == 0 {
-			return errors.New("code_sync.roots[].studio_path must not be empty")
+		key := strings.Join(target.StudioPath, "\x00")
+		if _, ok := seen[key]; ok {
+			return fmt.Errorf("duplicate code_sync target studio_path %v", target.StudioPath)
 		}
-		if _, ok := seen[root.RootID]; ok {
-			return fmt.Errorf("duplicate code_sync root_id %s", root.RootID)
-		}
-		seen[root.RootID] = struct{}{}
-		for _, segment := range root.StudioPath {
+		seen[key] = struct{}{}
+		for _, segment := range target.StudioPath {
 			if segment == "" {
-				return fmt.Errorf("code_sync root %s has empty studio_path segment", root.RootID)
+				return fmt.Errorf("code_sync target %v has empty studio_path segment", target.StudioPath)
 			}
 		}
 	}

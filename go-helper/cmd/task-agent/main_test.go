@@ -36,7 +36,7 @@ func TestStartRequiresWorkspaceConfigPlaceID(t *testing.T) {
 func TestStartMissingCodeSyncFilesGetsHelpfulError(t *testing.T) {
 	workspace := writeWorkspaceConfig(t)
 	err := run([]string{"start", "--workspace", workspace, "--machine_name", "win-a"})
-	if err == nil || !strings.Contains(err.Error(), "code-sync manages") {
+	if err == nil || !strings.Contains(err.Error(), "Studio node tree") {
 		t.Fatalf("expected helpful code-sync config error, got %v", err)
 	}
 }

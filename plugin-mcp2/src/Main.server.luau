@@ -477,25 +477,26 @@ local function codeSyncSummarize(instance)
 	end
 	local kind = codeSyncKind(instance)
 	if kind == nil then
-		return nil
+		error("code_sync_unmanaged_child: " .. instance:GetFullName() .. " is " .. instance.ClassName)
 	end
 	local seen = {}
 	local children = {}
 	for _, child in instance:GetChildren() do
 		local childEntryKind = codeSyncKind(child)
-		if childEntryKind ~= nil then
-			if seen[child.Name] then
-				error("code_sync_ambiguous_remote_tree: duplicate child name " .. child.Name)
-			end
-			seen[child.Name] = true
-			local childSummary = codeSyncSummarize(child)
-			table.insert(children, {
-				name = child.Name,
-				entry_kind = childEntryKind,
-				entry_hash = childSummary.entry_hash,
-				children_count = childSummary.children_count,
-			})
+		if seen[child.Name] then
+			error("code_sync_ambiguous_remote_tree: duplicate child name " .. child.Name)
 		end
+		seen[child.Name] = true
+		if childEntryKind == nil then
+			error("code_sync_unmanaged_child: " .. child:GetFullName() .. " is " .. child.ClassName)
+		end
+		local childSummary = codeSyncSummarize(child)
+		table.insert(children, {
+			name = child.Name,
+			entry_kind = childEntryKind,
+			entry_hash = childSummary.entry_hash,
+			children_count = childSummary.children_count,
+		})
 	end
 	table.sort(children, codeSyncSortChildren)
 	local entryHash = codeSyncNodeHash(kind, instance.Name, codeSyncSourceOf(instance), children)
@@ -511,19 +512,28 @@ local function codeSyncSummarize(instance)
 	}
 end
 
-local function codeSyncRootHash(rootId, mappingProfile, summary)
-	return codeSyncBlake3Hex(codeSyncS("clockp.code_sync.v1.root") .. codeSyncS(rootId) .. codeSyncS(mappingProfile) .. codeSyncS(summary.root_kind) .. codeSyncS(summary.entry_hash))
+local function codeSyncCanonicalStudioPath(studioPath)
+	local parts = table.create(#studioPath)
+	for index, segment in studioPath do
+		local text = tostring(segment)
+		parts[index] = tostring(#text) .. ":" .. text
+	end
+	return "studio-path-v1:" .. table.concat(parts)
 end
 
-local function codeSyncCombinedHash(mappingProfile, roots)
-	table.sort(roots, function(left, right)
-		return left.root_id < right.root_id
+local function codeSyncTargetHash(studioPath, mappingProfile, summary)
+	return codeSyncBlake3Hex(codeSyncS("clockp.code_sync.v2.target") .. codeSyncS(codeSyncCanonicalStudioPath(studioPath)) .. codeSyncS(mappingProfile) .. codeSyncS(summary.root_kind) .. codeSyncS(summary.entry_hash))
+end
+
+local function codeSyncCombinedHash(mappingProfile, targets)
+	table.sort(targets, function(left, right)
+		return left.target_id < right.target_id
 	end)
-	local encoded = table.create(#roots)
-	for index, root in roots do
-		encoded[index] = codeSyncS(root.root_id) .. codeSyncS(root.root_hash)
+	local encoded = table.create(#targets)
+	for index, target in targets do
+		encoded[index] = codeSyncS(target.target_id) .. codeSyncS(target.target_hash)
 	end
-	return codeSyncBlake3Hex(codeSyncS("clockp.code_sync.v1.combined") .. codeSyncS(mappingProfile) .. codeSyncS(#roots) .. table.concat(encoded))
+	return codeSyncBlake3Hex(codeSyncS("clockp.code_sync.v2.combined") .. codeSyncS(mappingProfile) .. codeSyncS(#targets) .. table.concat(encoded))
 end
 
 local function codeSyncGetManifest(args)
@@ -539,8 +549,8 @@ local function codeSyncGetManifest(args)
 	if args.mapping_profile ~= "sync_lua_v1" then
 		return false, nil, "code_sync_unsupported_mapping"
 	end
-	if typeof(args.roots) ~= "table" then
-		return false, nil, "code_sync_invalid_config: roots must be a table"
+	if typeof(args.targets) ~= "table" then
+		return false, nil, "code_sync_invalid_config: targets must be a table"
 	end
 	local result = {
 		kind = "code_sync_get_manifest",
@@ -548,28 +558,29 @@ local function codeSyncGetManifest(args)
 		mapping_profile = args.mapping_profile,
 		mode = mode,
 		mode_seq = modeSeq,
-		roots = {},
+		targets = {},
 	}
-	local combinedRoots = {}
-	for _, root in args.roots do
-		if typeof(root) ~= "table" or typeof(root.root_id) ~= "string" or typeof(root.studio_path) ~= "table" then
-			return false, nil, "code_sync_invalid_config: root must include root_id and studio_path"
+	local combinedTargets = {}
+	for _, target in args.targets do
+		if typeof(target) ~= "table" or typeof(target.studio_path) ~= "table" then
+			return false, nil, "code_sync_invalid_config: target must include studio_path"
 		end
-		local summary = codeSyncSummarize(codeSyncFindPath(root.studio_path))
-		local currentRootHash = nil
+		local summary = codeSyncSummarize(codeSyncFindPath(target.studio_path))
+		local currentTargetHash = nil
+		local targetId = codeSyncCanonicalStudioPath(target.studio_path)
 		if summary ~= nil then
-			currentRootHash = codeSyncRootHash(root.root_id, args.mapping_profile, summary)
-			table.insert(combinedRoots, { root_id = root.root_id, root_hash = currentRootHash })
+			currentTargetHash = codeSyncTargetHash(target.studio_path, args.mapping_profile, summary)
+			table.insert(combinedTargets, { target_id = targetId, target_hash = currentTargetHash })
 		end
-		table.insert(result.roots, {
-			root_id = root.root_id,
-			studio_path = root.studio_path,
+		table.insert(result.targets, {
+			target_id = targetId,
+			studio_path = target.studio_path,
 			exists = summary ~= nil,
-			root_hash = currentRootHash,
+			target_hash = currentTargetHash,
 			summary = summary,
 		})
 	end
-	result.combined_hash = codeSyncCombinedHash(args.mapping_profile, combinedRoots)
+	result.combined_hash = codeSyncCombinedHash(args.mapping_profile, combinedTargets)
 	return true, result, nil
 end
 
@@ -624,32 +635,106 @@ end
 
 local function codeSyncEnsureRoot(path, tree)
 	local current = game:GetService(path[1])
-	for index = 2, #path do
-		local className = if index == #path then codeSyncClassForKind(tree.kind) else "Folder"
+	for index = 2, #path - 1 do
+		local className = "Folder"
 		local nextChild, childError = codeSyncEnsureChild(current, path[index], className)
 		if nextChild == nil then
 			return nil, childError
 		end
 		current = nextChild
 	end
+	if #path >= 2 then
+		local finalName = path[#path]
+		local finalClassName = codeSyncClassForKind(tree.kind)
+		local existing, findError = codeSyncFindUniqueChild(current, finalName)
+		if findError ~= nil then
+			return nil, findError
+		end
+		if existing ~= nil and existing.ClassName ~= finalClassName then
+			local acceptsFolderLike = finalClassName == "Folder" and codeSyncKind(existing) == "Folder"
+			if not acceptsFolderLike then
+				if not codeSyncManagedClass(existing.ClassName) then
+					return nil, "code_sync_unmanaged_child: " .. existing:GetFullName() .. " is " .. existing.ClassName
+				end
+				existing:Destroy()
+				existing = nil
+			end
+		end
+		if existing == nil then
+			existing = Instance.new(finalClassName)
+			existing.Name = finalName
+			existing.Parent = current
+		end
+		current = existing
+	end
 	return current, nil
 end
 
-local function codeSyncWriteNode(instance, node)
-	if node.kind == "ModuleScript" or node.kind == "Script" or node.kind == "LocalScript" then
-		instance.Source = node.source or ""
+local function codeSyncValidateNodePayload(node)
+	if typeof(node) ~= "table" or typeof(node.name) ~= "string" or typeof(node.kind) ~= "string" or typeof(node.children) ~= "table" then
+		return false, "code_sync_invalid_config: tree node must include name, kind and children"
 	end
-	for _, child in instance:GetChildren() do
-		if not codeSyncManagedClass(child.ClassName) then
-			return false, "code_sync_unmanaged_child: " .. child:GetFullName() .. " is " .. child.ClassName
+	if node.kind == "Folder" and node.source ~= nil and node.source ~= "" then
+		return false, "code_sync_invalid_config: Folder node cannot include source"
+	end
+	return true, nil
+end
+
+local function codeSyncReconcileNode(instance, node)
+	local valid, validationError = codeSyncValidateNodePayload(node)
+	if not valid then
+		return false, validationError
+	end
+	if node.kind == "ModuleScript" or node.kind == "Script" or node.kind == "LocalScript" then
+		local source = node.source or ""
+		if codeSyncSourceOf(instance) ~= source then
+			instance.Source = source
 		end
 	end
-	instance:ClearAllChildren()
+	local targetByName = {}
 	for _, child in node.children do
-		local childInstance = Instance.new(codeSyncClassForKind(child.kind))
-		childInstance.Name = child.name
-		childInstance.Parent = instance
-		local ok, err = codeSyncWriteNode(childInstance, child)
+		local childValid, childValidationError = codeSyncValidateNodePayload(child)
+		if not childValid then
+			return false, childValidationError
+		end
+		if targetByName[child.name] ~= nil then
+			return false, "code_sync_invalid_config: duplicate target child name " .. child.name
+		end
+		targetByName[child.name] = child
+	end
+	local existingByName = {}
+	for _, child in instance:GetChildren() do
+		if existingByName[child.Name] ~= nil then
+			return false, "code_sync_ambiguous_path: duplicate child name " .. child.Name
+		end
+		existingByName[child.Name] = child
+	end
+	for childName, existing in existingByName do
+		local target = targetByName[childName]
+		if target == nil then
+			if not codeSyncManagedClass(existing.ClassName) then
+				return false, "code_sync_unmanaged_child: " .. existing:GetFullName() .. " is " .. existing.ClassName
+			end
+			existing:Destroy()
+		else
+			local targetClassName = codeSyncClassForKind(target.kind)
+			if existing.ClassName ~= targetClassName then
+				if not codeSyncManagedClass(existing.ClassName) then
+					return false, "code_sync_unmanaged_child: " .. existing:GetFullName() .. " is " .. existing.ClassName
+				end
+				existing:Destroy()
+				existingByName[childName] = nil
+			end
+		end
+	end
+	for _, child in node.children do
+		local childInstance = existingByName[child.name]
+		if childInstance == nil then
+			childInstance = Instance.new(codeSyncClassForKind(child.kind))
+			childInstance.Name = child.name
+			childInstance.Parent = instance
+		end
+		local ok, err = codeSyncReconcileNode(childInstance, child)
 		if not ok then
 			return false, err
 		end
@@ -670,23 +755,23 @@ local function codeSyncApply(args)
 	if args.mapping_profile ~= "sync_lua_v1" then
 		return false, nil, "code_sync_unsupported_mapping"
 	end
-	if typeof(args.roots) ~= "table" then
-		return false, nil, "code_sync_invalid_config: roots must be a table"
+	if typeof(args.targets) ~= "table" then
+		return false, nil, "code_sync_invalid_config: targets must be a table"
 	end
 	local applied = {}
-	for _, root in args.roots do
-		if typeof(root) ~= "table" or typeof(root.root_id) ~= "string" or typeof(root.studio_path) ~= "table" or typeof(root.tree) ~= "table" then
-			return false, nil, "code_sync_invalid_config: root must include root_id, studio_path and tree"
+	for _, target in args.targets do
+		if typeof(target) ~= "table" or typeof(target.studio_path) ~= "table" or typeof(target.tree) ~= "table" then
+			return false, nil, "code_sync_invalid_config: target must include studio_path and tree"
 		end
-		local rootInstance, rootError = codeSyncEnsureRoot(root.studio_path, root.tree)
-		if rootInstance == nil then
-			return false, nil, rootError
+		local targetInstance, targetError = codeSyncEnsureRoot(target.studio_path, target.tree)
+		if targetInstance == nil then
+			return false, nil, targetError
 		end
-		local writeOk, writeError = codeSyncWriteNode(rootInstance, root.tree)
+		local writeOk, writeError = codeSyncReconcileNode(targetInstance, target.tree)
 		if not writeOk then
 			return false, nil, writeError
 		end
-		table.insert(applied, root.root_id)
+		table.insert(applied, codeSyncCanonicalStudioPath(target.studio_path))
 	end
 	return true, {
 		kind = "code_sync_apply",
@@ -694,7 +779,7 @@ local function codeSyncApply(args)
 		mapping_profile = args.mapping_profile,
 		mode = mode,
 		mode_seq = modeSeq,
-		applied_roots = applied,
+		applied_targets = applied,
 	}, nil
 end
 

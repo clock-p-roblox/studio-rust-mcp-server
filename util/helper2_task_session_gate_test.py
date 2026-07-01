@@ -177,10 +177,9 @@ def code_sync_binding(task_id: str, *, place_id: str, config_hash: str | None = 
         "machine_name": MACHINE_NAME,
         "mapping_profile": "sync_lua_v1",
         "code_sync_config_hash": config_hash or f"config-{task_id}",
-        "roots_authority_hash": f"roots-{task_id}",
-        "roots": [
+        "target_authority_hash": f"targets-{task_id}",
+        "targets": [
             {
-                "root_id": "app",
                 "studio_path": ["ReplicatedStorage", "ClockPTaskSession"],
             }
         ],
@@ -280,7 +279,7 @@ def run_task_session_gate(args: argparse.Namespace) -> dict[str, Any]:
         require(desired_owner_ids(status_b) == ["task-b"], f"task B desired state is not task-owned: {status_b}")
         contract_a = status_a.get("contract") or {}
         require("task_session_token" not in contract_a, f"status leaked task token: {status_a}")
-        require((contract_a.get("code_sync") or {}).get("roots_authority_hash") == "roots-task-a", f"task A code_sync missing: {status_a}")
+        require((contract_a.get("code_sync") or {}).get("target_authority_hash") == "targets-task-a", f"task A code_sync missing: {status_a}")
 
         mismatch = beat(base1, "task-a", pid=40101, started_at=1700000001001, config_hash="changed-config", expected=409)
         require(mismatch.get("code") == "immutable_mismatch", f"code_sync mutation was not rejected: {mismatch}")

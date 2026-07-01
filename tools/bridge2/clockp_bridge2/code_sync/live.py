@@ -6,25 +6,19 @@ from ..errors import BridgeError
 from ..session import Session
 from ..studio import code_sync_get_manifest as helper_code_sync_get_manifest
 from ..studio import mode
-from .config import MAPPING_PROFILE, load_config
+from .config import MAPPING_PROFILE
+from .targets import build_targets
 
 
 def query_live_manifest(session: Session, workspace: Path, config_path: Path) -> dict:
     before_mode = _require_stable_edit_mode(mode(session))
-    config = load_config(config_path)
-    roots = [
-        {
-            "root_id": root.root_id,
-            "studio_path": root.studio_path,
-        }
-        for root in config.roots
-    ]
+    _config, targets = build_targets(workspace, config_path)
     result = helper_code_sync_get_manifest(
         session,
         {
             "protocol_version": 2,
             "mapping_profile": MAPPING_PROFILE,
-            "roots": roots,
+            "targets": [target.route_payload() for target in targets],
         },
     )
     after_mode = _require_stable_edit_mode(mode(session))
@@ -34,7 +28,7 @@ def query_live_manifest(session: Session, workspace: Path, config_path: Path) ->
         "protocol_version": 2,
         "mapping_profile": MAPPING_PROFILE,
         "combined_hash": result.get("combined_hash"),
-        "roots": result.get("roots", []),
+        "targets": result.get("targets", []),
         "mode": result.get("mode") or before_mode.get("mode"),
         "mode_seq": result.get("mode_seq") or before_mode.get("mode_seq"),
     }

@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 
 from ..errors import BridgeError
-from .config import CodeSyncRoot
+from .config import CodeSyncNode
 
 MAX_STUDIO_SOURCE_CHARS = 200000
 
@@ -17,15 +17,15 @@ class SourceFile:
     source_bytes: int
 
 
-def scan_root(workspace: Path, root: CodeSyncRoot) -> list[SourceFile]:
+def scan_root(workspace: Path, root: CodeSyncNode) -> list[SourceFile]:
     base = (workspace / root.local_path).resolve()
     workspace_resolved = workspace.resolve()
     try:
         base.relative_to(workspace_resolved)
     except ValueError as exc:
-        raise BridgeError("code_sync_invalid_config", "local_path escapes workspace", {"root_id": root.root_id, "local_path": root.local_path})
+        raise BridgeError("code_sync_invalid_config", "local_path escapes workspace", {"studio_path": root.studio_path, "local_path": root.local_path}) from exc
     if not base.exists() or not base.is_dir():
-        raise BridgeError("code_sync_invalid_config", "local_path must exist and be a directory", {"root_id": root.root_id, "local_path": str(base)})
+        raise BridgeError("code_sync_invalid_config", "local_path must exist and be a directory", {"studio_path": root.studio_path, "local_path": str(base)})
     result: list[SourceFile] = []
     for path in sorted(base.rglob("*"), key=lambda item: item.as_posix().encode("utf-8")):
         if not path.is_file():
@@ -37,7 +37,7 @@ def scan_root(workspace: Path, root: CodeSyncRoot) -> list[SourceFile]:
             raw = path.read_bytes()
             text = raw.decode("utf-8")
         except UnicodeDecodeError as exc:
-            raise BridgeError("code_sync_unsupported_encoding", "code-sync only supports UTF-8 text files", {"root_id": root.root_id, "path": str(path)}) from exc
+            raise BridgeError("code_sync_unsupported_encoding", "code-sync only supports UTF-8 text files", {"studio_path": root.studio_path, "path": str(path)}) from exc
         normalized = text.replace("\r\n", "\n").replace("\r", "\n")
         source_chars = len(normalized)
         if source_chars >= MAX_STUDIO_SOURCE_CHARS:
@@ -45,7 +45,7 @@ def scan_root(workspace: Path, root: CodeSyncRoot) -> list[SourceFile]:
                 "code_sync_source_too_large",
                 "code-sync source must stay below Roblox Studio Source size limit",
                 {
-                    "root_id": root.root_id,
+                    "studio_path": root.studio_path,
                     "path": str(path),
                     "relative_path": rel,
                     "source_chars": source_chars,

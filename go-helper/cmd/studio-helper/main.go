@@ -122,14 +122,14 @@ type codeSyncGetManifestCommandArgs struct {
 	PlaceID         string           `json:"place_id"`
 	ProtocolVersion int              `json:"protocol_version"`
 	MappingProfile  string           `json:"mapping_profile"`
-	Roots           []map[string]any `json:"roots"`
+	Targets         []map[string]any `json:"targets"`
 }
 
 type codeSyncApplyCommandArgs struct {
 	PlaceID         string           `json:"place_id"`
 	ProtocolVersion int              `json:"protocol_version"`
 	MappingProfile  string           `json:"mapping_profile"`
-	Roots           []map[string]any `json:"roots"`
+	Targets         []map[string]any `json:"targets"`
 }
 
 type mcp2ChannelSummary struct {
@@ -1198,7 +1198,7 @@ func main() {
 			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_protocol_version_unsupported", "code-sync protocol_version must be 2", "fix_request", map[string]any{"protocol_version": request.ProtocolVersion})
 			return
 		}
-		if !requireCodeSyncRequestBinding(w, taskID, status, request.MappingProfile, request.Roots) {
+		if !requireCodeSyncRequestBinding(w, taskID, status, request.MappingProfile, request.Targets) {
 			return
 		}
 		if _, err := studioManager.ManagedProcessForTask(taskID); err != nil {
@@ -1244,7 +1244,7 @@ func main() {
 			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_protocol_version_unsupported", "code-sync protocol_version must be 2", "fix_request", map[string]any{"protocol_version": request.ProtocolVersion})
 			return
 		}
-		if !requireCodeSyncRequestBinding(w, taskID, status, request.MappingProfile, request.Roots) {
+		if !requireCodeSyncRequestBinding(w, taskID, status, request.MappingProfile, request.Targets) {
 			return
 		}
 		if _, err := studioManager.ManagedProcessForTask(taskID); err != nil {
@@ -1756,7 +1756,7 @@ func requireTaskSessionToken(w http.ResponseWriter, r *http.Request, taskID stri
 	return true
 }
 
-func requireCodeSyncRequestBinding(w http.ResponseWriter, taskID string, status tasksession.StatusResponse, mappingProfile string, roots []map[string]any) bool {
+func requireCodeSyncRequestBinding(w http.ResponseWriter, taskID string, status tasksession.StatusResponse, mappingProfile string, targets []map[string]any) bool {
 	if status.Contract == nil {
 		writeJSON(w, http.StatusNotFound, status)
 		return false
@@ -1766,42 +1766,42 @@ func requireCodeSyncRequestBinding(w http.ResponseWriter, taskID string, status 
 		writeTaskAPIError(w, http.StatusConflict, taskID, "code_sync_binding_mismatch", "code-sync mapping_profile does not match task session", "reload_session", map[string]any{"mapping_profile": mappingProfile, "expected_mapping_profile": binding.MappingProfile})
 		return false
 	}
-	expected := make(map[string][]string, len(binding.Roots))
-	for _, root := range binding.Roots {
-		expected[root.RootID] = append([]string(nil), root.StudioPath...)
+	expected := make(map[string][]string, len(binding.Targets))
+	for _, target := range binding.Targets {
+		expected[codeSyncPathKey(target.StudioPath)] = append([]string(nil), target.StudioPath...)
 	}
-	if len(roots) != len(expected) {
-		writeTaskAPIError(w, http.StatusConflict, taskID, "code_sync_binding_mismatch", "code-sync roots do not match task session", "reload_session", map[string]any{"root_count": len(roots), "expected_root_count": len(expected)})
+	if len(targets) != len(expected) {
+		writeTaskAPIError(w, http.StatusConflict, taskID, "code_sync_binding_mismatch", "code-sync targets do not match task session", "reload_session", map[string]any{"target_count": len(targets), "expected_target_count": len(expected)})
 		return false
 	}
-	seen := make(map[string]struct{}, len(roots))
-	for _, root := range roots {
-		rootID := strings.TrimSpace(fmt.Sprint(root["root_id"]))
-		if rootID == "" {
-			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_invalid_config", "root_id is required", "fix_request", nil)
-			return false
-		}
-		expectedPath, ok := expected[rootID]
+	seen := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		studioPath, ok := codeSyncRequestStudioPath(target["studio_path"])
 		if !ok {
-			writeTaskAPIError(w, http.StatusConflict, taskID, "code_sync_binding_mismatch", "code-sync root_id does not belong to task session", "reload_session", map[string]any{"root_id": rootID})
+			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_invalid_config", "studio_path must be a non-empty string array", "fix_request", nil)
 			return false
 		}
-		if _, exists := seen[rootID]; exists {
-			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_invalid_config", "duplicate root_id", "fix_request", map[string]any{"root_id": rootID})
-			return false
-		}
-		seen[rootID] = struct{}{}
-		studioPath, ok := codeSyncRequestStudioPath(root["studio_path"])
+		key := codeSyncPathKey(studioPath)
+		expectedPath, ok := expected[key]
 		if !ok {
-			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_invalid_config", "studio_path must be a non-empty string array", "fix_request", map[string]any{"root_id": rootID})
+			writeTaskAPIError(w, http.StatusConflict, taskID, "code_sync_binding_mismatch", "code-sync target does not belong to task session", "reload_session", map[string]any{"studio_path": studioPath})
 			return false
 		}
+		if _, exists := seen[key]; exists {
+			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_invalid_config", "duplicate studio_path", "fix_request", map[string]any{"studio_path": studioPath})
+			return false
+		}
+		seen[key] = struct{}{}
 		if !stringSlicesEqual(studioPath, expectedPath) {
-			writeTaskAPIError(w, http.StatusConflict, taskID, "code_sync_binding_mismatch", "code-sync studio_path does not match task session", "reload_session", map[string]any{"root_id": rootID, "studio_path": studioPath, "expected_studio_path": expectedPath})
+			writeTaskAPIError(w, http.StatusConflict, taskID, "code_sync_binding_mismatch", "code-sync studio_path does not match task session", "reload_session", map[string]any{"studio_path": studioPath, "expected_studio_path": expectedPath})
 			return false
 		}
 	}
 	return true
+}
+
+func codeSyncPathKey(path []string) string {
+	return strings.Join(path, "\x00")
 }
 
 func codeSyncRequestStudioPath(value any) ([]string, bool) {

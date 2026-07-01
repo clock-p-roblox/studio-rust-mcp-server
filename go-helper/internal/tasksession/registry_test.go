@@ -30,15 +30,15 @@ func validHeartbeat(taskID string) HeartbeatRequest {
 		TaskAgentStartedAtMS: 1000,
 		TaskSessionToken:     "token-" + taskID,
 		CodeSync: CodeSyncBinding{
-			ProtocolVersion:    2,
-			WorkspaceID:        "workspace-" + taskID,
-			PlaceID:            "123",
-			MachineName:        "win-a",
-			MappingProfile:     "sync_lua_v1",
-			CodeSyncConfigHash: "config-hash-" + taskID,
-			RootsAuthorityHash: "roots-hash-" + taskID,
-			Roots: []CodeSyncRootRoute{
-				{RootID: "root", StudioPath: []string{"Workspace", "ClockPTest"}},
+			ProtocolVersion:     2,
+			WorkspaceID:         "workspace-" + taskID,
+			PlaceID:             "123",
+			MachineName:         "win-a",
+			MappingProfile:      "sync_lua_v1",
+			CodeSyncConfigHash:  "config-hash-" + taskID,
+			TargetAuthorityHash: "targets-hash-" + taskID,
+			Targets: []CodeSyncTargetRoute{
+				{StudioPath: []string{"Workspace", "ClockPTest"}},
 			},
 		},
 	}
@@ -233,9 +233,9 @@ func TestLeaseExpiryRejectsChangedContract(t *testing.T) {
 			},
 		},
 		{
-			name: "roots_authority_hash",
+			name: "target_authority_hash",
 			mutate: func(request *HeartbeatRequest) {
-				request.CodeSync.RootsAuthorityHash = "changed"
+				request.CodeSync.TargetAuthorityHash = "changed"
 			},
 		},
 	}

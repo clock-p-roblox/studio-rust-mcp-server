@@ -35,6 +35,10 @@ def sort_key_name_kind(item: tuple[str, str, object]) -> tuple[bytes, bytes]:
     return (item[0].encode("utf-8"), item[1].encode("utf-8"))
 
 
+def canonical_studio_path(studio_path: list[str]) -> str:
+    return "studio-path-v1:" + "".join(f"{len(segment.encode('utf-8'))}:{segment}" for segment in studio_path)
+
+
 @dataclass
 class LogicalNode:
     name: str
@@ -87,31 +91,32 @@ class LogicalNode:
         }
 
 
-def root_hash(root_id: str, mapping_profile: str, root: LogicalNode) -> str:
+def target_hash(studio_path: list[str], mapping_profile: str, root: LogicalNode) -> str:
     return hash_parts(
-        s("clockp.code_sync.v1.root"),
-        s(root_id),
+        s("clockp.code_sync.v2.target"),
+        s(canonical_studio_path(studio_path)),
         s(mapping_profile),
         s(root.kind),
         s(root.entry_hash()),
     )
 
 
-def combined_hash(mapping_profile: str, roots: list[tuple[str, str]]) -> str:
-    ordered = sorted(roots, key=lambda item: item[0].encode("utf-8"))
-    encoded = b"".join(s(root_id) + s(root_hash_value) for root_id, root_hash_value in ordered)
-    return hash_parts(s("clockp.code_sync.v1.combined"), s(mapping_profile), s(len(ordered)), encoded)
+def combined_hash(mapping_profile: str, targets: list[tuple[str, str]]) -> str:
+    ordered = sorted(targets, key=lambda item: item[0].encode("utf-8"))
+    encoded = b"".join(s(target_id) + s(target_hash_value) for target_id, target_hash_value in ordered)
+    return hash_parts(s("clockp.code_sync.v2.combined"), s(mapping_profile), s(len(ordered)), encoded)
 
 
-def config_hash(protocol_version: int, mapping_profile: str, roots: list[dict]) -> str:
-    root_parts = []
-    for root in sorted(roots, key=lambda item: str(item["root_id"]).encode("utf-8")):
-        studio_path = list(root["studio_path"])
-        include = sorted(root.get("include", []), key=lambda item: str(item).encode("utf-8"))
-        exclude = sorted(root.get("exclude", []), key=lambda item: str(item).encode("utf-8"))
-        root_parts.append(
-            s(str(root["root_id"]))
-            + s(str(root["local_path"]).replace("\\", "/"))
+def config_hash(protocol_version: int, mapping_profile: str, nodes: list[dict]) -> str:
+    node_parts = []
+    for node in sorted(nodes, key=lambda item: canonical_studio_path(list(item["studio_path"])).encode("utf-8")):
+        studio_path = list(node["studio_path"])
+        include = sorted(node.get("include", []), key=lambda item: str(item).encode("utf-8"))
+        exclude = sorted(node.get("exclude", []), key=lambda item: str(item).encode("utf-8"))
+        node_parts.append(
+            s(canonical_studio_path(studio_path))
+            + s(str(node["kind"] or ""))
+            + s(str(node["local_path"]).replace("\\", "/"))
             + s(len(studio_path))
             + b"".join(s(str(segment)) for segment in studio_path)
             + s(len(include))
@@ -120,9 +125,15 @@ def config_hash(protocol_version: int, mapping_profile: str, roots: list[dict]) 
             + b"".join(s(str(pattern)) for pattern in exclude)
         )
     return hash_parts(
-        s("clockp.code_sync.v1.config"),
+        s("clockp.code_sync.v2.config"),
         s(protocol_version),
         s(mapping_profile),
-        s(len(root_parts)),
-        b"".join(root_parts),
+        s(len(node_parts)),
+        b"".join(node_parts),
     )
+
+
+def target_authority_hash(targets: list[list[str]]) -> str:
+    target_ids = sorted(canonical_studio_path(target) for target in targets)
+    encoded = b"".join(s(target_id) for target_id in target_ids)
+    return hash_parts(s("clockp.code_sync.v2.target_authority"), s(len(target_ids)), encoded)

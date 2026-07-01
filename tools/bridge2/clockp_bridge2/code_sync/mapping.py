@@ -15,7 +15,7 @@ class _DirNode:
     dirs: dict[str, "_DirNode"] = field(default_factory=dict)
 
 
-def build_logical_tree(root_name: str, files: list[SourceFile]) -> LogicalNode:
+def build_logical_tree(root_name: str, files: list[SourceFile], root_kind: str | None = None) -> LogicalNode:
     root = _DirNode(root_name)
     for source_file in files:
         parts = list(PurePosixPath(source_file.relative_path).parts)
@@ -27,11 +27,22 @@ def build_logical_tree(root_name: str, files: list[SourceFile]) -> LogicalNode:
         if parts[-1] in current.files:
             raise BridgeError("code_sync_invalid_config", "duplicate logical file path", {"path": source_file.relative_path})
         current.files[parts[-1]] = source_file
-    return _dir_to_logical(root)
+    return _dir_to_logical(root, explicit_kind=root_kind)
 
 
-def _dir_to_logical(directory: _DirNode) -> LogicalNode:
+def _dir_to_logical(directory: _DirNode, explicit_kind: str | None = None) -> LogicalNode:
     init_file = _choose_init_file(directory)
+    if explicit_kind == "Folder":
+        if init_file is not None:
+            raise BridgeError("code_sync_unsupported_mapping", "node with $kind Folder cannot use init.* as node Source", {"directory": directory.name})
+        return LogicalNode(name=directory.name, kind="Folder", children=_children_for_dir(directory, skip_file=None))
+    if explicit_kind in {"ModuleScript", "Script", "LocalScript"}:
+        if init_file is None:
+            raise BridgeError("code_sync_unsupported_mapping", "script node $kind requires matching init.* file", {"directory": directory.name, "kind": explicit_kind})
+        file_name, source_file, kind = init_file
+        if kind != explicit_kind:
+            raise BridgeError("code_sync_unsupported_mapping", "script node $kind does not match init.* file kind", {"directory": directory.name, "kind": explicit_kind, "init_kind": kind, "file": file_name})
+        return LogicalNode(name=directory.name, kind=kind, source=source_file.source, children=_children_for_dir(directory, skip_file=file_name))
     if init_file is not None:
         file_name, source_file, kind = init_file
         children = _children_for_dir(directory, skip_file=file_name)
@@ -88,3 +99,30 @@ def _map_script_file(file_name: str, source_file: SourceFile) -> LogicalNode | N
         if file_name.endswith(suffix):
             return LogicalNode(name=file_name[: -len(suffix)], kind=kind, source=source_file.source)
     return None
+
+
+def graft_child_tree(parent: LogicalNode, relative_path: list[str], child: LogicalNode) -> None:
+    if not relative_path:
+        raise BridgeError("code_sync_invalid_config", "subnode relative path cannot be empty", {"child": child.name})
+    current = parent
+    for segment in relative_path[:-1]:
+        next_node = _find_child(current, segment)
+        if next_node is None or next_node.kind != "Folder":
+            replacement = LogicalNode(name=segment, kind="Folder")
+            _replace_child(current, replacement)
+            next_node = replacement
+        current = next_node
+    mounted = LogicalNode(name=relative_path[-1], kind=child.kind, source=child.source, children=child.children)
+    _replace_child(current, mounted)
+
+
+def _find_child(parent: LogicalNode, name: str) -> LogicalNode | None:
+    for child in parent.children:
+        if child.name == name:
+            return child
+    return None
+
+
+def _replace_child(parent: LogicalNode, child: LogicalNode) -> None:
+    parent.children = [existing for existing in parent.children if existing.name != child.name]
+    parent.children.append(child)
