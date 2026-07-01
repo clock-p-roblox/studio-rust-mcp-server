@@ -163,6 +163,8 @@ tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> code-sync-dry-run
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> code-sync-apply
 ```
 
+这里有两个 play 层级：bridge2 `play` 是标准 launch；helper2 / MCP 的 `studio_play` 是被 bridge2 `play` 调用的底层原语。
+
 `run-code-direct` 不做模式切换。`run-code` 会先 ensure edit。需要 edit 的子命令自己决定是否 ensure；CLI 顶层不做全局 ensure。
 
 `play` 的成功判据不读日志，也不靠截图：

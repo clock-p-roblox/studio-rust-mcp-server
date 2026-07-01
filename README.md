@@ -220,6 +220,8 @@ tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> stop
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> screenshot
 ```
 
+这里有两个 play 层级：bridge2 `play` 是标准 launch；helper2 / MCP 的 `studio_play` 是被 bridge2 `play` 调用的底层原语。
+
 `play` 的成功判据是程序化状态链，不读日志：
 
 - bridge2 生成本次随机 `launch_id`，随 play args 下发。
