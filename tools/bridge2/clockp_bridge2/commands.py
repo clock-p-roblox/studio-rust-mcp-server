@@ -31,6 +31,7 @@ from .studio import (
     status,
     stop,
 )
+from .workspace_config import load_workspace_config
 
 KNOWN_COMMANDS = {
     "status",
@@ -152,41 +153,38 @@ def _build_parser() -> JSONArgumentParser:
     insert_parser.add_argument("--no-ensure-edit", action="store_true")
 
     code_sync_manifest_parser = subparsers.add_parser("code-sync-manifest", add_help=False)
-    code_sync_manifest_parser.add_argument("--config", default="code-sync.roots.json")
-    code_sync_manifest_parser.add_argument("--code-sync-project", default="default.project.json")
+    code_sync_manifest_parser.add_argument("--config", default=None)
 
     code_sync_live_parser = subparsers.add_parser("code-sync-live-manifest", add_help=False)
-    code_sync_live_parser.add_argument("--config", default="code-sync.roots.json")
-    code_sync_live_parser.add_argument("--code-sync-project", default="default.project.json")
+    code_sync_live_parser.add_argument("--config", default=None)
 
     code_sync_dry_run_parser = subparsers.add_parser("code-sync-dry-run", add_help=False)
-    code_sync_dry_run_parser.add_argument("--config", default="code-sync.roots.json")
-    code_sync_dry_run_parser.add_argument("--code-sync-project", default="default.project.json")
+    code_sync_dry_run_parser.add_argument("--config", default=None)
 
     code_sync_apply_parser = subparsers.add_parser("code-sync-apply", add_help=False)
-    code_sync_apply_parser.add_argument("--config", default="code-sync.roots.json")
-    code_sync_apply_parser.add_argument("--code-sync-project", default="default.project.json")
+    code_sync_apply_parser.add_argument("--config", default=None)
 
     return parser
 
 
 def _run_command(args: argparse.Namespace) -> dict:
     command = args.command
+    workspace = Path(args.workspace)
     if command == "code-sync-manifest":
-        workspace = Path(args.workspace)
-        return build_local_manifest(workspace, workspace / args.config, workspace / args.code_sync_project)
+        config_path = _resolve_code_sync_config_path(workspace, args)
+        return build_local_manifest(workspace, config_path)
     session = load_session(args.workspace)
     if command == "code-sync-live-manifest":
-        workspace = Path(args.workspace)
-        return query_live_manifest(session, workspace, workspace / args.config, workspace / args.code_sync_project)
+        config_path = _resolve_code_sync_config_path(workspace, args)
+        return query_live_manifest(session, workspace, config_path)
     if command == "code-sync-dry-run":
-        workspace = Path(args.workspace)
-        local_manifest = build_local_manifest(workspace, workspace / args.config, workspace / args.code_sync_project)
-        live_manifest = query_live_manifest(session, workspace, workspace / args.config, workspace / args.code_sync_project)
+        config_path = _resolve_code_sync_config_path(workspace, args)
+        local_manifest = build_local_manifest(workspace, config_path)
+        live_manifest = query_live_manifest(session, workspace, config_path)
         return {"local": local_manifest, "live": live_manifest, "diff": diff_manifests(local_manifest, live_manifest)}
     if command == "code-sync-apply":
-        workspace = Path(args.workspace)
-        return apply_code_sync(session, workspace, workspace / args.config, workspace / args.code_sync_project)
+        config_path = _resolve_code_sync_config_path(workspace, args)
+        return apply_code_sync(session, workspace, config_path)
     if command == "status":
         return _checked_helper_result(command, status(session))
     if command == "mode":
@@ -228,6 +226,12 @@ def _run_command(args: argparse.Namespace) -> dict:
         official_result = _checked_helper_result(command, official_insert_from_creator_store(session, _insert_payload(args)))
         return _with_optional_ensure(ensure_result, official_result)
     raise BridgeError("unknown_command", f"unknown command: {command}")
+
+
+def _resolve_code_sync_config_path(workspace: Path, args: argparse.Namespace) -> Path:
+    workspace_config = load_workspace_config(workspace)
+    config_value = args.config or workspace_config.code_sync_config
+    return workspace / config_value
 
 
 def _checked_helper_result(command: str, result: dict) -> dict:

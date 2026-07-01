@@ -44,7 +44,7 @@ helper2 不接受这些人工覆盖参数：
 - `--clockbridge-register-host`
 - `--clockbridge-register-ip`
 
-task-agent 的规则相反：`--machine_name` 必须显式传入，不读取本机 `machine_name` 文件。task-agent 启动后，后续命令只读 `.clock-p/session.json`。
+task-agent 的规则相反：`--machine_name` 必须显式传入，不读取本机 `machine_name` 文件。这里的 `--machine_name` 是目标 Windows helper 的 `machine_name`，也就是 `aim_helper_machine_name` 的语义，不是 task-agent 当前这台机器的名字。helper2 自己的本地 `machine_name` 仍然来自 Windows 身份文件。task-agent 启动前会从 workspace 根的 `clock-p.workspace.json` 读取 `place_id` 与 code-sync 绑定；启动后，后续命令只读 `.clock-p/session.json`。
 
 ## 构建
 
@@ -87,14 +87,43 @@ rojo build default.project.json --plugin MCP2Plugin.rbxm
 ```powershell
 <mcp_repo>\go-helper\bin\task-agent.exe start `
   --workspace <workspace> `
-  --place_id <place_id> `
-  --machine_name <machine_name> `
-  --helper-base-url http://127.0.0.1:<helper2_port> `
-  --code-sync-config code-sync.roots.json `
-  --code-sync-project default.project.json
+  --machine_name <machine_name>
 ```
 
-测试者必须显式提供 `--workspace` 和 `--place_id`。不要在测试入口里内置固定测试 place。
+第一次接入一个 workspace，最少先确认这 2 个文件：
+
+```text
+clock-p.workspace.json
+code-sync.roots.json
+```
+
+workspace 根的 `clock-p.workspace.json` 至少要有：
+
+```json
+{
+  "place_id": "93795519121520",
+  "code_sync_config": "code-sync.roots.json"
+}
+```
+
+说明：
+
+- `place_id` 必填。
+- `code_sync_config` 可省略；省略后默认去 workspace 根找 `code-sync.roots.json`。
+- 所以如果你只写了 `place_id`，但默认 `code-sync.roots.json` 不存在，`task-agent` / `bridge2 code-sync-*` 仍会失败。
+- `code-sync.roots.json` 负责声明“同步哪些本地目录、各自映射到 Studio 哪些路径”。
+
+当前默认 `--environment public`。若要走本地 helper2，显式传：
+
+```powershell
+<mcp_repo>\go-helper\bin\task-agent.exe start `
+  --workspace <workspace> `
+  --machine_name <machine_name> `
+  --environment local `
+  --helper-url http://127.0.0.1:<helper2_port>
+```
+
+`local` 故意保持手工模式：你自己决定 helper2 的监听地址，再显式把 `--helper-url` 传给 task-agent；当前主线不额外封装这条路径。
 
 
 查看和停止：
@@ -111,16 +140,13 @@ rojo build default.project.json --plugin MCP2Plugin.rbxm
 <mcp_repo>\go-helper\bin\task-agent.exe start `
   --workspace <workspace> `
   --environment public `
-  --place_id <place_id> `
   --machine_name <machine_name> `
-  --user <feishu-user_name> `
-  --code-sync-config code-sync.roots.json `
-  --code-sync-project default.project.json
+  --user <feishu-user_name>
 ```
 
 public `task-agent` 访问公网 helper 时会读取 workspace 或本机身份目录里的 `feishu-token`，并注入 Bearer 鉴权。
 
-helper2 自身的 HTTP handler 不做 Bearer 鉴权；但当 `bridge2` 通过公网 `helper.base_url` 访问时，外层 `dev.clock-p.com` 入口仍要求 `Authorization: Bearer <feishu-token>`。`bridge2` 会自动从 workspace 或身份目录读取 `feishu-token` 注入。
+helper2 自身的 HTTP handler 不做 Bearer 鉴权；但当 `bridge2` 通过公网 `helper_url` 访问时，外层 `dev.clock-p.com` 入口仍要求 `Authorization: Bearer <feishu-token>`。`bridge2` 会自动从 workspace 或身份目录读取 `feishu-token` 注入。
 
 
 ## bridge2 命令

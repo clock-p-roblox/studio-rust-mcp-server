@@ -4,22 +4,20 @@ import hashlib
 import json
 from pathlib import Path
 
-from .config import load_config
+from .config import MAPPING_PROFILE, load_config
 from .hashing import combined_hash, config_hash, root_hash
 from .mapping import build_logical_tree
-from .project import load_project_targets
 from .scanner import scan_root
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 
-def build_local_manifest(workspace: Path, config_path: Path, project_path: Path) -> dict:
+def build_local_manifest(workspace: Path, config_path: Path) -> dict:
     workspace = workspace.resolve()
-    targets = load_project_targets(project_path)
-    config = load_config(config_path, targets)
+    config = load_config(config_path)
     config_dicts = [root.as_config_dict() for root in config.roots]
-    cfg_hash = config_hash(PROTOCOL_VERSION, config.project_id, config.mapping_profile, targets, config_dicts)
+    cfg_hash = config_hash(PROTOCOL_VERSION, MAPPING_PROFILE, config_dicts)
     root_results = []
     total_files = 0
     total_source_bytes = 0
@@ -27,7 +25,7 @@ def build_local_manifest(workspace: Path, config_path: Path, project_path: Path)
     for root in config.roots:
         files = scan_root(workspace, root)
         logical = build_logical_tree(root.studio_path[-1], files)
-        current_root_hash = root_hash(root.root_id, config.mapping_profile, logical)
+        current_root_hash = root_hash(root.root_id, MAPPING_PROFILE, logical)
         root_hashes.append((root.root_id, current_root_hash))
         total_files += len(files)
         total_source_bytes += sum(item.source_bytes for item in files)
@@ -48,11 +46,9 @@ def build_local_manifest(workspace: Path, config_path: Path, project_path: Path)
     payload = {
         "protocol_version": PROTOCOL_VERSION,
         "workspace_id": _workspace_id(workspace),
-        "project_id": config.project_id,
-        "mapping_profile": config.mapping_profile,
+        "mapping_profile": MAPPING_PROFILE,
         "code_sync_config_hash": cfg_hash,
-        "studio_target_allowlist": targets,
-        "combined_hash": combined_hash(config.mapping_profile, root_hashes),
+        "combined_hash": combined_hash(MAPPING_PROFILE, root_hashes),
         "roots": root_results,
         "file_count": total_files,
         "normalized_source_bytes": total_source_bytes,

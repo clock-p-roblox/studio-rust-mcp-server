@@ -90,12 +90,10 @@ type CodeSyncBinding struct {
 	WorkspaceID        string              `json:"workspace_id"`
 	PlaceID            string              `json:"place_id"`
 	MachineName        string              `json:"machine_name"`
-	ProjectID          string              `json:"project_id"`
 	MappingProfile     string              `json:"mapping_profile"`
 	CodeSyncConfigHash string              `json:"code_sync_config_hash"`
 	RootsAuthorityHash string              `json:"roots_authority_hash"`
 	ConfigPath         string              `json:"config_path,omitempty"`
-	ProjectPath        string              `json:"project_path,omitempty"`
 	Roots              []CodeSyncRootRoute `json:"roots"`
 }
 
@@ -408,8 +406,8 @@ func requireSameContract(existing Contract, incoming Contract) error {
 }
 
 func validateCodeSyncBinding(machineName string, placeID string, binding CodeSyncBinding) error {
-	if binding.ProtocolVersion != 1 {
-		return errors.New("code_sync.protocol_version must be 1")
+	if binding.ProtocolVersion != 2 {
+		return errors.New("code_sync.protocol_version must be 2")
 	}
 	if binding.WorkspaceID == "" {
 		return errors.New("code_sync.workspace_id must not be empty")
@@ -419,9 +417,6 @@ func validateCodeSyncBinding(machineName string, placeID string, binding CodeSyn
 	}
 	if binding.MachineName != machineName {
 		return errors.New("code_sync.machine_name must match machine_name")
-	}
-	if binding.ProjectID == "" {
-		return errors.New("code_sync.project_id must not be empty")
 	}
 	if binding.MappingProfile == "" {
 		return errors.New("code_sync.mapping_profile must not be empty")

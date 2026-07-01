@@ -14,20 +14,31 @@ import (
 	"github.com/zeebo/blake3"
 )
 
-const codeSyncProtocolVersion = 1
+const codeSyncProtocolVersion = 2
 const codeSyncMappingProfile = "sync_lua_v1"
+
+var allowedStudioServices = map[string]struct{}{
+	"Lighting":            {},
+	"ReplicatedFirst":     {},
+	"ReplicatedStorage":   {},
+	"ServerScriptService": {},
+	"ServerStorage":       {},
+	"SoundService":        {},
+	"StarterGui":          {},
+	"StarterPack":         {},
+	"StarterPlayer":       {},
+	"Workspace":           {},
+}
 
 type CodeSyncBinding struct {
 	ProtocolVersion    int                 `json:"protocol_version"`
 	WorkspaceID        string              `json:"workspace_id"`
 	PlaceID            string              `json:"place_id"`
 	MachineName        string              `json:"machine_name"`
-	ProjectID          string              `json:"project_id"`
 	MappingProfile     string              `json:"mapping_profile"`
 	CodeSyncConfigHash string              `json:"code_sync_config_hash"`
 	RootsAuthorityHash string              `json:"roots_authority_hash"`
 	ConfigPath         string              `json:"config_path"`
-	ProjectPath        string              `json:"project_path"`
 	Roots              []CodeSyncRootRoute `json:"roots"`
 }
 
@@ -45,9 +56,7 @@ type codeSyncRootConfig struct {
 }
 
 type codeSyncConfigPayload struct {
-	ProjectID      string                `json:"project_id"`
-	MappingProfile string                `json:"mapping_profile"`
-	Roots          []codeSyncRootPayload `json:"roots"`
+	Roots []codeSyncRootPayload `json:"roots"`
 }
 
 type codeSyncRootPayload struct {
@@ -58,18 +67,13 @@ type codeSyncRootPayload struct {
 	Exclude    []string `json:"exclude"`
 }
 
-func BuildCodeSyncBinding(workspace string, configPath string, projectPath string, machineName string, placeID string) (CodeSyncBinding, error) {
+func BuildCodeSyncBinding(workspace string, configPath string, machineName string, placeID string) (CodeSyncBinding, error) {
 	workspaceAbs, err := filepath.Abs(workspace)
 	if err != nil {
 		return CodeSyncBinding{}, err
 	}
 	configRel, configAbs := normalizeWorkspacePath(workspaceAbs, configPath, "code-sync.roots.json")
-	projectRel, projectAbs := normalizeWorkspacePath(workspaceAbs, projectPath, "default.project.json")
-	targets, err := loadProjectTargets(projectAbs)
-	if err != nil {
-		return CodeSyncBinding{}, err
-	}
-	projectID, mappingProfile, roots, err := loadCodeSyncConfig(configAbs, targets)
+	roots, err := loadCodeSyncConfig(configAbs)
 	if err != nil {
 		return CodeSyncBinding{}, err
 	}
@@ -93,12 +97,10 @@ func BuildCodeSyncBinding(workspace string, configPath string, projectPath strin
 		WorkspaceID:        workspaceID(workspaceAbs),
 		PlaceID:            placeID,
 		MachineName:        machineName,
-		ProjectID:          projectID,
-		MappingProfile:     mappingProfile,
-		CodeSyncConfigHash: configHash(codeSyncProtocolVersion, projectID, mappingProfile, targets, rootDicts),
+		MappingProfile:     codeSyncMappingProfile,
+		CodeSyncConfigHash: configHash(codeSyncProtocolVersion, codeSyncMappingProfile, rootDicts),
 		RootsAuthorityHash: rootsAuthorityHash(rootRoutes),
 		ConfigPath:         configRel,
-		ProjectPath:        projectRel,
 		Roots:              rootRoutes,
 	}, nil
 }
@@ -129,44 +131,33 @@ func workspaceID(workspace string) string {
 	return hex.EncodeToString(sum[:])[:24]
 }
 
-func loadCodeSyncConfig(path string, targets [][]string) (string, string, []codeSyncRootConfig, error) {
+func loadCodeSyncConfig(path string) ([]codeSyncRootConfig, error) {
 	body, err := os.ReadFile(path)
 	if err != nil {
-		return "", "", nil, err
+		return nil, err
 	}
 	var payload codeSyncConfigPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return "", "", nil, err
-	}
-	projectID := strings.TrimSpace(payload.ProjectID)
-	if projectID == "" {
-		return "", "", nil, fmt.Errorf("project_id must be a non-empty string")
-	}
-	mappingProfile := strings.TrimSpace(payload.MappingProfile)
-	if mappingProfile == "" {
-		return "", "", nil, fmt.Errorf("mapping_profile must be a non-empty string")
-	}
-	if mappingProfile != codeSyncMappingProfile {
-		return "", "", nil, fmt.Errorf("only mapping_profile=%s is supported", codeSyncMappingProfile)
+		return nil, err
 	}
 	if len(payload.Roots) == 0 {
-		return "", "", nil, fmt.Errorf("roots must be a non-empty array")
+		return nil, fmt.Errorf("roots must be a non-empty array")
 	}
 	roots := make([]codeSyncRootConfig, 0, len(payload.Roots))
 	for _, item := range payload.Roots {
-		root, err := parseCodeSyncRoot(item, targets)
+		root, err := parseCodeSyncRoot(item)
 		if err != nil {
-			return "", "", nil, err
+			return nil, err
 		}
 		roots = append(roots, root)
 	}
 	if err := validateUniqueCodeSyncRoots(roots); err != nil {
-		return "", "", nil, err
+		return nil, err
 	}
-	return projectID, mappingProfile, roots, nil
+	return roots, nil
 }
 
-func parseCodeSyncRoot(item codeSyncRootPayload, targets [][]string) (codeSyncRootConfig, error) {
+func parseCodeSyncRoot(item codeSyncRootPayload) (codeSyncRootConfig, error) {
 	rootID := strings.TrimSpace(item.RootID)
 	if rootID == "" {
 		return codeSyncRootConfig{}, fmt.Errorf("root_id must be a non-empty string")
@@ -187,8 +178,8 @@ func parseCodeSyncRoot(item codeSyncRootPayload, targets [][]string) (codeSyncRo
 			return codeSyncRootConfig{}, fmt.Errorf("studio_path must not contain empty segments for root_id %s", rootID)
 		}
 	}
-	if !studioPathAllowed(studioPath, targets) {
-		return codeSyncRootConfig{}, fmt.Errorf("studio_path is not declared by the project target allowlist for root_id %s", rootID)
+	if _, ok := allowedStudioServices[studioPath[0]]; !ok {
+		return codeSyncRootConfig{}, fmt.Errorf("studio_path must start from a supported DataModel service for root_id %s", rootID)
 	}
 	include := normalizePatterns(item.Include, []string{"**/*.lua", "**/*.luau"})
 	exclude := normalizePatterns(item.Exclude, nil)
@@ -231,81 +222,6 @@ func validateUniqueCodeSyncRoots(roots []codeSyncRootConfig) error {
 	return nil
 }
 
-func loadProjectTargets(path string) ([][]string, error) {
-	body, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var payload struct {
-		Tree map[string]any `json:"tree"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, err
-	}
-	if payload.Tree == nil {
-		return nil, fmt.Errorf("project missing tree object")
-	}
-	var targets [][]string
-	for name, child := range payload.Tree {
-		if strings.HasPrefix(name, "$") {
-			continue
-		}
-		if childMap, ok := child.(map[string]any); ok {
-			collectProjectTargets(childMap, []string{name}, &targets, true)
-		}
-	}
-	return dedupePaths(targets), nil
-}
-
-func collectProjectTargets(node map[string]any, path []string, targets *[][]string, isService bool) {
-	_, hasPath := node["$path"]
-	var children []struct {
-		name string
-		node map[string]any
-	}
-	for name, child := range node {
-		if strings.HasPrefix(name, "$") {
-			continue
-		}
-		if childMap, ok := child.(map[string]any); ok {
-			children = append(children, struct {
-				name string
-				node map[string]any
-			}{name: name, node: childMap})
-		}
-	}
-	if hasPath || len(children) == 0 || !isService {
-		*targets = append(*targets, append([]string(nil), path...))
-	}
-	for _, child := range children {
-		collectProjectTargets(child.node, append(append([]string(nil), path...), child.name), targets, false)
-	}
-}
-
-func dedupePaths(paths [][]string) [][]string {
-	seen := make(map[string]struct{})
-	var result [][]string
-	for _, path := range paths {
-		key := strings.Join(path, "\x00")
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-		result = append(result, append([]string(nil), path...))
-	}
-	sort.Slice(result, func(i, j int) bool { return comparePath(result[i], result[j]) < 0 })
-	return result
-}
-
-func studioPathAllowed(path []string, targets [][]string) bool {
-	for _, target := range targets {
-		if pathPrefix(target, path) {
-			return true
-		}
-	}
-	return false
-}
-
 func samePath(left []string, right []string) bool {
 	return len(left) == len(right) && pathPrefix(left, right)
 }
@@ -340,16 +256,7 @@ func comparePath(left []string, right []string) int {
 	return 0
 }
 
-func configHash(protocolVersion int, projectID string, mappingProfile string, targets [][]string, roots []map[string]any) string {
-	targetsCopy := append([][]string(nil), targets...)
-	sort.Slice(targetsCopy, func(i, j int) bool { return comparePath(targetsCopy[i], targetsCopy[j]) < 0 })
-	var targetBytes []byte
-	for _, target := range targetsCopy {
-		targetBytes = append(targetBytes, canonicalString(len(target))...)
-		for _, segment := range target {
-			targetBytes = append(targetBytes, canonicalString(segment)...)
-		}
-	}
+func configHash(protocolVersion int, mappingProfile string, roots []map[string]any) string {
 	rootsCopy := append([]map[string]any(nil), roots...)
 	sort.Slice(rootsCopy, func(i, j int) bool { return fmt.Sprint(rootsCopy[i]["root_id"]) < fmt.Sprint(rootsCopy[j]["root_id"]) })
 	var rootBytes []byte
@@ -377,10 +284,7 @@ func configHash(protocolVersion int, projectID string, mappingProfile string, ta
 	return blake3Hex(joinBytes(
 		canonicalString("clockp.code_sync.v1.config"),
 		canonicalString(protocolVersion),
-		canonicalString(projectID),
 		canonicalString(mappingProfile),
-		canonicalString(len(targetsCopy)),
-		targetBytes,
 		canonicalString(len(rootsCopy)),
 		rootBytes,
 	))

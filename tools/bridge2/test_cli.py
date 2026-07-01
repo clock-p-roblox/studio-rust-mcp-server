@@ -138,17 +138,16 @@ class FakeHelper(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def test_session_payload(helper_base_url: str) -> dict:
+def test_session_payload(helper_url: str) -> dict:
     return {
         "task_id": "task-a",
         "task_session_token": "token-task-a",
-        "helper": {"base_url": helper_base_url},
+        "helper_url": helper_url,
         "code_sync": {
-            "protocol_version": 1,
+            "protocol_version": 2,
             "workspace_id": "workspace-test",
             "place_id": "134795435066737",
             "machine_name": "test-machine",
-            "project_id": "cli-test",
             "mapping_profile": "sync_lua_v1",
             "code_sync_config_hash": "config-hash",
             "roots_authority_hash": "roots-hash",
@@ -186,6 +185,15 @@ class Bridge2CLITest(unittest.TestCase):
         root = Path(self.tmp.name)
         session_dir = root / ".clock-p"
         session_dir.mkdir()
+        (root / "clock-p.workspace.json").write_text(
+            json.dumps(
+                {
+                    "place_id": "134795435066737",
+                    "code_sync_config": "code-sync.roots.json",
+                }
+            ),
+            encoding="utf-8",
+        )
         (session_dir / "session.json").write_text(
             json.dumps(test_session_payload(f"http://127.0.0.1:{self.server.server_address[1]}")),
             encoding="utf-8",
@@ -231,25 +239,9 @@ class Bridge2CLITest(unittest.TestCase):
     def test_code_sync_manifest_does_not_require_session(self) -> None:
         workspace = Path(self.workspace)
         (workspace / ".clock-p" / "session.json").unlink()
-        (workspace / "default.project.json").write_text(
-            json.dumps(
-                {
-                    "tree": {
-                        "$className": "DataModel",
-                        "ReplicatedStorage": {
-                            "$className": "ReplicatedStorage",
-                            "ClockPRealTest": {"$className": "Folder"},
-                        },
-                    }
-                }
-            ),
-            encoding="utf-8",
-        )
         (workspace / "code-sync.roots.json").write_text(
             json.dumps(
                 {
-                    "project_id": "cli-test",
-                    "mapping_profile": "sync_lua_v1",
                     "roots": [
                         {
                             "root_id": "app",
@@ -275,25 +267,9 @@ class Bridge2CLITest(unittest.TestCase):
 
     def test_code_sync_live_manifest_uses_session(self) -> None:
         workspace = Path(self.workspace)
-        (workspace / "default.project.json").write_text(
-            json.dumps(
-                {
-                    "tree": {
-                        "$className": "DataModel",
-                        "ReplicatedStorage": {
-                            "$className": "ReplicatedStorage",
-                            "ClockPRealTest": {"$className": "Folder"},
-                        },
-                    }
-                }
-            ),
-            encoding="utf-8",
-        )
         (workspace / "code-sync.roots.json").write_text(
             json.dumps(
                 {
-                    "project_id": "cli-test",
-                    "mapping_profile": "sync_lua_v1",
                     "roots": [
                         {
                             "root_id": "app",

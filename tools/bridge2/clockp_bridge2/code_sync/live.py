@@ -6,14 +6,12 @@ from ..errors import BridgeError
 from ..session import Session
 from ..studio import code_sync_get_manifest as helper_code_sync_get_manifest
 from ..studio import mode
-from .config import load_config
-from .project import load_project_targets
+from .config import MAPPING_PROFILE, load_config
 
 
-def query_live_manifest(session: Session, workspace: Path, config_path: Path, project_path: Path) -> dict:
+def query_live_manifest(session: Session, workspace: Path, config_path: Path) -> dict:
     before_mode = _require_stable_edit_mode(mode(session))
-    targets = load_project_targets(project_path)
-    config = load_config(config_path, targets)
+    config = load_config(config_path)
     roots = [
         {
             "root_id": root.root_id,
@@ -24,9 +22,8 @@ def query_live_manifest(session: Session, workspace: Path, config_path: Path, pr
     result = helper_code_sync_get_manifest(
         session,
         {
-            "protocol_version": 1,
-            "project_id": config.project_id,
-            "mapping_profile": config.mapping_profile,
+            "protocol_version": 2,
+            "mapping_profile": MAPPING_PROFILE,
             "roots": roots,
         },
     )
@@ -34,9 +31,8 @@ def query_live_manifest(session: Session, workspace: Path, config_path: Path, pr
     if after_mode.get("mode_seq") != before_mode.get("mode_seq"):
         raise BridgeError("code_sync_state_stale", "Studio mode_seq changed during live code-sync manifest query", {"before_mode": before_mode, "after_mode": after_mode})
     return {
-        "protocol_version": 1,
-        "project_id": config.project_id,
-        "mapping_profile": config.mapping_profile,
+        "protocol_version": 2,
+        "mapping_profile": MAPPING_PROFILE,
         "combined_hash": result.get("combined_hash"),
         "roots": result.get("roots", []),
         "mode": result.get("mode") or before_mode.get("mode"),

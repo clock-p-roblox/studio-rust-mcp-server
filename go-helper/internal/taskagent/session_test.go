@@ -22,7 +22,7 @@ func TestSaveDescriptorDoesNotStoreWorkspace(t *testing.T) {
 		TaskAgentStartedAtMS: 1000,
 		TaskAgentStatusURL:   "http://127.0.0.1:1/status",
 		TaskSessionToken:     "token",
-		Helper:               HelperRoute{BaseURL: "http://127.0.0.1:44750"},
+		HelperURL:            "http://127.0.0.1:44750",
 		CodeSync:             testCodeSyncBinding(),
 	}
 	if err := SaveDescriptor(workspace, descriptor); err != nil {
@@ -43,17 +43,17 @@ func TestSaveDescriptorDoesNotStoreWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load descriptor failed: %v", err)
 	}
-	if loaded.TaskID != descriptor.TaskID || loaded.Helper.BaseURL != descriptor.Helper.BaseURL {
+	if loaded.TaskID != descriptor.TaskID || loaded.HelperURL != descriptor.HelperURL {
 		t.Fatalf("loaded descriptor mismatch: %+v", loaded)
 	}
 }
 
-func TestResolveHelperBaseURLLocalRequiresExplicitURL(t *testing.T) {
-	_, _, err := ResolveHelperBaseURL(RouteConfig{
+func TestResolveHelperURLLocalRequiresExplicitURL(t *testing.T) {
+	_, err := ResolveHelperURL(RouteConfig{
 		Environment: "local",
 		MachineName: "win-a",
 	})
-	if err == nil || !strings.Contains(err.Error(), "--helper-base-url is required") {
+	if err == nil || !strings.Contains(err.Error(), "--helper-url is required") {
 		t.Fatalf("expected local helper URL error, got %v", err)
 	}
 }
@@ -84,8 +84,8 @@ func TestCodeSyncHashesUseBlake3Fixtures(t *testing.T) {
 	}
 }
 
-func TestResolveHelperBaseURLPublicDerivesFromMachineAndUser(t *testing.T) {
-	baseURL, publicURL, err := ResolveHelperBaseURL(RouteConfig{
+func TestResolveHelperURLPublicDerivesFromMachineAndUser(t *testing.T) {
+	helperURL, err := ResolveHelperURL(RouteConfig{
 		Environment: "public",
 		MachineName: "win-a",
 		UserName:    "sunjun",
@@ -94,13 +94,13 @@ func TestResolveHelperBaseURLPublicDerivesFromMachineAndUser(t *testing.T) {
 		t.Fatalf("public helper URL failed: %v", err)
 	}
 	want := "https://roblox-helper-win-a-sunjun-user.dev.clock-p.com"
-	if baseURL != want || publicURL != want {
-		t.Fatalf("unexpected public URLs: base=%q public=%q", baseURL, publicURL)
+	if helperURL != want {
+		t.Fatalf("unexpected helper url: %q", helperURL)
 	}
 }
 
-func TestResolveHelperBaseURLPublicHonorsDomainSuffix(t *testing.T) {
-	baseURL, publicURL, err := ResolveHelperBaseURL(RouteConfig{
+func TestResolveHelperURLPublicHonorsDomainSuffix(t *testing.T) {
+	helperURL, err := ResolveHelperURL(RouteConfig{
 		Environment:  "public",
 		MachineName:  "win-a",
 		UserName:     "sunjun",
@@ -110,35 +110,29 @@ func TestResolveHelperBaseURLPublicHonorsDomainSuffix(t *testing.T) {
 		t.Fatalf("public helper URL failed: %v", err)
 	}
 	want := "https://roblox-helper-win-a-sunjun-user.example.test"
-	if baseURL != want || publicURL != want {
-		t.Fatalf("unexpected public URLs: base=%q public=%q", baseURL, publicURL)
+	if helperURL != want {
+		t.Fatalf("unexpected helper url: %q", helperURL)
 	}
 }
 
-func TestResolveHelperBaseURLPublicRequiresExplicitIdentity(t *testing.T) {
+func TestResolveHelperURLPublicRequiresExplicitIdentity(t *testing.T) {
 	emptyHome := t.TempDir()
 	t.Setenv("APPDATA", emptyHome)
 	t.Setenv("USERPROFILE", emptyHome)
 	t.Setenv("HOME", emptyHome)
 
-	_, _, missingUserErr := ResolveHelperBaseURL(RouteConfig{
-		Environment: "public",
-		MachineName: "win-a",
-	})
+	_, missingUserErr := ResolveHelperURL(RouteConfig{Environment: "public", MachineName: "win-a"})
 	if missingUserErr == nil || !strings.Contains(missingUserErr.Error(), "--user is required") {
 		t.Fatalf("expected public user error, got %v", missingUserErr)
 	}
 
-	_, _, missingMachineErr := ResolveHelperBaseURL(RouteConfig{
-		Environment: "public",
-		UserName:    "sunjun",
-	})
+	_, missingMachineErr := ResolveHelperURL(RouteConfig{Environment: "public", UserName: "sunjun"})
 	if missingMachineErr == nil || !strings.Contains(missingMachineErr.Error(), "machine_name is required") {
 		t.Fatalf("expected public machine error, got %v", missingMachineErr)
 	}
 }
 
-func TestResolveHelperBaseURLPublicNeverReadsMachineNameFile(t *testing.T) {
+func TestResolveHelperURLPublicNeverReadsMachineNameFile(t *testing.T) {
 	dir := t.TempDir()
 	identityDir := filepath.Join(dir, "dev.clock-p.com")
 	if err := os.MkdirAll(identityDir, 0o755); err != nil {
@@ -154,9 +148,35 @@ func TestResolveHelperBaseURLPublicNeverReadsMachineNameFile(t *testing.T) {
 	t.Setenv("USERPROFILE", t.TempDir())
 	t.Setenv("HOME", t.TempDir())
 
-	_, _, err := ResolveHelperBaseURL(RouteConfig{Environment: "public"})
+	_, err := ResolveHelperURL(RouteConfig{Environment: "public"})
 	if err == nil || !strings.Contains(err.Error(), "machine_name is required") {
 		t.Fatalf("expected explicit machine_name error, got %v", err)
+	}
+}
+
+func TestLoadWorkspaceConfig(t *testing.T) {
+	workspace := t.TempDir()
+	body := []byte("{\"place_id\":\"123\",\"code_sync_config\":\"custom/roots.json\"}\n")
+	if err := os.WriteFile(filepath.Join(workspace, workspaceConfigFileName), body, 0o644); err != nil {
+		t.Fatalf("write workspace config: %v", err)
+	}
+	config, err := LoadWorkspaceConfig(workspace)
+	if err != nil {
+		t.Fatalf("load workspace config failed: %v", err)
+	}
+	if config.PlaceID != "123" || config.CodeSyncConfig != "custom/roots.json" {
+		t.Fatalf("unexpected workspace config: %+v", config)
+	}
+}
+
+func TestValidateWorkspaceBindingFilesExplainsConfigRole(t *testing.T) {
+	workspace := t.TempDir()
+	err := ValidateWorkspaceBindingFiles(workspace, WorkspaceConfig{
+		PlaceID:        "123",
+		CodeSyncConfig: "code-sync.roots.json",
+	})
+	if err == nil || !strings.Contains(err.Error(), "which local directories code-sync manages") {
+		t.Fatalf("expected helpful config message, got %v", err)
 	}
 }
 
@@ -196,16 +216,14 @@ func TestRequestExistingShutdownUsesStatusURLAndTaskID(t *testing.T) {
 
 func testCodeSyncBinding() CodeSyncBinding {
 	return CodeSyncBinding{
-		ProtocolVersion:    1,
+		ProtocolVersion:    2,
 		WorkspaceID:        "workspace",
 		PlaceID:            "123",
 		MachineName:        "win-a",
-		ProjectID:          "game",
 		MappingProfile:     "sync_lua_v1",
 		CodeSyncConfigHash: "config",
 		RootsAuthorityHash: "roots",
 		ConfigPath:         "code-sync.roots.json",
-		ProjectPath:        "default.project.json",
 		Roots: []CodeSyncRootRoute{
 			{RootID: "root", StudioPath: []string{"Workspace", "ClockPTest"}},
 		},

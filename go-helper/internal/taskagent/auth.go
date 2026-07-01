@@ -24,9 +24,9 @@ func (transport bearerTransport) RoundTrip(req *http.Request) (*http.Response, e
 	return base.RoundTrip(next)
 }
 
-func newHelperHTTPClient(helperBaseURL string, workspace string) (*http.Client, error) {
+func newHelperHTTPClient(helperURL string, workspace string) (*http.Client, error) {
 	client := &http.Client{Timeout: heartbeatHTTPTimeout}
-	if helperBaseURLRequiresBearer(helperBaseURL) {
+	if helperURLRequiresBearer(helperURL) {
 		token, err := ResolveClockbridgeRegisterToken(workspace)
 		if err != nil {
 			return nil, err
@@ -36,8 +36,8 @@ func newHelperHTTPClient(helperBaseURL string, workspace string) (*http.Client, 
 	return client, nil
 }
 
-func helperBaseURLRequiresBearer(helperBaseURL string) bool {
-	parsed, err := url.Parse(strings.TrimSpace(helperBaseURL))
+func helperURLRequiresBearer(helperURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(helperURL))
 	if err != nil {
 		return false
 	}

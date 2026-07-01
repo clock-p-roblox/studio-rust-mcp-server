@@ -24,17 +24,15 @@ const heartbeatHTTPTimeout = 5 * time.Second
 var placeIDPattern = regexp.MustCompile(`^[0-9]+$`)
 
 type Config struct {
-	Workspace           string
-	Environment         string
-	MachineName         string
-	UserName            string
-	PlaceID             string
-	HelperBaseURL       string
-	HelperPublicURL     string
-	DomainSuffix        string
-	CodeSyncConfigPath  string
-	CodeSyncProjectPath string
-	StatusAddr          string
+	Workspace          string
+	Environment        string
+	MachineName        string
+	UserName           string
+	PlaceID            string
+	HelperURL          string
+	DomainSuffix       string
+	CodeSyncConfigPath string
+	StatusAddr         string
 }
 
 type StatusResponse struct {
@@ -46,7 +44,7 @@ type StatusResponse struct {
 	TaskAgentPID             int             `json:"task_agent_pid"`
 	TaskAgentStartedAtMS     int64           `json:"task_agent_started_at_ms"`
 	TaskAgentStatusURL       string          `json:"task_agent_status_url"`
-	HelperBaseURL            string          `json:"helper_base_url"`
+	HelperURL                string          `json:"helper_url"`
 	HelperRegistrationState  string          `json:"helper_registration_state"`
 	HelperLastHeartbeatAt    *time.Time      `json:"helper_last_heartbeat_at,omitempty"`
 	HelperLastHeartbeatError string          `json:"helper_last_heartbeat_error,omitempty"`
@@ -96,17 +94,17 @@ func New(config Config, logger *slog.Logger) (*Agent, error) {
 	if !placeIDPattern.MatchString(config.PlaceID) {
 		return nil, errors.New("place_id must contain digits only")
 	}
-	if config.HelperBaseURL == "" {
-		return nil, errors.New("helper_base_url is required in local mode")
+	if config.HelperURL == "" {
+		return nil, errors.New("helper_url is required")
 	}
 	if config.Environment == "" {
-		config.Environment = "local"
+		config.Environment = "public"
 	}
 	config.DomainSuffix = ResolveDomainSuffix(config.DomainSuffix)
 	if config.StatusAddr == "" {
 		config.StatusAddr = "127.0.0.1:0"
 	}
-	client, err := newHelperHTTPClient(config.HelperBaseURL, config.Workspace)
+	client, err := newHelperHTTPClient(config.HelperURL, config.Workspace)
 	if err != nil {
 		return nil, err
 	}
@@ -143,7 +141,6 @@ func (a *Agent) Run(ctx context.Context) error {
 	codeSync, err := BuildCodeSyncBinding(
 		a.config.Workspace,
 		a.config.CodeSyncConfigPath,
-		a.config.CodeSyncProjectPath,
 		a.config.MachineName,
 		a.config.PlaceID,
 	)
@@ -160,11 +157,8 @@ func (a *Agent) Run(ctx context.Context) error {
 		TaskAgentStartedAtMS: UnixMillis(a.startedAt),
 		TaskAgentStatusURL:   statusURL,
 		TaskSessionToken:     taskSessionToken,
-		Helper: HelperRoute{
-			BaseURL:   a.config.HelperBaseURL,
-			PublicURL: a.config.HelperPublicURL,
-		},
-		CodeSync: codeSync,
+		HelperURL:            a.config.HelperURL,
+		CodeSync:             codeSync,
 	}
 	if err := SaveDescriptor(a.config.Workspace, a.descriptor); err != nil {
 		_ = listener.Close()
@@ -225,7 +219,7 @@ func (a *Agent) Status() StatusResponse {
 		TaskAgentPID:             a.descriptor.TaskAgentPID,
 		TaskAgentStartedAtMS:     a.descriptor.TaskAgentStartedAtMS,
 		TaskAgentStatusURL:       a.descriptor.TaskAgentStatusURL,
-		HelperBaseURL:            a.descriptor.Helper.BaseURL,
+		HelperURL:                a.descriptor.HelperURL,
 		HelperRegistrationState:  a.helperState,
 		HelperLastHeartbeatAt:    a.helperLastHeartbeatAt,
 		HelperLastHeartbeatError: a.helperLastError,
@@ -258,7 +252,7 @@ func (a *Agent) sendHeartbeat() {
 		"code_sync":                a.descriptor.CodeSync,
 	}
 	payload, _ := json.Marshal(body)
-	url := fmt.Sprintf("%s/session/%s/heartbeat", a.descriptor.Helper.BaseURL, a.descriptor.TaskID)
+	url := fmt.Sprintf("%s/session/%s/heartbeat", a.descriptor.HelperURL, a.descriptor.TaskID)
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
 	if err == nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -312,10 +306,10 @@ func (a *Agent) shutdownBounded() {
 }
 
 func (a *Agent) releaseHelper() {
-	if a.descriptor.TaskID == "" || a.descriptor.Helper.BaseURL == "" {
+	if a.descriptor.TaskID == "" || a.descriptor.HelperURL == "" {
 		return
 	}
-	url := fmt.Sprintf("%s/session/%s/release", a.descriptor.Helper.BaseURL, a.descriptor.TaskID)
+	url := fmt.Sprintf("%s/session/%s/release", a.descriptor.HelperURL, a.descriptor.TaskID)
 	body := map[string]any{
 		"task_agent_pid":           a.descriptor.TaskAgentPID,
 		"task_agent_started_at_ms": a.descriptor.TaskAgentStartedAtMS,

@@ -9,7 +9,6 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from clockp_bridge2.code_sync.mapping import build_logical_tree
-from clockp_bridge2.code_sync.project import load_project_targets, validate_studio_path_allowed
 from clockp_bridge2.code_sync.config import CodeSyncRoot
 from clockp_bridge2.code_sync.diff import diff_manifests
 from clockp_bridge2.code_sync.hashing import LogicalNode
@@ -18,31 +17,42 @@ from clockp_bridge2.errors import BridgeError
 
 
 class CodeSyncTests(unittest.TestCase):
-    def test_game1_style_project_targets_allow_workspace_and_declared_container(self) -> None:
+    def test_load_config_allows_supported_service_roots(self) -> None:
+        from clockp_bridge2.code_sync.config import load_config
+
         with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp) / "default.project.json"
-            project.write_text(
+            path = Path(tmp) / "code-sync.roots.json"
+            path.write_text(
                 json.dumps(
                     {
-                        "tree": {
-                            "$className": "DataModel",
-                            "ReplicatedStorage": {
-                                "$className": "ReplicatedStorage",
-                                "ClockPRealTest": {"$className": "Folder"},
-                            },
-                            "Workspace": {"$className": "Workspace"},
-                        }
+                        "roots": [
+                            {"root_id": "a", "local_path": "src", "studio_path": ["Workspace"], "include": [], "exclude": []},
+                            {"root_id": "b", "local_path": "lib", "studio_path": ["ReplicatedStorage", "ClockPRealTest"], "include": [], "exclude": []},
+                        ]
                     }
                 ),
                 encoding="utf-8",
             )
-            targets = load_project_targets(project)
-        self.assertIn(["ReplicatedStorage", "ClockPRealTest"], targets)
-        self.assertIn(["Workspace"], targets)
-        validate_studio_path_allowed(["Workspace", "Probe"], targets)
-        validate_studio_path_allowed(["ReplicatedStorage", "ClockPRealTest", "App"], targets)
-        with self.assertRaises(BridgeError):
-            validate_studio_path_allowed(["ReplicatedStorage", "Shared"], targets)
+            config = load_config(path)
+        self.assertEqual([root.root_id for root in config.roots], ["a", "b"])
+
+    def test_load_config_rejects_unknown_service_root(self) -> None:
+        from clockp_bridge2.code_sync.config import load_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "code-sync.roots.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "roots": [
+                            {"root_id": "a", "local_path": "src", "studio_path": ["NotAService"], "include": [], "exclude": []},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(BridgeError):
+                load_config(path)
 
     def test_init_usurp_script_keeps_children(self) -> None:
         tree = build_logical_tree(
@@ -90,17 +100,8 @@ class CodeSyncTests(unittest.TestCase):
 
             with tempfile.TemporaryDirectory() as tmp:
                 path = Path(tmp) / "code-sync.roots.json"
-                path.write_text(
-                    json.dumps(
-                        {
-                            "project_id": "x",
-                            "mapping_profile": "sync_lua_v1",
-                            "roots": [{"root_id": "x", "local_path": "K:/outside", "studio_path": ["Workspace"], "include": [], "exclude": []}],
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-                load_config(path, [["Workspace"]])
+                path.write_text(json.dumps({"roots": [{"root_id": "x", "local_path": "K:/outside", "studio_path": ["Workspace"], "include": [], "exclude": []}]}), encoding="utf-8")
+                load_config(path)
 
     def test_root_overlap_rejected(self) -> None:
         from clockp_bridge2.code_sync.config import load_config
@@ -110,8 +111,6 @@ class CodeSyncTests(unittest.TestCase):
             path.write_text(
                 json.dumps(
                     {
-                        "project_id": "x",
-                        "mapping_profile": "sync_lua_v1",
                         "roots": [
                             {"root_id": "a", "local_path": "a", "studio_path": ["Workspace", "A"], "include": [], "exclude": []},
                             {"root_id": "b", "local_path": "b", "studio_path": ["Workspace", "A", "B"], "include": [], "exclude": []},
@@ -121,7 +120,7 @@ class CodeSyncTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaises(BridgeError):
-                load_config(path, [["Workspace"]])
+                load_config(path)
 
     def test_invalid_utf8_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

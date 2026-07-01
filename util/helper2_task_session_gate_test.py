@@ -171,11 +171,10 @@ def task_token(task_id: str) -> str:
 
 def code_sync_binding(task_id: str, *, place_id: str, config_hash: str | None = None) -> dict[str, Any]:
     return {
-        "protocol_version": 1,
+        "protocol_version": 2,
         "workspace_id": f"workspace-{task_id}",
         "place_id": place_id,
         "machine_name": MACHINE_NAME,
-        "project_id": "task-session",
         "mapping_profile": "sync_lua_v1",
         "code_sync_config_hash": config_hash or f"config-{task_id}",
         "roots_authority_hash": f"roots-{task_id}",

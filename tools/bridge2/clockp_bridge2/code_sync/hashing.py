@@ -103,10 +103,7 @@ def combined_hash(mapping_profile: str, roots: list[tuple[str, str]]) -> str:
     return hash_parts(s("clockp.code_sync.v1.combined"), s(mapping_profile), s(len(ordered)), encoded)
 
 
-def config_hash(protocol_version: int, project_id: str, mapping_profile: str, targets: list[list[str]], roots: list[dict]) -> str:
-    target_parts = []
-    for target in sorted(targets, key=lambda path: [segment.encode("utf-8") for segment in path]):
-        target_parts.append(s(len(target)) + b"".join(s(segment) for segment in target))
+def config_hash(protocol_version: int, mapping_profile: str, roots: list[dict]) -> str:
     root_parts = []
     for root in sorted(roots, key=lambda item: str(item["root_id"]).encode("utf-8")):
         studio_path = list(root["studio_path"])
@@ -125,10 +122,7 @@ def config_hash(protocol_version: int, project_id: str, mapping_profile: str, ta
     return hash_parts(
         s("clockp.code_sync.v1.config"),
         s(protocol_version),
-        s(project_id),
         s(mapping_profile),
-        s(len(target_parts)),
-        b"".join(target_parts),
         s(len(root_parts)),
         b"".join(root_parts),
     )

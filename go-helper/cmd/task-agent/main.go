@@ -42,14 +42,11 @@ func run(args []string) error {
 func runStart(args []string) error {
 	fs := flag.NewFlagSet("start", flag.ExitOnError)
 	workspace := fs.String("workspace", ".", "workspace directory")
-	environment := fs.String("environment", "local", "task-agent environment: local or public")
-	machineName := fs.String("machine_name", "", "explicit helper machine name")
+	environment := fs.String("environment", "public", "task-agent environment: public or local")
+	machineName := fs.String("machine_name", "", "target helper machine_name (aim_helper_machine_name), not this machine")
 	userName := fs.String("user", "", "clock-p user name for public helper URL derivation")
-	placeID := fs.String("place_id", "", "Roblox place id")
-	helperBaseURL := fs.String("helper-base-url", "", "local helper2 base URL")
+	helperURL := fs.String("helper-url", "", "local helper2 URL for --environment local")
 	publicDomainSuffix := fs.String("public-domain-suffix", "dev.clock-p.com", "domain suffix for public helper URL derivation")
-	codeSyncConfigPath := fs.String("code-sync-config", "code-sync.roots.json", "code-sync roots config path, relative to workspace unless absolute")
-	codeSyncProjectPath := fs.String("code-sync-project", "default.project.json", "project DataModel declaration path, relative to workspace unless absolute")
 	statusAddr := fs.String("status-addr", "127.0.0.1:0", "task-agent status listen address")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -57,17 +54,21 @@ func runStart(args []string) error {
 	if *machineName == "" {
 		return errors.New("--machine_name is required")
 	}
-	if *placeID == "" {
-		return errors.New("--place_id is required")
+	workspaceConfig, err := taskagent.LoadWorkspaceConfig(*workspace)
+	if err != nil {
+		return err
 	}
-	resolvedHelperBaseURL, resolvedHelperPublicURL, err := taskagent.ResolveHelperBaseURL(taskagent.RouteConfig{
-		Environment:   *environment,
-		MachineName:   *machineName,
-		UserName:      *userName,
-		DomainSuffix:  *publicDomainSuffix,
-		HelperBaseURL: *helperBaseURL,
+	resolvedHelperURL, err := taskagent.ResolveHelperURL(taskagent.RouteConfig{
+		Environment:  *environment,
+		MachineName:  *machineName,
+		UserName:     *userName,
+		DomainSuffix: *publicDomainSuffix,
+		HelperURL:    *helperURL,
 	})
 	if err != nil {
+		return err
+	}
+	if err := taskagent.ValidateWorkspaceBindingFiles(*workspace, workspaceConfig); err != nil {
 		return err
 	}
 
@@ -89,17 +90,15 @@ func runStart(args []string) error {
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	agent, err := taskagent.New(taskagent.Config{
-		Workspace:           *workspace,
-		Environment:         *environment,
-		MachineName:         *machineName,
-		UserName:            *userName,
-		PlaceID:             *placeID,
-		HelperBaseURL:       resolvedHelperBaseURL,
-		HelperPublicURL:     resolvedHelperPublicURL,
-		DomainSuffix:        *publicDomainSuffix,
-		CodeSyncConfigPath:  *codeSyncConfigPath,
-		CodeSyncProjectPath: *codeSyncProjectPath,
-		StatusAddr:          *statusAddr,
+		Workspace:          *workspace,
+		Environment:        *environment,
+		MachineName:        *machineName,
+		UserName:           *userName,
+		PlaceID:            workspaceConfig.PlaceID,
+		HelperURL:          resolvedHelperURL,
+		DomainSuffix:       *publicDomainSuffix,
+		CodeSyncConfigPath: workspaceConfig.CodeSyncConfig,
+		StatusAddr:         *statusAddr,
 	}, logger)
 	if err != nil {
 		return err

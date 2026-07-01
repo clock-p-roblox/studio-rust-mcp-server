@@ -11,7 +11,7 @@ from .errors import BridgeError
 class Session:
     workspace: Path
     task_id: str
-    helper_base_url: str
+    helper_url: str
     task_session_token: str
     code_sync: dict
 
@@ -37,16 +37,15 @@ def load_session(workspace: str | None = None) -> Session:
 
     task_id = str(data.get("task_id") or "").strip()
     task_session_token = str(data.get("task_session_token") or "").strip()
-    helper = data.get("helper") if isinstance(data.get("helper"), dict) else {}
     code_sync = data.get("code_sync") if isinstance(data.get("code_sync"), dict) else {}
-    helper_base_url = str(helper.get("base_url") or "").strip().rstrip("/")
+    helper_url = str(data.get("helper_url") or "").strip().rstrip("/")
     if not task_id:
         raise BridgeError("session_missing_task_id", "session.json is missing task_id", {"path": str(path)})
     if not task_session_token:
         raise BridgeError("session_missing_task_session_token", "session.json is missing task_session_token", {"path": str(path)})
-    if not helper_base_url:
-        raise BridgeError("session_missing_helper_base_url", "session.json is missing helper.base_url", {"path": str(path)})
+    if not helper_url:
+        raise BridgeError("session_missing_helper_url", "session.json is missing helper_url", {"path": str(path)})
     if not code_sync:
         raise BridgeError("session_missing_code_sync", "session.json is missing code_sync binding", {"path": str(path)})
 
-    return Session(workspace=root, task_id=task_id, helper_base_url=helper_base_url, task_session_token=task_session_token, code_sync=code_sync)
+    return Session(workspace=root, task_id=task_id, helper_url=helper_url, task_session_token=task_session_token, code_sync=code_sync)

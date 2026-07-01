@@ -533,7 +533,7 @@ local function codeSyncGetManifest(args)
 	if typeof(args) ~= "table" then
 		return false, nil, "code_sync_invalid_config: args must be a table"
 	end
-	if args.protocol_version ~= 1 then
+	if args.protocol_version ~= 2 then
 		return false, nil, "code_sync_protocol_version_unsupported"
 	end
 	if args.mapping_profile ~= "sync_lua_v1" then
@@ -544,8 +544,7 @@ local function codeSyncGetManifest(args)
 	end
 	local result = {
 		kind = "code_sync_get_manifest",
-		protocol_version = 1,
-		project_id = args.project_id,
+		protocol_version = 2,
 		mapping_profile = args.mapping_profile,
 		mode = mode,
 		mode_seq = modeSeq,
@@ -665,7 +664,7 @@ local function codeSyncApply(args)
 	if typeof(args) ~= "table" then
 		return false, nil, "code_sync_invalid_config: args must be a table"
 	end
-	if args.protocol_version ~= 1 then
+	if args.protocol_version ~= 2 then
 		return false, nil, "code_sync_protocol_version_unsupported"
 	end
 	if args.mapping_profile ~= "sync_lua_v1" then
@@ -691,8 +690,7 @@ local function codeSyncApply(args)
 	end
 	return true, {
 		kind = "code_sync_apply",
-		protocol_version = 1,
-		project_id = args.project_id,
+		protocol_version = 2,
 		mapping_profile = args.mapping_profile,
 		mode = mode,
 		mode_seq = modeSeq,

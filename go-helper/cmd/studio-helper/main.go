@@ -121,7 +121,6 @@ type studioRunCodeCommandArgs struct {
 type codeSyncGetManifestCommandArgs struct {
 	PlaceID         string           `json:"place_id"`
 	ProtocolVersion int              `json:"protocol_version"`
-	ProjectID       string           `json:"project_id"`
 	MappingProfile  string           `json:"mapping_profile"`
 	Roots           []map[string]any `json:"roots"`
 }
@@ -129,7 +128,6 @@ type codeSyncGetManifestCommandArgs struct {
 type codeSyncApplyCommandArgs struct {
 	PlaceID         string           `json:"place_id"`
 	ProtocolVersion int              `json:"protocol_version"`
-	ProjectID       string           `json:"project_id"`
 	MappingProfile  string           `json:"mapping_profile"`
 	Roots           []map[string]any `json:"roots"`
 }
@@ -1196,11 +1194,11 @@ func main() {
 			writeTaskAPIError(w, http.StatusBadRequest, taskID, "bad_request", err.Error(), "fix_request", nil)
 			return
 		}
-		if request.ProtocolVersion != 1 {
-			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_protocol_version_unsupported", "code-sync protocol_version must be 1", "fix_request", map[string]any{"protocol_version": request.ProtocolVersion})
+		if request.ProtocolVersion != 2 {
+			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_protocol_version_unsupported", "code-sync protocol_version must be 2", "fix_request", map[string]any{"protocol_version": request.ProtocolVersion})
 			return
 		}
-		if !requireCodeSyncRequestBinding(w, taskID, status, request.ProjectID, request.MappingProfile, request.Roots) {
+		if !requireCodeSyncRequestBinding(w, taskID, status, request.MappingProfile, request.Roots) {
 			return
 		}
 		if _, err := studioManager.ManagedProcessForTask(taskID); err != nil {
@@ -1242,11 +1240,11 @@ func main() {
 			writeTaskAPIError(w, http.StatusBadRequest, taskID, "bad_request", err.Error(), "fix_request", nil)
 			return
 		}
-		if request.ProtocolVersion != 1 {
-			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_protocol_version_unsupported", "code-sync protocol_version must be 1", "fix_request", map[string]any{"protocol_version": request.ProtocolVersion})
+		if request.ProtocolVersion != 2 {
+			writeTaskAPIError(w, http.StatusBadRequest, taskID, "code_sync_protocol_version_unsupported", "code-sync protocol_version must be 2", "fix_request", map[string]any{"protocol_version": request.ProtocolVersion})
 			return
 		}
-		if !requireCodeSyncRequestBinding(w, taskID, status, request.ProjectID, request.MappingProfile, request.Roots) {
+		if !requireCodeSyncRequestBinding(w, taskID, status, request.MappingProfile, request.Roots) {
 			return
 		}
 		if _, err := studioManager.ManagedProcessForTask(taskID); err != nil {
@@ -1758,16 +1756,12 @@ func requireTaskSessionToken(w http.ResponseWriter, r *http.Request, taskID stri
 	return true
 }
 
-func requireCodeSyncRequestBinding(w http.ResponseWriter, taskID string, status tasksession.StatusResponse, projectID string, mappingProfile string, roots []map[string]any) bool {
+func requireCodeSyncRequestBinding(w http.ResponseWriter, taskID string, status tasksession.StatusResponse, mappingProfile string, roots []map[string]any) bool {
 	if status.Contract == nil {
 		writeJSON(w, http.StatusNotFound, status)
 		return false
 	}
 	binding := status.Contract.CodeSync
-	if projectID != binding.ProjectID {
-		writeTaskAPIError(w, http.StatusConflict, taskID, "code_sync_binding_mismatch", "code-sync project_id does not match task session", "reload_session", map[string]any{"project_id": projectID, "expected_project_id": binding.ProjectID})
-		return false
-	}
 	if mappingProfile != binding.MappingProfile {
 		writeTaskAPIError(w, http.StatusConflict, taskID, "code_sync_binding_mismatch", "code-sync mapping_profile does not match task session", "reload_session", map[string]any{"mapping_profile": mappingProfile, "expected_mapping_profile": binding.MappingProfile})
 		return false

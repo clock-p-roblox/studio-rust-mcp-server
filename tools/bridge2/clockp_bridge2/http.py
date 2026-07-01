@@ -13,7 +13,7 @@ from .session import Session
 
 def task_url(session: Session, path: str, query: dict[str, str | int | None] | None = None) -> str:
     quoted_task = parse.quote(session.task_id, safe="")
-    url = f"{session.helper_base_url}/session/{quoted_task}{path}"
+    url = f"{session.helper_url}/session/{quoted_task}{path}"
     if query:
         filtered = {key: str(value) for key, value in query.items() if value is not None and str(value) != ""}
         if filtered:

@@ -7,7 +7,20 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import BridgeError
-from .project import validate_studio_path_allowed
+
+MAPPING_PROFILE = "sync_lua_v1"
+ALLOWED_STUDIO_SERVICES = {
+    "Lighting",
+    "ReplicatedFirst",
+    "ReplicatedStorage",
+    "ServerScriptService",
+    "ServerStorage",
+    "SoundService",
+    "StarterGui",
+    "StarterPack",
+    "StarterPlayer",
+    "Workspace",
+}
 
 
 @dataclass(frozen=True)
@@ -30,12 +43,10 @@ class CodeSyncRoot:
 
 @dataclass(frozen=True)
 class CodeSyncConfig:
-    project_id: str
-    mapping_profile: str
     roots: list[CodeSyncRoot]
 
 
-def load_config(config_path: Path, targets: list[list[str]]) -> CodeSyncConfig:
+def load_config(config_path: Path) -> CodeSyncConfig:
     try:
         payload = json.loads(config_path.read_text(encoding="utf-8-sig"))
     except OSError as exc:
@@ -44,19 +55,15 @@ def load_config(config_path: Path, targets: list[list[str]]) -> CodeSyncConfig:
         raise BridgeError("code_sync_invalid_config", str(exc), {"path": str(config_path)}) from exc
     if not isinstance(payload, dict):
         raise BridgeError("code_sync_invalid_config", "code-sync config must be a JSON object", {"path": str(config_path)})
-    project_id = _required_string(payload, "project_id")
-    mapping_profile = _required_string(payload, "mapping_profile")
-    if mapping_profile != "sync_lua_v1":
-        raise BridgeError("code_sync_unsupported_mapping", "only mapping_profile=sync_lua_v1 is supported", {"mapping_profile": mapping_profile})
     raw_roots = payload.get("roots")
     if not isinstance(raw_roots, list) or not raw_roots:
         raise BridgeError("code_sync_invalid_config", "roots must be a non-empty array", {"path": str(config_path)})
-    roots = [_parse_root(item, targets) for item in raw_roots]
+    roots = [_parse_root(item) for item in raw_roots]
     _validate_unique_roots(roots)
-    return CodeSyncConfig(project_id=project_id, mapping_profile=mapping_profile, roots=roots)
+    return CodeSyncConfig(roots=roots)
 
 
-def _parse_root(value: Any, targets: list[list[str]]) -> CodeSyncRoot:
+def _parse_root(value: Any) -> CodeSyncRoot:
     if not isinstance(value, dict):
         raise BridgeError("code_sync_invalid_config", "root entry must be an object", {"root": value})
     root_id = _required_string(value, "root_id")
@@ -72,10 +79,20 @@ def _parse_root(value: Any, targets: list[list[str]]) -> CodeSyncRoot:
     studio_path = value.get("studio_path")
     if not isinstance(studio_path, list) or not all(isinstance(segment, str) and segment for segment in studio_path):
         raise BridgeError("code_sync_invalid_config", "studio_path must be a non-empty string array", {"root_id": root_id})
-    validate_studio_path_allowed(studio_path, targets)
+    _validate_studio_path(studio_path, root_id)
     include = _pattern_list(value.get("include", ["**/*.lua", "**/*.luau"]), "include", root_id)
     exclude = _pattern_list(value.get("exclude", []), "exclude", root_id)
     return CodeSyncRoot(root_id=root_id, local_path=local_path, studio_path=studio_path, include=include, exclude=exclude)
+
+
+def _validate_studio_path(studio_path: list[str], root_id: str) -> None:
+    service = studio_path[0]
+    if service not in ALLOWED_STUDIO_SERVICES:
+        raise BridgeError(
+            "code_sync_invalid_config",
+            "studio_path must start from a supported DataModel service",
+            {"root_id": root_id, "studio_path": studio_path, "service": service},
+        )
 
 
 def _required_string(payload: dict, key: str) -> str:

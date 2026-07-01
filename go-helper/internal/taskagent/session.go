@@ -24,13 +24,8 @@ type Descriptor struct {
 	TaskAgentStartedAtMS int64           `json:"task_agent_started_at_ms"`
 	TaskAgentStatusURL   string          `json:"task_agent_status_url"`
 	TaskSessionToken     string          `json:"task_session_token"`
-	Helper               HelperRoute     `json:"helper"`
+	HelperURL            string          `json:"helper_url"`
 	CodeSync             CodeSyncBinding `json:"code_sync"`
-}
-
-type HelperRoute struct {
-	BaseURL   string `json:"base_url"`
-	PublicURL string `json:"public_url,omitempty"`
 }
 
 func SessionPath(workspace string) string {
@@ -153,37 +148,36 @@ func UnixMillis(t time.Time) int64 {
 }
 
 type RouteConfig struct {
-	Environment   string
-	MachineName   string
-	UserName      string
-	DomainSuffix  string
-	HelperBaseURL string
+	Environment  string
+	MachineName  string
+	UserName     string
+	DomainSuffix string
+	HelperURL    string
 }
 
-func ResolveHelperBaseURL(config RouteConfig) (string, string, error) {
+func ResolveHelperURL(config RouteConfig) (string, error) {
 	environment := strings.TrimSpace(config.Environment)
 	if environment == "" {
-		environment = "local"
+		environment = "public"
 	}
 	switch environment {
-	case "local":
-		if strings.TrimSpace(config.HelperBaseURL) == "" {
-			return "", "", errors.New("--helper-base-url is required for local task-agent start")
-		}
-		return strings.TrimRight(strings.TrimSpace(config.HelperBaseURL), "/"), "", nil
 	case "public":
 		userName, err := ResolveUserName(config.UserName)
 		if err != nil {
-			return "", "", err
+			return "", err
 		}
 		machineName := strings.TrimSpace(config.MachineName)
 		if machineName == "" {
-			return "", "", errors.New("machine_name is required for public helper URL")
+			return "", errors.New("machine_name is required for public helper URL")
 		}
-		baseURL := fmt.Sprintf("https://roblox-helper-%s-%s-user.%s", machineName, userName, ResolveDomainSuffix(config.DomainSuffix))
-		return baseURL, baseURL, nil
+		return fmt.Sprintf("https://roblox-helper-%s-%s-user.%s", machineName, userName, ResolveDomainSuffix(config.DomainSuffix)), nil
+	case "local":
+		if strings.TrimSpace(config.HelperURL) == "" {
+			return "", errors.New("--helper-url is required for local task-agent start")
+		}
+		return strings.TrimRight(strings.TrimSpace(config.HelperURL), "/"), nil
 	default:
-		return "", "", fmt.Errorf("--environment must be local or public, got %q", environment)
+		return "", fmt.Errorf("--environment must be public or local, got %q", environment)
 	}
 }
 

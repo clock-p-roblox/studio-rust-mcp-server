@@ -1,4 +1,4 @@
-﻿package tasksession
+package tasksession
 
 import (
 	"testing"
@@ -30,11 +30,10 @@ func validHeartbeat(taskID string) HeartbeatRequest {
 		TaskAgentStartedAtMS: 1000,
 		TaskSessionToken:     "token-" + taskID,
 		CodeSync: CodeSyncBinding{
-			ProtocolVersion:    1,
+			ProtocolVersion:    2,
 			WorkspaceID:        "workspace-" + taskID,
 			PlaceID:            "123",
 			MachineName:        "win-a",
-			ProjectID:          "game",
 			MappingProfile:     "sync_lua_v1",
 			CodeSyncConfigHash: "config-hash-" + taskID,
 			RootsAuthorityHash: "roots-hash-" + taskID,

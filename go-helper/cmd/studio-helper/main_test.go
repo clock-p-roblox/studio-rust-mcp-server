@@ -196,7 +196,6 @@ func TestRequireCodeSyncRequestBinding(t *testing.T) {
 		Contract: &tasksession.Contract{
 			TaskID: "task-a",
 			CodeSync: tasksession.CodeSyncBinding{
-				ProjectID:      "game",
 				MappingProfile: "sync_lua_v1",
 				Roots: []tasksession.CodeSyncRootRoute{
 					{RootID: "app", StudioPath: []string{"ReplicatedStorage", "ClockPTest"}},
@@ -206,7 +205,6 @@ func TestRequireCodeSyncRequestBinding(t *testing.T) {
 	}
 	cases := []struct {
 		name       string
-		projectID  string
 		mapping    string
 		roots      []map[string]any
 		wantOK     bool
@@ -214,9 +212,8 @@ func TestRequireCodeSyncRequestBinding(t *testing.T) {
 		wantCode   string
 	}{
 		{
-			name:      "match",
-			projectID: "game",
-			mapping:   "sync_lua_v1",
+			name:    "match",
+			mapping: "sync_lua_v1",
 			roots: []map[string]any{{
 				"root_id":     "app",
 				"studio_path": []any{"ReplicatedStorage", "ClockPTest"},
@@ -225,16 +222,7 @@ func TestRequireCodeSyncRequestBinding(t *testing.T) {
 			wantOK: true,
 		},
 		{
-			name:       "project mismatch",
-			projectID:  "other",
-			mapping:    "sync_lua_v1",
-			roots:      []map[string]any{{"root_id": "app", "studio_path": []any{"ReplicatedStorage", "ClockPTest"}}},
-			wantStatus: http.StatusConflict,
-			wantCode:   "code_sync_binding_mismatch",
-		},
-		{
 			name:       "root path mismatch",
-			projectID:  "game",
 			mapping:    "sync_lua_v1",
 			roots:      []map[string]any{{"root_id": "app", "studio_path": []any{"Workspace", "ClockPTest"}}},
 			wantStatus: http.StatusConflict,
@@ -242,7 +230,6 @@ func TestRequireCodeSyncRequestBinding(t *testing.T) {
 		},
 		{
 			name:       "duplicate root",
-			projectID:  "game",
 			mapping:    "sync_lua_v1",
 			roots:      []map[string]any{{"root_id": "app", "studio_path": []any{"ReplicatedStorage", "ClockPTest"}}, {"root_id": "app", "studio_path": []any{"ReplicatedStorage", "ClockPTest"}}},
 			wantStatus: http.StatusConflict,
@@ -252,7 +239,7 @@ func TestRequireCodeSyncRequestBinding(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			response := httptest.NewRecorder()
-			ok := requireCodeSyncRequestBinding(response, "task-a", status, tc.projectID, tc.mapping, tc.roots)
+			ok := requireCodeSyncRequestBinding(response, "task-a", status, tc.mapping, tc.roots)
 			if ok != tc.wantOK {
 				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
 			}
@@ -628,11 +615,11 @@ func TestStudioRunCodeRoutesTaskScopedCommand(t *testing.T) {
 func TestCodeSyncCommandsRequireEditMode(t *testing.T) {
 	broker := newMCP2CommandBroker()
 	initializeBroker(t, broker, "play_server", 11, 101)
-	manifestRequest := codeSyncGetManifestCommandArgs{ProtocolVersion: 1, MappingProfile: "sync_lua_v1", Roots: []map[string]any{{"root_id": "r"}}}
+	manifestRequest := codeSyncGetManifestCommandArgs{ProtocolVersion: 2, MappingProfile: "sync_lua_v1", Roots: []map[string]any{{"root_id": "r"}}}
 	if _, err := broker.enqueueCodeSyncGetManifest("111", manifestRequest); err == nil {
 		t.Fatalf("enqueueCodeSyncGetManifest succeeded in play_server mode")
 	}
-	applyRequest := codeSyncApplyCommandArgs{ProtocolVersion: 1, MappingProfile: "sync_lua_v1", Roots: []map[string]any{{"root_id": "r"}}}
+	applyRequest := codeSyncApplyCommandArgs{ProtocolVersion: 2, MappingProfile: "sync_lua_v1", Roots: []map[string]any{{"root_id": "r"}}}
 	if _, err := broker.enqueueCodeSyncApply("111", applyRequest); err == nil {
 		t.Fatalf("enqueueCodeSyncApply succeeded in play_server mode")
 	}
@@ -641,7 +628,7 @@ func TestCodeSyncCommandsRequireEditMode(t *testing.T) {
 func TestCodeSyncCommandsRouteTaskScopedCommand(t *testing.T) {
 	broker := newMCP2CommandBroker()
 	initializeBroker(t, broker, "edit", 11, 101)
-	manifestRequest := codeSyncGetManifestCommandArgs{ProtocolVersion: 1, ProjectID: "game", MappingProfile: "sync_lua_v1", Roots: []map[string]any{{"root_id": "r"}}}
+	manifestRequest := codeSyncGetManifestCommandArgs{ProtocolVersion: 2, MappingProfile: "sync_lua_v1", Roots: []map[string]any{{"root_id": "r"}}}
 	manifestCommand, err := broker.enqueueCodeSyncGetManifest("111", manifestRequest)
 	if err != nil {
 		t.Fatalf("enqueueCodeSyncGetManifest failed: %v", err)
@@ -651,10 +638,10 @@ func TestCodeSyncCommandsRouteTaskScopedCommand(t *testing.T) {
 		t.Fatalf("pulled manifest command = %+v close=%v, want %d", pulled, closePull, manifestCommand.CommandID)
 	}
 	args, ok := pulled.Args.(codeSyncGetManifestCommandArgs)
-	if !ok || args.PlaceID != "111" || args.ProjectID != "game" {
+	if !ok || args.PlaceID != "111" {
 		t.Fatalf("manifest args = %+v type_ok=%v", pulled.Args, ok)
 	}
-	applyRequest := codeSyncApplyCommandArgs{ProtocolVersion: 1, ProjectID: "game", MappingProfile: "sync_lua_v1", Roots: []map[string]any{{"root_id": "r"}}}
+	applyRequest := codeSyncApplyCommandArgs{ProtocolVersion: 2, MappingProfile: "sync_lua_v1", Roots: []map[string]any{{"root_id": "r"}}}
 	applyCommand, err := broker.enqueueCodeSyncApply("222", applyRequest)
 	if err != nil {
 		t.Fatalf("enqueueCodeSyncApply failed: %v", err)
@@ -664,7 +651,7 @@ func TestCodeSyncCommandsRouteTaskScopedCommand(t *testing.T) {
 		t.Fatalf("pulled apply command = %+v close=%v, want %d", pulled, closePull, applyCommand.CommandID)
 	}
 	applyArgs, ok := pulled.Args.(codeSyncApplyCommandArgs)
-	if !ok || applyArgs.PlaceID != "222" || applyArgs.ProjectID != "game" {
+	if !ok || applyArgs.PlaceID != "222" {
 		t.Fatalf("apply args = %+v type_ok=%v", pulled.Args, ok)
 	}
 }
@@ -1131,11 +1118,10 @@ func registerTestTask(t *testing.T, runtime *mcpRuntime, taskID string, placeID 
 		TaskAgentStartedAtMS: time.Now().UnixMilli(),
 		TaskSessionToken:     "token-" + taskID,
 		CodeSync: tasksession.CodeSyncBinding{
-			ProtocolVersion:    1,
+			ProtocolVersion:    2,
 			WorkspaceID:        "workspace-" + taskID,
 			PlaceID:            placeID,
 			MachineName:        "test-machine",
-			ProjectID:          "game",
 			MappingProfile:     "sync_lua_v1",
 			CodeSyncConfigHash: "config-" + taskID,
 			RootsAuthorityHash: "roots-" + taskID,
