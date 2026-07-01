@@ -150,6 +150,8 @@ helper2 自身的 HTTP handler 不做 Bearer 鉴权；但当 `bridge2` 通过公
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> status
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> mode
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> ensure-edit
+tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> launch
+tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> launch --data-file debug\play-data\startup-profile.json --wait-seconds 10
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> play
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> play --data-file debug\play-data\startup-profile.json
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> stop
@@ -162,7 +164,11 @@ tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> code-sync-dry-run
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> code-sync-apply
 ```
 
-这里有两个 play 层级：bridge2 `play` 是标准 launch；helper2 / MCP 的 `studio_play` 是被 bridge2 `play` 调用的底层原语。
+这里有三个层级：
+
+- bridge2 `launch` 是工程级启动入口：先跑 workspace 的 `prelaunch.json`，全部成功后再调用 `play`。
+- bridge2 `play` 是直接 PlayMode 入口：只负责下发 play args、等待 `play_server` 并校验 `launch_id`，不执行 build 或 code-sync。
+- helper2 / MCP 的 `studio_play` 是被 bridge2 `play` 调用的底层原语。
 
 `run-code-direct` 不做模式切换。`run-code` 会先 ensure edit。需要 edit 的子命令自己决定是否 ensure；CLI 顶层不做全局 ensure。
 
@@ -175,7 +181,40 @@ tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> code-sync-apply
 - 最终 `mode_seq` 必须不同于 play 前的 edit `mode_seq`。
 - 最终 mode payload 的 `launch_id` 必须等于本次请求的 `launch_id`。
 
-调试参数、测试场景参数和大段输入统一走 `play` 的 `data`。默认推荐 `--data-file`：
+`launch` 默认读取 workspace 根目录的 `prelaunch.json`。可用 `--prelaunch <path>` 指定其他 workspace 内文件；prelaunch path、shell cwd 和 code-sync config 都必须留在 workspace 内。
+
+示例：
+
+```json
+{
+  "steps": [
+    {
+      "kind": "shell",
+      "name": "build",
+      "argv": ["npm", "run", "build:roblox"],
+      "cwd": "."
+    },
+    {
+      "kind": "ensure_edit",
+      "name": "ensure-edit"
+    },
+    {
+      "kind": "code_sync_apply",
+      "name": "code-sync"
+    }
+  ]
+}
+```
+
+支持的 step：
+
+- `shell`：在 workspace 内指定 `cwd` 执行 `argv`，非 0 exit code 会阻止 play。
+- `ensure_edit`：若当前在 play，则先 stop 回 edit。
+- `code_sync_apply`：执行当前 bridge2 `code-sync-apply`。默认读取 `clock-p.workspace.json.code_sync_config`，也可显式写 `"config": "code-sync.tree.json"`；默认 `"ensure_edit": true`。
+
+`launch` 和 `play` 都支持 `--data-file` / `--data-json`，二者都会把 data 传给同一套 PlayMode args。`launch --wait-seconds N` 会在 play 成功后等待 N 秒并返回等待后的 mode，用于 smoke 或压测启动观察。
+
+调试参数、测试场景参数和大段输入统一走 PlayMode `data`。默认推荐 `--data-file`：
 
 ```powershell
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> play --data-file debug\play-data\startup-profile.json
