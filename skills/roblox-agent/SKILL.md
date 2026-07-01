@@ -134,12 +134,10 @@ workspace 根的 `clock-p.workspace.json` 至少要有：
 ```powershell
 <mcp_repo>\go-helper\bin\task-agent.exe start `
   --workspace <workspace> `
-  --environment public `
-  --machine_name <machine_name> `
-  --user <feishu-user_name>
+  --machine_name <machine_name>
 ```
 
-public `task-agent` 访问公网 helper 时会读取 workspace 或本机身份目录里的 `feishu-token`，并注入 Bearer 鉴权。
+public 是默认环境。`task-agent` 会从 workspace 或本机身份目录读取 `feishu-user_name` 来推导公网 helper URL，并读取 `feishu-token` 注入 Bearer 鉴权。`--user` 只用于特殊覆盖，不是正常主线参数。
 
 helper2 自身的 HTTP handler 不做 Bearer 鉴权；但当 `bridge2` 通过公网 `helper_url` 访问时，外层 `dev.clock-p.com` 入口仍要求 `Authorization: Bearer <feishu-token>`。`bridge2` 会自动从 workspace 或身份目录读取 `feishu-token` 注入。
 
@@ -207,6 +205,8 @@ tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> code-sync-apply
 - `helper2_official_wait_job`
 - `helper2_official_search_creator_store`
 - `helper2_official_insert_from_creator_store`
+
+MCP 工具和 bridge2 共享同一个 task-scoped helper2 控制通道，但语义层级不同：`helper2_studio_play` 只是标准 launch 的底层受理步骤，返回后仍需要继续查询 mode；正常启动游戏应走 bridge2 `play`，由它完成 `launch_id`、`mode_seq` 和 `play_server` 的完整验证。
 
 ## 验证
 

@@ -189,10 +189,6 @@ def screenshot(session: Session) -> dict:
     return get_json(task_url(session, "/studio/screenshot"), timeout=30.0, session=session)
 
 
-def play_mode_logs(session: Session, cursor: str | None = None, limit: int | None = None) -> dict:
-    return get_json(task_url(session, "/runtime-log", {"cursor": cursor, "limit": limit}), session=session)
-
-
 def run_code_direct(session: Session, code: str) -> dict:
     return post_json(task_url(session, "/studio/run-code-direct"), {"code": code}, timeout=30.0, session=session)
 

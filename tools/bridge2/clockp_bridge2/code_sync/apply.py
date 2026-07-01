@@ -16,13 +16,13 @@ from .targets import build_targets
 def apply_code_sync(session: Session, workspace: Path, config_path: Path) -> dict:
     before_mode = _require_stable_edit_mode(mode(session))
     local_manifest = build_local_manifest(workspace, config_path)
-    roots_payload = _build_roots_payload(workspace, config_path)
+    targets_payload = _build_targets_payload(workspace, config_path)
     result = helper_code_sync_apply(
         session,
         {
             "protocol_version": 2,
             "mapping_profile": MAPPING_PROFILE,
-            "targets": roots_payload,
+            "targets": targets_payload,
         },
     )
     after_mode = _require_stable_edit_mode(mode(session))
@@ -35,6 +35,6 @@ def apply_code_sync(session: Session, workspace: Path, config_path: Path) -> dic
     return {"applied": True, "local": local_manifest, "live": live_manifest, "diff": diff, "apply_result": result}
 
 
-def _build_roots_payload(workspace: Path, config_path: Path) -> list[dict]:
+def _build_targets_payload(workspace: Path, config_path: Path) -> list[dict]:
     _config, targets = build_targets(workspace, config_path)
     return [target.apply_payload() for target in targets]

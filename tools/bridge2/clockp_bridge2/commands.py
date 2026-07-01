@@ -25,7 +25,6 @@ from .studio import (
     official_store_image,
     official_wait_job,
     play,
-    play_mode_logs,
     run_code_direct,
     screenshot,
     status,
@@ -40,7 +39,6 @@ KNOWN_COMMANDS = {
     "play",
     "stop",
     "screenshot",
-    "play-mode-logs",
     "run-code-direct",
     "run-code",
     "official-ping",
@@ -101,10 +99,6 @@ def _build_parser() -> JSONArgumentParser:
     play_source = play_parser.add_mutually_exclusive_group(required=False)
     play_source.add_argument("--data-json")
     play_source.add_argument("--data-file")
-
-    logs_parser = subparsers.add_parser("play-mode-logs", add_help=False)
-    logs_parser.add_argument("--cursor", default=None)
-    logs_parser.add_argument("--limit", type=int, default=None)
 
     for name in ("run-code-direct", "run-code"):
         run_parser = subparsers.add_parser(name, add_help=False)
@@ -197,8 +191,6 @@ def _run_command(args: argparse.Namespace) -> dict:
         return stop(session)
     if command == "screenshot":
         return _checked_helper_result(command, screenshot(session))
-    if command == "play-mode-logs":
-        return _checked_helper_result(command, play_mode_logs(session, args.cursor, args.limit))
     if command == "run-code-direct":
         return _checked_helper_result(command, run_code_direct(session, _read_code(args)))
     if command == "run-code":

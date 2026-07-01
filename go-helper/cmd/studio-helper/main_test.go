@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/runtimelog"
 	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/studio"
 	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/tasksession"
 )
@@ -752,19 +751,9 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 	}
 }
 
-func TestMCPStatusAndRuntimeLogToolsRequireExplicitTaskID(t *testing.T) {
+func TestMCPStatusToolRequiresExplicitTaskID(t *testing.T) {
 	runtime := newTestMCPRuntime(t)
 	registerTestTask(t, runtime, "task-a", "123")
-	if _, err := runtime.runtimeLogs.Append("task-a", runtimelog.Upload{
-		RuntimeID:   "server",
-		Mode:        "play_server",
-		TimestampMS: time.Now().UnixMilli(),
-		Level:       "info",
-		Message:     "hello",
-		Fields:      map[string]any{"session_id": "sess"},
-	}); err != nil {
-		t.Fatalf("append runtime log failed: %v", err)
-	}
 
 	statusResult := callMCPTool(t, runtime, "helper2_status", map[string]any{
 		"task_id":            "task-a",
@@ -773,16 +762,6 @@ func TestMCPStatusAndRuntimeLogToolsRequireExplicitTaskID(t *testing.T) {
 	statusPayload := decodeToolText(t, statusResult)
 	if statusPayload["task_id"] != "task-a" || statusPayload["state"] != "live" {
 		t.Fatalf("unexpected status payload: %+v", statusPayload)
-	}
-
-	logResult := callMCPTool(t, runtime, "helper2_runtime_log", map[string]any{
-		"task_id":            "task-a",
-		"task_session_token": "token-task-a",
-	})
-	logPayload := decodeToolText(t, logResult)
-	entries, ok := logPayload["entries"].([]any)
-	if !ok || len(entries) != 1 {
-		t.Fatalf("unexpected runtime log payload: %+v", logPayload)
 	}
 
 	missingTaskResult := callMCPTool(t, runtime, "helper2_status", map[string]any{})
@@ -1058,20 +1037,10 @@ func newTestMCPRuntime(t *testing.T) *mcpRuntime {
 			t.Fatalf("close studio manager failed: %v", err)
 		}
 	})
-	logs, err := runtimelog.NewStore(runtimelog.DefaultMaxEntriesPerTask)
-	if err != nil {
-		t.Fatalf("new runtime log store failed: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := logs.Close(); err != nil {
-			t.Fatalf("close runtime log store failed: %v", err)
-		}
-	})
 	return &mcpRuntime{
 		taskSessions:   tasksession.NewRegistry(31*time.Second, manager),
 		studioManager:  manager,
 		commandBroker:  newMCP2CommandBrokerRegistry(),
-		runtimeLogs:    logs,
 		officialRunner: fakeOfficialRunner{},
 		logger:         logger,
 	}

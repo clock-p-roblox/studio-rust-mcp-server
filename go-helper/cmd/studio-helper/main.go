@@ -20,7 +20,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/runtimelog"
 	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/screenshot"
 	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/studio"
 	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/tasksession"
@@ -858,11 +857,6 @@ func main() {
 	commandBrokers := newMCP2CommandBrokerRegistry()
 	taskSessions := tasksession.NewRegistry(31*time.Second, studioManager)
 	officialRunner := officialCLIProcessRunner{}
-	runtimeLogs, err := runtimelog.NewStore(runtimelog.DefaultMaxEntriesPerTask)
-	if err != nil {
-		logger.Error("failed to create runtime log store", "error", err)
-		os.Exit(1)
-	}
 	effectiveListenAddr := *addr
 	publicExposure, err := newPublicExposureManager(publicExposureConfig{Enabled: false}, logger)
 	if err != nil {
@@ -871,9 +865,6 @@ func main() {
 	}
 	defer func() {
 		publicExposure.Stop()
-		if err := runtimeLogs.Close(); err != nil {
-			logger.Warn("failed to clean runtime log store", "dir", runtimeLogs.Dir(), "error", err)
-		}
 		if err := studioManager.Close(); err != nil {
 			logger.Error("failed to close Studio manager", "error", err)
 		}
@@ -886,7 +877,7 @@ func main() {
 			Service: "studio-helper",
 		})
 	})
-	registerMCPHandlers(mux, taskSessions, studioManager, commandBrokers, runtimeLogs, officialRunner, logger, func() publicExposureStatus {
+	registerMCPHandlers(mux, taskSessions, studioManager, commandBrokers, officialRunner, logger, func() publicExposureStatus {
 		return publicExposure.Status()
 	})
 	registerOfficialHTTPHandlers(mux, taskSessions, studioManager, officialRunner)
@@ -975,33 +966,6 @@ func main() {
 			"studios":           studios,
 			"mcp2_channel":      commandBrokers.summaryForTask(taskID),
 			"recent_commands":   commandBrokers.recentTerminalsForTask(taskID, 20),
-		})
-	})
-	mux.HandleFunc("GET /session/{task_id}/runtime-log", func(w http.ResponseWriter, r *http.Request) {
-		taskID := r.PathValue("task_id")
-		status := taskSessions.Status(taskID)
-		if !status.OK || status.Contract == nil {
-			writeJSON(w, http.StatusNotFound, status)
-			return
-		}
-		if !requireTaskSessionToken(w, r, taskID, status) {
-			return
-		}
-		limit, err := parseRuntimeLogLimit(r.URL.Query().Get("limit"))
-		if err != nil {
-			writeRuntimeLogAPIError(w, http.StatusBadRequest, "bad_limit", err.Error(), map[string]any{"task_id": taskID})
-			return
-		}
-		entries, nextCursor, err := runtimeLogs.Read(taskID, r.URL.Query().Get("cursor"), limit)
-		if err != nil {
-			writeRuntimeLogAPIError(w, http.StatusBadRequest, "bad_cursor", err.Error(), map[string]any{"task_id": taskID})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":          true,
-			"task_id":     taskID,
-			"entries":     entries,
-			"next_cursor": nextCursor,
 		})
 	})
 	mux.HandleFunc("POST /session/{task_id}/studio/play", func(w http.ResponseWriter, r *http.Request) {
@@ -1565,33 +1529,6 @@ func printPrettyJSON(label string, value any) {
 		return
 	}
 	fmt.Printf("%s:\n%s\n", label, body)
-}
-
-func parseRuntimeLogLimit(value string) (int, error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return runtimelog.DefaultReadLimit, nil
-	}
-	limit, err := strconv.Atoi(value)
-	if err != nil || limit <= 0 {
-		return 0, fmt.Errorf("limit must be a positive integer: %s", value)
-	}
-	if limit > runtimelog.MaxReadLimit {
-		return runtimelog.MaxReadLimit, nil
-	}
-	return limit, nil
-}
-
-func writeRuntimeLogAPIError(w http.ResponseWriter, status int, code string, message string, extra map[string]any) {
-	body := map[string]any{
-		"ok":      false,
-		"code":    code,
-		"message": message,
-	}
-	for key, value := range extra {
-		body[key] = value
-	}
-	writeJSON(w, status, body)
 }
 
 func writeTaskStudioCommandTerminal(w http.ResponseWriter, taskID string, command mcp2Command, terminal mcp2CommandTerminal) {

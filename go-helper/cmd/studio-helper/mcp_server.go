@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/runtimelog"
 	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/screenshot"
 	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/studio"
 	"github.com/clock-p-roblox/studio-rust-mcp-server/go-helper/internal/tasksession"
@@ -45,7 +44,6 @@ type mcpRuntime struct {
 	taskSessions         *tasksession.Registry
 	studioManager        *studio.Manager
 	commandBroker        *mcp2CommandBrokerRegistry
-	runtimeLogs          *runtimelog.Store
 	officialRunner       officialToolRunner
 	logger               *slog.Logger
 	publicExposureStatus func() publicExposureStatus
@@ -56,7 +54,6 @@ func registerMCPHandlers(
 	taskSessions *tasksession.Registry,
 	studioManager *studio.Manager,
 	commandBrokers *mcp2CommandBrokerRegistry,
-	runtimeLogs *runtimelog.Store,
 	officialRunner officialToolRunner,
 	logger *slog.Logger,
 	publicExposureStatus func() publicExposureStatus,
@@ -65,7 +62,6 @@ func registerMCPHandlers(
 		taskSessions:         taskSessions,
 		studioManager:        studioManager,
 		commandBroker:        commandBrokers,
-		runtimeLogs:          runtimeLogs,
 		officialRunner:       officialRunner,
 		logger:               logger,
 		publicExposureStatus: publicExposureStatus,
@@ -206,10 +202,6 @@ func (m *mcpRuntime) runTool(ctx context.Context, name string, args map[string]a
 			return nil, err
 		}
 		return m.runStudioRunCode(ctx, taskID, code)
-	case "helper2_runtime_log":
-		cursor, _ := optionalStringArg(args, "cursor")
-		limit := optionalIntArg(args, "limit", runtimelog.DefaultReadLimit)
-		return m.readRuntimeLog(taskID, cursor, limit)
 	case "helper2_official_ping":
 		return m.runOfficial(ctx, taskID, "", map[string]any{})
 	case "helper2_official_store_image":
@@ -475,23 +467,6 @@ func (m *mcpRuntime) runScreenshot(ctx context.Context, taskID string) (map[stri
 	}, nil
 }
 
-func (m *mcpRuntime) readRuntimeLog(taskID string, cursor string, limit int) (map[string]any, error) {
-	status := m.taskSessions.Status(taskID)
-	if !status.OK || status.Contract == nil {
-		return nil, fmt.Errorf("helper2 has no registered session for task_id %s", taskID)
-	}
-	entries, nextCursor, err := m.runtimeLogs.Read(taskID, cursor, limit)
-	if err != nil {
-		return nil, err
-	}
-	return map[string]any{
-		"ok":          true,
-		"task_id":     taskID,
-		"entries":     entries,
-		"next_cursor": nextCursor,
-	}, nil
-}
-
 func (m *mcpRuntime) runOfficial(ctx context.Context, taskID string, toolName string, args map[string]any) (map[string]any, error) {
 	if m.officialRunner == nil {
 		return nil, fmt.Errorf("official runner is not configured")
@@ -738,25 +713,6 @@ func optionalStringArg(args map[string]any, key string) (string, bool) {
 	return strings.TrimSpace(text), true
 }
 
-func optionalIntArg(args map[string]any, key string, defaultValue int) int {
-	value, ok := args[key]
-	if !ok {
-		return defaultValue
-	}
-	switch typed := value.(type) {
-	case float64:
-		return int(typed)
-	case int:
-		return typed
-	case string:
-		parsed, err := strconv.Atoi(strings.TrimSpace(typed))
-		if err == nil {
-			return parsed
-		}
-	}
-	return defaultValue
-}
-
 func copyOptionalOfficialArgs(source map[string]any, target map[string]any, mapping map[string]string) {
 	for sourceKey, targetKey := range mapping {
 		value, ok := source[sourceKey]
@@ -836,11 +792,6 @@ func mcpTools() []map[string]any {
 		mcpTool("helper2_studio_run_code", "Run Luau code in edit mode through the task-bound mcp2 channel without ensuring edit mode.", map[string]any{
 			"task_id": stringSchema(),
 			"code":    stringSchema(),
-		}),
-		mcpTool("helper2_runtime_log", "Read helper2 runtime logs for a task.", map[string]any{
-			"task_id": stringSchema(),
-			"cursor":  stringSchema(),
-			"limit":   map[string]any{"type": "integer"},
 		}),
 		mcpTool("helper2_official_ping", "Bind the official Roblox Studio CLI to the task-owned Studio.", map[string]any{"task_id": stringSchema()}),
 		mcpTool("helper2_official_store_image", "Call official store_image for the task-owned Studio.", map[string]any{

@@ -1,5 +1,7 @@
 # Code Sync Node Tree
 
+归档说明：这份设计记录保留历史讨论脉络，不再作为当前实现判定依据。当前 code-sync 事实以 `README.md`、`skills/roblox-agent/SKILL.md` 和 `tools/bridge2` / `go-helper` / `plugin-mcp2` 源码为准。
+
 ## 目标
 
 把 code-sync 配置从旧的 `roots` 列表改成按 Studio DataModel 形状书写的 `tree`。bridge2 和 task-agent 负责解释配置、扫描本地文件、推导文件 kind、组合 node/subnode，并把最终目标树发给 helper2/mcp2。helper2/mcp2 不理解 ownership / subnode 持有关系，只负责查询 Studio 子树和把给定目标树增量写入 Studio。

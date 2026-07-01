@@ -65,8 +65,6 @@ class FakeHelper(BaseHTTPRequestHandler):
             self._json(payload)
         elif self.path.endswith("/studio/screenshot"):
             self._json({"ok": True, "screenshot": {"path": "shot.png"}})
-        elif self.path.startswith("/session/task-a/runtime-log"):
-            self._json({"ok": True, "entries": [], "next_cursor": ""})
         else:
             self._json({"code": "not_found", "message": self.path}, status=404)
 
@@ -436,7 +434,7 @@ class Bridge2CLITest(unittest.TestCase):
         self.assertEqual(payload["message"], "blocked token")
 
     def test_thin_commands_do_not_ensure_edit(self) -> None:
-        for command in ("status", "mode", "play", "stop", "screenshot", "play-mode-logs", "official-ping"):
+        for command in ("status", "mode", "play", "stop", "screenshot", "official-ping"):
             with self.subTest(command=command):
                 FakeHelper.requests_seen = []
                 FakeHelper.mode = "edit"
