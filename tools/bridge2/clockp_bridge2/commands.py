@@ -13,6 +13,7 @@ from .code_sync.apply import apply_code_sync
 from .code_sync.diff import diff_manifests
 from .code_sync.live import query_live_manifest
 from .errors import BridgeError
+from .prelaunch import launch
 from .session import load_session
 from .studio import (
     ensure_edit_mode,
@@ -36,6 +37,7 @@ KNOWN_COMMANDS = {
     "status",
     "mode",
     "ensure-edit",
+    "launch",
     "play",
     "stop",
     "screenshot",
@@ -95,6 +97,12 @@ def _build_parser() -> JSONArgumentParser:
 
     for name in ("status", "mode", "ensure-edit", "stop", "screenshot"):
         subparsers.add_parser(name, add_help=False)
+
+    launch_parser = subparsers.add_parser("launch", add_help=False)
+    launch_parser.add_argument("--prelaunch", default="prelaunch.json")
+    launch_source = launch_parser.add_mutually_exclusive_group(required=False)
+    launch_source.add_argument("--data-json")
+    launch_source.add_argument("--data-file")
 
     play_parser = subparsers.add_parser("play", add_help=False)
     play_source = play_parser.add_mutually_exclusive_group(required=False)
@@ -166,6 +174,10 @@ def _build_parser() -> JSONArgumentParser:
     code_sync_apply_parser = subparsers.add_parser("code-sync-apply", add_help=False)
     code_sync_apply_parser.add_argument("--config", default="code-sync.roots.json")
     code_sync_apply_parser.add_argument("--code-sync-project", default="default.project.json")
+    ensure_group = code_sync_apply_parser.add_mutually_exclusive_group(required=False)
+    ensure_group.add_argument("--ensure-edit", dest="ensure_edit", action="store_true")
+    ensure_group.add_argument("--no-ensure-edit", dest="ensure_edit", action="store_false")
+    code_sync_apply_parser.set_defaults(ensure_edit=True)
 
     return parser
 
@@ -186,13 +198,16 @@ def _run_command(args: argparse.Namespace) -> dict:
         return {"local": local_manifest, "live": live_manifest, "diff": diff_manifests(local_manifest, live_manifest)}
     if command == "code-sync-apply":
         workspace = Path(args.workspace)
-        return apply_code_sync(session, workspace, workspace / args.config, workspace / args.code_sync_project)
+        return apply_code_sync(session, workspace, workspace / args.config, workspace / args.code_sync_project, ensure_edit=args.ensure_edit)
     if command == "status":
         return _checked_helper_result(command, status(session))
     if command == "mode":
         return _checked_helper_result(command, mode(session))
     if command == "ensure-edit":
         return ensure_edit_mode(session)
+    if command == "launch":
+        workspace = Path(args.workspace)
+        return launch(session, workspace, Path(args.prelaunch), _read_play_data(args))
     if command == "play":
         return play(session, _read_play_data(args))
     if command == "stop":

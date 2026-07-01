@@ -5,16 +5,19 @@ import tempfile
 import unittest
 from pathlib import Path
 import sys
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from clockp_bridge2.code_sync.mapping import build_logical_tree
 from clockp_bridge2.code_sync.project import load_project_targets, validate_studio_path_allowed
 from clockp_bridge2.code_sync.config import CodeSyncRoot
+from clockp_bridge2.code_sync.apply import apply_code_sync
 from clockp_bridge2.code_sync.diff import diff_manifests
 from clockp_bridge2.code_sync.hashing import LogicalNode
 from clockp_bridge2.code_sync.scanner import SourceFile, scan_root
 from clockp_bridge2.errors import BridgeError
+from clockp_bridge2.session import Session
 
 
 class CodeSyncTests(unittest.TestCase):
@@ -157,6 +160,108 @@ class CodeSyncTests(unittest.TestCase):
         self.assertEqual(len(tree.children), 1)
         self.assertEqual(tree.children[0].name, "Dir")
         self.assertEqual(len(tree.children[0].children), 1000)
+
+    def test_apply_code_sync_optionally_ensures_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            session = Session(workspace=workspace, task_id="task-a", helper_base_url="http://helper", task_session_token="token", code_sync={})
+            config_path = workspace / "code-sync.roots.json"
+            project_path = workspace / "default.project.json"
+            with mock.patch("clockp_bridge2.code_sync.apply.ensure_edit_mode", return_value={"reason": "already_edit"}) as mocked_ensure, mock.patch(
+                "clockp_bridge2.code_sync.apply.mode", return_value={"ok": True, "available": True, "mode": "edit", "mode_seq": 101}
+            ), mock.patch(
+                "clockp_bridge2.code_sync.apply.build_local_manifest",
+                return_value={"project_id": "game1", "mapping_profile": "sync_lua_v1", "combined_hash": "local-hash", "roots": []},
+            ), mock.patch(
+                "clockp_bridge2.code_sync.apply._build_roots_payload", return_value=[]
+            ), mock.patch(
+                "clockp_bridge2.code_sync.apply.helper_code_sync_apply", return_value={"ok": True}
+            ), mock.patch(
+                "clockp_bridge2.code_sync.apply.query_live_manifest",
+                return_value={"project_id": "game1", "mapping_profile": "sync_lua_v1", "combined_hash": "local-hash", "roots": [], "mode": "edit", "mode_seq": 101},
+            ):
+                result = apply_code_sync(session, workspace, config_path, project_path, ensure_edit=True)
+                self.assertEqual(result["ensure_edit"]["reason"], "already_edit")
+                mocked_ensure.assert_called_once()
+
+            with mock.patch("clockp_bridge2.code_sync.apply.ensure_edit_mode", return_value={"reason": "already_edit"}) as mocked_ensure, mock.patch(
+                "clockp_bridge2.code_sync.apply.mode", return_value={"ok": True, "available": True, "mode": "edit", "mode_seq": 101}
+            ), mock.patch(
+                "clockp_bridge2.code_sync.apply.build_local_manifest",
+                return_value={"project_id": "game1", "mapping_profile": "sync_lua_v1", "combined_hash": "local-hash", "roots": []},
+            ), mock.patch(
+                "clockp_bridge2.code_sync.apply._build_roots_payload", return_value=[]
+            ), mock.patch(
+                "clockp_bridge2.code_sync.apply.helper_code_sync_apply", return_value={"ok": True}
+            ), mock.patch(
+                "clockp_bridge2.code_sync.apply.query_live_manifest",
+                return_value={"project_id": "game1", "mapping_profile": "sync_lua_v1", "combined_hash": "local-hash", "roots": [], "mode": "edit", "mode_seq": 101},
+            ):
+                result = apply_code_sync(session, workspace, config_path, project_path, ensure_edit=False)
+                self.assertNotIn("ensure_edit", result)
+                mocked_ensure.assert_not_called()
+
+    def test_apply_code_sync_local_preflight_runs_before_ensure_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            session = Session(workspace=workspace, task_id="task-a", helper_base_url="http://helper", task_session_token="token", code_sync={})
+            config_path = workspace / "code-sync.roots.json"
+            project_path = workspace / "default.project.json"
+            with mock.patch(
+                "clockp_bridge2.code_sync.apply.build_local_manifest",
+                side_effect=BridgeError("code_sync_invalid_config", "broken config"),
+            ), mock.patch("clockp_bridge2.code_sync.apply.ensure_edit_mode", return_value={"reason": "already_edit"}) as mocked_ensure:
+                with self.assertRaises(BridgeError) as raised:
+                    apply_code_sync(session, workspace, config_path, project_path, ensure_edit=True)
+            self.assertEqual(raised.exception.code, "code_sync_invalid_config")
+            mocked_ensure.assert_not_called()
+
+    def test_apply_code_sync_with_ensure_edit_calls_ensure_edit_before_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            session = Session(workspace=workspace, task_id="task-a", helper_base_url="http://helper", task_session_token="token", code_sync={})
+            config_path = workspace / "code-sync.roots.json"
+            project_path = workspace / "default.project.json"
+            mode_values = [
+                {"ok": True, "available": True, "mode": "edit", "mode_seq": 101},
+                {"ok": True, "available": True, "mode": "edit", "mode_seq": 101},
+            ]
+            with mock.patch("clockp_bridge2.code_sync.apply.ensure_edit_mode", return_value={"reason": "stopped_play"}) as mocked_ensure, mock.patch(
+                "clockp_bridge2.code_sync.apply.mode", side_effect=mode_values
+            ), mock.patch(
+                "clockp_bridge2.code_sync.apply.build_local_manifest",
+                return_value={"project_id": "game1", "mapping_profile": "sync_lua_v1", "combined_hash": "local-hash", "roots": []},
+            ), mock.patch(
+                "clockp_bridge2.code_sync.apply._build_roots_payload", return_value=[]
+            ), mock.patch(
+                "clockp_bridge2.code_sync.apply.helper_code_sync_apply", return_value={"ok": True}
+            ) as mocked_helper_apply, mock.patch(
+                "clockp_bridge2.code_sync.apply.query_live_manifest",
+                return_value={"project_id": "game1", "mapping_profile": "sync_lua_v1", "combined_hash": "local-hash", "roots": [], "mode": "edit", "mode_seq": 101},
+            ):
+                result = apply_code_sync(session, workspace, config_path, project_path, ensure_edit=True)
+            self.assertEqual(result["ensure_edit"]["reason"], "stopped_play")
+            mocked_ensure.assert_called_once()
+            mocked_helper_apply.assert_called_once()
+
+    def test_apply_code_sync_without_ensure_edit_keeps_old_fail_closed_behavior(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            session = Session(workspace=workspace, task_id="task-a", helper_base_url="http://helper", task_session_token="token", code_sync={})
+            config_path = workspace / "code-sync.roots.json"
+            project_path = workspace / "default.project.json"
+            with mock.patch(
+                "clockp_bridge2.code_sync.apply.build_local_manifest",
+                return_value={"project_id": "game1", "mapping_profile": "sync_lua_v1", "combined_hash": "local-hash", "roots": []},
+            ), mock.patch(
+                "clockp_bridge2.code_sync.apply._build_roots_payload", return_value=[]
+            ), mock.patch(
+                "clockp_bridge2.code_sync.apply.mode", return_value={"ok": True, "available": True, "mode": "play_server", "mode_seq": 101}
+            ), mock.patch("clockp_bridge2.code_sync.apply.ensure_edit_mode", return_value={"reason": "stopped_play"}) as mocked_ensure:
+                with self.assertRaises(BridgeError) as raised:
+                    apply_code_sync(session, workspace, config_path, project_path, ensure_edit=False)
+            self.assertEqual(raised.exception.code, "code_sync_not_in_edit")
+            mocked_ensure.assert_not_called()
 
 
 if __name__ == "__main__":

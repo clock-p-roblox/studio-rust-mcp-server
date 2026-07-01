@@ -131,6 +131,7 @@ helper2 自身的 HTTP handler 不做 Bearer 鉴权；但当 `bridge2` 通过公
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> status
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> mode
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> ensure-edit
+tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> launch
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> play
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> stop
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> screenshot
@@ -141,11 +142,24 @@ tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> code-sync-manifest
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> code-sync-live-manifest
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> code-sync-dry-run
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> code-sync-apply
+tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> code-sync-apply --no-ensure-edit
 ```
+
+`launch` 读取 workspace 下的 `prelaunch.json`，按顺序执行 prelaunch steps，全部成功后再调用 `play`。`play` 是 direct Studio start 原语，不执行 build、flush 或其他 prelaunch workflow。
 
 `run-code-direct` 不做模式切换。`run-code` 会先 ensure edit。需要 edit 的子命令自己决定是否 ensure；CLI 顶层不做全局 ensure。
 
-`code-sync-manifest` 是本地扫描，不需要 `.clock-p/session.json`。`code-sync-live-manifest`、`code-sync-dry-run`、`code-sync-apply` 走 task-scoped helper2 / mcp2 链路，只允许稳定 edit 态，并用 BLAKE3 hash 验证 Studio live tree。
+`ensure-edit` 只处理两种稳定态：当前已是 `edit` 则直接成功；当前是 `play_server` 则调用 `stop` 等待回到 `edit`。其他模式一律失败，不做猜测。
+
+`code-sync-manifest` 是本地扫描，不需要 `.clock-p/session.json`。`code-sync-live-manifest`、`code-sync-dry-run`、`code-sync-apply` 走 task-scoped helper2 / mcp2 链路，并用 BLAKE3 hash 验证 Studio live tree。`code-sync-apply` CLI 默认会先 ensure edit；只有显式 `--no-ensure-edit` 时才保留“当前不是稳定 edit 就直接失败”的 direct 语义。
+
+`prelaunch.json` 第一版支持：
+
+- `ensure_edit`
+- `shell`
+- `code_sync_apply`
+
+其中 `code_sync_apply` 默认 `ensure_edit = true`；如需保留 direct flush 语义，必须显式写 `ensure_edit: false`。
 
 官方 adapter 命令：
 

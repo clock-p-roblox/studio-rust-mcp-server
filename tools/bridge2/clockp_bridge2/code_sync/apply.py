@@ -5,6 +5,7 @@ from pathlib import Path
 from ..errors import BridgeError
 from ..session import Session
 from ..studio import code_sync_apply as helper_code_sync_apply
+from ..studio import ensure_edit_mode
 from ..studio import mode
 from .config import load_config
 from .diff import diff_manifests
@@ -15,10 +16,11 @@ from .project import load_project_targets
 from .scanner import scan_root
 
 
-def apply_code_sync(session: Session, workspace: Path, config_path: Path, project_path: Path) -> dict:
-    before_mode = _require_stable_edit_mode(mode(session))
+def apply_code_sync(session: Session, workspace: Path, config_path: Path, project_path: Path, *, ensure_edit: bool = False) -> dict:
     local_manifest = build_local_manifest(workspace, config_path, project_path)
     roots_payload = _build_roots_payload(workspace, config_path, project_path)
+    ensure_result = ensure_edit_mode(session) if ensure_edit else None
+    before_mode = _require_stable_edit_mode(mode(session))
     result = helper_code_sync_apply(
         session,
         {
@@ -35,7 +37,10 @@ def apply_code_sync(session: Session, workspace: Path, config_path: Path, projec
     diff = diff_manifests(local_manifest, live_manifest)
     if not diff["matched"]:
         raise BridgeError("code_sync_verify_failed", "live Studio manifest hash does not match local manifest after apply", {"local": local_manifest, "live": live_manifest, "diff": diff})
-    return {"applied": True, "local": local_manifest, "live": live_manifest, "diff": diff, "apply_result": result}
+    payload = {"applied": True, "local": local_manifest, "live": live_manifest, "diff": diff, "apply_result": result}
+    if ensure_result is not None:
+        payload["ensure_edit"] = ensure_result
+    return payload
 
 
 def _build_roots_payload(workspace: Path, config_path: Path, project_path: Path) -> list[dict]:

@@ -14,6 +14,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from clockp_bridge2 import commands
 from clockp_bridge2 import http as bridge_http
+from clockp_bridge2 import prelaunch as bridge_prelaunch
 from clockp_bridge2.commands import main
 from clockp_bridge2.errors import BridgeError
 from clockp_bridge2.session import load_session
@@ -266,12 +267,14 @@ class Bridge2CLITest(unittest.TestCase):
         src = workspace / "src"
         src.mkdir()
         (src / "Main.lua").write_text("return 1\n", encoding="utf-8")
-        code, payload, stderr = self.run_cli("code-sync-manifest")
+        with mock.patch.object(commands, "build_local_manifest", return_value={"file_count": 1, "combined_hash": "local-hash"}) as mocked_manifest:
+            code, payload, stderr = self.run_cli("code-sync-manifest")
         self.assertEqual(code, 0)
         self.assertEqual(stderr, "")
         self.assertEqual(payload["ok"], True)
         self.assertEqual(payload["details"]["file_count"], 1)
         self.assertEqual(FakeHelper.requests_seen, [])
+        mocked_manifest.assert_called_once()
 
     def test_code_sync_live_manifest_uses_session(self) -> None:
         workspace = Path(self.workspace)
@@ -313,6 +316,22 @@ class Bridge2CLITest(unittest.TestCase):
         self.assertEqual(stderr, "")
         self.assertEqual(payload["details"]["combined_hash"], "remote-hash")
         self.assertTrue(any(path.endswith("/code-sync/get-manifest") for _method, path, _payload in FakeHelper.requests_seen))
+
+    def test_code_sync_apply_ensure_edit_flag_defaults_true_and_can_disable(self) -> None:
+        workspace = Path(self.workspace)
+        with mock.patch.object(commands, "apply_code_sync", return_value={"applied": True}) as mocked_apply:
+            code, payload, stderr = self.run_cli("code-sync-apply")
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, "")
+            self.assertEqual(payload["details"]["applied"], True)
+            self.assertEqual(mocked_apply.call_args.kwargs["ensure_edit"], True)
+
+        with mock.patch.object(commands, "apply_code_sync", return_value={"applied": True}) as mocked_apply:
+            code, payload, stderr = self.run_cli("code-sync-apply", "--no-ensure-edit")
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, "")
+            self.assertEqual(payload["details"]["applied"], True)
+            self.assertEqual(mocked_apply.call_args.kwargs["ensure_edit"], False)
 
     def test_unhandled_exception_is_json(self) -> None:
         original = commands.load_session
@@ -386,6 +405,248 @@ class Bridge2CLITest(unittest.TestCase):
         self.assertEqual(len(play_requests), 1)
         sent_payload = play_requests[0][2]
         self.assertEqual(sent_payload["play_args"]["data"], {"kind": "smoke"})
+
+    def test_launch_runs_prelaunch_then_play(self) -> None:
+        workspace = Path(self.workspace)
+        FakeHelper.mode = "play_server"
+        prelaunch_path = workspace / "prelaunch.json"
+        build_marker = workspace / "build.ok"
+        prelaunch_path.write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {"kind": "ensure_edit", "name": "ensure"},
+                        {
+                            "kind": "shell",
+                            "name": "build",
+                            "argv": ["python3", "-c", f"from pathlib import Path; Path({str(build_marker)!r}).write_text('ok', encoding='utf-8')"],
+                            "cwd": ".",
+                        },
+                        {
+                            "kind": "code_sync_apply",
+                            "name": "flush",
+                            "config": "code-sync.roots.json",
+                            "project": "default.project.json",
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch.object(bridge_prelaunch, "apply_code_sync", return_value={"applied": True}) as mocked_apply:
+            code, payload, _stderr = self.run_cli("launch")
+        self.assertEqual(code, 0)
+        self.assertTrue(build_marker.exists())
+        self.assertEqual(payload["details"]["prelaunch"]["ok"], True)
+        self.assertEqual(len(payload["details"]["prelaunch"]["steps"]), 3)
+        self.assertEqual(payload["details"]["prelaunch"]["steps"][0]["result"]["reason"], "stopped_play")
+        self.assertEqual(payload["details"]["play"]["final_mode"]["mode"], "play_server")
+        self.assertEqual(mocked_apply.call_count, 1)
+        self.assertEqual(mocked_apply.call_args.kwargs["ensure_edit"], True)
+        paths = [path for _method, path, _payload in FakeHelper.requests_seen]
+        self.assertIn("/session/task-a/studio/stop", paths)
+        self.assertIn("/session/task-a/studio/play", paths)
+
+    def test_launch_forwards_play_data(self) -> None:
+        workspace = Path(self.workspace)
+        (workspace / "prelaunch.json").write_text(json.dumps({"steps": []}), encoding="utf-8")
+        code, payload, _stderr = self.run_cli("launch", "--data-json", '{"kind":"smoke"}')
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["details"]["play"]["final_mode"]["mode"], "play_server")
+        play_requests = [request for request in FakeHelper.requests_seen if request[1].endswith("/studio/play")]
+        self.assertEqual(len(play_requests), 1)
+        self.assertEqual(play_requests[0][2]["play_args"]["data"], {"kind": "smoke"})
+
+    def test_launch_wraps_play_failure(self) -> None:
+        workspace = Path(self.workspace)
+        (workspace / "prelaunch.json").write_text(json.dumps({"steps": []}), encoding="utf-8")
+        FakeHelper.play_error_payload = {
+            "ok": False,
+            "code": "play_request_superseded",
+            "message": "Studio mode changed before this play request produced a response",
+        }
+        code, payload, _stderr = self.run_cli("launch")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(payload["code"], "launch_play_failed")
+        self.assertEqual(payload["details"]["play_error"]["code"], "play_request_superseded")
+        self.assertEqual(payload["details"]["prelaunch_results"], [])
+
+    def test_launch_prelaunch_failure_blocks_play(self) -> None:
+        workspace = Path(self.workspace)
+        prelaunch_path = workspace / "prelaunch.json"
+        prelaunch_path.write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "kind": "shell",
+                            "name": "build",
+                            "argv": ["python3", "-c", "import sys; sys.exit(3)"],
+                            "cwd": ".",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        code, payload, _stderr = self.run_cli("launch")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(payload["code"], "launch_prelaunch_failed")
+        self.assertEqual(payload["details"]["step_index"], 0)
+        self.assertEqual(payload["details"]["step_error"]["code"], "prelaunch_shell_failed")
+        paths = [path for _method, path, _payload in FakeHelper.requests_seen]
+        self.assertNotIn("/session/task-a/studio/play", paths)
+
+    def test_launch_missing_or_invalid_prelaunch_is_structured_failure(self) -> None:
+        code, payload, _stderr = self.run_cli("launch")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(payload["code"], "launch_prelaunch_failed")
+        self.assertEqual(payload["details"]["step_index"], None)
+        self.assertEqual(payload["details"]["step_error"]["code"], "prelaunch_missing")
+
+        workspace = Path(self.workspace)
+        (workspace / "prelaunch.json").write_text(json.dumps({"steps": [{"kind": "wat"}]}), encoding="utf-8")
+        code, payload, _stderr = self.run_cli("launch")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(payload["code"], "launch_prelaunch_failed")
+        self.assertEqual(payload["details"]["step_index"], None)
+        self.assertEqual(payload["details"]["step_error"]["code"], "prelaunch_invalid_config")
+
+    def test_launch_rejects_prelaunch_path_outside_workspace(self) -> None:
+        outside = Path(self.workspace).parent / "outside-prelaunch.json"
+        outside.write_text(json.dumps({"steps": []}), encoding="utf-8")
+        code, payload, _stderr = self.run_cli("launch", "--prelaunch", str(outside))
+        self.assertNotEqual(code, 0)
+        self.assertEqual(payload["code"], "launch_prelaunch_failed")
+        self.assertEqual(payload["details"]["step_index"], None)
+        self.assertEqual(payload["details"]["step_error"]["code"], "prelaunch_invalid_path")
+
+    def test_launch_missing_shell_command_is_prelaunch_failure(self) -> None:
+        workspace = Path(self.workspace)
+        prelaunch_path = workspace / "prelaunch.json"
+        prelaunch_path.write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "kind": "shell",
+                            "name": "build",
+                            "argv": ["definitely-not-a-real-command-xyz"],
+                            "cwd": ".",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        code, payload, _stderr = self.run_cli("launch")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(payload["code"], "launch_prelaunch_failed")
+        self.assertEqual(payload["details"]["step_error"]["code"], "prelaunch_shell_exec_failed")
+
+    def test_launch_rejects_shell_cwd_outside_workspace(self) -> None:
+        workspace = Path(self.workspace)
+        outside = workspace.parent
+        (workspace / "prelaunch.json").write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "kind": "shell",
+                            "name": "escape",
+                            "argv": ["python3", "-c", "print('nope')"],
+                            "cwd": str(outside),
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        code, payload, _stderr = self.run_cli("launch")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(payload["code"], "launch_prelaunch_failed")
+        self.assertEqual(payload["details"]["step_error"]["code"], "prelaunch_shell_invalid_cwd")
+
+    def test_launch_wraps_ensure_edit_step_failure(self) -> None:
+        workspace = Path(self.workspace)
+        FakeHelper.mode = "starting_play"
+        (workspace / "prelaunch.json").write_text(json.dumps({"steps": [{"kind": "ensure_edit", "name": "ensure"}]}), encoding="utf-8")
+        code, payload, _stderr = self.run_cli("launch")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(payload["code"], "launch_prelaunch_failed")
+        self.assertEqual(payload["details"]["step_index"], 0)
+        self.assertEqual(payload["details"]["step_kind"], "ensure_edit")
+        self.assertEqual(payload["details"]["step_error"]["code"], "studio_mode_not_editable")
+
+    def test_launch_wraps_code_sync_apply_step_failure(self) -> None:
+        workspace = Path(self.workspace)
+        (workspace / "prelaunch.json").write_text(
+            json.dumps({"steps": [{"kind": "code_sync_apply", "name": "flush", "config": "code-sync.roots.json", "project": "default.project.json"}]}),
+            encoding="utf-8",
+        )
+        with mock.patch.object(
+            bridge_prelaunch,
+            "apply_code_sync",
+            side_effect=BridgeError("code_sync_verify_failed", "hash mismatch", {"root_id": "app"}),
+        ):
+            code, payload, _stderr = self.run_cli("launch")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(payload["code"], "launch_prelaunch_failed")
+        self.assertEqual(payload["details"]["step_index"], 0)
+        self.assertEqual(payload["details"]["step_kind"], "code_sync_apply")
+        self.assertEqual(payload["details"]["step_error"]["code"], "code_sync_verify_failed")
+
+    def test_launch_rejects_code_sync_paths_outside_workspace(self) -> None:
+        workspace = Path(self.workspace)
+        outside = workspace.parent / "outside-project.json"
+        outside.write_text("{}", encoding="utf-8")
+        (workspace / "prelaunch.json").write_text(
+            json.dumps({"steps": [{"kind": "code_sync_apply", "name": "flush", "config": "code-sync.roots.json", "project": str(outside)}]}),
+            encoding="utf-8",
+        )
+        code, payload, _stderr = self.run_cli("launch")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(payload["code"], "launch_prelaunch_failed")
+        self.assertEqual(payload["details"]["step_kind"], "code_sync_apply")
+        self.assertEqual(payload["details"]["step_error"]["code"], "prelaunch_invalid_project_path")
+
+    def test_code_sync_apply_cli_default_ensures_edit_when_in_play(self) -> None:
+        FakeHelper.mode = "play_server"
+        with mock.patch(
+            "clockp_bridge2.code_sync.apply.build_local_manifest",
+            return_value={"project_id": "game1", "mapping_profile": "sync_lua_v1", "combined_hash": "local-hash", "roots": []},
+        ), mock.patch(
+            "clockp_bridge2.code_sync.apply._build_roots_payload",
+            return_value=[],
+        ), mock.patch(
+            "clockp_bridge2.code_sync.apply.helper_code_sync_apply",
+            return_value={"ok": True},
+        ), mock.patch(
+            "clockp_bridge2.code_sync.apply.query_live_manifest",
+            return_value={"project_id": "game1", "mapping_profile": "sync_lua_v1", "combined_hash": "local-hash", "roots": [], "mode": "edit", "mode_seq": 102},
+        ):
+            code, payload, stderr = self.run_cli("code-sync-apply")
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(payload["details"]["ensure_edit"]["reason"], "stopped_play")
+        paths = [path for _method, path, _payload in FakeHelper.requests_seen]
+        self.assertIn("/session/task-a/studio/stop", paths)
+
+    def test_code_sync_apply_cli_no_ensure_edit_keeps_direct_failure(self) -> None:
+        FakeHelper.mode = "play_server"
+        with mock.patch(
+            "clockp_bridge2.code_sync.apply.build_local_manifest",
+            return_value={"project_id": "game1", "mapping_profile": "sync_lua_v1", "combined_hash": "local-hash", "roots": []},
+        ), mock.patch(
+            "clockp_bridge2.code_sync.apply._build_roots_payload",
+            return_value=[],
+        ):
+            code, payload, stderr = self.run_cli("code-sync-apply", "--no-ensure-edit")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(payload["code"], "code_sync_not_in_edit")
+        paths = [path for _method, path, _payload in FakeHelper.requests_seen]
+        self.assertNotIn("/session/task-a/studio/stop", paths)
 
     def test_play_with_data_file_verifies_launch_id(self) -> None:
         data_path = Path(self.workspace) / "play-data.json"
