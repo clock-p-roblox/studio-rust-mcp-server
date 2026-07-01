@@ -1,30 +1,55 @@
-# clock-p Roblox agent
+# studio-rust-mcp-server
 
-本文档只描述当前 Roblox agent 主线。新的联调入口由 `task-agent`、`helper2`、`plugin-mcp2`、`bridge2` 和内嵌 clockbridge 组成。
+本仓维护 Roblox Studio 侧联调服务源码：
 
-## 主线结构
+- `go-helper/cmd/studio-helper`：Windows helper2 进程，负责和 Studio 插件、MCP、公网 clockbridge 通信。
+- `go-helper/cmd/task-agent`：workspace 侧 task-agent，负责写入 `.clock-p/session.json` 并向 helper2 心跳。
+- `plugin-mcp2`：Roblox Studio 插件，执行 helper2 下发的 Studio 命令。
+- `go-helper/internal/*`：task session、Studio 控制、截图、official adapter、task-agent 配置等实现。
+
+bridge CLI 不在本仓维护。当前 CLI、PlayMode data、code-sync、launch/prelaunch、run-code、screenshot 等操作手册在：
 
 ```text
-LLM / 脚本
-  -> tools/bridge2/clockp-roblox-cli
-  -> 工作区 .clock-p/session.json
-  -> helper2
-  -> plugin-mcp2
-  -> Roblox Studio
-
-task-agent
-  -> 维护 .clock-p/session.json
-  -> 向 helper2 心跳
+K:\roblox_space\roblox-dev-infra\README.md
+K:\roblox_space\roblox-dev-infra\skills\roblox-agent\SKILL.md
+K:\roblox_space\roblox-dev-infra\tools\bridge\
 ```
 
-职责边界：
+不要在本仓恢复历史 CLI、旧 bridge wrapper、helper1、hub、task-server、mcp1 或 runtime-log 入口。
 
-- `task-agent`：工作区侧会话 owner。启动后写入 `.clock-p/session.json`，后续命令只读该文件，不再手动传会话身份。
-- `plugin-mcp2`：Studio 内插件。只和 helper2 通信，负责执行 helper2 下发的 Studio 命令。
-- `bridge2`：LLM / 脚本使用的 CLI 层。只做会话读取、JSON 输出和命令编排。
-- `clockbridge`：公网转发能力。helper2 内嵌调用库，不依赖外部 `clockbridge-cli` 二进制。
+## 构建 helper2 / task-agent
 
-## 本机身份文件
+helper2 必须使用本仓当前源码 build 出来的本地二进制，不要使用公网矩阵测试临时目录里的 `studio-helper.exe`。
+
+```powershell
+cd K:\roblox_space\studio-rust-mcp-server\go-helper
+New-Item -ItemType Directory -Force bin | Out-Null
+go build -o bin\studio-helper.exe ./cmd/studio-helper
+go build -o bin\task-agent.exe ./cmd/task-agent
+```
+
+启动 helper2：
+
+```powershell
+K:\roblox_space\studio-rust-mcp-server\go-helper\bin\studio-helper.exe --addr 127.0.0.1:44750
+```
+
+启动 task-agent：
+
+```powershell
+K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe start `
+  --workspace <workspace> `
+  --machine_name <machine_name>
+```
+
+查看和停止 task-agent：
+
+```powershell
+K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe status --workspace <workspace>
+K:\roblox_space\studio-rust-mcp-server\go-helper\bin\task-agent.exe stop --workspace <workspace>
+```
+
+## 身份与会话边界
 
 Windows 客户端身份文件统一放在：
 
@@ -38,404 +63,40 @@ Windows 客户端身份文件统一放在：
 - `feishu-user_name`：helper2 读取，用于拼接公网用户名段。
 - `feishu-token`：helper2 读取，用于 clockbridge 注册认证。
 
-helper2 不再接受下面这些启动参数：
+`task-agent --machine_name` 必须显式传入，语义是目标 Windows helper 的 `machine_name`，不是 task-agent 当前机器名。task-agent 启动前读取 workspace 根的 `clock-p.workspace.json`，启动后写入 `.clock-p/session.json`。
 
-- `--public-machine-name`
-- `--public-user`
-- `--clockbridge-token-file`
-- `--clockbridge-bin`
-- `--clockbridge-x-token`
-- `--clockbridge-register-host`
-- `--clockbridge-register-ip`
+后续 bridge 命令只读 `.clock-p/session.json`。不要重新拼 machine、user、token 或 task 身份。
 
-`task-agent` 部署在服务端或工作区侧时，`machine_name` 必须由启动参数显式传入。这里的 `--machine_name` 语义是“目标 Windows helper 的 machine_name”，也就是你前面说的 `aim_helper_machine_name`，不是 task-agent 当前这台机器的名字。helper2 自己的本地 `machine_name` 仍然来自 Windows 身份文件。`task-agent` 不读取本机 `machine_name` 文件；启动前会从 workspace 根的 `clock-p.workspace.json` 读取 `place_id` 与 code-sync 绑定；启动完成后写入 `.clock-p/session.json`，之后的 `bridge2` 命令从 session 文件取值。
-
-## 启动流程
-
-### 构建
-
-helper2 必须使用本仓当前源码 build 出来的本地二进制：
-
-```text
-<mcp_repo>\go-helper\bin\studio-helper.exe
-```
-
-不要使用公网矩阵测试临时目录里的 `studio-helper.exe`。启动前先重新 build，并确保 `go` 在 PATH 中。
-
-```powershell
-cd <mcp_repo>\go-helper
-New-Item -ItemType Directory -Force bin | Out-Null
-go build -o bin\studio-helper.exe ./cmd/studio-helper
-go build -o bin\task-agent.exe ./cmd/task-agent
-```
-
-### 构建并安装 plugin-mcp2
+## plugin-mcp2
 
 Studio 侧插件必须使用本仓当前源码构建。更新 `plugin-mcp2` 后，先停止当前 Studio / task-agent，再按 Windows 侧当前插件打包流程生成并安装 `MCP2Plugin.rbxm`。
 
-server 侧不再把插件打包工具作为 code-sync / flush 运行时依赖；本机只能做源码、Python、Go 与静态检查，最终插件包由 Windows 侧部署验证。
+server 侧不把插件打包工具作为 code-sync / flush 运行时依赖；Linux 本机通常只做源码、Go 与静态检查，最终插件包由 Windows 侧部署验证。
 
-### 启动 helper2
-
-```powershell
-<mcp_repo>\go-helper\bin\studio-helper.exe --addr 127.0.0.1:44750
-```
-
-`--register-domain` 默认开启。开启后 helper2 会按本机身份文件注册公网 helper 域名，同时保留本地监听端口。
-
-### 启动 task-agent
-
-第一次接入一个 workspace，最少先确认这 2 个文件：
-
-```text
-clock-p.workspace.json
-code-sync.tree.json
-```
-
-workspace 根必须先有：
-
-```json
-{
-  "place_id": "93795519121520",
-  "code_sync_config": "code-sync.tree.json"
-}
-```
-
-文件名固定为 `clock-p.workspace.json`。当前主线推荐只显式传 `--workspace` 和 `--machine_name`；`feishu-user_name`、`feishu-token` 默认从身份目录读取。
-
-说明：
-
-- `place_id` 必填。
-- `code_sync_config` 可省略；省略后默认去 workspace 根找 `code-sync.tree.json`。
-- 所以如果你只写了 `place_id`，但默认 `code-sync.tree.json` 不存在，`task-agent` / `bridge2 code-sync-*` 仍会直接失败。
-- `code-sync.tree.json` 负责按 Studio DataModel 树声明 code-sync 托管节点。
-
-```powershell
-<mcp_repo>\go-helper\bin\task-agent.exe start `
-  --workspace <workspace> `
-  --machine_name <machine_name> `
-```
-
-当前默认 `--environment public`。若要连本机 helper2 而不是公网 helper，显式传：
-
-```powershell
-<mcp_repo>\go-helper\bin\task-agent.exe start `
-  --workspace <workspace> `
-  --machine_name <machine_name> `
-  --environment local `
-  --helper-url http://127.0.0.1:<helper2_port>
-```
-
-`local` 故意保持手工模式：你自己决定 helper2 的监听地址，再显式把 `--helper-url` 传给 task-agent；当前主线不额外封装这条路径。
-
-推荐的新开发者最小顺序：
-
-```text
-1. Windows 侧准备 identity 文件
-2. workspace 根写 clock-p.workspace.json
-3. 确认 code-sync.tree.json 已存在
-4. Windows 启动 helper2 并安装最新 plugin-mcp2
-5. workspace 侧启动 task-agent
-6. 运行 bridge2 status / mode
-7. 运行 code-sync-apply
-8. 运行 play
-```
-
-
-查看和停止当前 workspace 的 task-agent：
-
-```powershell
-<mcp_repo>\go-helper\bin\task-agent.exe status --workspace <workspace>
-<mcp_repo>\go-helper\bin\task-agent.exe stop --workspace <workspace>
-```
-
-公网场景下，`task-agent` 仍然只需要显式传 `--workspace` 和 `--machine_name`；`--environment public` 是默认值：
-
-```powershell
-<mcp_repo>\go-helper\bin\task-agent.exe start `
-  --workspace <workspace> `
-  --machine_name <machine_name>
-```
-
-public `task-agent` 会从 workspace 或本机身份目录读取 `feishu-user_name` 来推导公网 helper URL，并读取 `feishu-token` 注入 Bearer 鉴权。`--user` 只用于特殊覆盖，不是正常主线参数。
-
-## session.json
-
-`.clock-p/session.json` 是 bridge2 的唯一会话入口。典型字段：
-
-```json
-{
-  "task_id": "t0123abcd45",
-  "environment": "public",
-  "machine_name": "<machine_name>",
-  "place_id": "<place_id>",
-  "task_agent_pid": 12345,
-  "task_agent_started_at_ms": 1780000000000,
-  "task_agent_status_url": "http://127.0.0.1:32123/status",
-  "helper_url": "https://roblox-helper-sunjun2-user-user.dev.clock-p.com",
-  "task_session_token": "opaque-random-token",
-  "code_sync": {
-    "protocol_version": 2,
-    "workspace_id": "workspace-id",
-    "place_id": "<place_id>",
-    "machine_name": "<machine_name>",
-    "mapping_profile": "sync_lua_v1",
-    "code_sync_config_hash": "hex-hash",
-    "target_authority_hash": "hex-hash",
-    "config_path": "code-sync.tree.json",
-    "targets": [
-      {
-        "studio_path": ["Workspace", "ClockPTest"]
-      }
-    ]
-  }
-}
-```
-
-约束：
-
-- `helper_url` 是 bridge2 控制面的目标地址；公网验收时必须是真实公网 helper URL。
-- 后续命令不得重新拼 machine、user、token 或 task 身份。
-
-## bridge2 CLI
-
-入口脚本：
-
-- `tools/bridge2/clockp-roblox-cli.cmd`
-- `tools/bridge2/clockp-roblox-cli.sh`
-- `tools/bridge2/cli.py`
-
-所有命令只输出 JSON。成功和失败都必须是 JSON，便于 LLM 和脚本读取。
-
-常用命令：
-
-```powershell
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> status
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> mode
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> ensure-edit
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> launch
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> launch --data-file debug\play-data\startup-profile.json --wait-seconds 10
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> play
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> play --data-file debug\play-data\startup-profile.json
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> stop
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> screenshot
-```
-
-这里有三个层级：
-
-- bridge2 `launch` 是工程级启动入口：先跑 workspace 的 `prelaunch.json`，全部成功后再调用 `play`。
-- bridge2 `play` 是直接 PlayMode 入口：只负责下发 play args、等待 `play_server` 并校验 `launch_id`，不执行 build 或 code-sync。
-- helper2 / MCP 的 `studio_play` 是被 bridge2 `play` 调用的底层原语。
-
-`play` 的成功判据是程序化状态链，不读日志：
-
-- bridge2 生成本次随机 `launch_id`，随 play args 下发。
-- helper2 response 必须 echo 同一个 `requested_launch_id`。
-- plugin-mcp2 command result 必须 echo 同一个 `launch_id`。
-- 最终 Studio mode 必须变为 `play_server`。
-- 最终 `mode_seq` 必须不同于 play 前的 edit `mode_seq`。
-- 最终 mode payload 的 `launch_id` 必须等于本次请求的 `launch_id`。
-
-截图只作为可选视觉检查，不作为 play 成功的主判据。
-
-### Launch / prelaunch
-
-`launch` 默认读取 workspace 根目录的 `prelaunch.json`。可用 `--prelaunch <path>` 指定其他 workspace 内文件；prelaunch path、shell cwd 和 code-sync config 都必须留在 workspace 内。
-
-示例：
-
-```json
-{
-  "steps": [
-    {
-      "kind": "shell",
-      "name": "build",
-      "argv": ["npm", "run", "build:roblox"],
-      "cwd": "."
-    },
-    {
-      "kind": "ensure_edit",
-      "name": "ensure-edit"
-    },
-    {
-      "kind": "code_sync_apply",
-      "name": "code-sync"
-    }
-  ]
-}
-```
-
-支持的 step：
-
-- `shell`：在 workspace 内指定 `cwd` 执行 `argv`，非 0 exit code 会阻止 play。
-- `ensure_edit`：若当前在 play，则先 stop 回 edit。
-- `code_sync_apply`：执行当前 bridge2 `code-sync-apply`。默认读取 `clock-p.workspace.json.code_sync_config`，也可显式写 `"config": "code-sync.tree.json"`；默认 `"ensure_edit": true`。
-
-`launch` 和 `play` 都支持 `--data-file` / `--data-json`，二者都会把 data 传给同一套 PlayMode args。`launch --wait-seconds N` 会在 play 成功后等待 N 秒并返回等待后的 mode，用于 smoke 或压测启动观察。
-
-### Play data / 调试输入
-
-调试参数、测试场景参数和大段输入走 PlayMode `data`，不要再依赖 workspace 里的静态 `runtime_launch_params.lua`。plugin-mcp2 会把完整 `play_args` 传给 `StudioTestService:ExecutePlayModeAsync(play_args)`；运行时代码从 `StudioTestService:GetTestArgs().data` 读取。
-
-推荐默认使用 `--data-file`：
-
-```powershell
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> play --data-file debug\play-data\startup-profile.json
-```
-
-`--data-file` 适合当前主线测试、可复用调试 preset、压测矩阵和大篇幅输入。测试输入需要被 review、复跑或沉淀时，应放成文件。
-
-`--data-json` 只用于很短的一次性 smoke：
-
-```powershell
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> play --data-json "{\"probe\":\"smoke\"}"
-```
-
-`data` 必须是 JSON object。不要传数组、字符串或数字作为顶层值。
-
-代码 flush：
-
-```powershell
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> code-sync-manifest
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> code-sync-live-manifest
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> code-sync-dry-run
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> code-sync-apply
-```
-
-
-Lua 执行：
-
-```powershell
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> run-code-direct --file code.lua
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> run-code --file code.lua
-```
-
-语义：
-
-- `run-code-direct` 只转发执行，不做模式切换。
-- `run-code` 先确认 Studio 处于 edit 模式，再调用 `run-code-direct`。
-- 每个子命令自己决定是否需要 ensure-edit；CLI 顶层不做默认 ensure。
-
-官方 Studio MCP adapter 命令：
-
-```text
-official-ping
-official-store-image
-official-generate-mesh
-official-generate-procedural-model
-official-wait-job
-official-search-creator-store
-official-insert-from-creator-store
-```
-
-常见参数：
-
-```powershell
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> official-store-image --file image.png
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> official-generate-mesh --text-prompt "small tree" --size-x 1 --size-y 2 --size-z 3
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> official-generate-procedural-model --prompt "wooden crate"
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> official-wait-job --generation-id <generation_id>
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> official-search-creator-store --query tree --asset-type Model --max-results 3
-tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> official-insert-from-creator-store --asset-id 123456789
-```
-
-需要 edit 模式的官方命令由对应子命令自己执行 ensure-edit。`official-generate-mesh`、`official-generate-procedural-model` 和 `official-insert-from-creator-store` 可用 `--no-ensure-edit` 跳过。
-
-## helper2 HTTP 原语
-
-当前 task-scoped 原语：
-
-```text
-POST /session/{task_id}/heartbeat
-POST /session/{task_id}/release
-GET  /session/{task_id}/status
-GET  /session/{task_id}/studio/mode
-POST /session/{task_id}/studio/play
-POST /session/{task_id}/studio/stop
-GET  /session/{task_id}/studio/screenshot
-POST /session/{task_id}/studio/run-code-direct
-POST /session/{task_id}/code-sync/get-manifest
-POST /session/{task_id}/code-sync/apply
-POST /session/{task_id}/official/ping
-POST /session/{task_id}/official/store-image
-POST /session/{task_id}/official/generate-mesh
-POST /session/{task_id}/official/generate-procedural-model
-POST /session/{task_id}/official/wait-job
-POST /session/{task_id}/official/search-creator-store
-POST /session/{task_id}/official/insert-from-creator-store
-```
-
-## helper2 MCP 工具
-
-helper2 当前 MCP 工具面：
-
-```text
-helper2_status
-helper2_studio_mode
-helper2_studio_play
-helper2_studio_stop
-helper2_studio_screenshot
-helper2_studio_run_code
-helper2_official_ping
-helper2_official_store_image
-helper2_official_generate_mesh
-helper2_official_generate_procedural_model
-helper2_official_wait_job
-helper2_official_search_creator_store
-helper2_official_insert_from_creator_store
-```
-
-MCP 工具和 bridge2 共享同一个 task-scoped helper2 控制通道，但语义层级不同：`helper2_studio_play` 只是标准 launch 的底层受理步骤，返回后仍需要继续查询 mode；正常启动游戏应走 bridge2 `play`，由它完成 `launch_id`、`mode_seq` 和 `play_server` 的完整验证。
-
-
-
-公网验收时需要确认两件事：
-
-- bridge2 控制面确实走 `helper_url` 的公网地址。
-
-
-## 测试工作区
-
-测试者必须提供工作区和 place，不允许在测试入口里内置固定测试 place。本机这次可用的测试值：
-
-```text
-workspace: D:\roblox_space\test_game2
-place_id: 105986423068266
-```
-
-## 验证命令
+## 验证
 
 Go 侧：
 
 ```powershell
-cd <mcp_repo>\go-helper
+cd K:\roblox_space\studio-rust-mcp-server\go-helper
 go test -count=1 ./...
-New-Item -ItemType Directory -Force bin | Out-Null
-go build -o bin\studio-helper.exe ./cmd/studio-helper
-go build -o bin\task-agent.exe ./cmd/task-agent
 ```
 
-bridge2 Python：
+bridge Python 侧在 `roblox-dev-infra` 验证：
 
 ```powershell
-cd <mcp_repo>
-py -3 -m py_compile tools\bridge2\cli.py
-py -3 -m unittest discover tools\bridge2 -p "test*.py"
+cd K:\roblox_space\roblox-dev-infra
+py -3 -m py_compile tools\bridge\cli.py
+py -3 -m unittest discover tools\bridge -p "test_*.py"
 ```
 
-公网矩阵：
+涉及公网 task session gate 时再跑：
 
 ```powershell
-cd <mcp_repo>
+cd K:\roblox_space\studio-rust-mcp-server
 py -3 util\helper2_task_session_gate_test.py --place-id <place_id>
 ```
 
-公网矩阵必须覆盖：
+## 文档边界
 
-- helper2 公网 URL 鉴权和 task 可见性。
-- play / stop / screenshot 的 bridge2 直连路径。
-- MCP play / stop / screenshot。
-
-## 文档原则
-
-以后新增文档只写当前主线，不引用历史实现作为操作依据。
+本仓 README 只描述 helper2、task-agent、plugin-mcp2 的源码与构建边界。Roblox 联调操作流程、bridge CLI 参数和测试输入策略只在 `roblox-dev-infra` 维护。
