@@ -775,7 +775,7 @@ func mcpToolNames() []string {
 func mcpTools() []map[string]any {
 	return []map[string]any{
 		mcpTool("helper2_status", "Read helper2 task status.", map[string]any{"task_id": stringSchema()}),
-		mcpTool("helper2_studio_play", "Request Studio play through the task-bound mcp2 channel.", map[string]any{
+		mcpTool("helper2_studio_play", "Low-level bridge2 play primitive: enqueue Studio play and return request acceptance only; normal launch callers should use bridge2 play and verify mode_seq plus launch_id.", map[string]any{
 			"task_id": stringSchema(),
 			"play_args": map[string]any{
 				"type": "object",

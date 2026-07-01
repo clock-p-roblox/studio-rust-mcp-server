@@ -151,6 +151,7 @@ tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> status
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> mode
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> ensure-edit
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> play
+tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> play --data-file debug\play-data\startup-profile.json
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> stop
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> screenshot
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> run-code-direct --file code.lua
@@ -173,6 +174,20 @@ tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> code-sync-apply
 - 最终 Studio mode 必须变为 `play_server`。
 - 最终 `mode_seq` 必须不同于 play 前的 edit `mode_seq`。
 - 最终 mode payload 的 `launch_id` 必须等于本次请求的 `launch_id`。
+
+调试参数、测试场景参数和大段输入统一走 `play` 的 `data`。默认推荐 `--data-file`：
+
+```powershell
+tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> play --data-file debug\play-data\startup-profile.json
+```
+
+`--data-file` 用于当前主线测试、可复用 debug preset、压测矩阵和需要 review / 复跑的输入。`--data-json` 只用于很短的一次性 smoke：
+
+```powershell
+tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> play --data-json "{\"probe\":\"smoke\"}"
+```
+
+运行时代码从 `StudioTestService:GetTestArgs().data` 读取这些参数；不要再用 workspace 静态 `runtime_launch_params.lua` 承载测试输入。`data` 顶层必须是 JSON object。
 
 `code-sync-manifest` 是本地扫描，不需要 `.clock-p/session.json`。`code-sync-live-manifest`、`code-sync-dry-run`、`code-sync-apply` 走 task-scoped helper2 / mcp2 链路，只允许稳定 edit 态，并用 BLAKE3 hash 验证 Studio live tree。
 

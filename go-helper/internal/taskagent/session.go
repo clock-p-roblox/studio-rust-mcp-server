@@ -201,7 +201,7 @@ func ResolveUserName(explicit string) (string, error) {
 			}
 		}
 	}
-	return "", errors.New("--user is required for public task-agent start when feishu-user_name cannot be resolved")
+	return "", errors.New("public task-agent start requires feishu-user_name identity file; --user is only a special override")
 }
 
 func userNameCandidates() []string {

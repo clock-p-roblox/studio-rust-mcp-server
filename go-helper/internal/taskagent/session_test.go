@@ -122,8 +122,8 @@ func TestResolveHelperURLPublicRequiresExplicitIdentity(t *testing.T) {
 	t.Setenv("HOME", emptyHome)
 
 	_, missingUserErr := ResolveHelperURL(RouteConfig{Environment: "public", MachineName: "win-a"})
-	if missingUserErr == nil || !strings.Contains(missingUserErr.Error(), "--user is required") {
-		t.Fatalf("expected public user error, got %v", missingUserErr)
+	if missingUserErr == nil || !strings.Contains(missingUserErr.Error(), "feishu-user_name identity file") {
+		t.Fatalf("expected public identity file error, got %v", missingUserErr)
 	}
 
 	_, missingMachineErr := ResolveHelperURL(RouteConfig{Environment: "public", UserName: "sunjun"})
@@ -156,7 +156,7 @@ func TestResolveHelperURLPublicNeverReadsMachineNameFile(t *testing.T) {
 
 func TestLoadWorkspaceConfig(t *testing.T) {
 	workspace := t.TempDir()
-	body := []byte("{\"place_id\":\"123\",\"code_sync_config\":\"custom/roots.json\"}\n")
+	body := []byte("{\"place_id\":\"123\",\"code_sync_config\":\"custom/code-sync.tree.json\"}\n")
 	if err := os.WriteFile(filepath.Join(workspace, workspaceConfigFileName), body, 0o644); err != nil {
 		t.Fatalf("write workspace config: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestLoadWorkspaceConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load workspace config failed: %v", err)
 	}
-	if config.PlaceID != "123" || config.CodeSyncConfig != "custom/roots.json" {
+	if config.PlaceID != "123" || config.CodeSyncConfig != "custom/code-sync.tree.json" {
 		t.Fatalf("unexpected workspace config: %+v", config)
 	}
 }

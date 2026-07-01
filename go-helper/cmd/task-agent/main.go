@@ -44,7 +44,7 @@ func runStart(args []string) error {
 	workspace := fs.String("workspace", ".", "workspace directory")
 	environment := fs.String("environment", "public", "task-agent environment: public or local")
 	machineName := fs.String("machine_name", "", "target helper machine_name (aim_helper_machine_name), not this machine")
-	userName := fs.String("user", "", "clock-p user name for public helper URL derivation")
+	userName := fs.String("user", "", "special public helper user override; normally resolved from feishu-user_name")
 	helperURL := fs.String("helper-url", "", "local helper2 URL for --environment local")
 	publicDomainSuffix := fs.String("public-domain-suffix", "dev.clock-p.com", "domain suffix for public helper URL derivation")
 	statusAddr := fs.String("status-addr", "127.0.0.1:0", "task-agent status listen address")

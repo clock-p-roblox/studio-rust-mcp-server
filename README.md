@@ -214,6 +214,7 @@ tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> status
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> mode
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> ensure-edit
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> play
+tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> play --data-file debug\play-data\startup-profile.json
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> stop
 tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> screenshot
 ```
@@ -230,6 +231,26 @@ tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> screenshot
 - 最终 mode payload 的 `launch_id` 必须等于本次请求的 `launch_id`。
 
 截图只作为可选视觉检查，不作为 play 成功的主判据。
+
+### Play data / 调试输入
+
+调试参数、测试场景参数和大段输入走 `play` 的 `data`，不要再依赖 workspace 里的静态 `runtime_launch_params.lua`。plugin-mcp2 会把完整 `play_args` 传给 `StudioTestService:ExecutePlayModeAsync(play_args)`；运行时代码从 `StudioTestService:GetTestArgs().data` 读取。
+
+推荐默认使用 `--data-file`：
+
+```powershell
+tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> play --data-file debug\play-data\startup-profile.json
+```
+
+`--data-file` 适合当前主线测试、可复用调试 preset、压测矩阵和大篇幅输入。测试输入需要被 review、复跑或沉淀时，应放成文件。
+
+`--data-json` 只用于很短的一次性 smoke：
+
+```powershell
+tools\bridge2\clockp-roblox-cli.cmd --workspace <workspace> play --data-json "{\"probe\":\"smoke\"}"
+```
+
+`data` 必须是 JSON object。不要传数组、字符串或数字作为顶层值。
 
 代码 flush：
 
